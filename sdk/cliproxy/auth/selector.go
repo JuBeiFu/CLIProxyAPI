@@ -369,6 +369,16 @@ func isAuthBlockedForModel(auth *Auth, model string, now time.Time) (bool, block
 	if auth.Disabled || auth.Status == StatusDisabled {
 		return true, blockReasonDisabled, time.Time{}
 	}
+	// Treat quota cooldown as global for the auth: Codex "usage_limit_reached" and
+	// similar 429 quota signals are account-level, so we must avoid reusing the
+	// same credential across other models until it recovers.
+	if auth.Quota.Exceeded && !auth.Quota.NextRecoverAt.IsZero() && auth.Quota.NextRecoverAt.After(now) {
+		next := auth.Quota.NextRecoverAt
+		if next.Before(now) {
+			next = now
+		}
+		return true, blockReasonCooldown, next
+	}
 	if model != "" {
 		if len(auth.ModelStates) > 0 {
 			state, ok := auth.ModelStates[model]
