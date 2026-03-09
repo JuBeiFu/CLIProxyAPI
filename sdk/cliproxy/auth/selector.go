@@ -369,6 +369,9 @@ func isAuthBlockedForModel(auth *Auth, model string, now time.Time) (bool, block
 	if auth.Disabled || auth.Status == StatusDisabled {
 		return true, blockReasonDisabled, time.Time{}
 	}
+	if until, ok := cooldownUntilFromAuthMetadata(auth.Metadata); ok && until.After(now) {
+		return true, blockReasonCooldown, until
+	}
 	// Treat quota cooldown as global for the auth: Codex "usage_limit_reached" and
 	// similar 429 quota signals are account-level, so we must avoid reusing the
 	// same credential across other models until it recovers.
@@ -429,4 +432,50 @@ func isAuthBlockedForModel(auth *Auth, model string, now time.Time) (bool, block
 		return true, blockReasonOther, next
 	}
 	return false, blockReasonNone, time.Time{}
+}
+
+func cooldownUntilFromAuthMetadata(meta map[string]any) (time.Time, bool) {
+	if len(meta) == 0 {
+		return time.Time{}, false
+	}
+	raw, ok := meta[metadataCooldownUntilKey]
+	if !ok || raw == nil {
+		return time.Time{}, false
+	}
+	switch v := raw.(type) {
+	case int64:
+		if v <= 0 {
+			return time.Time{}, false
+		}
+		return time.Unix(v, 0), true
+	case int:
+		if v <= 0 {
+			return time.Time{}, false
+		}
+		return time.Unix(int64(v), 0), true
+	case float64:
+		if v <= 0 {
+			return time.Time{}, false
+		}
+		return time.Unix(int64(v), 0), true
+	case json.Number:
+		parsed, err := v.Int64()
+		if err != nil || parsed <= 0 {
+			return time.Time{}, false
+		}
+		return time.Unix(parsed, 0), true
+	case string:
+		s := strings.TrimSpace(v)
+		if s == "" {
+			return time.Time{}, false
+		}
+		if parsed, err := strconv.ParseInt(s, 10, 64); err == nil && parsed > 0 {
+			return time.Unix(parsed, 0), true
+		}
+		if parsed, err := time.Parse(time.RFC3339, s); err == nil && !parsed.IsZero() {
+			return parsed, true
+		}
+	default:
+	}
+	return time.Time{}, false
 }

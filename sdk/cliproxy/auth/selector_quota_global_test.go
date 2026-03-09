@@ -43,3 +43,40 @@ func TestIsAuthBlockedForModel_GlobalQuotaBlocksAllModels(t *testing.T) {
 	}
 }
 
+func TestIsAuthBlockedForModel_MetadataCooldownBlocksAllModels(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now()
+	until := now.Add(90 * time.Minute)
+	auth := &Auth{
+		ID:       "auth-1",
+		Metadata: map[string]any{metadataCooldownUntilKey: until.Unix()},
+	}
+
+	blocked, reason, next := isAuthBlockedForModel(auth, "gpt-5", now)
+	if !blocked {
+		t.Fatalf("expected auth to be blocked by metadata cooldown")
+	}
+	if reason != blockReasonCooldown {
+		t.Fatalf("expected cooldown reason, got %v", reason)
+	}
+	if next.IsZero() || !next.Equal(time.Unix(until.Unix(), 0)) {
+		t.Fatalf("expected next=%v, got %v", until, next)
+	}
+}
+
+func TestIsAuthBlockedForModel_MetadataCooldownExpiredAllows(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now()
+	until := now.Add(-5 * time.Minute)
+	auth := &Auth{
+		ID:       "auth-1",
+		Metadata: map[string]any{metadataCooldownUntilKey: until.Unix()},
+	}
+
+	blocked, reason, next := isAuthBlockedForModel(auth, "gpt-5", now)
+	if blocked {
+		t.Fatalf("expected auth not to be blocked, got reason=%v next=%v", reason, next)
+	}
+}

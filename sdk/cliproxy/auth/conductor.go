@@ -1732,6 +1732,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 				state := ensureModelState(auth, result.Model)
 				resetModelState(state, now)
 				updateAggregatedAvailability(auth, now)
+				syncCooldownMetadata(auth, now)
 				if !hasModelError(auth, now) {
 					auth.LastError = nil
 					auth.StatusMessage = ""
@@ -1742,6 +1743,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 				clearModelQuota = true
 			} else {
 				clearAuthStateOnSuccess(auth, now)
+				syncCooldownMetadata(auth, now)
 			}
 		} else {
 			if result.Model != "" {
@@ -1809,8 +1811,10 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 				auth.Status = StatusError
 				auth.UpdatedAt = now
 				updateAggregatedAvailability(auth, now)
+				syncCooldownMetadata(auth, now)
 			} else {
 				applyAuthFailureState(auth, result.Error, result.RetryAfter, now)
+				syncCooldownMetadata(auth, now)
 			}
 		}
 
@@ -1932,6 +1936,19 @@ func updateAggregatedAvailability(auth *Auth, now time.Time) {
 		auth.Quota.NextRecoverAt = time.Time{}
 		auth.Quota.BackoffLevel = 0
 	}
+}
+
+func syncCooldownMetadata(auth *Auth, now time.Time) {
+	if auth == nil || auth.Metadata == nil {
+		return
+	}
+	if auth.Quota.Exceeded && !auth.Quota.NextRecoverAt.IsZero() && auth.Quota.NextRecoverAt.After(now) {
+		auth.Metadata[metadataCooldownUntilKey] = auth.Quota.NextRecoverAt.Unix()
+		auth.Metadata[metadataCooldownReasonKey] = cooldownReasonQuota
+		return
+	}
+	delete(auth.Metadata, metadataCooldownUntilKey)
+	delete(auth.Metadata, metadataCooldownReasonKey)
 }
 
 func hasModelError(auth *Auth, now time.Time) bool {
