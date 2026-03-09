@@ -47,8 +47,12 @@ func TestParseCodexRetryAfter(t *testing.T) {
 
 	t.Run("non-429 status code", func(t *testing.T) {
 		body := []byte(`{"error":{"type":"usage_limit_reached","resets_in_seconds":30}}`)
-		if got := parseCodexRetryAfter(http.StatusBadRequest, body, now); got != nil {
-			t.Fatalf("expected nil for non-429, got %v", *got)
+		got := parseCodexRetryAfter(http.StatusBadRequest, body, now)
+		if got == nil {
+			t.Fatal("expected retryAfter for non-429 usage_limit_reached")
+		}
+		if *got != 30*time.Second {
+			t.Fatalf("retryAfter = %v, want %v", *got, 30*time.Second)
 		}
 	})
 
@@ -56,6 +60,21 @@ func TestParseCodexRetryAfter(t *testing.T) {
 		body := []byte(`{"error":{"type":"server_error","resets_in_seconds":30}}`)
 		if got := parseCodexRetryAfter(http.StatusTooManyRequests, body, now); got != nil {
 			t.Fatalf("expected nil for non-usage_limit_reached, got %v", *got)
+		}
+	})
+
+	t.Run("newCodexStatusErr normalizes usage_limit_reached to 429", func(t *testing.T) {
+		body := []byte(`{"error":{"type":"usage_limit_reached","resets_in_seconds":45}}`)
+		err := newCodexStatusErr(http.StatusBadRequest, body)
+		if err.StatusCode() != http.StatusTooManyRequests {
+			t.Fatalf("statusCode = %d, want %d", err.StatusCode(), http.StatusTooManyRequests)
+		}
+		retryAfter := err.RetryAfter()
+		if retryAfter == nil {
+			t.Fatal("expected retryAfter, got nil")
+		}
+		if *retryAfter != 45*time.Second {
+			t.Fatalf("retryAfter = %v, want %v", *retryAfter, 45*time.Second)
 		}
 	})
 }

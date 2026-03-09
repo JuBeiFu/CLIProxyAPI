@@ -30,6 +30,25 @@ type SDKConfig struct {
 	// NonStreamKeepAliveInterval controls how often blank lines are emitted for non-streaming responses.
 	// <= 0 disables keep-alives. Value is in seconds.
 	NonStreamKeepAliveInterval int `yaml:"nonstream-keepalive-interval,omitempty" json:"nonstream-keepalive-interval,omitempty"`
+
+	// ModelProviderMappings supplies fallback routing rules when a model is not present
+	// in the dynamic model registry. Rules are evaluated in order; the first match wins.
+	//
+	// This is useful when upstream introduces new model IDs (for example, "gpt-*") before
+	// the local static model list is updated.
+	ModelProviderMappings []ModelProviderMapping `yaml:"model-provider-mappings,omitempty" json:"model-provider-mappings,omitempty"`
+}
+
+// ModelProviderMapping defines a fallback mapping from model name patterns to provider identifiers.
+// Providers must match executor identifiers (for example: "codex", "claude", "gemini").
+type ModelProviderMapping struct {
+	// Pattern matches model IDs. When Regex=false, supports simple glob wildcards ("*" and "?")
+	// and falls back to case-insensitive exact matching.
+	Pattern string `yaml:"pattern" json:"pattern"`
+	// Providers is the ordered list of providers to try for the matching model.
+	Providers []string `yaml:"providers" json:"providers"`
+	// Regex toggles interpreting Pattern as a regular expression.
+	Regex bool `yaml:"regex,omitempty" json:"regex,omitempty"`
 }
 
 // StreamingConfig holds server streaming behavior configuration.

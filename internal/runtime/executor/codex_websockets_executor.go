@@ -5,8 +5,10 @@ package executor
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"net/http"
 	"net/url"
@@ -607,19 +609,41 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 }
 
 func (e *CodexWebsocketsExecutor) dialCodexWebsocket(ctx context.Context, auth *cliproxyauth.Auth, wsURL string, headers http.Header) (*websocket.Conn, *http.Response, error) {
-	dialer := newProxyAwareWebsocketDialer(e.cfg, auth)
-	dialer.HandshakeTimeout = codexResponsesWebsocketHandshakeTO
-	dialer.EnableCompression = true
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	conn, resp, err := dialer.DialContext(ctx, wsURL, headers)
-	if conn != nil {
-		// Avoid gorilla/websocket flate tail validation issues on some upstreams/Go versions.
-		// Negotiating permessage-deflate is fine; we just don't compress outbound messages.
-		conn.EnableWriteCompression(false)
+	proxyURLs := resolveProxyPoolURLs(e.cfg, auth)
+	if len(proxyURLs) == 0 {
+		proxyURLs = []string{""}
 	}
-	return conn, resp, err
+
+	var lastResp *http.Response
+	var lastErr error
+	for idx := range proxyURLs {
+		dialer, ok := newProxyAwareWebsocketDialer(proxyURLs[idx])
+		if !ok {
+			continue
+		}
+		conn, resp, err := dialer.DialContext(ctx, wsURL, headers)
+		if conn != nil {
+			// Avoid gorilla/websocket flate tail validation issues on some upstreams/Go versions.
+			// Negotiating permessage-deflate is fine; we just don't compress outbound messages.
+			conn.EnableWriteCompression(false)
+		}
+		if err == nil {
+			return conn, resp, nil
+		}
+		lastResp = resp
+		lastErr = err
+		if idx+1 >= len(proxyURLs) || !shouldRetryNextWebsocketProxy(err, resp) {
+			return conn, resp, err
+		}
+		if resp != nil && resp.Body != nil {
+			_ = resp.Body.Close()
+		}
+		log.WithError(err).Debug("codex websockets executor: websocket proxy failed, retrying next proxy")
+	}
+	return nil, lastResp, lastErr
 }
 
 func writeCodexWebsocketMessage(sess *codexWebsocketSession, conn *websocket.Conn, payload []byte) error {
@@ -683,7 +707,7 @@ func readCodexWebsocketMessage(ctx context.Context, sess *codexWebsocketSession,
 	}
 }
 
-func newProxyAwareWebsocketDialer(cfg *config.Config, auth *cliproxyauth.Auth) *websocket.Dialer {
+func newProxyAwareWebsocketDialer(proxyURL string) (*websocket.Dialer, bool) {
 	dialer := &websocket.Dialer{
 		Proxy:             http.ProxyFromEnvironment,
 		HandshakeTimeout:  codexResponsesWebsocketHandshakeTO,
@@ -694,25 +718,19 @@ func newProxyAwareWebsocketDialer(cfg *config.Config, auth *cliproxyauth.Auth) *
 		}).DialContext,
 	}
 
-	proxyURL := ""
-	if auth != nil {
-		proxyURL = strings.TrimSpace(auth.ProxyURL)
-	}
-	if proxyURL == "" && cfg != nil {
-		proxyURL = strings.TrimSpace(cfg.ProxyURL)
-	}
+	proxyURL = strings.TrimSpace(proxyURL)
 	if proxyURL == "" {
-		return dialer
+		return dialer, true
 	}
 
 	parsedURL, errParse := url.Parse(proxyURL)
 	if errParse != nil {
 		log.Errorf("codex websockets executor: parse proxy URL failed: %v", errParse)
-		return dialer
+		return nil, false
 	}
 
 	switch parsedURL.Scheme {
-	case "socks5":
+	case "socks5", "socks5h":
 		var proxyAuth *proxy.Auth
 		if parsedURL.User != nil {
 			username := parsedURL.User.Username()
@@ -722,7 +740,7 @@ func newProxyAwareWebsocketDialer(cfg *config.Config, auth *cliproxyauth.Auth) *
 		socksDialer, errSOCKS5 := proxy.SOCKS5("tcp", parsedURL.Host, proxyAuth, proxy.Direct)
 		if errSOCKS5 != nil {
 			log.Errorf("codex websockets executor: create SOCKS5 dialer failed: %v", errSOCKS5)
-			return dialer
+			return nil, false
 		}
 		dialer.Proxy = nil
 		dialer.NetDialContext = func(_ context.Context, network, addr string) (net.Conn, error) {
@@ -732,9 +750,32 @@ func newProxyAwareWebsocketDialer(cfg *config.Config, auth *cliproxyauth.Auth) *
 		dialer.Proxy = http.ProxyURL(parsedURL)
 	default:
 		log.Errorf("codex websockets executor: unsupported proxy scheme: %s", parsedURL.Scheme)
+		return nil, false
 	}
 
-	return dialer
+	return dialer, true
+}
+
+func resolveProxyPoolURLs(cfg *config.Config, auth *cliproxyauth.Auth) []string {
+	if auth != nil {
+		if proxyURL := strings.TrimSpace(auth.ProxyURL); proxyURL != "" {
+			return util.OrderedProxyURLs(proxyURL)
+		}
+	}
+	if cfg != nil {
+		return util.OrderedProxyURLs(cfg.ProxyURL)
+	}
+	return nil
+}
+
+func shouldRetryNextWebsocketProxy(err error, resp *http.Response) bool {
+	if err == nil {
+		return false
+	}
+	if resp != nil {
+		return false
+	}
+	return !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded)
 }
 
 func buildCodexResponsesWebsocketURL(httpURL string) (string, error) {
@@ -866,10 +907,6 @@ func parseCodexWebsocketError(payload []byte) (error, bool) {
 	if status == 0 {
 		status = int(gjson.GetBytes(payload, "status_code").Int())
 	}
-	if status <= 0 {
-		return nil, false
-	}
-
 	out := []byte(`{}`)
 	if errNode := gjson.GetBytes(payload, "error"); errNode.Exists() {
 		raw := errNode.Raw
@@ -879,12 +916,38 @@ func parseCodexWebsocketError(payload []byte) (error, bool) {
 		out, _ = sjson.SetRawBytes(out, "error", []byte(raw))
 	} else {
 		out, _ = sjson.SetBytes(out, "error.type", "server_error")
-		out, _ = sjson.SetBytes(out, "error.message", http.StatusText(status))
+		message := "Unknown websocket error"
+		if status > 0 {
+			message = http.StatusText(status)
+		}
+		out, _ = sjson.SetBytes(out, "error.message", message)
+	}
+	if status <= 0 && isCodexUsageLimitError(out) {
+		// Some websocket error events omit status fields; treat usage limit exhaustion
+		// as a quota restriction so the auth manager can cool down the credential.
+		status = http.StatusTooManyRequests
+	}
+	if status <= 0 {
+		return nil, false
 	}
 
+	baseErr := newCodexStatusErr(status, out)
 	headers := parseCodexWebsocketErrorHeaders(payload)
+	if baseErr.retryAfter != nil {
+		if headers == nil {
+			headers = make(http.Header)
+		}
+		// Expose cooldown hints to downstream clients when available.
+		if headers.Get("Retry-After") == "" {
+			secs := int(math.Ceil(baseErr.retryAfter.Seconds()))
+			if secs < 0 {
+				secs = 0
+			}
+			headers.Set("Retry-After", strconv.Itoa(secs))
+		}
+	}
 	return statusErrWithHeaders{
-		statusErr: statusErr{code: status, msg: string(out)},
+		statusErr: baseErr,
 		headers:   headers,
 	}, true
 }

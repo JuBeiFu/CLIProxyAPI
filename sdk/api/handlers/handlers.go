@@ -8,6 +8,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"path"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -468,12 +470,15 @@ func appendAPIResponse(c *gin.Context, data []byte) {
 // ExecuteWithAuthManager executes a non-streaming request via the core auth manager.
 // This path is the only supported execution route.
 func (h *BaseAPIHandler) ExecuteWithAuthManager(ctx context.Context, handlerType, modelName string, rawJSON []byte, alt string) ([]byte, http.Header, *interfaces.ErrorMessage) {
-	providers, normalizedModel, errMsg := h.getRequestDetails(modelName)
+	providers, normalizedModel, skipModelRegistryCheck, errMsg := h.getRequestDetails(modelName)
 	if errMsg != nil {
 		return nil, nil, errMsg
 	}
 	reqMeta := requestExecutionMetadata(ctx)
 	reqMeta[coreexecutor.RequestedModelMetadataKey] = normalizedModel
+	if skipModelRegistryCheck {
+		reqMeta[coreexecutor.SkipModelRegistryCheckMetadataKey] = true
+	}
 	payload := rawJSON
 	if len(payload) == 0 {
 		payload = nil
@@ -514,12 +519,15 @@ func (h *BaseAPIHandler) ExecuteWithAuthManager(ctx context.Context, handlerType
 // ExecuteCountWithAuthManager executes a non-streaming request via the core auth manager.
 // This path is the only supported execution route.
 func (h *BaseAPIHandler) ExecuteCountWithAuthManager(ctx context.Context, handlerType, modelName string, rawJSON []byte, alt string) ([]byte, http.Header, *interfaces.ErrorMessage) {
-	providers, normalizedModel, errMsg := h.getRequestDetails(modelName)
+	providers, normalizedModel, skipModelRegistryCheck, errMsg := h.getRequestDetails(modelName)
 	if errMsg != nil {
 		return nil, nil, errMsg
 	}
 	reqMeta := requestExecutionMetadata(ctx)
 	reqMeta[coreexecutor.RequestedModelMetadataKey] = normalizedModel
+	if skipModelRegistryCheck {
+		reqMeta[coreexecutor.SkipModelRegistryCheckMetadataKey] = true
+	}
 	payload := rawJSON
 	if len(payload) == 0 {
 		payload = nil
@@ -561,7 +569,7 @@ func (h *BaseAPIHandler) ExecuteCountWithAuthManager(ctx context.Context, handle
 // This path is the only supported execution route.
 // The returned http.Header carries upstream response headers captured before streaming begins.
 func (h *BaseAPIHandler) ExecuteStreamWithAuthManager(ctx context.Context, handlerType, modelName string, rawJSON []byte, alt string) (<-chan []byte, http.Header, <-chan *interfaces.ErrorMessage) {
-	providers, normalizedModel, errMsg := h.getRequestDetails(modelName)
+	providers, normalizedModel, skipModelRegistryCheck, errMsg := h.getRequestDetails(modelName)
 	if errMsg != nil {
 		errChan := make(chan *interfaces.ErrorMessage, 1)
 		errChan <- errMsg
@@ -570,6 +578,9 @@ func (h *BaseAPIHandler) ExecuteStreamWithAuthManager(ctx context.Context, handl
 	}
 	reqMeta := requestExecutionMetadata(ctx)
 	reqMeta[coreexecutor.RequestedModelMetadataKey] = normalizedModel
+	if skipModelRegistryCheck {
+		reqMeta[coreexecutor.SkipModelRegistryCheckMetadataKey] = true
+	}
 	payload := rawJSON
 	if len(payload) == 0 {
 		payload = nil
@@ -774,7 +785,7 @@ func statusFromError(err error) int {
 	return 0
 }
 
-func (h *BaseAPIHandler) getRequestDetails(modelName string) (providers []string, normalizedModel string, err *interfaces.ErrorMessage) {
+func (h *BaseAPIHandler) getRequestDetails(modelName string) (providers []string, normalizedModel string, skipModelRegistryCheck bool, err *interfaces.ErrorMessage) {
 	resolvedModelName := modelName
 	initialSuffix := thinking.ParseSuffix(modelName)
 	if initialSuffix.ModelName == "auto" {
@@ -802,12 +813,99 @@ func (h *BaseAPIHandler) getRequestDetails(modelName string) (providers []string
 	}
 
 	if len(providers) == 0 {
-		return nil, "", &interfaces.ErrorMessage{StatusCode: http.StatusBadGateway, Error: fmt.Errorf("unknown provider for model %s", modelName)}
+		// Configurable fallback mapping for unregistered models.
+		if mapped, ok := matchModelProviderMappings(h, baseModel); ok {
+			providers = mapped
+			skipModelRegistryCheck = true
+		} else if baseModel != resolvedModelName {
+			if mapped, ok := matchModelProviderMappings(h, resolvedModelName); ok {
+				providers = mapped
+				skipModelRegistryCheck = true
+			}
+		}
+	}
+
+	if len(providers) == 0 {
+		// Built-in fallback: route unknown GPT-family models through the Codex executor.
+		// This keeps routing resilient when new "gpt-*" model IDs land before static model lists are updated.
+		if strings.HasPrefix(strings.ToLower(baseModel), "gpt-") {
+			providers = []string{"codex"}
+			skipModelRegistryCheck = true
+		}
+	}
+
+	if len(providers) == 0 {
+		return nil, "", false, &interfaces.ErrorMessage{StatusCode: http.StatusBadGateway, Error: fmt.Errorf("unknown provider for model %s", modelName)}
 	}
 
 	// The thinking suffix is preserved in the model name itself, so no
 	// metadata-based configuration passing is needed.
-	return providers, resolvedModelName, nil
+	return providers, resolvedModelName, skipModelRegistryCheck, nil
+}
+
+func matchModelProviderMappings(h *BaseAPIHandler, modelName string) ([]string, bool) {
+	if h == nil || h.Cfg == nil {
+		return nil, false
+	}
+	modelName = strings.TrimSpace(modelName)
+	if modelName == "" {
+		return nil, false
+	}
+	rules := h.Cfg.ModelProviderMappings
+	if len(rules) == 0 {
+		return nil, false
+	}
+	for i := range rules {
+		pattern := strings.TrimSpace(rules[i].Pattern)
+		if pattern == "" || len(rules[i].Providers) == 0 {
+			continue
+		}
+		matched := false
+		if rules[i].Regex {
+			re, errCompile := regexp.Compile(pattern)
+			if errCompile != nil {
+				continue
+			}
+			matched = re.MatchString(modelName)
+		} else if strings.ContainsAny(pattern, "*?") {
+			ok, errMatch := path.Match(pattern, modelName)
+			matched = errMatch == nil && ok
+		} else {
+			matched = strings.EqualFold(pattern, modelName)
+		}
+		if !matched {
+			continue
+		}
+		providers := normalizeProviderList(rules[i].Providers)
+		if len(providers) == 0 {
+			continue
+		}
+		return providers, true
+	}
+	return nil, false
+}
+
+func normalizeProviderList(providers []string) []string {
+	if len(providers) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(providers))
+	seen := make(map[string]struct{}, len(providers))
+	for _, raw := range providers {
+		p := strings.ToLower(strings.TrimSpace(raw))
+		if p == "" {
+			continue
+		}
+		if _, ok := seen[p]; ok {
+			continue
+		}
+		seen[p] = struct{}{}
+		out = append(out, p)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 func cloneBytes(src []byte) []byte {

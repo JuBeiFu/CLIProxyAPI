@@ -11,6 +11,10 @@ import (
 const RequestedModelMetadataKey = "requested_model"
 
 const (
+	// SkipModelRegistryCheckMetadataKey disables per-credential model support filtering.
+	// This is used when routing relies on fallback model->provider mappings for models that
+	// are not registered in the dynamic model registry.
+	SkipModelRegistryCheckMetadataKey = "skip_model_registry_check"
 	// PinnedAuthMetadataKey locks execution to a specific auth ID.
 	PinnedAuthMetadataKey = "pinned_auth_id"
 	// SelectedAuthMetadataKey stores the auth ID selected by the scheduler.

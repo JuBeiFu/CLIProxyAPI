@@ -678,6 +678,11 @@ func applyCodexHeaders(r *http.Request, auth *cliproxyauth.Auth, token string, s
 }
 
 func newCodexStatusErr(statusCode int, body []byte) statusErr {
+	if isCodexUsageLimitError(body) {
+		// Normalize provider-specific quota exhaustion responses so the auth manager
+		// can suspend the credential until the upstream reset window expires.
+		statusCode = http.StatusTooManyRequests
+	}
 	err := statusErr{code: statusCode, msg: string(body)}
 	if retryAfter := parseCodexRetryAfter(statusCode, body, time.Now()); retryAfter != nil {
 		err.retryAfter = retryAfter
@@ -686,10 +691,10 @@ func newCodexStatusErr(statusCode int, body []byte) statusErr {
 }
 
 func parseCodexRetryAfter(statusCode int, errorBody []byte, now time.Time) *time.Duration {
-	if statusCode != http.StatusTooManyRequests || len(errorBody) == 0 {
+	if len(errorBody) == 0 {
 		return nil
 	}
-	if strings.TrimSpace(gjson.GetBytes(errorBody, "error.type").String()) != "usage_limit_reached" {
+	if !isCodexUsageLimitError(errorBody) {
 		return nil
 	}
 	if resetsAt := gjson.GetBytes(errorBody, "error.resets_at").Int(); resetsAt > 0 {
@@ -704,6 +709,20 @@ func parseCodexRetryAfter(statusCode int, errorBody []byte, now time.Time) *time
 		return &retryAfter
 	}
 	return nil
+}
+
+func isCodexUsageLimitError(errorBody []byte) bool {
+	if len(errorBody) == 0 {
+		return false
+	}
+	if strings.EqualFold(strings.TrimSpace(gjson.GetBytes(errorBody, "error.type").String()), "usage_limit_reached") {
+		return true
+	}
+	if strings.EqualFold(strings.TrimSpace(gjson.GetBytes(errorBody, "error.code").String()), "usage_limit_reached") {
+		return true
+	}
+	message := strings.ToLower(strings.TrimSpace(gjson.GetBytes(errorBody, "error.message").String()))
+	return strings.Contains(message, "usage limit has been reached")
 }
 
 func codexCreds(a *cliproxyauth.Auth) (apiKey, baseURL string) {

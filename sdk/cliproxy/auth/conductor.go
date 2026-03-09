@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"math/rand/v2"
 	"net/http"
 	"path/filepath"
 	"strconv"
@@ -65,9 +66,13 @@ const (
 	refreshFailureBackoff = 5 * time.Minute
 	quotaBackoffBase      = time.Second
 	quotaBackoffMax       = 30 * time.Minute
+	sameAuthRetryMinWait  = 5 * time.Second
+	sameAuthRetryMaxWait  = 10 * time.Second
 )
 
 var quotaCooldownDisabled atomic.Bool
+
+var sameAuthRetryDelayFunc = nextSameAuthRetryDelay
 
 // SetQuotaCooldownDisabled toggles quota cooldown scheduling globally.
 func SetQuotaCooldownDisabled(disable bool) {
@@ -978,6 +983,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 	}
 	routeModel := req.Model
 	opts = ensureRequestedModelMetadata(opts, routeModel)
+	requestRetry, _, _ := m.retrySettings()
 	tried := make(map[string]struct{})
 	var lastErr error
 	for {
@@ -1007,39 +1013,67 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 		}
 
 		models := m.prepareExecutionModels(auth, routeModel)
-		var authErr error
-		for _, upstreamModel := range models {
-			execReq := req
-			execReq.Model = upstreamModel
-			resp, errExec := executor.Execute(execCtx, auth, execReq, opts)
-			result := Result{AuthID: auth.ID, Provider: provider, Model: routeModel, Success: errExec == nil}
-			if errExec != nil {
-				if errCtx := execCtx.Err(); errCtx != nil {
-					return cliproxyexecutor.Response{}, errCtx
-				}
-				result.Error = &Error{Message: errExec.Error()}
-				if se, ok := errors.AsType[cliproxyexecutor.StatusError](errExec); ok && se != nil {
-					result.Error.HTTPStatus = se.StatusCode()
-				}
-				if ra := retryAfterFromError(errExec); ra != nil {
-					result.RetryAfter = ra
+		sameAuthRetries := effectiveRequestRetry(requestRetry, auth)
+		for authAttempt := 0; ; authAttempt++ {
+			switchAuth := false
+			retrySameAuth := false
+
+			for idx, upstreamModel := range models {
+				execReq := req
+				execReq.Model = upstreamModel
+				resp, errExec := executor.Execute(execCtx, auth, execReq, opts)
+				result := Result{AuthID: auth.ID, Provider: provider, Model: routeModel, Success: errExec == nil}
+				if errExec != nil {
+					if errCtx := execCtx.Err(); errCtx != nil {
+						return cliproxyexecutor.Response{}, errCtx
+					}
+					result.Error = &Error{Message: errExec.Error()}
+					if se, ok := errors.AsType[cliproxyexecutor.StatusError](errExec); ok && se != nil {
+						result.Error.HTTPStatus = se.StatusCode()
+					}
+					if ra := retryAfterFromError(errExec); ra != nil {
+						result.RetryAfter = ra
+					}
+					m.MarkResult(execCtx, result)
+					if isRequestInvalidError(errExec) {
+						return cliproxyexecutor.Response{}, errExec
+					}
+
+					status := statusCodeFromError(errExec)
+					if status == http.StatusNotFound && idx < len(models)-1 {
+						lastErr = errExec
+						continue
+					}
+
+					lastErr = errExec
+					if shouldRetryAcrossAuths(errExec) {
+						switchAuth = true
+					} else {
+						retrySameAuth = true
+					}
+					break
 				}
 				m.MarkResult(execCtx, result)
-				if isRequestInvalidError(errExec) {
-					return cliproxyexecutor.Response{}, errExec
+				return resp, nil
+			}
+
+			if switchAuth {
+				break
+			}
+			if retrySameAuth {
+				if authAttempt < sameAuthRetries {
+					if errWait := waitForCooldown(execCtx, sameAuthRetryDelayFunc()); errWait != nil {
+						return cliproxyexecutor.Response{}, errWait
+					}
+					continue
 				}
-				authErr = errExec
-				continue
+				if lastErr != nil {
+					return cliproxyexecutor.Response{}, lastErr
+				}
+				return cliproxyexecutor.Response{}, &Error{Code: "auth_not_found", Message: "no auth available"}
 			}
-			m.MarkResult(execCtx, result)
-			return resp, nil
-		}
-		if authErr != nil {
-			if isRequestInvalidError(authErr) {
-				return cliproxyexecutor.Response{}, authErr
-			}
-			lastErr = authErr
-			continue
+
+			break
 		}
 	}
 }
@@ -1050,6 +1084,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 	}
 	routeModel := req.Model
 	opts = ensureRequestedModelMetadata(opts, routeModel)
+	requestRetry, _, _ := m.retrySettings()
 	tried := make(map[string]struct{})
 	var lastErr error
 	for {
@@ -1079,39 +1114,67 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 		}
 
 		models := m.prepareExecutionModels(auth, routeModel)
-		var authErr error
-		for _, upstreamModel := range models {
-			execReq := req
-			execReq.Model = upstreamModel
-			resp, errExec := executor.CountTokens(execCtx, auth, execReq, opts)
-			result := Result{AuthID: auth.ID, Provider: provider, Model: routeModel, Success: errExec == nil}
-			if errExec != nil {
-				if errCtx := execCtx.Err(); errCtx != nil {
-					return cliproxyexecutor.Response{}, errCtx
-				}
-				result.Error = &Error{Message: errExec.Error()}
-				if se, ok := errors.AsType[cliproxyexecutor.StatusError](errExec); ok && se != nil {
-					result.Error.HTTPStatus = se.StatusCode()
-				}
-				if ra := retryAfterFromError(errExec); ra != nil {
-					result.RetryAfter = ra
+		sameAuthRetries := effectiveRequestRetry(requestRetry, auth)
+		for authAttempt := 0; ; authAttempt++ {
+			switchAuth := false
+			retrySameAuth := false
+
+			for idx, upstreamModel := range models {
+				execReq := req
+				execReq.Model = upstreamModel
+				resp, errExec := executor.CountTokens(execCtx, auth, execReq, opts)
+				result := Result{AuthID: auth.ID, Provider: provider, Model: routeModel, Success: errExec == nil}
+				if errExec != nil {
+					if errCtx := execCtx.Err(); errCtx != nil {
+						return cliproxyexecutor.Response{}, errCtx
+					}
+					result.Error = &Error{Message: errExec.Error()}
+					if se, ok := errors.AsType[cliproxyexecutor.StatusError](errExec); ok && se != nil {
+						result.Error.HTTPStatus = se.StatusCode()
+					}
+					if ra := retryAfterFromError(errExec); ra != nil {
+						result.RetryAfter = ra
+					}
+					m.hook.OnResult(execCtx, result)
+					if isRequestInvalidError(errExec) {
+						return cliproxyexecutor.Response{}, errExec
+					}
+
+					status := statusCodeFromError(errExec)
+					if status == http.StatusNotFound && idx < len(models)-1 {
+						lastErr = errExec
+						continue
+					}
+
+					lastErr = errExec
+					if shouldRetryAcrossAuths(errExec) {
+						switchAuth = true
+					} else {
+						retrySameAuth = true
+					}
+					break
 				}
 				m.hook.OnResult(execCtx, result)
-				if isRequestInvalidError(errExec) {
-					return cliproxyexecutor.Response{}, errExec
+				return resp, nil
+			}
+
+			if switchAuth {
+				break
+			}
+			if retrySameAuth {
+				if authAttempt < sameAuthRetries {
+					if errWait := waitForCooldown(execCtx, sameAuthRetryDelayFunc()); errWait != nil {
+						return cliproxyexecutor.Response{}, errWait
+					}
+					continue
 				}
-				authErr = errExec
-				continue
+				if lastErr != nil {
+					return cliproxyexecutor.Response{}, lastErr
+				}
+				return cliproxyexecutor.Response{}, &Error{Code: "auth_not_found", Message: "no auth available"}
 			}
-			m.hook.OnResult(execCtx, result)
-			return resp, nil
-		}
-		if authErr != nil {
-			if isRequestInvalidError(authErr) {
-				return cliproxyexecutor.Response{}, authErr
-			}
-			lastErr = authErr
-			continue
+
+			break
 		}
 	}
 }
@@ -1122,6 +1185,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 	}
 	routeModel := req.Model
 	opts = ensureRequestedModelMetadata(opts, routeModel)
+	requestRetry, _, _ := m.retrySettings()
 	tried := make(map[string]struct{})
 	var lastErr error
 	for {
@@ -1149,18 +1213,31 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			execCtx = context.WithValue(execCtx, roundTripperContextKey{}, rt)
 			execCtx = context.WithValue(execCtx, "cliproxy.roundtripper", rt)
 		}
-		streamResult, errStream := m.executeStreamWithModelPool(execCtx, executor, auth, provider, req, opts, routeModel)
-		if errStream != nil {
-			if errCtx := execCtx.Err(); errCtx != nil {
-				return nil, errCtx
-			}
-			if isRequestInvalidError(errStream) {
+
+		sameAuthRetries := effectiveRequestRetry(requestRetry, auth)
+		for authAttempt := 0; ; authAttempt++ {
+			streamResult, errStream := m.executeStreamWithModelPool(execCtx, executor, auth, provider, req, opts, routeModel)
+			if errStream != nil {
+				if errCtx := execCtx.Err(); errCtx != nil {
+					return nil, errCtx
+				}
+				if isRequestInvalidError(errStream) {
+					return nil, errStream
+				}
+				if shouldRetryAcrossAuths(errStream) {
+					lastErr = errStream
+					break
+				}
+				if authAttempt < sameAuthRetries {
+					if errWait := waitForCooldown(execCtx, sameAuthRetryDelayFunc()); errWait != nil {
+						return nil, errWait
+					}
+					continue
+				}
 				return nil, errStream
 			}
-			lastErr = errStream
-			continue
+			return streamResult, nil
 		}
-		return streamResult, nil
 	}
 }
 
@@ -1218,6 +1295,39 @@ func pinnedAuthIDFromMetadata(meta map[string]any) string {
 		return strings.TrimSpace(string(val))
 	default:
 		return ""
+	}
+}
+
+func metadataBool(meta map[string]any, key string) bool {
+	if len(meta) == 0 {
+		return false
+	}
+	key = strings.TrimSpace(key)
+	if key == "" {
+		return false
+	}
+	raw, ok := meta[key]
+	if !ok || raw == nil {
+		return false
+	}
+	switch v := raw.(type) {
+	case bool:
+		return v
+	case string:
+		s := strings.ToLower(strings.TrimSpace(v))
+		return s == "true" || s == "1" || s == "yes" || s == "y"
+	case int:
+		return v != 0
+	case int32:
+		return v != 0
+	case int64:
+		return v != 0
+	case float32:
+		return v != 0
+	case float64:
+		return v != 0
+	default:
+		return false
 	}
 }
 
@@ -1489,6 +1599,26 @@ func (m *Manager) retrySettings() (int, int, time.Duration) {
 	return int(m.requestRetry.Load()), int(m.maxRetryCredentials.Load()), time.Duration(m.maxRetryInterval.Load())
 }
 
+func effectiveRequestRetry(defaultRetry int, auth *Auth) int {
+	if auth != nil {
+		if override, ok := auth.RequestRetryOverride(); ok {
+			defaultRetry = override
+		}
+	}
+	if defaultRetry < 0 {
+		return 0
+	}
+	return defaultRetry
+}
+
+func nextSameAuthRetryDelay() time.Duration {
+	if sameAuthRetryMaxWait <= sameAuthRetryMinWait {
+		return sameAuthRetryMinWait
+	}
+	window := sameAuthRetryMaxWait - sameAuthRetryMinWait
+	return sameAuthRetryMinWait + time.Duration(rand.Int64N(int64(window)+1))
+}
+
 func (m *Manager) closestCooldownWait(providers []string, model string, attempt int) (time.Duration, bool) {
 	if m == nil || len(providers) == 0 {
 		return 0, false
@@ -1556,7 +1686,7 @@ func (m *Manager) shouldRetryAfterError(err error, attempt int, providers []stri
 	if status := statusCodeFromError(err); status == http.StatusOK {
 		return 0, false
 	}
-	if isRequestInvalidError(err) {
+	if !shouldRetryAcrossAuths(err) {
 		return 0, false
 	}
 	wait, found := m.closestCooldownWait(providers, model, attempt)
@@ -1591,13 +1721,19 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	suspendReason := ""
 	clearModelQuota := false
 	setModelQuota := false
+	removedAuth := (*Auth)(nil)
+	deleteWarning := ""
 	var authSnapshot *Auth
 
 	m.mu.Lock()
 	if auth, ok := m.auths[result.AuthID]; ok && auth != nil {
 		now := time.Now()
 
-		if result.Success {
+		if deleteAuth, reason := shouldDeleteRevokedAuth(auth, result.Error); deleteAuth {
+			removedAuth = auth.Clone()
+			deleteWarning = reason
+			delete(m.auths, result.AuthID)
+		} else if result.Success {
 			if result.Model != "" {
 				state := ensureModelState(auth, result.Model)
 				resetModelState(state, now)
@@ -1684,12 +1820,20 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 			}
 		}
 
-		_ = m.persist(ctx, auth)
-		authSnapshot = auth.Clone()
+		if removedAuth == nil {
+			_ = m.persist(ctx, auth)
+			authSnapshot = auth.Clone()
+		}
 	}
 	m.mu.Unlock()
 	if m.scheduler != nil && authSnapshot != nil {
 		m.scheduler.upsertAuth(authSnapshot)
+	}
+
+	if removedAuth != nil {
+		m.deleteRevokedAuth(ctx, removedAuth, deleteWarning, "request")
+		m.hook.OnResult(ctx, result)
+		return
 	}
 
 	if clearModelQuota && result.Model != "" {
@@ -1884,22 +2028,120 @@ func statusCodeFromResult(err *Error) int {
 }
 
 // isRequestInvalidError returns true if the error represents a client request
-// error that should not be retried. Specifically, it treats 400 responses with
-// "invalid_request_error" and all 422 responses as request-shape failures,
-// where switching auths or pooled upstream models will not help.
+// error that should not be retried across other auths. This covers explicit
+// invalid-request markers and unsupported/unknown parameter errors where the
+// request payload itself is incompatible with the upstream API.
 func isRequestInvalidError(err error) bool {
 	if err == nil {
 		return false
 	}
 	status := statusCodeFromError(err)
-	switch status {
-	case http.StatusBadRequest:
-		return strings.Contains(err.Error(), "invalid_request_error")
-	case http.StatusUnprocessableEntity:
+	if status != http.StatusBadRequest && status != http.StatusUnprocessableEntity {
+		return false
+	}
+	message := strings.ToLower(strings.TrimSpace(err.Error()))
+	if message == "" {
+		return false
+	}
+	return strings.Contains(message, "invalid_request_error") ||
+		strings.Contains(message, "unsupported parameter") ||
+		strings.Contains(message, "unknown parameter")
+}
+
+// shouldRetryAcrossAuths returns true only for auth/model specific restriction
+// failures where switching credentials has a reasonable chance to succeed.
+func shouldRetryAcrossAuths(err error) bool {
+	if err == nil || isRequestInvalidError(err) {
+		return false
+	}
+	switch statusCodeFromError(err) {
+	case http.StatusUnauthorized, http.StatusPaymentRequired, http.StatusForbidden, http.StatusNotFound, http.StatusTooManyRequests:
 		return true
 	default:
 		return false
 	}
+}
+
+func shouldDeleteRevokedAuth(auth *Auth, resultErr *Error) (bool, string) {
+	if auth == nil || resultErr == nil {
+		return false, ""
+	}
+	if resultErr.StatusCode() != http.StatusUnauthorized {
+		return false, ""
+	}
+	if !hasPersistedAuthRecord(auth) {
+		return false, ""
+	}
+	msg := strings.ToLower(strings.TrimSpace(resultErr.Message))
+	if msg == "" {
+		return false, ""
+	}
+	for _, needle := range []string{
+		"token_revoked",
+		"token_invalidated",
+		"account_deactivated",
+		"encountered invalidated oauth token for user",
+		"your authentication token has been invalidated. please try signing in again.",
+		"your openai account has been deactivated",
+		"account has been deactivated",
+	} {
+		if strings.Contains(msg, needle) {
+			return true, strings.TrimSpace(resultErr.Message)
+		}
+	}
+	return false, ""
+}
+
+func hasPersistedAuthRecord(auth *Auth) bool {
+	if auth == nil {
+		return false
+	}
+	if auth.Attributes != nil {
+		if path := strings.TrimSpace(auth.Attributes["path"]); path != "" {
+			return true
+		}
+	}
+	if fileName := strings.TrimSpace(auth.FileName); fileName != "" {
+		return true
+	}
+	id := strings.TrimSpace(auth.ID)
+	if id == "" {
+		return false
+	}
+	lowerID := strings.ToLower(id)
+	return strings.HasSuffix(lowerID, ".json") || filepath.IsAbs(id) || strings.ContainsAny(id, `/\`)
+}
+
+func authPathSuffix(auth *Auth) string {
+	if auth == nil || auth.Attributes == nil {
+		return ""
+	}
+	path := strings.TrimSpace(auth.Attributes["path"])
+	if path == "" {
+		return ""
+	}
+	return " (" + path + ")"
+}
+
+func (m *Manager) deleteRevokedAuth(ctx context.Context, auth *Auth, warning string, source string) {
+	if auth == nil {
+		return
+	}
+	if m.scheduler != nil {
+		m.scheduler.removeAuth(auth.ID)
+	}
+	if m.store != nil {
+		if err := m.store.Delete(ctx, auth.ID); err != nil {
+			log.Warnf("failed to delete revoked auth %s from store: %v", auth.ID, err)
+		}
+	}
+	m.rebuildAPIKeyModelAliasFromRuntimeConfig()
+	registry.GetGlobalRegistry().UnregisterClient(auth.ID)
+	source = strings.TrimSpace(source)
+	if source == "" {
+		source = "request"
+	}
+	log.Warnf("deleted revoked auth %s%s after invalid token error during %s: %s", auth.ID, authPathSuffix(auth), source, warning)
 }
 
 func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Duration, now time.Time) {
@@ -2071,6 +2313,7 @@ func shouldRetrySchedulerPick(err error) bool {
 
 func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, ProviderExecutor, error) {
 	pinnedAuthID := pinnedAuthIDFromMetadata(opts.Metadata)
+	skipModelRegistryCheck := metadataBool(opts.Metadata, cliproxyexecutor.SkipModelRegistryCheckMetadataKey)
 
 	m.mu.RLock()
 	executor, okExecutor := m.executors[provider]
@@ -2098,7 +2341,7 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 		if _, used := tried[candidate.ID]; used {
 			continue
 		}
-		if modelKey != "" && registryRef != nil && !registryRef.ClientSupportsModel(candidate.ID, modelKey) {
+		if !skipModelRegistryCheck && modelKey != "" && registryRef != nil && !registryRef.ClientSupportsModel(candidate.ID, modelKey) {
 			continue
 		}
 		candidates = append(candidates, candidate)
@@ -2162,6 +2405,7 @@ func (m *Manager) pickNext(ctx context.Context, provider, model string, opts cli
 
 func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, ProviderExecutor, string, error) {
 	pinnedAuthID := pinnedAuthIDFromMetadata(opts.Metadata)
+	skipModelRegistryCheck := metadataBool(opts.Metadata, cliproxyexecutor.SkipModelRegistryCheckMetadataKey)
 
 	providerSet := make(map[string]struct{}, len(providers))
 	for _, provider := range providers {
@@ -2206,7 +2450,7 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 		if _, ok := m.executors[providerKey]; !ok {
 			continue
 		}
-		if modelKey != "" && registryRef != nil && !registryRef.ClientSupportsModel(candidate.ID, modelKey) {
+		if !skipModelRegistryCheck && modelKey != "" && registryRef != nil && !registryRef.ClientSupportsModel(candidate.ID, modelKey) {
 			continue
 		}
 		candidates = append(candidates, candidate)
@@ -2641,10 +2885,26 @@ func (m *Manager) refreshAuth(ctx context.Context, id string) {
 	log.Debugf("refreshed %s, %s, %v", auth.Provider, auth.ID, err)
 	now := time.Now()
 	if err != nil {
+		resultErr := &Error{Message: err.Error()}
+		if se, ok := errors.AsType[cliproxyexecutor.StatusError](err); ok && se != nil {
+			resultErr.HTTPStatus = se.StatusCode()
+		}
+		if deleteAuth, reason := shouldDeleteRevokedAuth(auth, resultErr); deleteAuth {
+			m.mu.Lock()
+			current := m.auths[id]
+			if current != nil {
+				delete(m.auths, id)
+			}
+			m.mu.Unlock()
+			if current != nil {
+				m.deleteRevokedAuth(ctx, current.Clone(), reason, "refresh")
+			}
+			return
+		}
 		m.mu.Lock()
 		if current := m.auths[id]; current != nil {
 			current.NextRefreshAfter = now.Add(refreshFailureBackoff)
-			current.LastError = &Error{Message: err.Error()}
+			current.LastError = resultErr
 			m.auths[id] = current
 			if m.scheduler != nil {
 				m.scheduler.upsertAuth(current.Clone())
