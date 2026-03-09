@@ -501,7 +501,11 @@ func (m *Manager) wrapStreamResult(ctx context.Context, auth *Auth, provider, ro
 				if se, ok := errors.AsType[cliproxyexecutor.StatusError](chunk.Err); ok && se != nil {
 					rerr.HTTPStatus = se.StatusCode()
 				}
-				m.MarkResult(ctx, Result{AuthID: auth.ID, Provider: provider, Model: routeModel, Success: false, Error: rerr})
+				result := Result{AuthID: auth.ID, Provider: provider, Model: routeModel, Success: false, Error: rerr}
+				if ra := retryAfterFromError(chunk.Err); ra != nil {
+					result.RetryAfter = ra
+				}
+				m.MarkResult(ctx, result)
 			}
 			if !forward {
 				return false
@@ -1999,15 +2003,16 @@ func retryAfterFromError(err error) *time.Duration {
 	type retryAfterProvider interface {
 		RetryAfter() *time.Duration
 	}
-	rap, ok := err.(retryAfterProvider)
-	if !ok || rap == nil {
+	var rap retryAfterProvider
+	if !errors.As(err, &rap) || rap == nil {
 		return nil
 	}
 	retryAfter := rap.RetryAfter()
 	if retryAfter == nil {
 		return nil
 	}
-	return new(*retryAfter)
+	copied := *retryAfter
+	return &copied
 }
 
 func statusCodeFromResult(err *Error) int {
