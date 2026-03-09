@@ -1015,8 +1015,10 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 		models := m.prepareExecutionModels(auth, routeModel)
 		sameAuthRetries := effectiveRequestRetry(requestRetry, auth)
 		for authAttempt := 0; ; authAttempt++ {
-			switchAuth := false
-			retrySameAuth := false
+			var (
+				authErr        error
+				restrictionErr error
+			)
 
 			for idx, upstreamModel := range models {
 				execReq := req
@@ -1039,17 +1041,12 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 						return cliproxyexecutor.Response{}, errExec
 					}
 
-					status := statusCodeFromError(errExec)
-					if status == http.StatusNotFound && idx < len(models)-1 {
-						lastErr = errExec
-						continue
+					authErr = errExec
+					if restrictionErr == nil && shouldRetryAcrossAuths(errExec) {
+						restrictionErr = errExec
 					}
-
-					lastErr = errExec
-					if shouldRetryAcrossAuths(errExec) {
-						switchAuth = true
-					} else {
-						retrySameAuth = true
+					if idx < len(models)-1 {
+						continue
 					}
 					break
 				}
@@ -1057,23 +1054,21 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 				return resp, nil
 			}
 
-			if switchAuth {
+			if authErr == nil {
 				break
 			}
-			if retrySameAuth {
-				if authAttempt < sameAuthRetries {
-					if errWait := waitForCooldown(execCtx, sameAuthRetryDelayFunc()); errWait != nil {
-						return cliproxyexecutor.Response{}, errWait
-					}
-					continue
-				}
-				if lastErr != nil {
-					return cliproxyexecutor.Response{}, lastErr
-				}
-				return cliproxyexecutor.Response{}, &Error{Code: "auth_not_found", Message: "no auth available"}
+			if restrictionErr != nil {
+				lastErr = restrictionErr
+				break
 			}
-
-			break
+			lastErr = authErr
+			if authAttempt < sameAuthRetries {
+				if errWait := waitForCooldown(execCtx, sameAuthRetryDelayFunc()); errWait != nil {
+					return cliproxyexecutor.Response{}, errWait
+				}
+				continue
+			}
+			return cliproxyexecutor.Response{}, authErr
 		}
 	}
 }
@@ -1116,8 +1111,10 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 		models := m.prepareExecutionModels(auth, routeModel)
 		sameAuthRetries := effectiveRequestRetry(requestRetry, auth)
 		for authAttempt := 0; ; authAttempt++ {
-			switchAuth := false
-			retrySameAuth := false
+			var (
+				authErr        error
+				restrictionErr error
+			)
 
 			for idx, upstreamModel := range models {
 				execReq := req
@@ -1140,17 +1137,12 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 						return cliproxyexecutor.Response{}, errExec
 					}
 
-					status := statusCodeFromError(errExec)
-					if status == http.StatusNotFound && idx < len(models)-1 {
-						lastErr = errExec
-						continue
+					authErr = errExec
+					if restrictionErr == nil && shouldRetryAcrossAuths(errExec) {
+						restrictionErr = errExec
 					}
-
-					lastErr = errExec
-					if shouldRetryAcrossAuths(errExec) {
-						switchAuth = true
-					} else {
-						retrySameAuth = true
+					if idx < len(models)-1 {
+						continue
 					}
 					break
 				}
@@ -1158,23 +1150,21 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 				return resp, nil
 			}
 
-			if switchAuth {
+			if authErr == nil {
 				break
 			}
-			if retrySameAuth {
-				if authAttempt < sameAuthRetries {
-					if errWait := waitForCooldown(execCtx, sameAuthRetryDelayFunc()); errWait != nil {
-						return cliproxyexecutor.Response{}, errWait
-					}
-					continue
-				}
-				if lastErr != nil {
-					return cliproxyexecutor.Response{}, lastErr
-				}
-				return cliproxyexecutor.Response{}, &Error{Code: "auth_not_found", Message: "no auth available"}
+			if restrictionErr != nil {
+				lastErr = restrictionErr
+				break
 			}
-
-			break
+			lastErr = authErr
+			if authAttempt < sameAuthRetries {
+				if errWait := waitForCooldown(execCtx, sameAuthRetryDelayFunc()); errWait != nil {
+					return cliproxyexecutor.Response{}, errWait
+				}
+				continue
+			}
+			return cliproxyexecutor.Response{}, authErr
 		}
 	}
 }
@@ -2036,16 +2026,22 @@ func isRequestInvalidError(err error) bool {
 		return false
 	}
 	status := statusCodeFromError(err)
-	if status != http.StatusBadRequest && status != http.StatusUnprocessableEntity {
+	switch status {
+	case http.StatusUnprocessableEntity:
+		// All 422 responses represent request-shape failures, so retries with other
+		// auths or upstream model pool entries will not help.
+		return true
+	case http.StatusBadRequest:
+		message := strings.ToLower(strings.TrimSpace(err.Error()))
+		if message == "" {
+			return false
+		}
+		return strings.Contains(message, "invalid_request_error") ||
+			strings.Contains(message, "unsupported parameter") ||
+			strings.Contains(message, "unknown parameter")
+	default:
 		return false
 	}
-	message := strings.ToLower(strings.TrimSpace(err.Error()))
-	if message == "" {
-		return false
-	}
-	return strings.Contains(message, "invalid_request_error") ||
-		strings.Contains(message, "unsupported parameter") ||
-		strings.Contains(message, "unknown parameter")
 }
 
 // shouldRetryAcrossAuths returns true only for auth/model specific restriction
