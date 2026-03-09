@@ -622,6 +622,8 @@ func (e *CodexWebsocketsExecutor) dialCodexWebsocket(ctx context.Context, auth *
 	for idx := range proxyURLs {
 		dialer, ok := newProxyAwareWebsocketDialer(proxyURLs[idx])
 		if !ok {
+			// All proxies invalid would otherwise fall through with lastErr still nil.
+			lastErr = fmt.Errorf("codex websockets executor: invalid proxy URL: %q", proxyURLs[idx])
 			continue
 		}
 		conn, resp, err := dialer.DialContext(ctx, wsURL, headers)

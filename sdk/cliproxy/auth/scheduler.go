@@ -59,11 +59,14 @@ type scheduledAuthMeta struct {
 // modelScheduler tracks ready and blocked auths for one provider/model combination.
 type modelScheduler struct {
 	modelKey        string
+	includeAllAuths bool
 	entries         map[string]*scheduledAuth
 	priorityOrder   []int
 	readyByPriority map[int]*readyBucket
 	blocked         cooldownQueue
 }
+
+const fallbackModelShardKeyPrefix = "__fallback_shard__:"
 
 // scheduledAuth stores the runtime scheduling state for a single auth inside a model shard.
 type scheduledAuth struct {
@@ -179,6 +182,13 @@ func (s *authScheduler) pickSingle(ctx context.Context, provider, model string, 
 	modelKey := canonicalModelKey(model)
 	pinnedAuthID := pinnedAuthIDFromMetadata(opts.Metadata)
 	preferWebsocket := cliproxyexecutor.DownstreamWebsocket(ctx) && providerKey == "codex" && pinnedAuthID == ""
+	skipModelRegistryCheck := metadataBool(opts.Metadata, cliproxyexecutor.SkipModelRegistryCheckMetadataKey)
+	shardKey := modelKey
+	includeAllAuths := false
+	if skipModelRegistryCheck && modelKey != "" {
+		shardKey = fallbackModelShardKeyPrefix + modelKey
+		includeAllAuths = true
+	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -186,7 +196,7 @@ func (s *authScheduler) pickSingle(ctx context.Context, provider, model string, 
 	if providerState == nil {
 		return nil, &Error{Code: "auth_not_found", Message: "no auth available"}
 	}
-	shard := providerState.ensureModelLocked(modelKey, time.Now())
+	shard := providerState.ensureModelLocked(shardKey, modelKey, includeAllAuths, time.Now())
 	if shard == nil {
 		return nil, &Error{Code: "auth_not_found", Message: "no auth available"}
 	}
@@ -221,6 +231,13 @@ func (s *authScheduler) pickMixed(ctx context.Context, providers []string, model
 	}
 	pinnedAuthID := pinnedAuthIDFromMetadata(opts.Metadata)
 	modelKey := canonicalModelKey(model)
+	skipModelRegistryCheck := metadataBool(opts.Metadata, cliproxyexecutor.SkipModelRegistryCheckMetadataKey)
+	shardKey := modelKey
+	includeAllAuths := false
+	if skipModelRegistryCheck && modelKey != "" {
+		shardKey = fallbackModelShardKeyPrefix + modelKey
+		includeAllAuths = true
+	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -233,7 +250,7 @@ func (s *authScheduler) pickMixed(ctx context.Context, providers []string, model
 		if providerState == nil {
 			return nil, "", &Error{Code: "auth_not_found", Message: "no auth available"}
 		}
-		shard := providerState.ensureModelLocked(modelKey, time.Now())
+		shard := providerState.ensureModelLocked(shardKey, modelKey, includeAllAuths, time.Now())
 		predicate := func(entry *scheduledAuth) bool {
 			if entry == nil || entry.auth == nil || entry.auth.ID != pinnedAuthID {
 				return false
@@ -260,7 +277,7 @@ func (s *authScheduler) pickMixed(ctx context.Context, providers []string, model
 		if providerState == nil {
 			continue
 		}
-		shard := providerState.ensureModelLocked(modelKey, now)
+		shard := providerState.ensureModelLocked(shardKey, modelKey, includeAllAuths, now)
 		candidateShards[providerIndex] = shard
 		if shard == nil {
 			continue
@@ -275,7 +292,7 @@ func (s *authScheduler) pickMixed(ctx context.Context, providers []string, model
 		}
 	}
 	if !hasCandidate {
-		return nil, "", s.mixedUnavailableErrorLocked(normalized, model, tried)
+		return nil, "", s.mixedUnavailableErrorLocked(normalized, model, shardKey, modelKey, includeAllAuths, tried)
 	}
 
 	if s.strategy == schedulerStrategyFillFirst {
@@ -289,7 +306,7 @@ func (s *authScheduler) pickMixed(ctx context.Context, providers []string, model
 				return picked, providerKey, nil
 			}
 		}
-		return nil, "", s.mixedUnavailableErrorLocked(normalized, model, tried)
+		return nil, "", s.mixedUnavailableErrorLocked(normalized, model, shardKey, modelKey, includeAllAuths, tried)
 	}
 
 	cursorKey := strings.Join(normalized, ",") + ":" + modelKey
@@ -311,11 +328,11 @@ func (s *authScheduler) pickMixed(ctx context.Context, providers []string, model
 		s.mixedCursors[cursorKey] = providerIndex + 1
 		return picked, providerKey, nil
 	}
-	return nil, "", s.mixedUnavailableErrorLocked(normalized, model, tried)
+	return nil, "", s.mixedUnavailableErrorLocked(normalized, model, shardKey, modelKey, includeAllAuths, tried)
 }
 
 // mixedUnavailableErrorLocked synthesizes the mixed-provider cooldown or unavailable error.
-func (s *authScheduler) mixedUnavailableErrorLocked(providers []string, model string, tried map[string]struct{}) error {
+func (s *authScheduler) mixedUnavailableErrorLocked(providers []string, model string, shardKey string, modelKey string, includeAllAuths bool, tried map[string]struct{}) error {
 	now := time.Now()
 	total := 0
 	cooldownCount := 0
@@ -325,7 +342,7 @@ func (s *authScheduler) mixedUnavailableErrorLocked(providers []string, model st
 		if providerState == nil {
 			continue
 		}
-		shard := providerState.ensureModelLocked(canonicalModelKey(model), now)
+		shard := providerState.ensureModelLocked(shardKey, modelKey, includeAllAuths, now)
 		if shard == nil {
 			continue
 		}
@@ -489,11 +506,11 @@ func (p *providerScheduler) upsertAuthLocked(meta *scheduledAuthMeta, now time.T
 		return
 	}
 	p.auths[meta.auth.ID] = meta
-	for modelKey, shard := range p.modelShards {
+	for _, shard := range p.modelShards {
 		if shard == nil {
 			continue
 		}
-		if !meta.supportsModel(modelKey) {
+		if !shard.includeAllAuths && !meta.supportsModel(shard.modelKey) {
 			shard.removeEntryLocked(meta.auth.ID)
 			continue
 		}
@@ -515,27 +532,32 @@ func (p *providerScheduler) removeAuthLocked(authID string) {
 }
 
 // ensureModelLocked returns the shard for modelKey, building it lazily from provider auths.
-func (p *providerScheduler) ensureModelLocked(modelKey string, now time.Time) *modelScheduler {
+func (p *providerScheduler) ensureModelLocked(shardKey string, modelKey string, includeAllAuths bool, now time.Time) *modelScheduler {
 	if p == nil {
 		return nil
 	}
+	shardKey = strings.TrimSpace(shardKey)
 	modelKey = canonicalModelKey(modelKey)
-	if shard, ok := p.modelShards[modelKey]; ok && shard != nil {
+	if shard, ok := p.modelShards[shardKey]; ok && shard != nil {
 		shard.promoteExpiredLocked(now)
 		return shard
 	}
 	shard := &modelScheduler{
 		modelKey:        modelKey,
+		includeAllAuths: includeAllAuths,
 		entries:         make(map[string]*scheduledAuth),
 		readyByPriority: make(map[int]*readyBucket),
 	}
 	for _, meta := range p.auths {
-		if meta == nil || !meta.supportsModel(modelKey) {
+		if meta == nil {
+			continue
+		}
+		if !includeAllAuths && !meta.supportsModel(modelKey) {
 			continue
 		}
 		shard.upsertEntryLocked(meta, now)
 	}
-	p.modelShards[modelKey] = shard
+	p.modelShards[shardKey] = shard
 	return shard
 }
 
