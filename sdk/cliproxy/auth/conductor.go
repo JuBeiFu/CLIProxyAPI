@@ -9,6 +9,7 @@ import (
 	"math/rand/v2"
 	"net/http"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -22,6 +23,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
+	sdktranslator "github.com/router-for-me/CLIProxyAPI/v6/sdk/translator"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -68,6 +70,20 @@ const (
 	quotaBackoffMax       = 30 * time.Minute
 	sameAuthRetryMinWait  = 5 * time.Second
 	sameAuthRetryMaxWait  = 10 * time.Second
+
+	quotaProbeBatchInterval  = 15 * time.Second
+	quotaProbeBatchSize      = 20
+	quotaProbeCooldown       = 15 * time.Minute
+	quotaProbeRetryLimit     = 2
+	quotaProbeTimeout        = 45 * time.Second
+	quotaProbeMaxConcurrency = 20
+)
+
+const (
+	metadataQuotaProbeLastKey        = "cliproxy_quota_probe_last"
+	metadataQuotaProbeAfterKey       = "cliproxy_quota_probe_after"
+	metadataAutoDisabledReasonKey    = "cliproxy_auto_disabled_reason"
+	autoDisabledReasonQuotaExhausted = "quota_exhausted"
 )
 
 var quotaCooldownDisabled atomic.Bool
@@ -168,6 +184,11 @@ type Manager struct {
 	// Auto refresh state
 	refreshCancel    context.CancelFunc
 	refreshSemaphore chan struct{}
+
+	// Auto quota refresh state
+	quotaRefreshCancel    context.CancelFunc
+	quotaRefreshSemaphore chan struct{}
+	quotaRefreshPending   map[string]time.Time
 }
 
 // NewManager constructs a manager with optional custom selector and hook.
@@ -179,14 +200,16 @@ func NewManager(store Store, selector Selector, hook Hook) *Manager {
 		hook = NoopHook{}
 	}
 	manager := &Manager{
-		store:            store,
-		executors:        make(map[string]ProviderExecutor),
-		selector:         selector,
-		hook:             hook,
-		auths:            make(map[string]*Auth),
-		providerOffsets:  make(map[string]int),
-		modelPoolOffsets: make(map[string]int),
-		refreshSemaphore: make(chan struct{}, refreshMaxConcurrency),
+		store:                 store,
+		executors:             make(map[string]ProviderExecutor),
+		selector:              selector,
+		hook:                  hook,
+		auths:                 make(map[string]*Auth),
+		providerOffsets:       make(map[string]int),
+		modelPoolOffsets:      make(map[string]int),
+		refreshSemaphore:      make(chan struct{}, refreshMaxConcurrency),
+		quotaRefreshSemaphore: make(chan struct{}, quotaProbeMaxConcurrency),
+		quotaRefreshPending:   make(map[string]time.Time),
 	}
 	// atomic.Value requires non-nil initial value.
 	manager.runtimeConfig.Store(&internalconfig.Config{})
@@ -1990,6 +2013,73 @@ func clearAuthStateOnSuccess(auth *Auth, now time.Time) {
 	auth.UpdatedAt = now
 }
 
+func resetAllModelStates(auth *Auth, now time.Time) {
+	if auth == nil || len(auth.ModelStates) == 0 {
+		return
+	}
+	for _, state := range auth.ModelStates {
+		resetModelState(state, now)
+	}
+}
+
+func applyQuotaProbeSuccessState(auth *Auth, now time.Time) {
+	if auth == nil {
+		return
+	}
+	autoDisabled := quotaProbeAutoDisabled(auth)
+	manualDisabled := auth.Disabled && !autoDisabled
+	previousStatusMessage := auth.StatusMessage
+	clearAuthStateOnSuccess(auth, now)
+	resetAllModelStates(auth, now)
+	if autoDisabled {
+		auth.Disabled = false
+		auth.Status = StatusActive
+		auth.StatusMessage = ""
+		clearQuotaProbeAutoDisabled(auth)
+	} else if manualDisabled {
+		auth.Status = StatusDisabled
+		auth.Disabled = true
+		auth.StatusMessage = previousStatusMessage
+	}
+	syncCooldownMetadata(auth, now)
+}
+
+func applyQuotaProbeQuotaExceededState(auth *Auth, resultErr *Error, retryAfter *time.Duration, now time.Time) {
+	if auth == nil {
+		return
+	}
+	manualDisabled := auth.Disabled && !quotaProbeAutoDisabled(auth)
+	applyAuthFailureState(auth, resultErr, retryAfter, now)
+	syncCooldownMetadata(auth, now)
+	if manualDisabled {
+		auth.Status = StatusDisabled
+		return
+	}
+	auth.Disabled = true
+	auth.Status = StatusDisabled
+	setQuotaProbeAutoDisabled(auth)
+}
+
+func shouldDeleteAuthOnQuotaProbe(auth *Auth, resultErr *Error) (bool, string) {
+	if deleteAuth, reason := shouldDeleteRevokedAuth(auth, resultErr); deleteAuth {
+		return true, reason
+	}
+	if auth == nil || resultErr == nil {
+		return false, ""
+	}
+	if resultErr.StatusCode() != http.StatusUnauthorized {
+		return false, ""
+	}
+	if !hasPersistedAuthRecord(auth) {
+		return false, ""
+	}
+	reason := strings.TrimSpace(resultErr.Message)
+	if reason == "" {
+		reason = "quota refresh returned unauthorized"
+	}
+	return true, reason
+}
+
 func cloneError(err *Error) *Error {
 	if err == nil {
 		return nil
@@ -2148,6 +2238,7 @@ func (m *Manager) deleteRevokedAuth(ctx context.Context, auth *Auth, warning str
 	if auth == nil {
 		return
 	}
+	m.clearQuotaRefreshPending(auth.ID)
 	if m.scheduler != nil {
 		m.scheduler.removeAuth(auth.ID)
 	}
@@ -2626,6 +2717,140 @@ func (m *Manager) StopAutoRefresh() {
 	}
 }
 
+// StartAutoQuotaRefresh launches a background loop that probes account quota state
+// in fixed-size batches. It intentionally includes disabled auths so accounts that
+// were auto-disabled on quota exhaustion can recover automatically.
+func (m *Manager) StartAutoQuotaRefresh(parent context.Context) {
+	if m == nil {
+		return
+	}
+	if m.quotaRefreshCancel != nil {
+		m.quotaRefreshCancel()
+		m.quotaRefreshCancel = nil
+	}
+	ctx, cancel := context.WithCancel(parent)
+	m.quotaRefreshCancel = cancel
+	go func() {
+		ticker := time.NewTicker(quotaProbeBatchInterval)
+		defer ticker.Stop()
+		m.checkQuotaRefreshes(ctx)
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				m.checkQuotaRefreshes(ctx)
+			}
+		}
+	}()
+}
+
+// StopAutoQuotaRefresh cancels the background quota refresh loop, if running.
+func (m *Manager) StopAutoQuotaRefresh() {
+	if m == nil {
+		return
+	}
+	if m.quotaRefreshCancel != nil {
+		m.quotaRefreshCancel()
+		m.quotaRefreshCancel = nil
+	}
+}
+
+func (m *Manager) checkQuotaRefreshes(ctx context.Context) {
+	now := time.Now()
+	batch := m.pickQuotaRefreshBatch(now, quotaProbeBatchSize)
+	for _, authID := range batch {
+		go m.refreshQuotaAuthWithLimit(ctx, authID)
+	}
+}
+
+func (m *Manager) refreshQuotaAuthWithLimit(ctx context.Context, id string) {
+	if m.quotaRefreshSemaphore == nil {
+		m.refreshQuotaAuth(ctx, id)
+		return
+	}
+	select {
+	case m.quotaRefreshSemaphore <- struct{}{}:
+		defer func() { <-m.quotaRefreshSemaphore }()
+	case <-ctx.Done():
+		return
+	}
+	m.refreshQuotaAuth(ctx, id)
+}
+
+func (m *Manager) pickQuotaRefreshBatch(now time.Time, limit int) []string {
+	if m == nil || limit <= 0 {
+		return nil
+	}
+	snapshot := m.snapshotAuths()
+	type quotaCandidate struct {
+		auth *Auth
+		due  time.Time
+		last time.Time
+	}
+	candidates := make([]quotaCandidate, 0, len(snapshot))
+	for _, auth := range snapshot {
+		if auth == nil {
+			continue
+		}
+		if m.executorFor(auth.Provider) == nil {
+			continue
+		}
+		due, last := quotaProbeSchedule(auth)
+		if !due.IsZero() && due.After(now) {
+			continue
+		}
+		candidates = append(candidates, quotaCandidate{auth: auth, due: due, last: last})
+	}
+	if len(candidates) == 0 {
+		return nil
+	}
+	sort.Slice(candidates, func(i, j int) bool {
+		left := candidates[i]
+		right := candidates[j]
+		leftAutoDisabled := quotaProbeAutoDisabled(left.auth)
+		rightAutoDisabled := quotaProbeAutoDisabled(right.auth)
+		if leftAutoDisabled != rightAutoDisabled {
+			return leftAutoDisabled
+		}
+		if left.auth.Disabled != right.auth.Disabled {
+			return left.auth.Disabled
+		}
+		if left.last.IsZero() != right.last.IsZero() {
+			return left.last.IsZero()
+		}
+		if !left.due.Equal(right.due) {
+			if left.due.IsZero() {
+				return true
+			}
+			if right.due.IsZero() {
+				return false
+			}
+			return left.due.Before(right.due)
+		}
+		if !left.last.Equal(right.last) {
+			if left.last.IsZero() {
+				return true
+			}
+			if right.last.IsZero() {
+				return false
+			}
+			return left.last.Before(right.last)
+		}
+		return left.auth.ID < right.auth.ID
+	})
+	selected := make([]string, 0, limit)
+	for _, candidate := range candidates {
+		if len(selected) >= limit {
+			break
+		}
+		if m.markQuotaRefreshPending(candidate.auth.ID, now) {
+			selected = append(selected, candidate.auth.ID)
+		}
+	}
+	return selected
+}
+
 func (m *Manager) checkRefreshes(ctx context.Context) {
 	// log.Debugf("checking refreshes")
 	now := time.Now()
@@ -2878,6 +3103,87 @@ func lookupMetadataTime(meta map[string]any, keys ...string) (time.Time, bool) {
 	return time.Time{}, false
 }
 
+func quotaProbeSchedule(auth *Auth) (time.Time, time.Time) {
+	if auth == nil || auth.Metadata == nil {
+		return time.Time{}, time.Time{}
+	}
+	next, _ := lookupMetadataTime(auth.Metadata, metadataQuotaProbeAfterKey)
+	last, _ := lookupMetadataTime(auth.Metadata, metadataQuotaProbeLastKey)
+	return next, last
+}
+
+func quotaProbeAutoDisabled(auth *Auth) bool {
+	if auth == nil || auth.Metadata == nil {
+		return false
+	}
+	raw, ok := auth.Metadata[metadataAutoDisabledReasonKey]
+	if !ok {
+		return false
+	}
+	reason, ok := raw.(string)
+	if !ok {
+		return false
+	}
+	return strings.EqualFold(strings.TrimSpace(reason), autoDisabledReasonQuotaExhausted)
+}
+
+func setQuotaProbeCooldown(auth *Auth, now time.Time) {
+	if auth == nil {
+		return
+	}
+	if auth.Metadata == nil {
+		auth.Metadata = make(map[string]any)
+	}
+	auth.Metadata[metadataQuotaProbeLastKey] = now.Unix()
+	auth.Metadata[metadataQuotaProbeAfterKey] = now.Add(quotaProbeCooldown).Unix()
+}
+
+func clearQuotaProbeAutoDisabled(auth *Auth) {
+	if auth == nil || auth.Metadata == nil {
+		return
+	}
+	delete(auth.Metadata, metadataAutoDisabledReasonKey)
+}
+
+func setQuotaProbeAutoDisabled(auth *Auth) {
+	if auth == nil {
+		return
+	}
+	if auth.Metadata == nil {
+		auth.Metadata = make(map[string]any)
+	}
+	auth.Metadata[metadataAutoDisabledReasonKey] = autoDisabledReasonQuotaExhausted
+}
+
+func (m *Manager) markQuotaRefreshPending(id string, now time.Time) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	auth, ok := m.auths[id]
+	if !ok || auth == nil {
+		return false
+	}
+	if pendingUntil, ok := m.quotaRefreshPending[id]; ok && pendingUntil.After(now) {
+		return false
+	}
+	if due, _ := quotaProbeSchedule(auth); !due.IsZero() && due.After(now) {
+		return false
+	}
+	if m.quotaRefreshPending == nil {
+		m.quotaRefreshPending = make(map[string]time.Time)
+	}
+	m.quotaRefreshPending[id] = now.Add(quotaProbeTimeout)
+	return true
+}
+
+func (m *Manager) clearQuotaRefreshPending(id string) {
+	if m == nil || id == "" {
+		return
+	}
+	m.mu.Lock()
+	delete(m.quotaRefreshPending, id)
+	m.mu.Unlock()
+}
+
 func (m *Manager) markRefreshPending(id string, now time.Time) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -2958,6 +3264,200 @@ func (m *Manager) refreshAuth(ctx context.Context, id string) {
 	updated.LastError = nil
 	updated.UpdatedAt = now
 	_, _ = m.Update(ctx, updated)
+}
+
+func (m *Manager) refreshQuotaAuth(ctx context.Context, id string) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	defer m.clearQuotaRefreshPending(id)
+	m.mu.RLock()
+	auth := m.auths[id]
+	var exec ProviderExecutor
+	if auth != nil {
+		exec = m.executors[auth.Provider]
+	}
+	m.mu.RUnlock()
+	if auth == nil || exec == nil {
+		return
+	}
+
+	err := m.executeQuotaProbe(ctx, exec, auth.Clone())
+	if err != nil && errors.Is(err, context.Canceled) {
+		if ctx.Err() != nil {
+			return
+		}
+	}
+
+	now := time.Now()
+	if err != nil {
+		resultErr := &Error{Message: err.Error()}
+		retryAfter := retryAfterFromError(err)
+		if se, ok := errors.AsType[cliproxyexecutor.StatusError](err); ok && se != nil {
+			resultErr.HTTPStatus = se.StatusCode()
+		}
+		if deleteAuth, reason := shouldDeleteAuthOnQuotaProbe(auth, resultErr); deleteAuth {
+			m.mu.Lock()
+			current := m.auths[id]
+			if current != nil {
+				delete(m.auths, id)
+			}
+			m.mu.Unlock()
+			if current != nil {
+				m.deleteRevokedAuth(ctx, current.Clone(), reason, "quota-refresh")
+			}
+			return
+		}
+		m.mu.Lock()
+		if current := m.auths[id]; current != nil {
+			setQuotaProbeCooldown(current, now)
+			if resultErr.HTTPStatus == http.StatusTooManyRequests {
+				applyQuotaProbeQuotaExceededState(current, resultErr, retryAfter, now)
+			} else {
+				applyAuthFailureState(current, resultErr, retryAfter, now)
+				syncCooldownMetadata(current, now)
+				if current.Disabled {
+					current.Status = StatusDisabled
+				}
+			}
+			current.UpdatedAt = now
+			m.auths[id] = current
+			if m.scheduler != nil {
+				m.scheduler.upsertAuth(current.Clone())
+			}
+			_ = m.persist(ctx, current)
+		}
+		m.mu.Unlock()
+		return
+	}
+
+	m.mu.Lock()
+	if current := m.auths[id]; current != nil {
+		setQuotaProbeCooldown(current, now)
+		applyQuotaProbeSuccessState(current, now)
+		current.UpdatedAt = now
+		m.auths[id] = current
+		if m.scheduler != nil {
+			m.scheduler.upsertAuth(current.Clone())
+		}
+		_ = m.persist(ctx, current)
+	}
+	m.mu.Unlock()
+}
+
+func (m *Manager) executeQuotaProbe(ctx context.Context, exec ProviderExecutor, auth *Auth) error {
+	if exec == nil {
+		return nil
+	}
+	req, opts, err := m.buildQuotaProbeRequest(auth)
+	if err != nil {
+		return err
+	}
+	attempts := quotaProbeRetryLimit + 1
+	for attempt := 0; attempt < attempts; attempt++ {
+		attemptCtx := ctx
+		cancel := func() {}
+		if quotaProbeTimeout > 0 {
+			attemptCtx, cancel = context.WithTimeout(ctx, quotaProbeTimeout)
+		}
+		_, execErr := exec.Execute(attemptCtx, auth.Clone(), req, opts)
+		cancel()
+		if execErr == nil {
+			return nil
+		}
+		statusCode := statusCodeFromError(execErr)
+		if statusCode == http.StatusUnauthorized || statusCode == http.StatusTooManyRequests {
+			return execErr
+		}
+		if attempt == attempts-1 {
+			return execErr
+		}
+	}
+	return nil
+}
+
+func (m *Manager) buildQuotaProbeRequest(auth *Auth) (cliproxyexecutor.Request, cliproxyexecutor.Options, error) {
+	model := pickQuotaProbeModel(auth)
+	if model == "" {
+		return cliproxyexecutor.Request{}, cliproxyexecutor.Options{}, errors.New("quota refresh probe skipped: no supported model for auth")
+	}
+	payload, err := json.Marshal(map[string]any{
+		"model": model,
+		"input": []map[string]any{{
+			"role": "user",
+			"content": []map[string]any{{
+				"type": "input_text",
+				"text": "quota refresh ping",
+			}},
+		}},
+		"max_output_tokens": 1,
+	})
+	if err != nil {
+		return cliproxyexecutor.Request{}, cliproxyexecutor.Options{}, err
+	}
+	return cliproxyexecutor.Request{
+			Model:   model,
+			Payload: payload,
+			Format:  sdktranslator.FormatOpenAIResponse,
+		}, cliproxyexecutor.Options{
+			SourceFormat: sdktranslator.FormatOpenAIResponse,
+		}, nil
+}
+
+func pickQuotaProbeModel(auth *Auth) string {
+	if auth == nil {
+		return ""
+	}
+	models := registry.GetGlobalRegistry().GetModelsForClient(auth.ID)
+	if len(models) == 0 {
+		models = defaultQuotaProbeModels(strings.ToLower(strings.TrimSpace(auth.Provider)))
+	}
+	if strings.EqualFold(strings.TrimSpace(auth.Provider), "codex") && !codexPlanIsPaid(codexPlanType(auth)) {
+		for _, model := range models {
+			if model == nil {
+				continue
+			}
+			candidate := strings.TrimSpace(model.ID)
+			if candidate == "" || codexModelRequiresPaidPlan(candidate) {
+				continue
+			}
+			return candidate
+		}
+	}
+	for _, model := range models {
+		if model == nil {
+			continue
+		}
+		if candidate := strings.TrimSpace(model.ID); candidate != "" {
+			return candidate
+		}
+	}
+	return ""
+}
+
+func defaultQuotaProbeModels(provider string) []*registry.ModelInfo {
+	switch strings.ToLower(strings.TrimSpace(provider)) {
+	case "codex":
+		return registry.GetOpenAIModels()
+	case "claude":
+		return registry.GetClaudeModels()
+	case "gemini":
+		return registry.GetGeminiModels()
+	case "gemini-cli":
+		return registry.GetGeminiCLIModels()
+	case "gemini-vertex":
+		return registry.GetGeminiVertexModels()
+	case "aistudio":
+		return registry.GetAIStudioModels()
+	case "qwen":
+		return registry.GetQwenModels()
+	case "iflow":
+		return registry.GetIFlowModels()
+	case "kimi":
+		return registry.GetKimiModels()
+	default:
+		return nil
+	}
 }
 
 func (m *Manager) executorFor(provider string) ProviderExecutor {
