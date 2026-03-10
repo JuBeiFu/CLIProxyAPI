@@ -103,3 +103,26 @@ func TestSelectorPick_AllPlanIneligibleReturnsAuthPlanRestricted(t *testing.T) {
 		t.Fatalf("error.HTTPStatus = %d, want %d", authErr.HTTPStatus, 403)
 	}
 }
+
+func TestSelectorPick_PlanIneligibleDoesNotBlockCooldownError(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now()
+	next := now.Add(30 * time.Second)
+
+	selector := &FillFirstSelector{}
+	auths := []*Auth{
+		{ID: "free", Provider: "codex", Metadata: map[string]any{metadataPlanTypeKey: "free"}},
+		{ID: "paid", Provider: "codex", Metadata: map[string]any{metadataPlanTypeKey: "team"}, Quota: QuotaState{Exceeded: true, NextRecoverAt: next}},
+	}
+
+	_, err := selector.Pick(context.Background(), "codex", "gpt-5.4", cliproxyexecutor.Options{}, auths)
+	if err == nil {
+		t.Fatalf("Pick() error = nil")
+	}
+
+	var cooldownErr *modelCooldownError
+	if !errors.As(err, &cooldownErr) {
+		t.Fatalf("Pick() error = %T, want *modelCooldownError", err)
+	}
+}

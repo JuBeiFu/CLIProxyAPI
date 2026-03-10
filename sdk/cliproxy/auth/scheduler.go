@@ -2,6 +2,8 @@ package auth
 
 import (
 	"context"
+	"fmt"
+	"net/http"
 	"sort"
 	"strings"
 	"sync"
@@ -335,6 +337,8 @@ func (s *authScheduler) pickMixed(ctx context.Context, providers []string, model
 func (s *authScheduler) mixedUnavailableErrorLocked(providers []string, model string, shardKey string, modelKey string, includeAllAuths bool, tried map[string]struct{}) error {
 	now := time.Now()
 	total := 0
+	eligibleTotal := 0
+	ineligibleCount := 0
 	cooldownCount := 0
 	earliest := time.Time{}
 	for _, providerKey := range providers {
@@ -346,8 +350,13 @@ func (s *authScheduler) mixedUnavailableErrorLocked(providers []string, model st
 		if shard == nil {
 			continue
 		}
-		localTotal, localCooldownCount, localEarliest := shard.availabilitySummaryLocked(triedPredicate(tried))
+		localTotal, localCooldownCount, localIneligible, localEarliest := shard.availabilitySummaryLocked(model, triedPredicate(tried))
 		total += localTotal
+		ineligibleCount += localIneligible
+		localEligible := localTotal - localIneligible
+		if localEligible > 0 {
+			eligibleTotal += localEligible
+		}
 		cooldownCount += localCooldownCount
 		if !localEarliest.IsZero() && (earliest.IsZero() || localEarliest.Before(earliest)) {
 			earliest = localEarliest
@@ -356,7 +365,12 @@ func (s *authScheduler) mixedUnavailableErrorLocked(providers []string, model st
 	if total == 0 {
 		return &Error{Code: "auth_not_found", Message: "no auth available"}
 	}
-	if cooldownCount == total && !earliest.IsZero() {
+	if eligibleTotal == 0 && ineligibleCount == total && model != "" {
+		message := fmt.Sprintf("No eligible credentials for model %s", model)
+		message = fmt.Sprintf("%s; requires a paid ChatGPT plan", message)
+		return &Error{Code: "auth_plan_restricted", Message: message, HTTPStatus: http.StatusForbidden}
+	}
+	if eligibleTotal > 0 && cooldownCount == eligibleTotal && !earliest.IsZero() {
 		resetIn := earliest.Sub(now)
 		if resetIn < 0 {
 			resetIn = 0
@@ -729,11 +743,27 @@ func (m *modelScheduler) pickReadyAtPriorityLocked(preferWebsocket bool, priorit
 // unavailableErrorLocked returns the correct unavailable or cooldown error for the shard.
 func (m *modelScheduler) unavailableErrorLocked(provider, model string, predicate func(*scheduledAuth) bool) error {
 	now := time.Now()
-	total, cooldownCount, earliest := m.availabilitySummaryLocked(predicate)
+	total, cooldownCount, ineligibleCount, earliest := m.availabilitySummaryLocked(model, predicate)
 	if total == 0 {
 		return &Error{Code: "auth_not_found", Message: "no auth available"}
 	}
-	if cooldownCount == total && !earliest.IsZero() {
+	eligibleTotal := total - ineligibleCount
+	if eligibleTotal < 0 {
+		eligibleTotal = 0
+	}
+	if eligibleTotal == 0 && ineligibleCount == total && model != "" {
+		providerForError := provider
+		if providerForError == "mixed" {
+			providerForError = ""
+		}
+		message := fmt.Sprintf("No eligible credentials for model %s", model)
+		if providerForError != "" {
+			message = fmt.Sprintf("%s via provider %s", message, providerForError)
+		}
+		message = fmt.Sprintf("%s; requires a paid ChatGPT plan", message)
+		return &Error{Code: "auth_plan_restricted", Message: message, HTTPStatus: http.StatusForbidden}
+	}
+	if eligibleTotal > 0 && cooldownCount == eligibleTotal && !earliest.IsZero() {
 		providerForError := provider
 		if providerForError == "mixed" {
 			providerForError = ""
@@ -747,14 +777,16 @@ func (m *modelScheduler) unavailableErrorLocked(provider, model string, predicat
 	return &Error{Code: "auth_unavailable", Message: "no auth available"}
 }
 
-// availabilitySummaryLocked summarizes total candidates, cooldown count, and earliest retry time.
-func (m *modelScheduler) availabilitySummaryLocked(predicate func(*scheduledAuth) bool) (int, int, time.Time) {
+// availabilitySummaryLocked summarizes candidates, cooldown count, plan ineligible count, and earliest retry time.
+func (m *modelScheduler) availabilitySummaryLocked(model string, predicate func(*scheduledAuth) bool) (int, int, int, time.Time) {
 	if m == nil {
-		return 0, 0, time.Time{}
+		return 0, 0, 0, time.Time{}
 	}
 	total := 0
 	cooldownCount := 0
+	ineligibleCount := 0
 	earliest := time.Time{}
+	requiresPaid := codexModelRequiresPaidPlan(model)
 	for _, entry := range m.entries {
 		if predicate != nil && !predicate(entry) {
 			continue
@@ -762,6 +794,12 @@ func (m *modelScheduler) availabilitySummaryLocked(predicate func(*scheduledAuth
 		total++
 		if entry == nil || entry.auth == nil {
 			continue
+		}
+		if requiresPaid && strings.EqualFold(strings.TrimSpace(entry.auth.Provider), "codex") {
+			if !codexPlanIsPaid(codexPlanType(entry.auth)) {
+				ineligibleCount++
+				continue
+			}
 		}
 		if entry.state != scheduledStateCooldown {
 			continue
@@ -771,7 +809,7 @@ func (m *modelScheduler) availabilitySummaryLocked(predicate func(*scheduledAuth
 			earliest = entry.nextRetryAt
 		}
 	}
-	return total, cooldownCount, earliest
+	return total, cooldownCount, ineligibleCount, earliest
 }
 
 // rebuildIndexesLocked reconstructs ready and blocked views from the current entry map.

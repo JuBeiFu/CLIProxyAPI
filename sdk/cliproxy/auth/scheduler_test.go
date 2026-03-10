@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"testing"
 	"time"
@@ -269,6 +270,64 @@ func TestSchedulerPick_MixedProvidersPrefersHighestPriorityTier(t *testing.T) {
 		if got.ID != wantIDs[index] {
 			t.Fatalf("pickMixed() #%d auth.ID = %q, want %q", index, got.ID, wantIDs[index])
 		}
+	}
+}
+
+func TestSchedulerPick_AllPlanIneligibleReturnsAuthPlanRestricted(t *testing.T) {
+	t.Parallel()
+
+	model := "gpt-5.4"
+	registerSchedulerModels(t, "codex", model, "free-a", "free-b")
+
+	scheduler := newSchedulerForTest(
+		&RoundRobinSelector{},
+		&Auth{ID: "free-a", Provider: "codex", Metadata: map[string]any{metadataPlanTypeKey: "free"}},
+		&Auth{ID: "free-b", Provider: "codex", Metadata: map[string]any{metadataPlanTypeKey: "free"}},
+	)
+
+	got, errPick := scheduler.pickSingle(context.Background(), "codex", model, cliproxyexecutor.Options{}, nil)
+	if errPick == nil {
+		t.Fatalf("pickSingle() error = nil")
+	}
+	if got != nil {
+		t.Fatalf("pickSingle() auth = %#v, want nil", got)
+	}
+	var authErr *Error
+	if !errors.As(errPick, &authErr) {
+		t.Fatalf("pickSingle() error = %T, want *Error", errPick)
+	}
+	if authErr.Code != "auth_plan_restricted" {
+		t.Fatalf("error.Code = %q, want %q", authErr.Code, "auth_plan_restricted")
+	}
+	if authErr.HTTPStatus != http.StatusForbidden {
+		t.Fatalf("error.HTTPStatus = %d, want %d", authErr.HTTPStatus, http.StatusForbidden)
+	}
+}
+
+func TestSchedulerPick_PlanIneligibleDoesNotBlockCooldownError(t *testing.T) {
+	t.Parallel()
+
+	model := "gpt-5.4"
+	now := time.Now()
+	next := now.Add(20 * time.Second)
+
+	registerSchedulerModels(t, "codex", model, "free", "paid")
+	scheduler := newSchedulerForTest(
+		&FillFirstSelector{},
+		&Auth{ID: "free", Provider: "codex", Metadata: map[string]any{metadataPlanTypeKey: "free"}},
+		&Auth{ID: "paid", Provider: "codex", Metadata: map[string]any{metadataPlanTypeKey: "team"}, Quota: QuotaState{Exceeded: true, NextRecoverAt: next}},
+	)
+
+	got, errPick := scheduler.pickSingle(context.Background(), "codex", model, cliproxyexecutor.Options{}, nil)
+	if errPick == nil {
+		t.Fatalf("pickSingle() error = nil")
+	}
+	if got != nil {
+		t.Fatalf("pickSingle() auth = %#v, want nil", got)
+	}
+	var cooldownErr *modelCooldownError
+	if !errors.As(errPick, &cooldownErr) {
+		t.Fatalf("pickSingle() error = %T, want *modelCooldownError", errPick)
 	}
 }
 

@@ -87,6 +87,34 @@ func TestRoundRobinSelectorPick_PriorityBuckets(t *testing.T) {
 	}
 }
 
+func TestRoundRobinSelectorPick_PriorityFromMetadata(t *testing.T) {
+	t.Parallel()
+
+	selector := &RoundRobinSelector{}
+	auths := []*Auth{
+		{ID: "low", Metadata: map[string]any{"priority": 0}},
+		{ID: "high-a", Metadata: map[string]any{"priority": 10}},
+		{ID: "high-b", Metadata: map[string]any{"priority": 10}},
+	}
+
+	want := []string{"high-a", "high-b", "high-a"}
+	for i, id := range want {
+		got, err := selector.Pick(context.Background(), "mixed", "", cliproxyexecutor.Options{}, auths)
+		if err != nil {
+			t.Fatalf("Pick() #%d error = %v", i, err)
+		}
+		if got == nil {
+			t.Fatalf("Pick() #%d auth = nil", i)
+		}
+		if got.ID != id {
+			t.Fatalf("Pick() #%d auth.ID = %q, want %q", i, got.ID, id)
+		}
+		if got.ID == "low" {
+			t.Fatalf("Pick() #%d unexpectedly selected lower priority auth", i)
+		}
+	}
+}
+
 func TestFillFirstSelectorPick_PriorityFallbackCooldown(t *testing.T) {
 	t.Parallel()
 

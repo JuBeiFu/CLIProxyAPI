@@ -110,17 +110,49 @@ func (e *modelCooldownError) Headers() http.Header {
 
 func authPriority(auth *Auth) int {
 	if auth == nil || auth.Attributes == nil {
-		return 0
+		return priorityFromMetadata(auth)
 	}
 	raw := strings.TrimSpace(auth.Attributes["priority"])
 	if raw == "" {
-		return 0
+		return priorityFromMetadata(auth)
 	}
 	parsed, err := strconv.Atoi(raw)
 	if err != nil {
-		return 0
+		return priorityFromMetadata(auth)
 	}
 	return parsed
+}
+
+func priorityFromMetadata(auth *Auth) int {
+	if auth == nil || len(auth.Metadata) == 0 {
+		return 0
+	}
+	raw, ok := auth.Metadata["priority"]
+	if !ok || raw == nil {
+		return 0
+	}
+	switch v := raw.(type) {
+	case int:
+		return v
+	case int64:
+		return int(v)
+	case float64:
+		return int(v)
+	case json.Number:
+		parsed, err := v.Int64()
+		if err != nil {
+			return 0
+		}
+		return int(parsed)
+	case string:
+		parsed, err := strconv.Atoi(strings.TrimSpace(v))
+		if err != nil {
+			return 0
+		}
+		return parsed
+	default:
+		return 0
+	}
 }
 
 func canonicalModelKey(model string) string {
@@ -231,7 +263,11 @@ func getAvailableAuths(auths []*Auth, provider, model string, now time.Time) ([]
 
 	availableByPriority, cooldownCount, ineligibleCount, earliest := collectAvailableByPriority(auths, model, now)
 	if len(availableByPriority) == 0 {
-		if cooldownCount == len(auths) && !earliest.IsZero() {
+		eligibleTotal := len(auths) - ineligibleCount
+		if eligibleTotal < 0 {
+			eligibleTotal = 0
+		}
+		if eligibleTotal > 0 && cooldownCount == eligibleTotal && !earliest.IsZero() {
 			providerForError := provider
 			if providerForError == "mixed" {
 				providerForError = ""
@@ -242,7 +278,7 @@ func getAvailableAuths(auths []*Auth, provider, model string, now time.Time) ([]
 			}
 			return nil, newModelCooldownError(model, providerForError, resetIn)
 		}
-		if ineligibleCount == len(auths) && model != "" {
+		if eligibleTotal == 0 && ineligibleCount == len(auths) && model != "" {
 			providerForError := provider
 			if providerForError == "mixed" {
 				providerForError = ""
