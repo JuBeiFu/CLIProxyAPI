@@ -35,6 +35,7 @@ const (
 	blockReasonNone blockReason = iota
 	blockReasonCooldown
 	blockReasonDisabled
+	blockReasonPlanIneligible
 	blockReasonOther
 )
 
@@ -135,6 +136,14 @@ func canonicalModelKey(model string) string {
 	return modelName
 }
 
+func codexModelRequiresPaidPlan(model string) bool {
+	base := strings.ToLower(canonicalModelKey(model))
+	if base == "" {
+		return false
+	}
+	return strings.HasPrefix(base, "gpt-5.3") || strings.HasPrefix(base, "gpt-5.4")
+}
+
 func authWebsocketsEnabled(auth *Auth) bool {
 	if auth == nil {
 		return false
@@ -191,7 +200,7 @@ func preferCodexWebsocketAuths(ctx context.Context, provider string, available [
 	return available
 }
 
-func collectAvailableByPriority(auths []*Auth, model string, now time.Time) (available map[int][]*Auth, cooldownCount int, earliest time.Time) {
+func collectAvailableByPriority(auths []*Auth, model string, now time.Time) (available map[int][]*Auth, cooldownCount int, ineligibleCount int, earliest time.Time) {
 	available = make(map[int][]*Auth)
 	for i := 0; i < len(auths); i++ {
 		candidate := auths[i]
@@ -206,9 +215,13 @@ func collectAvailableByPriority(auths []*Auth, model string, now time.Time) (ava
 			if !next.IsZero() && (earliest.IsZero() || next.Before(earliest)) {
 				earliest = next
 			}
+			continue
+		}
+		if reason == blockReasonPlanIneligible {
+			ineligibleCount++
 		}
 	}
-	return available, cooldownCount, earliest
+	return available, cooldownCount, ineligibleCount, earliest
 }
 
 func getAvailableAuths(auths []*Auth, provider, model string, now time.Time) ([]*Auth, error) {
@@ -216,7 +229,7 @@ func getAvailableAuths(auths []*Auth, provider, model string, now time.Time) ([]
 		return nil, &Error{Code: "auth_not_found", Message: "no auth candidates"}
 	}
 
-	availableByPriority, cooldownCount, earliest := collectAvailableByPriority(auths, model, now)
+	availableByPriority, cooldownCount, ineligibleCount, earliest := collectAvailableByPriority(auths, model, now)
 	if len(availableByPriority) == 0 {
 		if cooldownCount == len(auths) && !earliest.IsZero() {
 			providerForError := provider
@@ -228,6 +241,18 @@ func getAvailableAuths(auths []*Auth, provider, model string, now time.Time) ([]
 				resetIn = 0
 			}
 			return nil, newModelCooldownError(model, providerForError, resetIn)
+		}
+		if ineligibleCount == len(auths) && model != "" {
+			providerForError := provider
+			if providerForError == "mixed" {
+				providerForError = ""
+			}
+			message := fmt.Sprintf("No eligible credentials for model %s", model)
+			if providerForError != "" {
+				message = fmt.Sprintf("%s via provider %s", message, providerForError)
+			}
+			message = fmt.Sprintf("%s; requires a paid ChatGPT plan", message)
+			return nil, &Error{Code: "auth_plan_restricted", Message: message, HTTPStatus: http.StatusForbidden}
 		}
 		return nil, &Error{Code: "auth_unavailable", Message: "no auth available"}
 	}
@@ -368,6 +393,11 @@ func isAuthBlockedForModel(auth *Auth, model string, now time.Time) (bool, block
 	}
 	if auth.Disabled || auth.Status == StatusDisabled {
 		return true, blockReasonDisabled, time.Time{}
+	}
+	if model != "" && strings.EqualFold(strings.TrimSpace(auth.Provider), "codex") && codexModelRequiresPaidPlan(model) {
+		if !codexPlanIsPaid(codexPlanType(auth)) {
+			return true, blockReasonPlanIneligible, time.Time{}
+		}
 	}
 	if until, ok := cooldownUntilFromAuthMetadata(auth.Metadata); ok && until.After(now) {
 		return true, blockReasonCooldown, until

@@ -817,6 +817,7 @@ func (m *Manager) Register(ctx context.Context, auth *Auth) (*Auth, error) {
 		auth.ID = uuid.NewString()
 	}
 	auth.EnsureIndex()
+	hydrateCodexPlanType(auth)
 	authClone := auth.Clone()
 	m.mu.Lock()
 	m.auths[auth.ID] = authClone
@@ -846,6 +847,7 @@ func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 		}
 	}
 	auth.EnsureIndex()
+	hydrateCodexPlanType(auth)
 	authClone := auth.Clone()
 	m.auths[auth.ID] = authClone
 	m.mu.Unlock()
@@ -875,6 +877,7 @@ func (m *Manager) Load(ctx context.Context) error {
 		if auth == nil || auth.ID == "" {
 			continue
 		}
+		hydrateCodexPlanType(auth)
 		auth.EnsureIndex()
 		m.auths[auth.ID] = auth.Clone()
 	}
