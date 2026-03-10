@@ -55,6 +55,7 @@ type scheduledAuthMeta struct {
 	priority          int
 	virtualParent     string
 	websocketEnabled  bool
+	codexPaidPlan     bool
 	supportedModelSet map[string]struct{}
 }
 
@@ -483,12 +484,17 @@ func buildScheduledAuthMeta(auth *Auth) *scheduledAuthMeta {
 	if auth.Attributes != nil {
 		virtualParent = strings.TrimSpace(auth.Attributes["gemini_virtual_parent"])
 	}
+	codexPaidPlan := false
+	if providerKey == "codex" {
+		codexPaidPlan = codexPlanIsPaid(codexPlanType(auth))
+	}
 	return &scheduledAuthMeta{
 		auth:              auth,
 		providerKey:       providerKey,
 		priority:          authPriority(auth),
 		virtualParent:     virtualParent,
 		websocketEnabled:  authWebsocketsEnabled(auth),
+		codexPaidPlan:     codexPaidPlan,
 		supportedModelSet: supportedModelSetForAuth(auth.ID),
 	}
 }
@@ -622,10 +628,12 @@ func (m *modelScheduler) upsertEntryLocked(meta *scheduledAuthMeta, now time.Tim
 	previousPriority := 0
 	previousParent := ""
 	previousWebsocketEnabled := false
+	previousCodexPaidPlan := false
 	if entry.meta != nil {
 		previousPriority = entry.meta.priority
 		previousParent = entry.meta.virtualParent
 		previousWebsocketEnabled = entry.meta.websocketEnabled
+		previousCodexPaidPlan = entry.meta.codexPaidPlan
 	}
 
 	entry.meta = meta
@@ -645,7 +653,7 @@ func (m *modelScheduler) upsertEntryLocked(meta *scheduledAuthMeta, now time.Tim
 		entry.nextRetryAt = next
 	}
 
-	if ok && previousState == entry.state && previousNextRetryAt.Equal(entry.nextRetryAt) && previousPriority == meta.priority && previousParent == meta.virtualParent && previousWebsocketEnabled == meta.websocketEnabled {
+	if ok && previousState == entry.state && previousNextRetryAt.Equal(entry.nextRetryAt) && previousPriority == meta.priority && previousParent == meta.virtualParent && previousWebsocketEnabled == meta.websocketEnabled && previousCodexPaidPlan == meta.codexPaidPlan {
 		return
 	}
 	m.rebuildIndexesLocked()
@@ -953,10 +961,10 @@ func buildReadyBucket(providerKey string, entries []*scheduledAuth) *readyBucket
 	if providerKey == "codex" && len(entries) > 0 {
 		freeEntries := make([]*scheduledAuth, 0, len(entries))
 		for _, entry := range entries {
-			if entry == nil || entry.auth == nil {
+			if entry == nil || entry.meta == nil || entry.auth == nil {
 				continue
 			}
-			if codexPlanIsPaid(codexPlanType(entry.auth)) {
+			if entry.meta.codexPaidPlan {
 				continue
 			}
 			freeEntries = append(freeEntries, entry)
@@ -965,10 +973,10 @@ func buildReadyBucket(providerKey string, entries []*scheduledAuth) *readyBucket
 
 		wsFreeEntries := make([]*scheduledAuth, 0, len(wsEntries))
 		for _, entry := range wsEntries {
-			if entry == nil || entry.auth == nil {
+			if entry == nil || entry.meta == nil || entry.auth == nil {
 				continue
 			}
-			if codexPlanIsPaid(codexPlanType(entry.auth)) {
+			if entry.meta.codexPaidPlan {
 				continue
 			}
 			wsFreeEntries = append(wsFreeEntries, entry)

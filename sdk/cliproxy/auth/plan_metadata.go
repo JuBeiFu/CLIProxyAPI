@@ -51,7 +51,26 @@ func hydrateCodexPlanType(auth *Auth) {
 	if !strings.EqualFold(strings.TrimSpace(auth.Provider), "codex") {
 		return
 	}
-	if codexPlanType(auth) != "" {
+	// Operators may pin plan_type via immutable attributes; do not override.
+	if len(auth.Attributes) > 0 {
+		if v := strings.TrimSpace(auth.Attributes[metadataPlanTypeKey]); v != "" {
+			return
+		}
+	}
+
+	currentPlan := ""
+	if raw, ok := auth.Metadata[metadataPlanTypeKey]; ok {
+		if v, ok := raw.(string); ok {
+			currentPlan = strings.TrimSpace(v)
+		}
+	}
+	if currentPlan != "" && strings.EqualFold(currentPlan, "unknown") {
+		currentPlan = ""
+	}
+
+	// If we already have a plan type but no ID token, there's nothing to reconcile.
+	_, hasToken := auth.Metadata[metadataCodexIDToken].(string)
+	if currentPlan != "" && !hasToken {
 		return
 	}
 
@@ -71,7 +90,9 @@ func hydrateCodexPlanType(auth *Auth) {
 	if planType == "" {
 		return
 	}
-	auth.Metadata[metadataPlanTypeKey] = planType
+	if currentPlan == "" || !strings.EqualFold(currentPlan, planType) {
+		auth.Metadata[metadataPlanTypeKey] = planType
+	}
 }
 
 func codexPlanIsPaid(planType string) bool {
