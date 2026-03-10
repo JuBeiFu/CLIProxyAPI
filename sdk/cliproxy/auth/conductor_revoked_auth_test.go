@@ -334,3 +334,62 @@ func TestManager_RefreshAuth_DeletesDeactivatedPersistedAuth(t *testing.T) {
 		t.Fatalf("expected deactivated auth models to be unregistered after refresh, got %d", len(models))
 	}
 }
+
+func TestManager_RefreshAuth_PreservesDetailedFailureState(t *testing.T) {
+	store := &deletingStore{}
+	mgr := NewManager(store, nil, nil)
+	mgr.RegisterExecutor(&revokedRefreshExecutor{
+		id: "codex",
+		err: &Error{
+			HTTPStatus: 500,
+			Message:    "refresh upstream timeout while contacting auth server",
+		},
+	})
+
+	auth := &Auth{
+		ID:       "auths/refresh-error.json",
+		FileName: "auths/refresh-error.json",
+		Provider: "codex",
+		Attributes: map[string]string{
+			"path": "/tmp/refresh-error.json",
+		},
+		Metadata: map[string]any{
+			"type": "codex",
+		},
+	}
+
+	if _, err := mgr.Register(WithSkipPersist(context.Background()), auth); err != nil {
+		t.Fatalf("Register returned error: %v", err)
+	}
+
+	mgr.refreshAuth(context.Background(), auth.ID)
+
+	stored, ok := mgr.GetByID(auth.ID)
+	if !ok {
+		t.Fatalf("expected auth to remain registered after non-401 refresh failure")
+	}
+	if stored.Status != StatusError {
+		t.Fatalf("status = %q, want %q", stored.Status, StatusError)
+	}
+	if !stored.Unavailable {
+		t.Fatalf("expected auth to be marked unavailable")
+	}
+	if stored.StatusMessage != "refresh upstream timeout while contacting auth server" {
+		t.Fatalf("status_message = %q", stored.StatusMessage)
+	}
+	if stored.LastError == nil {
+		t.Fatalf("expected last_error to be recorded")
+	}
+	if stored.LastError.HTTPStatus != 500 {
+		t.Fatalf("last_error.http_status = %d, want 500", stored.LastError.HTTPStatus)
+	}
+	if stored.LastError.Message != "refresh upstream timeout while contacting auth server" {
+		t.Fatalf("last_error.message = %q", stored.LastError.Message)
+	}
+	if stored.NextRefreshAfter.IsZero() {
+		t.Fatalf("expected next_refresh_after to be scheduled")
+	}
+	if deleted := store.Deleted(); len(deleted) != 0 {
+		t.Fatalf("expected no deleted auths, got %v", deleted)
+	}
+}

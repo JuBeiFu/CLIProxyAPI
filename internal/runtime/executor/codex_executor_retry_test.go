@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"errors"
 	"net/http"
 	"strconv"
 	"testing"
@@ -75,6 +76,35 @@ func TestParseCodexRetryAfter(t *testing.T) {
 		}
 		if *retryAfter != 45*time.Second {
 			t.Fatalf("retryAfter = %v, want %v", *retryAfter, 45*time.Second)
+		}
+	})
+}
+
+func TestNormalizeCodexRefreshErr(t *testing.T) {
+	t.Run("wraps refresh status errors with status code", func(t *testing.T) {
+		raw := errors.New(`token refresh failed after 3 attempts: token refresh failed with status 401: {"error":{"message":"Your OpenAI account has been deactivated, please check your email for more information.","type":"invalid_request_error","code":"account_deactivated","param":null},"status":401}`)
+
+		err := normalizeCodexRefreshErr(raw)
+		statusErr, ok := err.(interface{ StatusCode() int })
+		if !ok {
+			t.Fatalf("expected StatusCode() error, got %T", err)
+		}
+		if statusErr.StatusCode() != http.StatusUnauthorized {
+			t.Fatalf("statusCode = %d, want %d", statusErr.StatusCode(), http.StatusUnauthorized)
+		}
+		if err.Error() == raw.Error() {
+			t.Fatalf("expected normalized error message, got original %q", err.Error())
+		}
+		if err.Error() != `{"error":{"message":"Your OpenAI account has been deactivated, please check your email for more information.","type":"invalid_request_error","code":"account_deactivated","param":null},"status":401}` {
+			t.Fatalf("error message = %q", err.Error())
+		}
+	})
+
+	t.Run("leaves generic errors untouched", func(t *testing.T) {
+		raw := errors.New("token refresh failed after 3 attempts: dial tcp timeout")
+		err := normalizeCodexRefreshErr(raw)
+		if err != raw {
+			t.Fatalf("expected original error to be returned unchanged")
 		}
 	})
 }

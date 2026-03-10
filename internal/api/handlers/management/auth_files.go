@@ -396,6 +396,9 @@ func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
 	if !auth.NextRetryAfter.IsZero() {
 		entry["next_retry_after"] = auth.NextRetryAfter
 	}
+	if auth.LastError != nil {
+		entry["last_error"] = auth.LastError
+	}
 	if path != "" {
 		entry["path"] = path
 		entry["source"] = "file"

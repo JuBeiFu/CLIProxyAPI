@@ -2181,16 +2181,24 @@ func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Durati
 	statusCode := statusCodeFromResult(resultErr)
 	switch statusCode {
 	case 401:
-		auth.StatusMessage = "unauthorized"
+		if strings.TrimSpace(auth.StatusMessage) == "" {
+			auth.StatusMessage = "unauthorized"
+		}
 		auth.NextRetryAfter = now.Add(30 * time.Minute)
 	case 402, 403:
-		auth.StatusMessage = "payment_required"
+		if strings.TrimSpace(auth.StatusMessage) == "" {
+			auth.StatusMessage = "payment_required"
+		}
 		auth.NextRetryAfter = now.Add(30 * time.Minute)
 	case 404:
-		auth.StatusMessage = "not_found"
+		if strings.TrimSpace(auth.StatusMessage) == "" {
+			auth.StatusMessage = "not_found"
+		}
 		auth.NextRetryAfter = now.Add(12 * time.Hour)
 	case 429:
-		auth.StatusMessage = "quota exhausted"
+		if strings.TrimSpace(auth.StatusMessage) == "" {
+			auth.StatusMessage = "quota exhausted"
+		}
 		auth.Quota.Exceeded = true
 		auth.Quota.Reason = "quota"
 		var next time.Time
@@ -2206,7 +2214,9 @@ func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Durati
 		auth.Quota.NextRecoverAt = next
 		auth.NextRetryAfter = next
 	case 408, 500, 502, 503, 504:
-		auth.StatusMessage = "transient upstream error"
+		if strings.TrimSpace(auth.StatusMessage) == "" {
+			auth.StatusMessage = "transient upstream error"
+		}
 		if quotaCooldownDisabledForAuth(auth) {
 			auth.NextRetryAfter = time.Time{}
 		} else {
@@ -2907,6 +2917,7 @@ func (m *Manager) refreshAuth(ctx context.Context, id string) {
 	now := time.Now()
 	if err != nil {
 		resultErr := &Error{Message: err.Error()}
+		retryAfter := retryAfterFromError(err)
 		if se, ok := errors.AsType[cliproxyexecutor.StatusError](err); ok && se != nil {
 			resultErr.HTTPStatus = se.StatusCode()
 		}
@@ -2924,8 +2935,8 @@ func (m *Manager) refreshAuth(ctx context.Context, id string) {
 		}
 		m.mu.Lock()
 		if current := m.auths[id]; current != nil {
+			applyAuthFailureState(current, resultErr, retryAfter, now)
 			current.NextRefreshAfter = now.Add(refreshFailureBackoff)
-			current.LastError = resultErr
 			m.auths[id] = current
 			if m.scheduler != nil {
 				m.scheduler.upsertAuth(current.Clone())

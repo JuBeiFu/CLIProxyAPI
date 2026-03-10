@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -574,7 +575,7 @@ func (e *CodexExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*
 	svc := codexauth.NewCodexAuth(e.cfg)
 	td, err := svc.RefreshTokensWithRetry(ctx, refreshToken, 3)
 	if err != nil {
-		return nil, err
+		return nil, normalizeCodexRefreshErr(err)
 	}
 	if auth.Metadata == nil {
 		auth.Metadata = make(map[string]any)
@@ -594,6 +595,34 @@ func (e *CodexExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*
 	now := time.Now().Format(time.RFC3339)
 	auth.Metadata["last_refresh"] = now
 	return auth, nil
+}
+
+func normalizeCodexRefreshErr(err error) error {
+	if err == nil {
+		return nil
+	}
+	raw := strings.TrimSpace(err.Error())
+	if raw == "" {
+		return err
+	}
+	idx := strings.LastIndex(strings.ToLower(raw), "status ")
+	if idx < 0 {
+		return err
+	}
+	tail := raw[idx+len("status "):]
+	colon := strings.Index(tail, ":")
+	if colon <= 0 {
+		return err
+	}
+	statusCode, convErr := strconv.Atoi(strings.TrimSpace(tail[:colon]))
+	if convErr != nil || statusCode < 100 || statusCode > 599 {
+		return err
+	}
+	body := strings.TrimSpace(tail[colon+1:])
+	if body == "" {
+		return statusErr{code: statusCode, msg: raw}
+	}
+	return newCodexStatusErr(statusCode, []byte(body))
 }
 
 func (e *CodexExecutor) cacheHelper(ctx context.Context, from sdktranslator.Format, url string, req cliproxyexecutor.Request, rawJSON []byte) (*http.Request, error) {
