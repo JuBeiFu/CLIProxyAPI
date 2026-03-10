@@ -17,6 +17,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/api/handlers"
+	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
@@ -238,15 +239,52 @@ func (h *OpenAIResponsesAPIHandler) handleStreamingResponse(c *gin.Context, rawJ
 			flusher.Flush()
 
 			// Continue
-			h.forwardResponsesStream(c, flusher, func(err error) { cliCancel(err) }, dataChan, errChan)
+			h.forwardResponsesStream(c, flusher, func(err error) { cliCancel(err) }, dataChan, errChan, responsesChunkHasCompleted(chunk))
 			return
 		}
 	}
 }
 
-func (h *OpenAIResponsesAPIHandler) forwardResponsesStream(c *gin.Context, flusher http.Flusher, cancel func(error), data <-chan []byte, errs <-chan *interfaces.ErrorMessage) {
+func responsesChunkHasCompleted(chunk []byte) bool {
+	for _, payload := range websocketJSONPayloadsFromChunk(chunk) {
+		if gjson.GetBytes(payload, "type").String() == wsEventTypeCompleted {
+			return true
+		}
+	}
+	return false
+}
+
+func responsesIncompleteStreamError() *interfaces.ErrorMessage {
+	return &interfaces.ErrorMessage{
+		StatusCode: http.StatusRequestTimeout,
+		Error:      fmt.Errorf("stream closed before response.completed"),
+	}
+}
+
+func (h *OpenAIResponsesAPIHandler) logResponsesStreamError(c *gin.Context, errMsg *interfaces.ErrorMessage) {
+	if errMsg == nil {
+		return
+	}
+	status := errMsg.StatusCode
+	if status <= 0 {
+		status = http.StatusInternalServerError
+	}
+	if errMsg.Error != nil {
+		log.Warnf("responses stream error: status=%d error=%v", status, errMsg.Error)
+	} else {
+		log.Warnf("responses stream error: status=%d", status)
+	}
+	h.LoggingAPIResponseError(context.WithValue(context.Background(), "gin", c), errMsg)
+	markAPIResponseTimestamp(c)
+}
+
+func (h *OpenAIResponsesAPIHandler) forwardResponsesStream(c *gin.Context, flusher http.Flusher, cancel func(error), data <-chan []byte, errs <-chan *interfaces.ErrorMessage, completed bool) {
 	h.ForwardStream(c, flusher, cancel, data, errs, handlers.StreamForwardOptions{
 		WriteChunk: func(chunk []byte) {
+			if responsesChunkHasCompleted(chunk) {
+				completed = true
+				markAPIResponseTimestamp(c)
+			}
 			if bytes.HasPrefix(chunk, []byte("event:")) {
 				_, _ = c.Writer.Write([]byte("\n"))
 			}
@@ -257,6 +295,7 @@ func (h *OpenAIResponsesAPIHandler) forwardResponsesStream(c *gin.Context, flush
 			if errMsg == nil {
 				return
 			}
+			h.logResponsesStreamError(c, errMsg)
 			status := http.StatusInternalServerError
 			if errMsg.StatusCode > 0 {
 				status = errMsg.StatusCode
@@ -269,6 +308,13 @@ func (h *OpenAIResponsesAPIHandler) forwardResponsesStream(c *gin.Context, flush
 			_, _ = fmt.Fprintf(c.Writer, "\nevent: error\ndata: %s\n\n", string(chunk))
 		},
 		WriteDone: func() {
+			if !completed {
+				errMsg := responsesIncompleteStreamError()
+				h.logResponsesStreamError(c, errMsg)
+				chunk := handlers.BuildOpenAIResponsesStreamErrorChunk(errMsg.StatusCode, errMsg.Error.Error(), 0)
+				_, _ = fmt.Fprintf(c.Writer, "\nevent: error\ndata: %s\n\n", string(chunk))
+				return
+			}
 			_, _ = c.Writer.Write([]byte("\n"))
 		},
 	})
