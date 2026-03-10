@@ -126,3 +126,24 @@ func TestSelectorPick_PlanIneligibleDoesNotBlockCooldownError(t *testing.T) {
 		t.Fatalf("Pick() error = %T, want *modelCooldownError", err)
 	}
 }
+
+func TestSelectorPick_CodexPrefersFreeForNonRestrictedGPTModels(t *testing.T) {
+	t.Parallel()
+
+	selector := &FillFirstSelector{}
+	auths := []*Auth{
+		{ID: "paid", Provider: "codex", Attributes: map[string]string{"priority": "10"}, Metadata: map[string]any{metadataPlanTypeKey: "team"}},
+		{ID: "free", Provider: "codex", Attributes: map[string]string{"priority": "0"}, Metadata: map[string]any{metadataPlanTypeKey: "free"}},
+	}
+
+	got, err := selector.Pick(context.Background(), "codex", "gpt-5.2", cliproxyexecutor.Options{}, auths)
+	if err != nil {
+		t.Fatalf("Pick() error = %v", err)
+	}
+	if got == nil {
+		t.Fatalf("Pick() auth = nil")
+	}
+	if got.ID != "free" {
+		t.Fatalf("Pick() auth.ID = %q, want %q", got.ID, "free")
+	}
+}

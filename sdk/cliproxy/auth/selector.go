@@ -293,6 +293,26 @@ func getAvailableAuths(auths []*Auth, provider, model string, now time.Time) ([]
 		return nil, &Error{Code: "auth_unavailable", Message: "no auth available"}
 	}
 
+	// Plan preference: for non-restricted GPT models, prefer free (non-paid) Codex accounts.
+	// This preserves paid accounts for gpt-5.3/gpt-5.4 where free accounts are ineligible.
+	if strings.EqualFold(strings.TrimSpace(provider), "codex") && model != "" && !codexModelRequiresPaidPlan(model) {
+		freeByPriority := make(map[int][]*Auth)
+		for priority, entries := range availableByPriority {
+			for _, candidate := range entries {
+				if candidate == nil {
+					continue
+				}
+				if codexPlanIsPaid(codexPlanType(candidate)) {
+					continue
+				}
+				freeByPriority[priority] = append(freeByPriority[priority], candidate)
+			}
+		}
+		if len(freeByPriority) > 0 {
+			availableByPriority = freeByPriority
+		}
+	}
+
 	bestPriority := 0
 	found := false
 	for priority := range availableByPriority {

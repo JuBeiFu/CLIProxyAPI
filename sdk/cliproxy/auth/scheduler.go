@@ -60,6 +60,7 @@ type scheduledAuthMeta struct {
 
 // modelScheduler tracks ready and blocked auths for one provider/model combination.
 type modelScheduler struct {
+	providerKey     string
 	modelKey        string
 	includeAllAuths bool
 	entries         map[string]*scheduledAuth
@@ -80,8 +81,10 @@ type scheduledAuth struct {
 
 // readyBucket keeps the ready views for one priority level.
 type readyBucket struct {
-	all readyView
-	ws  readyView
+	all    readyView
+	ws     readyView
+	free   readyView
+	wsFree readyView
 }
 
 // readyView holds the selection order for flat or grouped round-robin traversal.
@@ -557,6 +560,7 @@ func (p *providerScheduler) ensureModelLocked(shardKey string, modelKey string, 
 		return shard
 	}
 	shard := &modelScheduler{
+		providerKey:     p.providerKey,
 		modelKey:        modelKey,
 		includeAllAuths: includeAllAuths,
 		entries:         make(map[string]*scheduledAuth),
@@ -685,11 +689,71 @@ func (m *modelScheduler) pickReadyLocked(preferWebsocket bool, strategy schedule
 		return nil
 	}
 	m.promoteExpiredLocked(time.Now())
+	if m.shouldPreferCodexFree() {
+		if picked := m.pickReadyPreferFreeLocked(preferWebsocket, strategy, predicate); picked != nil {
+			return picked
+		}
+	}
 	priorityReady, okPriority := m.highestReadyPriorityLocked(preferWebsocket, predicate)
 	if !okPriority {
 		return nil
 	}
 	return m.pickReadyAtPriorityLocked(preferWebsocket, priorityReady, strategy, predicate)
+}
+
+func (m *modelScheduler) shouldPreferCodexFree() bool {
+	if m == nil {
+		return false
+	}
+	if m.providerKey != "codex" {
+		return false
+	}
+	if m.modelKey == "" {
+		return false
+	}
+	// Only bias GPT-family models (keeps other Codex flows unaffected).
+	if !strings.HasPrefix(strings.ToLower(m.modelKey), "gpt-") {
+		return false
+	}
+	return !codexModelRequiresPaidPlan(m.modelKey)
+}
+
+func (m *modelScheduler) pickReadyPreferFreeLocked(preferWebsocket bool, strategy schedulerStrategy, predicate func(*scheduledAuth) bool) *Auth {
+	if m == nil {
+		return nil
+	}
+	for _, priority := range m.priorityOrder {
+		bucket := m.readyByPriority[priority]
+		if bucket == nil {
+			continue
+		}
+
+		useWebsocketView := preferWebsocket && len(bucket.ws.flat) > 0
+		var view *readyView
+		if useWebsocketView {
+			if len(bucket.wsFree.flat) == 0 {
+				continue
+			}
+			view = &bucket.wsFree
+		} else {
+			if len(bucket.free.flat) == 0 {
+				continue
+			}
+			view = &bucket.free
+		}
+
+		var picked *scheduledAuth
+		if strategy == schedulerStrategyFillFirst {
+			picked = view.pickFirst(predicate)
+		} else {
+			picked = view.pickRoundRobin(predicate)
+		}
+		if picked == nil || picked.auth == nil {
+			continue
+		}
+		return picked.auth
+	}
+	return nil
 }
 
 // highestReadyPriorityLocked returns the highest priority bucket that still has a matching ready auth.
@@ -834,7 +898,7 @@ func (m *modelScheduler) rebuildIndexesLocked() {
 		sort.Slice(entries, func(i, j int) bool {
 			return entries[i].auth.ID < entries[j].auth.ID
 		})
-		m.readyByPriority[priority] = buildReadyBucket(entries)
+		m.readyByPriority[priority] = buildReadyBucket(m.providerKey, entries)
 		m.priorityOrder = append(m.priorityOrder, priority)
 	}
 	sort.Slice(m.priorityOrder, func(i, j int) bool {
@@ -860,7 +924,7 @@ func (m *modelScheduler) rebuildIndexesLocked() {
 }
 
 // buildReadyBucket prepares the general and websocket-only ready views for one priority bucket.
-func buildReadyBucket(entries []*scheduledAuth) *readyBucket {
+func buildReadyBucket(providerKey string, entries []*scheduledAuth) *readyBucket {
 	bucket := &readyBucket{}
 	bucket.all = buildReadyView(entries)
 	wsEntries := make([]*scheduledAuth, 0, len(entries))
@@ -870,6 +934,32 @@ func buildReadyBucket(entries []*scheduledAuth) *readyBucket {
 		}
 	}
 	bucket.ws = buildReadyView(wsEntries)
+	providerKey = strings.ToLower(strings.TrimSpace(providerKey))
+	if providerKey == "codex" && len(entries) > 0 {
+		freeEntries := make([]*scheduledAuth, 0, len(entries))
+		for _, entry := range entries {
+			if entry == nil || entry.auth == nil {
+				continue
+			}
+			if codexPlanIsPaid(codexPlanType(entry.auth)) {
+				continue
+			}
+			freeEntries = append(freeEntries, entry)
+		}
+		bucket.free = buildReadyView(freeEntries)
+
+		wsFreeEntries := make([]*scheduledAuth, 0, len(wsEntries))
+		for _, entry := range wsEntries {
+			if entry == nil || entry.auth == nil {
+				continue
+			}
+			if codexPlanIsPaid(codexPlanType(entry.auth)) {
+				continue
+			}
+			wsFreeEntries = append(wsFreeEntries, entry)
+		}
+		bucket.wsFree = buildReadyView(wsFreeEntries)
+	}
 	return bucket
 }
 

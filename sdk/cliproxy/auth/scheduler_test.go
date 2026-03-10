@@ -331,6 +331,30 @@ func TestSchedulerPick_PlanIneligibleDoesNotBlockCooldownError(t *testing.T) {
 	}
 }
 
+func TestSchedulerPick_CodexPrefersFreeForNonRestrictedGPTModels(t *testing.T) {
+	t.Parallel()
+
+	model := "gpt-5.2"
+	registerSchedulerModels(t, "codex", model, "free", "paid")
+
+	scheduler := newSchedulerForTest(
+		&RoundRobinSelector{},
+		&Auth{ID: "paid", Provider: "codex", Attributes: map[string]string{"priority": "10"}, Metadata: map[string]any{metadataPlanTypeKey: "team"}},
+		&Auth{ID: "free", Provider: "codex", Attributes: map[string]string{"priority": "0"}, Metadata: map[string]any{metadataPlanTypeKey: "free"}},
+	)
+
+	got, errPick := scheduler.pickSingle(context.Background(), "codex", model, cliproxyexecutor.Options{}, nil)
+	if errPick != nil {
+		t.Fatalf("pickSingle() error = %v", errPick)
+	}
+	if got == nil {
+		t.Fatalf("pickSingle() auth = nil")
+	}
+	if got.ID != "free" {
+		t.Fatalf("pickSingle() auth.ID = %q, want %q", got.ID, "free")
+	}
+}
+
 func TestManager_PickNextMixed_UsesProviderRotationBeforeCredentialRotation(t *testing.T) {
 	t.Parallel()
 
