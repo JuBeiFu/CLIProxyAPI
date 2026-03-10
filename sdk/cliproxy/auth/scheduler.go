@@ -563,18 +563,33 @@ func (p *providerScheduler) ensureModelLocked(shardKey string, modelKey string, 
 		providerKey:     p.providerKey,
 		modelKey:        modelKey,
 		includeAllAuths: includeAllAuths,
-		entries:         make(map[string]*scheduledAuth),
+		entries:         make(map[string]*scheduledAuth, len(p.auths)),
 		readyByPriority: make(map[int]*readyBucket),
 	}
 	for _, meta := range p.auths {
-		if meta == nil {
+		if meta == nil || meta.auth == nil {
 			continue
 		}
 		if !includeAllAuths && !meta.supportsModel(modelKey) {
 			continue
 		}
-		shard.upsertEntryLocked(meta, now)
+		entry := &scheduledAuth{meta: meta, auth: meta.auth}
+		blocked, reason, next := isAuthBlockedForModel(meta.auth, modelKey, now)
+		switch {
+		case !blocked:
+			entry.state = scheduledStateReady
+		case reason == blockReasonCooldown:
+			entry.state = scheduledStateCooldown
+			entry.nextRetryAt = next
+		case reason == blockReasonDisabled:
+			entry.state = scheduledStateDisabled
+		default:
+			entry.state = scheduledStateBlocked
+			entry.nextRetryAt = next
+		}
+		shard.entries[meta.auth.ID] = entry
 	}
+	shard.rebuildIndexesLocked()
 	p.modelShards[shardKey] = shard
 	return shard
 }
