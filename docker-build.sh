@@ -139,7 +139,9 @@ case "$choice" in
     echo "--- Building from Source and Running ---"
 
     # Get Version Information
-    VERSION="$(git describe --tags --always --dirty)"
+    BASE_VERSION="$(git describe --tags --always --dirty)"
+    VERSION_SUFFIX="$(date -u +%Y%m%d)"
+    VERSION="${BASE_VERSION}-${VERSION_SUFFIX}"
     COMMIT="$(git rev-parse --short HEAD)"
     BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 

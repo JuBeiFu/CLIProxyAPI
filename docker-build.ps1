@@ -24,7 +24,9 @@ switch ($choice) {
         Write-Host "--- Building from Source and Running ---"
 
         # Get Version Information
-        $VERSION = (git describe --tags --always --dirty)
+        $BASE_VERSION = (git describe --tags --always --dirty)
+        $VERSION_SUFFIX = (Get-Date).ToUniversalTime().ToString("yyyyMMdd")
+        $VERSION = "$BASE_VERSION-$VERSION_SUFFIX"
         $COMMIT  = (git rev-parse --short HEAD)
         $BUILD_DATE = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
 
