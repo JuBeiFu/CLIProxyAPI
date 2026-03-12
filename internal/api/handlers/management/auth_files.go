@@ -30,6 +30,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/auth/qwen"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/misc"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/proxyrouting"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	sdkAuth "github.com/router-for-me/CLIProxyAPI/v6/sdk/auth"
@@ -381,6 +382,27 @@ func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
 		}
 		if account != "" {
 			entry["account"] = account
+		}
+	}
+	if planType := strings.TrimSpace(auth.PlanType()); planType != "" {
+		entry["plan_type"] = planType
+	}
+	if proxyProfile := strings.TrimSpace(auth.ProxyProfile()); proxyProfile != "" {
+		entry["proxy_profile"] = proxyProfile
+	}
+	if proxyURL := strings.TrimSpace(auth.ProxyURL); proxyURL != "" {
+		entry["proxy_url"] = proxyURL
+	}
+	if selection := proxyrouting.Resolve(h.cfg, auth); selection.HasProxy() {
+		entry["effective_proxy_url"] = selection.ProxyURL
+		if selection.ProxyProfile != "" {
+			entry["effective_proxy_profile"] = selection.ProxyProfile
+		}
+		if selection.SelectionSource != "" {
+			entry["proxy_source"] = selection.SelectionSource
+		}
+		if selection.RoutingRule != "" {
+			entry["proxy_rule"] = selection.RoutingRule
 		}
 	}
 	if !auth.CreatedAt.IsZero() {
@@ -850,10 +872,12 @@ func (h *Handler) PatchAuthFileFields(c *gin.Context) {
 	}
 
 	var req struct {
-		Name     string  `json:"name"`
-		Prefix   *string `json:"prefix"`
-		ProxyURL *string `json:"proxy_url"`
-		Priority *int    `json:"priority"`
+		Name         string  `json:"name"`
+		Prefix       *string `json:"prefix"`
+		ProxyURL     *string `json:"proxy_url"`
+		Priority     *int    `json:"priority"`
+		PlanType     *string `json:"plan_type"`
+		ProxyProfile *string `json:"proxy_profile"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
@@ -904,6 +928,28 @@ func (h *Handler) PatchAuthFileFields(c *gin.Context) {
 			delete(targetAuth.Metadata, "priority")
 		} else {
 			targetAuth.Metadata["priority"] = *req.Priority
+		}
+		changed = true
+	}
+	if req.PlanType != nil {
+		if targetAuth.Metadata == nil {
+			targetAuth.Metadata = make(map[string]any)
+		}
+		if value := strings.TrimSpace(*req.PlanType); value == "" {
+			delete(targetAuth.Metadata, "plan_type")
+		} else {
+			targetAuth.Metadata["plan_type"] = value
+		}
+		changed = true
+	}
+	if req.ProxyProfile != nil {
+		if targetAuth.Metadata == nil {
+			targetAuth.Metadata = make(map[string]any)
+		}
+		if value := strings.TrimSpace(*req.ProxyProfile); value == "" {
+			delete(targetAuth.Metadata, "proxy_profile")
+		} else {
+			targetAuth.Metadata["proxy_profile"] = value
 		}
 		changed = true
 	}

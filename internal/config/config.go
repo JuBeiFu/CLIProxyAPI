@@ -330,6 +330,12 @@ type ClaudeKey struct {
 	// ProxyURL overrides the global proxy setting for this API key if provided.
 	ProxyURL string `yaml:"proxy-url" json:"proxy-url"`
 
+	// ProxyProfile selects a named proxy profile for this credential.
+	ProxyProfile string `yaml:"proxy-profile,omitempty" json:"proxy-profile,omitempty"`
+
+	// PlanType annotates the subscription tier for auth-aware proxy routing.
+	PlanType string `yaml:"plan-type,omitempty" json:"plan-type,omitempty"`
+
 	// Models defines upstream model names and aliases for request routing.
 	Models []ClaudeModel `yaml:"models" json:"models"`
 
@@ -381,6 +387,12 @@ type CodexKey struct {
 	// ProxyURL overrides the global proxy setting for this API key if provided.
 	ProxyURL string `yaml:"proxy-url" json:"proxy-url"`
 
+	// ProxyProfile selects a named proxy profile for this credential.
+	ProxyProfile string `yaml:"proxy-profile,omitempty" json:"proxy-profile,omitempty"`
+
+	// PlanType annotates the subscription tier for auth-aware proxy routing.
+	PlanType string `yaml:"plan-type,omitempty" json:"plan-type,omitempty"`
+
 	// Models defines upstream model names and aliases for request routing.
 	Models []CodexModel `yaml:"models" json:"models"`
 
@@ -424,6 +436,12 @@ type GeminiKey struct {
 
 	// ProxyURL optionally overrides the global proxy for this API key.
 	ProxyURL string `yaml:"proxy-url,omitempty" json:"proxy-url,omitempty"`
+
+	// ProxyProfile selects a named proxy profile for this credential.
+	ProxyProfile string `yaml:"proxy-profile,omitempty" json:"proxy-profile,omitempty"`
+
+	// PlanType annotates the subscription tier for auth-aware proxy routing.
+	PlanType string `yaml:"plan-type,omitempty" json:"plan-type,omitempty"`
 
 	// Models defines upstream model names and aliases for request routing.
 	Models []GeminiModel `yaml:"models,omitempty" json:"models,omitempty"`
@@ -483,6 +501,12 @@ type OpenAICompatibilityAPIKey struct {
 
 	// ProxyURL overrides the global proxy setting for this API key if provided.
 	ProxyURL string `yaml:"proxy-url,omitempty" json:"proxy-url,omitempty"`
+
+	// ProxyProfile selects a named proxy profile for this credential.
+	ProxyProfile string `yaml:"proxy-profile,omitempty" json:"proxy-profile,omitempty"`
+
+	// PlanType annotates the subscription tier for auth-aware proxy routing.
+	PlanType string `yaml:"plan-type,omitempty" json:"plan-type,omitempty"`
 }
 
 // OpenAICompatibilityModel represents a model configuration for OpenAI compatibility,
@@ -621,6 +645,9 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	// Sanitize OpenAI compatibility providers: drop entries without base-url
 	cfg.SanitizeOpenAICompatibility()
 
+	// Normalize named proxy profiles and routing rules.
+	cfg.SanitizeProxyRouting()
+
 	// Normalize OAuth provider model exclusion map.
 	cfg.OAuthExcludedModels = NormalizeOAuthExcludedModels(cfg.OAuthExcludedModels)
 
@@ -756,6 +783,12 @@ func (cfg *Config) SanitizeOpenAICompatibility() {
 		e.Prefix = normalizeModelPrefix(e.Prefix)
 		e.BaseURL = strings.TrimSpace(e.BaseURL)
 		e.Headers = NormalizeHeaders(e.Headers)
+		for j := range e.APIKeyEntries {
+			e.APIKeyEntries[j].APIKey = strings.TrimSpace(e.APIKeyEntries[j].APIKey)
+			e.APIKeyEntries[j].ProxyURL = strings.TrimSpace(e.APIKeyEntries[j].ProxyURL)
+			e.APIKeyEntries[j].ProxyProfile = strings.TrimSpace(e.APIKeyEntries[j].ProxyProfile)
+			e.APIKeyEntries[j].PlanType = strings.TrimSpace(e.APIKeyEntries[j].PlanType)
+		}
 		if e.BaseURL == "" {
 			// Skip providers with no base-url; treated as removed
 			continue
@@ -776,6 +809,9 @@ func (cfg *Config) SanitizeCodexKeys() {
 		e := cfg.CodexKey[i]
 		e.Prefix = normalizeModelPrefix(e.Prefix)
 		e.BaseURL = strings.TrimSpace(e.BaseURL)
+		e.ProxyURL = strings.TrimSpace(e.ProxyURL)
+		e.ProxyProfile = strings.TrimSpace(e.ProxyProfile)
+		e.PlanType = strings.TrimSpace(e.PlanType)
 		e.Headers = NormalizeHeaders(e.Headers)
 		e.ExcludedModels = NormalizeExcludedModels(e.ExcludedModels)
 		if e.BaseURL == "" {
@@ -794,6 +830,9 @@ func (cfg *Config) SanitizeClaudeKeys() {
 	for i := range cfg.ClaudeKey {
 		entry := &cfg.ClaudeKey[i]
 		entry.Prefix = normalizeModelPrefix(entry.Prefix)
+		entry.ProxyURL = strings.TrimSpace(entry.ProxyURL)
+		entry.ProxyProfile = strings.TrimSpace(entry.ProxyProfile)
+		entry.PlanType = strings.TrimSpace(entry.PlanType)
 		entry.Headers = NormalizeHeaders(entry.Headers)
 		entry.ExcludedModels = NormalizeExcludedModels(entry.ExcludedModels)
 	}
@@ -816,6 +855,8 @@ func (cfg *Config) SanitizeGeminiKeys() {
 		entry.Prefix = normalizeModelPrefix(entry.Prefix)
 		entry.BaseURL = strings.TrimSpace(entry.BaseURL)
 		entry.ProxyURL = strings.TrimSpace(entry.ProxyURL)
+		entry.ProxyProfile = strings.TrimSpace(entry.ProxyProfile)
+		entry.PlanType = strings.TrimSpace(entry.PlanType)
 		entry.Headers = NormalizeHeaders(entry.Headers)
 		entry.ExcludedModels = NormalizeExcludedModels(entry.ExcludedModels)
 		if _, exists := seen[entry.APIKey]; exists {
@@ -825,6 +866,69 @@ func (cfg *Config) SanitizeGeminiKeys() {
 		out = append(out, entry)
 	}
 	cfg.GeminiKey = out
+}
+
+func (cfg *Config) SanitizeProxyRouting() {
+	if cfg == nil {
+		return
+	}
+	if len(cfg.ProxyProfiles) > 0 {
+		seenProfiles := make(map[string]struct{}, len(cfg.ProxyProfiles))
+		profiles := make([]ProxyProfile, 0, len(cfg.ProxyProfiles))
+		for _, item := range cfg.ProxyProfiles {
+			item.Name = strings.TrimSpace(item.Name)
+			item.ProxyURL = strings.TrimSpace(item.ProxyURL)
+			item.Description = strings.TrimSpace(item.Description)
+			key := strings.ToLower(item.Name)
+			if item.Name == "" || item.ProxyURL == "" {
+				continue
+			}
+			if _, exists := seenProfiles[key]; exists {
+				continue
+			}
+			seenProfiles[key] = struct{}{}
+			profiles = append(profiles, item)
+		}
+		cfg.ProxyProfiles = profiles
+	}
+	if len(cfg.ProxyRouting.Rules) > 0 {
+		rules := make([]ProxyRoutingRule, 0, len(cfg.ProxyRouting.Rules))
+		for _, rule := range cfg.ProxyRouting.Rules {
+			rule.Name = strings.TrimSpace(rule.Name)
+			rule.ProxyProfile = strings.TrimSpace(rule.ProxyProfile)
+			rule.ProxyURL = strings.TrimSpace(rule.ProxyURL)
+			rule.Providers = normalizeProxyRuleValues(rule.Providers)
+			rule.PlanTypes = normalizeProxyRuleValues(rule.PlanTypes)
+			rule.AuthKinds = normalizeProxyRuleValues(rule.AuthKinds)
+			if rule.ProxyProfile == "" && rule.ProxyURL == "" {
+				continue
+			}
+			rules = append(rules, rule)
+		}
+		cfg.ProxyRouting.Rules = rules
+	}
+}
+
+func normalizeProxyRuleValues(values []string) []string {
+	if len(values) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(values))
+	result := make([]string, 0, len(values))
+	for _, value := range values {
+		normalized := strings.ToLower(strings.TrimSpace(value))
+		normalized = strings.ReplaceAll(normalized, "_", "-")
+		normalized = strings.ReplaceAll(normalized, " ", "-")
+		if normalized == "" {
+			continue
+		}
+		if _, exists := seen[normalized]; exists {
+			continue
+		}
+		seen[normalized] = struct{}{}
+		result = append(result, normalized)
+	}
+	return result
 }
 
 func normalizeModelPrefix(prefix string) string {

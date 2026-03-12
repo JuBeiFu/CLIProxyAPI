@@ -9,13 +9,19 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"sync/atomic"
+	"time"
 
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/proxystats"
 	log "github.com/sirupsen/logrus"
 	"golang.org/x/net/proxy"
 )
 
-var proxyPoolCounter atomic.Uint64
+var (
+	proxyPoolCounter    atomic.Uint64
+	proxyTransportCache sync.Map
+)
 
 type proxyTransportEntry struct {
 	proxyURL  string
@@ -75,6 +81,15 @@ func OrderedProxyURLs(raw string) []string {
 // configured proxy list and falls back to the next proxy when the current one
 // fails at the transport layer.
 func NewProxyPoolTransport(raw string) http.RoundTripper {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+	if cached, ok := proxyTransportCache.Load(raw); ok {
+		if rt, okCast := cached.(http.RoundTripper); okCast && rt != nil {
+			return rt
+		}
+	}
 	proxies := SplitProxyURLs(raw)
 	entries := make([]proxyTransportEntry, 0, len(proxies))
 	for i := range proxies {
@@ -87,10 +102,13 @@ func NewProxyPoolTransport(raw string) http.RoundTripper {
 	if len(entries) == 0 {
 		return nil
 	}
-	if len(entries) == 1 {
-		return entries[0].transport
+	rt := http.RoundTripper(&proxyPoolTransport{entries: entries})
+	if actual, loaded := proxyTransportCache.LoadOrStore(raw, rt); loaded {
+		if cached, okCast := actual.(http.RoundTripper); okCast && cached != nil {
+			return cached
+		}
 	}
-	return &proxyPoolTransport{entries: entries}
+	return rt
 }
 
 // NewProxyDialer creates a proxy.Dialer that load-balances SOCKS proxy usage
@@ -179,10 +197,12 @@ func (p *proxyPoolTransport) RoundTrip(req *http.Request) (*http.Response, error
 		if errClone != nil {
 			return nil, errClone
 		}
+		attemptStarted := time.Now()
 		resp, err := p.entries[idx].transport.RoundTrip(retryReq)
 		if err == nil {
-			return resp, nil
+			return proxystats.WrapResponse(req.Context(), p.entries[idx].proxyURL, attemptStarted, resp), nil
 		}
+		proxystats.RecordTransportFailure(req.Context(), p.entries[idx].proxyURL, attemptStarted, err)
 		lastErr = err
 		if attempt+1 >= len(p.entries) || !isRetryableProxyTransportError(err) {
 			return nil, err

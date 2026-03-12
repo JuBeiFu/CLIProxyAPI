@@ -304,6 +304,14 @@ func (m *Manager) SetConfig(cfg *internalconfig.Config) {
 	m.rebuildAPIKeyModelAliasFromRuntimeConfig()
 }
 
+func (m *Manager) CurrentConfig() *internalconfig.Config {
+	if m == nil {
+		return nil
+	}
+	cfg, _ := m.runtimeConfig.Load().(*internalconfig.Config)
+	return cfg
+}
+
 func (m *Manager) lookupAPIKeyUpstreamModel(authID, requestedModel string) string {
 	if m == nil {
 		return ""
@@ -570,10 +578,31 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 	}
 	execModels := m.prepareExecutionModels(auth, routeModel)
 	var lastErr error
+	revokedRefreshAttempted := false
 	for idx, execModel := range execModels {
 		execReq := req
 		execReq.Model = execModel
 		streamResult, errStream := executor.ExecuteStream(ctx, auth, execReq, opts)
+		if errStream != nil && !revokedRefreshAttempted {
+			rerr := &Error{Message: errStream.Error()}
+			if se, ok := errors.AsType[cliproxyexecutor.StatusError](errStream); ok && se != nil {
+				rerr.HTTPStatus = se.StatusCode()
+			}
+			if deleteAuth, _ := shouldDeleteRevokedAuth(auth, rerr); deleteAuth && hasRefreshTokenMetadata(auth) {
+				revokedRefreshAttempted = true
+				refreshed, errRefresh := executor.Refresh(ctx, auth.Clone())
+				if errRefresh == nil && refreshed != nil {
+					if refreshed.Runtime == nil {
+						refreshed.Runtime = auth.Runtime
+					}
+					auth = refreshed
+					_, _ = m.Update(ctx, refreshed.Clone())
+					streamResult, errStream = executor.ExecuteStream(ctx, auth, execReq, opts)
+				} else if errRefresh != nil {
+					log.WithError(errRefresh).Debugf("auth refresh after revoked token failed: %s", auth.ID)
+				}
+			}
+		}
 		if errStream != nil {
 			if errCtx := ctx.Err(); errCtx != nil {
 				return nil, errCtx
@@ -1044,6 +1073,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 
 		models := m.prepareExecutionModels(auth, routeModel)
 		sameAuthRetries := effectiveRequestRetry(requestRetry, auth)
+		revokedRefreshAttempted := false
 		for authAttempt := 0; ; authAttempt++ {
 			var (
 				authErr        error
@@ -1066,6 +1096,39 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 					if ra := retryAfterFromError(errExec); ra != nil {
 						result.RetryAfter = ra
 					}
+
+					if deleteAuth, _ := shouldDeleteRevokedAuth(auth, result.Error); deleteAuth && !revokedRefreshAttempted && hasRefreshTokenMetadata(auth) {
+						revokedRefreshAttempted = true
+						refreshed, errRefresh := executor.Refresh(execCtx, auth.Clone())
+						if errRefresh == nil && refreshed != nil {
+							if refreshed.Runtime == nil {
+								refreshed.Runtime = auth.Runtime
+							}
+							auth = refreshed
+							_, _ = m.Update(execCtx, refreshed.Clone())
+
+							retryResp, retryErr := executor.Execute(execCtx, auth, execReq, opts)
+							if retryErr == nil {
+								m.MarkResult(execCtx, Result{AuthID: auth.ID, Provider: provider, Model: routeModel, Success: true})
+								return retryResp, nil
+							}
+
+							errExec = retryErr
+							result.Success = false
+							result.Error = &Error{Message: retryErr.Error()}
+							if se, ok := errors.AsType[cliproxyexecutor.StatusError](retryErr); ok && se != nil {
+								result.Error.HTTPStatus = se.StatusCode()
+							}
+							if ra := retryAfterFromError(retryErr); ra != nil {
+								result.RetryAfter = ra
+							} else {
+								result.RetryAfter = nil
+							}
+						} else if errRefresh != nil {
+							log.WithError(errRefresh).Debugf("auth refresh after revoked token failed: %s", auth.ID)
+						}
+					}
+
 					m.MarkResult(execCtx, result)
 					if isRequestInvalidError(errExec) {
 						return cliproxyexecutor.Response{}, errExec
@@ -2201,6 +2264,39 @@ func shouldDeleteRevokedAuth(auth *Auth, resultErr *Error) (bool, string) {
 		}
 	}
 	return false, ""
+}
+
+func hasRefreshTokenMetadata(auth *Auth) bool {
+	if auth == nil || auth.Metadata == nil {
+		return false
+	}
+	if v, ok := auth.Metadata["refresh_token"].(string); ok && strings.TrimSpace(v) != "" {
+		return true
+	}
+	if v, ok := auth.Metadata["refreshToken"].(string); ok && strings.TrimSpace(v) != "" {
+		return true
+	}
+	raw, ok := auth.Metadata["token"]
+	if !ok || raw == nil {
+		return false
+	}
+	switch typed := raw.(type) {
+	case map[string]any:
+		if v, ok := typed["refresh_token"].(string); ok && strings.TrimSpace(v) != "" {
+			return true
+		}
+		if v, ok := typed["refreshToken"].(string); ok && strings.TrimSpace(v) != "" {
+			return true
+		}
+	case map[string]string:
+		if v := strings.TrimSpace(typed["refresh_token"]); v != "" {
+			return true
+		}
+		if v := strings.TrimSpace(typed["refreshToken"]); v != "" {
+			return true
+		}
+	}
+	return false
 }
 
 func hasPersistedAuthRecord(auth *Auth) bool {

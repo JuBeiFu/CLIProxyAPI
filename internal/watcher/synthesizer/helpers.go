@@ -118,3 +118,15 @@ func addConfigHeadersToAttrs(headers map[string]string, attrs map[string]string)
 		attrs["header:"+key] = val
 	}
 }
+
+func addRoutingMetadataToAttrs(attrs map[string]string, planType, proxyProfile string) {
+	if attrs == nil {
+		return
+	}
+	if normalizedPlanType := strings.TrimSpace(planType); normalizedPlanType != "" {
+		attrs["plan_type"] = normalizedPlanType
+	}
+	if normalizedProxyProfile := strings.TrimSpace(proxyProfile); normalizedProxyProfile != "" {
+		attrs["proxy_profile"] = normalizedProxyProfile
+	}
+}

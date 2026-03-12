@@ -65,6 +65,29 @@ usage-statistics-enabled: false
 # Proxy URL. Supports socks5/http/https protocols. Example: socks5://user:pass@192.168.1.1:1080/
 proxy-url: ""
 
+# Named proxy profiles that proxy-routing rules can reference.
+# proxy-profiles:
+#   - name: paid-egress
+#     proxy-url: "socks5://socksuser:password@example.com:1080"
+#   - name: free-warp
+#     proxy-url: "socks5://warp:1080,socks5://warp2:1080,socks5://warp3:1080"
+#     description: "direct WARP pool for free-tier accounts"
+#
+# Auth-aware proxy routing. Rules are evaluated in order.
+# proxy-routing:
+#   rules:
+#     - name: free-to-warp
+#       providers: [codex, claude, antigravity]
+#       plan-types: [free]
+#       proxy-profile: free-warp
+#     - name: paid-egress
+#       providers: [codex, claude, antigravity]
+#       plan-types: [team, plus, pro]
+#       proxy-profile: paid-egress
+#     - name: api-key-fallback
+#       auth-kinds: [api-key]
+#       proxy-profile: paid-egress
+
 # When true, unprefixed model requests only use credentials without a prefix (except when prefix == model name).
 force-model-prefix: false
 
