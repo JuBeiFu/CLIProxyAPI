@@ -1054,6 +1054,12 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 		}
 		auth, executor, provider, errPick := m.pickNextMixed(ctx, providers, routeModel, opts, tried)
 		if errPick != nil {
+			if lastErr != nil && isPoolExhaustedPickError(errPick) {
+				if cooldownErr := m.triedModelCooldownError(tried, providers, routeModel); cooldownErr != nil {
+					return cliproxyexecutor.Response{}, cooldownErr
+				}
+				return cliproxyexecutor.Response{}, errPick
+			}
 			if lastErr != nil {
 				return cliproxyexecutor.Response{}, lastErr
 			}
@@ -1184,6 +1190,12 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 		}
 		auth, executor, provider, errPick := m.pickNextMixed(ctx, providers, routeModel, opts, tried)
 		if errPick != nil {
+			if lastErr != nil && isPoolExhaustedPickError(errPick) {
+				if cooldownErr := m.triedModelCooldownError(tried, providers, routeModel); cooldownErr != nil {
+					return cliproxyexecutor.Response{}, cooldownErr
+				}
+				return cliproxyexecutor.Response{}, errPick
+			}
 			if lastErr != nil {
 				return cliproxyexecutor.Response{}, lastErr
 			}
@@ -1280,6 +1292,12 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 		}
 		auth, executor, provider, errPick := m.pickNextMixed(ctx, providers, routeModel, opts, tried)
 		if errPick != nil {
+			if lastErr != nil && isPoolExhaustedPickError(errPick) {
+				if cooldownErr := m.triedModelCooldownError(tried, providers, routeModel); cooldownErr != nil {
+					return nil, cooldownErr
+				}
+				return nil, errPick
+			}
 			if lastErr != nil {
 				return nil, lastErr
 			}
@@ -1692,6 +1710,70 @@ func effectiveRequestRetry(defaultRetry int, auth *Auth) int {
 		return 0
 	}
 	return defaultRetry
+}
+
+func isPoolExhaustedPickError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var cooldownErr *modelCooldownError
+	if errors.As(err, &cooldownErr) {
+		return true
+	}
+	var authErr *Error
+	if errors.As(err, &authErr) && authErr != nil {
+		switch strings.ToLower(strings.TrimSpace(authErr.Code)) {
+		case "auth_not_found", "auth_unavailable":
+			return true
+		default:
+		}
+		msg := strings.ToLower(strings.TrimSpace(authErr.Message))
+		return strings.Contains(msg, "no auth available") || strings.Contains(msg, "selector returned no auth")
+	}
+	return false
+}
+
+func (m *Manager) triedModelCooldownError(tried map[string]struct{}, providers []string, model string) *modelCooldownError {
+	if m == nil || len(tried) == 0 || len(providers) == 0 {
+		return nil
+	}
+	providerForError := ""
+	if len(providers) == 1 {
+		providerForError = strings.ToLower(strings.TrimSpace(providers[0]))
+	}
+
+	now := time.Now()
+	total := 0
+	cooldownCount := 0
+	earliest := time.Time{}
+
+	m.mu.RLock()
+	for authID := range tried {
+		auth := m.auths[authID]
+		if auth == nil {
+			continue
+		}
+		total++
+
+		blocked, reason, next := isAuthBlockedForModel(auth, model, now)
+		if !blocked || reason != blockReasonCooldown || next.IsZero() || !next.After(now) {
+			continue
+		}
+		cooldownCount++
+		if earliest.IsZero() || next.Before(earliest) {
+			earliest = next
+		}
+	}
+	m.mu.RUnlock()
+
+	if total == 0 || cooldownCount != total || earliest.IsZero() {
+		return nil
+	}
+	resetIn := earliest.Sub(now)
+	if resetIn < 0 {
+		resetIn = 0
+	}
+	return newModelCooldownError(model, providerForError, resetIn)
 }
 
 func nextSameAuthRetryDelay() time.Duration {
@@ -2226,6 +2308,12 @@ func isRequestInvalidError(err error) bool {
 // failures where switching credentials has a reasonable chance to succeed.
 func shouldRetryAcrossAuths(err error) bool {
 	if err == nil || isRequestInvalidError(err) {
+		return false
+	}
+	var cooldownErr *modelCooldownError
+	if errors.As(err, &cooldownErr) {
+		// modelCooldownError is a pool-wide signal ("all creds cooling down"), so
+		// switching credentials or waiting inside the same request won't help.
 		return false
 	}
 	switch statusCodeFromError(err) {
