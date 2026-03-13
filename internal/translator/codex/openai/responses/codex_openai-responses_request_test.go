@@ -219,6 +219,44 @@ func TestConvertOpenAIResponsesRequestToCodex_OriginalIssue(t *testing.T) {
 	}
 }
 
+func TestConvertOpenAIResponsesRequestToCodex_StripsReasoningInputItems(t *testing.T) {
+	inputJSON := []byte(`{
+		"model":"gpt-5.2",
+		"input":[
+			{"type":"reasoning","id":"rs_abc","summary":[{"type":"summary_text","text":"internal"}]},
+			{"type":"item_reference","id":"rs_def"},
+			{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}
+		]
+	}`)
+
+	output := ConvertOpenAIResponsesRequestToCodex("gpt-5.2", inputJSON, false)
+	input := gjson.GetBytes(output, "input")
+	if !input.IsArray() {
+		t.Fatalf("expected input array, got %s", input.Type.String())
+	}
+	arr := input.Array()
+	if len(arr) != 1 {
+		t.Fatalf("expected 1 input item after stripping reasoning, got %d: %s", len(arr), input.Raw)
+	}
+	if got := arr[0].Get("type").String(); got != "message" {
+		t.Fatalf("expected remaining item type=message, got %q", got)
+	}
+}
+
+func TestConvertOpenAIResponsesRequestToCodex_PreservesStorePreference(t *testing.T) {
+	inputJSON := []byte(`{
+		"model":"gpt-5.2",
+		"store": true,
+		"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}]
+	}`)
+
+	output := ConvertOpenAIResponsesRequestToCodex("gpt-5.2", inputJSON, false)
+	store := gjson.GetBytes(output, "store")
+	if !store.Exists() || !store.Bool() {
+		t.Fatalf("expected store=true to be preserved, got %s", store.Raw)
+	}
+}
+
 // TestConvertSystemRoleToDeveloper_AssistantRole tests that assistant role is preserved
 func TestConvertSystemRoleToDeveloper_AssistantRole(t *testing.T) {
 	inputJSON := []byte(`{

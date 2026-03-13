@@ -2,6 +2,7 @@ package responses
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
@@ -17,7 +18,18 @@ func ConvertOpenAIResponsesRequestToCodex(modelName string, inputRawJSON []byte,
 	}
 
 	rawJSON, _ = sjson.SetBytes(rawJSON, "stream", true)
-	rawJSON, _ = sjson.SetBytes(rawJSON, "store", false)
+
+	// Some clients feed the previous response output back into `input` when they
+	// are not using `previous_response_id` incremental mode. The synthetic / real
+	// reasoning items (ids like "rs_...") are output-only and will break upstream
+	// requests with errors like:
+	// "Item with id 'rs_...' not found. Items are not persisted when `store` is set to false."
+	rawJSON = stripOutputOnlyReasoningFromInput(rawJSON)
+
+	// Preserve client preference when explicitly provided.
+	if !gjson.GetBytes(rawJSON, "store").Exists() {
+		rawJSON, _ = sjson.SetBytes(rawJSON, "store", false)
+	}
 	rawJSON, _ = sjson.SetBytes(rawJSON, "parallel_tool_calls", true)
 	rawJSON, _ = sjson.SetBytes(rawJSON, "include", []string{"reasoning.encrypted_content"})
 	// Codex Responses rejects token limit fields, so strip them out before forwarding.
@@ -41,6 +53,45 @@ func ConvertOpenAIResponsesRequestToCodex(modelName string, inputRawJSON []byte,
 	rawJSON = convertSystemRoleToDeveloper(rawJSON)
 
 	return rawJSON
+}
+
+func stripOutputOnlyReasoningFromInput(rawJSON []byte) []byte {
+	input := gjson.GetBytes(rawJSON, "input")
+	if !input.Exists() || !input.IsArray() {
+		return rawJSON
+	}
+
+	items := input.Array()
+	if len(items) == 0 {
+		return rawJSON
+	}
+
+	result := []byte(`{"arr":[]}`)
+	for _, item := range items {
+		itemType := strings.ToLower(strings.TrimSpace(item.Get("type").String()))
+		itemID := strings.TrimSpace(item.Get("id").String())
+
+		if itemType == "reasoning" {
+			continue
+		}
+		// Ignore reasoning item references accidentally copied into follow-up requests.
+		if strings.HasPrefix(itemID, "rs_") && (itemType == "" || itemType == "item_reference") {
+			continue
+		}
+
+		var err error
+		result, err = sjson.SetRawBytes(result, "arr.-1", []byte(item.Raw))
+		if err != nil {
+			return rawJSON
+		}
+	}
+
+	arr := gjson.GetBytes(result, "arr").Raw
+	updated, err := sjson.SetRawBytes(rawJSON, "input", []byte(arr))
+	if err != nil {
+		return rawJSON
+	}
+	return updated
 }
 
 // applyResponsesCompactionCompatibility handles OpenAI Responses context_management.compaction
