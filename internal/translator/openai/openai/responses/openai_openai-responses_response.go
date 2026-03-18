@@ -23,6 +23,7 @@ type oaiToResponsesState struct {
 	Started        bool
 	ReasoningID    string
 	ReasoningIndex int
+	ServiceTier    string
 	// aggregation buffers for response.output
 	// Per-output message text buffers by index
 	MsgTextBuf   map[int]*strings.Builder
@@ -94,6 +95,13 @@ func ConvertOpenAIChatCompletionsResponseToOpenAIResponses(ctx context.Context, 
 		return []string{}
 	}
 
+	if v := root.Get("service_tier"); v.Exists() {
+		serviceTier := strings.TrimSpace(v.String())
+		if serviceTier != "" {
+			st.ServiceTier = serviceTier
+		}
+	}
+
 	if usage := root.Get("usage"); usage.Exists() {
 		if v := usage.Get("prompt_tokens"); v.Exists() {
 			st.PromptTokens = v.Int()
@@ -148,6 +156,7 @@ func ConvertOpenAIChatCompletionsResponseToOpenAIResponses(ctx context.Context, 
 		st.TotalTokens = 0
 		st.ReasoningTokens = 0
 		st.UsageSeen = false
+		st.ServiceTier = ""
 		// response.created
 		created := `{"type":"response.created","sequence_number":0,"response":{"id":"","object":"response","created_at":0,"status":"in_progress","background":false,"error":null,"output":[]}}`
 		created, _ = sjson.Set(created, "sequence_number", nextSeq())
@@ -479,8 +488,14 @@ func ConvertOpenAIChatCompletionsResponseToOpenAIResponses(ctx context.Context, 
 					if v := req.Get("safety_identifier"); v.Exists() {
 						completed, _ = sjson.Set(completed, "response.safety_identifier", v.String())
 					}
-					if v := req.Get("service_tier"); v.Exists() {
-						completed, _ = sjson.Set(completed, "response.service_tier", v.String())
+					serviceTier := strings.TrimSpace(st.ServiceTier)
+					if serviceTier == "" {
+						if v := req.Get("service_tier"); v.Exists() {
+							serviceTier = strings.TrimSpace(v.String())
+						}
+					}
+					if serviceTier != "" {
+						completed, _ = sjson.Set(completed, "response.service_tier", serviceTier)
 					}
 					if v := req.Get("store"); v.Exists() {
 						completed, _ = sjson.Set(completed, "response.store", v.Bool())
@@ -660,8 +675,14 @@ func ConvertOpenAIChatCompletionsResponseToOpenAIResponsesNonStream(_ context.Co
 		if v := req.Get("safety_identifier"); v.Exists() {
 			resp, _ = sjson.Set(resp, "safety_identifier", v.String())
 		}
-		if v := req.Get("service_tier"); v.Exists() {
-			resp, _ = sjson.Set(resp, "service_tier", v.String())
+		serviceTier := strings.TrimSpace(root.Get("service_tier").String())
+		if serviceTier == "" {
+			if v := req.Get("service_tier"); v.Exists() {
+				serviceTier = strings.TrimSpace(v.String())
+			}
+		}
+		if serviceTier != "" {
+			resp, _ = sjson.Set(resp, "service_tier", serviceTier)
 		}
 		if v := req.Get("store"); v.Exists() {
 			resp, _ = sjson.Set(resp, "store", v.Bool())

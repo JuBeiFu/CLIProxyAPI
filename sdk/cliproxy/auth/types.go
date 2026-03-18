@@ -88,6 +88,10 @@ type Auth struct {
 	NextRetryAfter time.Time `json:"next_retry_after"`
 	// ModelStates tracks per-model runtime availability data.
 	ModelStates map[string]*ModelState `json:"model_states,omitempty"`
+	// TransientCooldownUntil blocks fresh selections immediately after runtime quota signals.
+	TransientCooldownUntil time.Time `json:"-"`
+	// QuotaPriorityPenalty lowers scheduler priority while the auth is under quota pressure.
+	QuotaPriorityPenalty int `json:"-"`
 
 	// Runtime carries non-serialisable data used during execution (in-memory only).
 	Runtime any `json:"-"`
@@ -346,6 +350,14 @@ func parseIntAny(val any) (int, bool) {
 func (a *Auth) AccountInfo() (string, string) {
 	if a == nil {
 		return "", ""
+	}
+	if a.Metadata != nil {
+		if v, ok := a.Metadata["account"].(string); ok {
+			account := strings.TrimSpace(v)
+			if account != "" {
+				return "oauth", account
+			}
+		}
 	}
 	// For Gemini CLI, include project ID in the OAuth account info if present.
 	if strings.ToLower(a.Provider) == "gemini-cli" {

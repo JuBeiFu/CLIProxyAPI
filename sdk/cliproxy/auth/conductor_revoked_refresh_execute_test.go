@@ -153,8 +153,5 @@ func TestManager_Execute_DeletesRevokedAuthWhenRefreshFails(t *testing.T) {
 	if _, ok := mgr.GetByID(auth.ID); ok {
 		t.Fatalf("expected auth to be removed after refresh failure")
 	}
-	deleted := store.Deleted()
-	if len(deleted) != 1 || deleted[0] != auth.ID {
-		t.Fatalf("expected deleted ids [%q], got %v", auth.ID, deleted)
-	}
+	waitForDeletedIDs(t, store, []string{auth.ID})
 }

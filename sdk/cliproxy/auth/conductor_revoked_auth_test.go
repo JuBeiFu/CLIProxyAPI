@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
@@ -32,6 +33,30 @@ func (s *deletingStore) Deleted() []string {
 	out := make([]string, len(s.deleted))
 	copy(out, s.deleted)
 	return out
+}
+
+func waitForDeletedIDs(t *testing.T, store *deletingStore, want []string) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		got := store.Deleted()
+		if len(got) == len(want) {
+			match := true
+			for i := range want {
+				if got[i] != want[i] {
+					match = false
+					break
+				}
+			}
+			if match {
+				return
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("expected deleted ids %v, got %v", want, got)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 }
 
 type revokedRefreshExecutor struct {
@@ -103,10 +128,7 @@ func TestManager_MarkResult_DeletesRevokedPersistedAuth(t *testing.T) {
 		t.Fatalf("expected revoked auth to be removed from manager")
 	}
 
-	deleted := store.Deleted()
-	if len(deleted) != 1 || deleted[0] != auth.ID {
-		t.Fatalf("expected deleted ids [%q], got %v", auth.ID, deleted)
-	}
+	waitForDeletedIDs(t, store, []string{auth.ID})
 
 	if models := reg.GetModelsForClient(auth.ID); len(models) != 0 {
 		t.Fatalf("expected revoked auth models to be unregistered, got %d", len(models))
@@ -153,13 +175,57 @@ func TestManager_MarkResult_DeletesDeactivatedPersistedAuth(t *testing.T) {
 		t.Fatalf("expected deactivated auth to be removed from manager")
 	}
 
-	deleted := store.Deleted()
-	if len(deleted) != 1 || deleted[0] != auth.ID {
-		t.Fatalf("expected deleted ids [%q], got %v", auth.ID, deleted)
-	}
+	waitForDeletedIDs(t, store, []string{auth.ID})
 
 	if models := reg.GetModelsForClient(auth.ID); len(models) != 0 {
 		t.Fatalf("expected deactivated auth models to be unregistered, got %d", len(models))
+	}
+}
+
+func TestManager_MarkResult_DeletesDeactivatedWorkspacePersistedAuth(t *testing.T) {
+	store := &deletingStore{}
+	mgr := NewManager(store, nil, nil)
+	auth := &Auth{
+		ID:       "auths/deactivated-workspace.json",
+		FileName: "auths/deactivated-workspace.json",
+		Provider: "codex",
+		Attributes: map[string]string{
+			"path": "/tmp/deactivated-workspace.json",
+		},
+		Metadata: map[string]any{
+			"type": "codex",
+		},
+	}
+
+	if _, err := mgr.Register(WithSkipPersist(context.Background()), auth); err != nil {
+		t.Fatalf("Register returned error: %v", err)
+	}
+
+	reg := registry.GetGlobalRegistry()
+	reg.RegisterClient(auth.ID, "codex", []*registry.ModelInfo{{ID: "gpt-5.4"}})
+	t.Cleanup(func() {
+		reg.UnregisterClient(auth.ID)
+	})
+
+	mgr.MarkResult(context.Background(), Result{
+		AuthID:   auth.ID,
+		Provider: "codex",
+		Model:    "gpt-5.4",
+		Success:  false,
+		Error: &Error{
+			HTTPStatus: 403,
+			Message:    `{"detail":{"code":"deactivated_workspace"}}`,
+		},
+	})
+
+	if _, ok := mgr.GetByID(auth.ID); ok {
+		t.Fatalf("expected deactivated_workspace auth to be removed from manager")
+	}
+
+	waitForDeletedIDs(t, store, []string{auth.ID})
+
+	if models := reg.GetModelsForClient(auth.ID); len(models) != 0 {
+		t.Fatalf("expected deactivated_workspace auth models to be unregistered, got %d", len(models))
 	}
 }
 
@@ -276,10 +342,7 @@ func TestManager_RefreshAuth_DeletesRevokedPersistedAuth(t *testing.T) {
 		t.Fatalf("expected revoked auth to be removed after refresh failure")
 	}
 
-	deleted := store.Deleted()
-	if len(deleted) != 1 || deleted[0] != auth.ID {
-		t.Fatalf("expected deleted ids [%q], got %v", auth.ID, deleted)
-	}
+	waitForDeletedIDs(t, store, []string{auth.ID})
 
 	if models := reg.GetModelsForClient(auth.ID); len(models) != 0 {
 		t.Fatalf("expected revoked auth models to be unregistered after refresh, got %d", len(models))
@@ -325,10 +388,7 @@ func TestManager_RefreshAuth_DeletesDeactivatedPersistedAuth(t *testing.T) {
 		t.Fatalf("expected deactivated auth to be removed after refresh failure")
 	}
 
-	deleted := store.Deleted()
-	if len(deleted) != 1 || deleted[0] != auth.ID {
-		t.Fatalf("expected deleted ids [%q], got %v", auth.ID, deleted)
-	}
+	waitForDeletedIDs(t, store, []string{auth.ID})
 
 	if models := reg.GetModelsForClient(auth.ID); len(models) != 0 {
 		t.Fatalf("expected deactivated auth models to be unregistered after refresh, got %d", len(models))

@@ -696,6 +696,51 @@ func TestFileSynthesizer_Synthesize_MultiProjectGemini(t *testing.T) {
 	}
 }
 
+func TestFileSynthesizer_Synthesize_CodexDuplicateAccountPrefersNewestFile(t *testing.T) {
+	tempDir := t.TempDir()
+
+	oldPath := filepath.Join(tempDir, "legacy-codex-free.json")
+	newPath := filepath.Join(tempDir, "codex-same@example.com-team.json")
+	oldData := []byte(`{"type":"codex","email":"same@example.com","plan_type":"free","refresh_token":"old-token"}`)
+	newData := []byte(`{"type":"codex","email":"same@example.com","plan_type":"team","refresh_token":"new-token"}`)
+	if err := os.WriteFile(oldPath, oldData, 0o644); err != nil {
+		t.Fatalf("failed to write old auth file: %v", err)
+	}
+	if err := os.WriteFile(newPath, newData, 0o644); err != nil {
+		t.Fatalf("failed to write new auth file: %v", err)
+	}
+	oldTime := time.Now().Add(-2 * time.Hour)
+	newTime := time.Now().Add(-1 * time.Hour)
+	if err := os.Chtimes(oldPath, oldTime, oldTime); err != nil {
+		t.Fatalf("failed to set old auth mtime: %v", err)
+	}
+	if err := os.Chtimes(newPath, newTime, newTime); err != nil {
+		t.Fatalf("failed to set new auth mtime: %v", err)
+	}
+
+	synth := NewFileSynthesizer()
+	ctx := &SynthesisContext{
+		Config:      &config.Config{},
+		AuthDir:     tempDir,
+		Now:         time.Now(),
+		IDGenerator: NewStableIDGenerator(),
+	}
+
+	auths, err := synth.Synthesize(ctx)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(auths) != 1 {
+		t.Fatalf("expected 1 auth, got %d", len(auths))
+	}
+	if auths[0].ID != "codex:same@example.com" {
+		t.Fatalf("auth.ID = %q, want %q", auths[0].ID, "codex:same@example.com")
+	}
+	if got, _ := auths[0].Metadata["plan_type"].(string); got != "team" {
+		t.Fatalf("auth.Metadata[plan_type] = %q, want %q", got, "team")
+	}
+}
+
 func TestBuildGeminiVirtualID(t *testing.T) {
 	tests := []struct {
 		name      string

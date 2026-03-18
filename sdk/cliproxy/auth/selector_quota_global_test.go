@@ -80,3 +80,22 @@ func TestIsAuthBlockedForModel_MetadataCooldownExpiredAllows(t *testing.T) {
 		t.Fatalf("expected auth not to be blocked, got reason=%v next=%v", reason, next)
 	}
 }
+
+func TestIsAuthBlockedForModel_TransientCooldownBlocksAllModels(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now()
+	until := now.Add(45 * time.Minute)
+	auth := &Auth{ID: "auth-transient", TransientCooldownUntil: until}
+
+	blocked, reason, next := isAuthBlockedForModel(auth, "gpt-5", now)
+	if !blocked {
+		t.Fatalf("expected auth to be blocked by transient cooldown")
+	}
+	if reason != blockReasonCooldown {
+		t.Fatalf("expected cooldown reason, got %v", reason)
+	}
+	if next.IsZero() || !next.Equal(until) {
+		t.Fatalf("expected next=%v, got %v", until, next)
+	}
+}

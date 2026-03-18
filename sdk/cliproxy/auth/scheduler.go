@@ -2,8 +2,6 @@ package auth
 
 import (
 	"context"
-	"fmt"
-	"net/http"
 	"sort"
 	"strings"
 	"sync"
@@ -84,6 +82,8 @@ type scheduledAuth struct {
 type readyBucket struct {
 	all    readyView
 	ws     readyView
+	paid   readyView
+	wsPaid readyView
 	free   readyView
 	wsFree readyView
 }
@@ -342,7 +342,6 @@ func (s *authScheduler) mixedUnavailableErrorLocked(providers []string, model st
 	now := time.Now()
 	total := 0
 	eligibleTotal := 0
-	ineligibleCount := 0
 	cooldownCount := 0
 	earliest := time.Time{}
 	for _, providerKey := range providers {
@@ -354,10 +353,9 @@ func (s *authScheduler) mixedUnavailableErrorLocked(providers []string, model st
 		if shard == nil {
 			continue
 		}
-		localTotal, localCooldownCount, localIneligible, localEarliest := shard.availabilitySummaryLocked(model, triedPredicate(tried))
+		localTotal, localCooldownCount, _, localEarliest := shard.availabilitySummaryLocked(model, triedPredicate(tried))
 		total += localTotal
-		ineligibleCount += localIneligible
-		localEligible := localTotal - localIneligible
+		localEligible := localTotal
 		if localEligible > 0 {
 			eligibleTotal += localEligible
 		}
@@ -368,11 +366,6 @@ func (s *authScheduler) mixedUnavailableErrorLocked(providers []string, model st
 	}
 	if total == 0 {
 		return &Error{Code: "auth_not_found", Message: "no auth available"}
-	}
-	if eligibleTotal == 0 && ineligibleCount == total && model != "" {
-		message := fmt.Sprintf("No eligible credentials for model %s", model)
-		message = fmt.Sprintf("%s; requires a paid ChatGPT plan", message)
-		return &Error{Code: "auth_plan_restricted", Message: message, HTTPStatus: http.StatusForbidden}
 	}
 	if eligibleTotal > 0 && cooldownCount == eligibleTotal && !earliest.IsZero() {
 		resetIn := earliest.Sub(now)
@@ -712,6 +705,11 @@ func (m *modelScheduler) pickReadyLocked(preferWebsocket bool, strategy schedule
 		return nil
 	}
 	m.promoteExpiredLocked(time.Now())
+	if m.shouldPreferCodexPaid() {
+		if picked := m.pickReadyPreferPaidLocked(preferWebsocket, strategy, predicate); picked != nil {
+			return picked
+		}
+	}
 	if m.shouldPreferCodexFree() {
 		if picked := m.pickReadyPreferFreeLocked(preferWebsocket, strategy, predicate); picked != nil {
 			return picked
@@ -724,6 +722,19 @@ func (m *modelScheduler) pickReadyLocked(preferWebsocket bool, strategy schedule
 	return m.pickReadyAtPriorityLocked(preferWebsocket, priorityReady, strategy, predicate)
 }
 
+func (m *modelScheduler) shouldPreferCodexPaid() bool {
+	if m == nil {
+		return false
+	}
+	if m.providerKey != "codex" {
+		return false
+	}
+	if m.modelKey == "" {
+		return false
+	}
+	return codexModelPrefersPaidPlan(m.modelKey)
+}
+
 func (m *modelScheduler) shouldPreferCodexFree() bool {
 	if m == nil {
 		return false
@@ -734,11 +745,49 @@ func (m *modelScheduler) shouldPreferCodexFree() bool {
 	if m.modelKey == "" {
 		return false
 	}
-	// Only bias GPT-family models (keeps other Codex flows unaffected).
-	if !strings.HasPrefix(strings.ToLower(m.modelKey), "gpt-") {
-		return false
+	return codexModelPrefersFreePlan(m.modelKey)
+}
+
+func (m *modelScheduler) pickReadyPreferPaidLocked(preferWebsocket bool, strategy schedulerStrategy, predicate func(*scheduledAuth) bool) *Auth {
+	if m == nil {
+		return nil
 	}
-	return !codexModelRequiresPaidPlan(m.modelKey)
+	for _, priority := range m.priorityOrder {
+		bucket := m.readyByPriority[priority]
+		if bucket == nil {
+			continue
+		}
+
+		useWebsocketView := preferWebsocket && len(bucket.ws.flat) > 0
+		var view *readyView
+		if useWebsocketView {
+			switch {
+			case len(bucket.wsPaid.flat) > 0:
+				view = &bucket.wsPaid
+			case len(bucket.paid.flat) > 0:
+				view = &bucket.paid
+			default:
+				continue
+			}
+		} else {
+			if len(bucket.paid.flat) == 0 {
+				continue
+			}
+			view = &bucket.paid
+		}
+
+		var picked *scheduledAuth
+		if strategy == schedulerStrategyFillFirst {
+			picked = view.pickFirst(predicate)
+		} else {
+			picked = view.pickRoundRobin(predicate)
+		}
+		if picked == nil || picked.auth == nil {
+			continue
+		}
+		return picked.auth
+	}
+	return nil
 }
 
 func (m *modelScheduler) pickReadyPreferFreeLocked(preferWebsocket bool, strategy schedulerStrategy, predicate func(*scheduledAuth) bool) *Auth {
@@ -838,18 +887,6 @@ func (m *modelScheduler) unavailableErrorLocked(provider, model string, predicat
 	if eligibleTotal < 0 {
 		eligibleTotal = 0
 	}
-	if eligibleTotal == 0 && ineligibleCount == total && model != "" {
-		providerForError := provider
-		if providerForError == "mixed" {
-			providerForError = ""
-		}
-		message := fmt.Sprintf("No eligible credentials for model %s", model)
-		if providerForError != "" {
-			message = fmt.Sprintf("%s via provider %s", message, providerForError)
-		}
-		message = fmt.Sprintf("%s; requires a paid ChatGPT plan", message)
-		return &Error{Code: "auth_plan_restricted", Message: message, HTTPStatus: http.StatusForbidden}
-	}
 	if eligibleTotal > 0 && cooldownCount == eligibleTotal && !earliest.IsZero() {
 		providerForError := provider
 		if providerForError == "mixed" {
@@ -871,9 +908,7 @@ func (m *modelScheduler) availabilitySummaryLocked(model string, predicate func(
 	}
 	total := 0
 	cooldownCount := 0
-	ineligibleCount := 0
 	earliest := time.Time{}
-	requiresPaid := codexModelRequiresPaidPlan(model)
 	for _, entry := range m.entries {
 		if predicate != nil && !predicate(entry) {
 			continue
@@ -881,12 +916,6 @@ func (m *modelScheduler) availabilitySummaryLocked(model string, predicate func(
 		total++
 		if entry == nil || entry.auth == nil {
 			continue
-		}
-		if requiresPaid && strings.EqualFold(strings.TrimSpace(entry.auth.Provider), "codex") {
-			if !codexPlanIsPaid(codexPlanType(entry.auth)) {
-				ineligibleCount++
-				continue
-			}
 		}
 		if entry.state != scheduledStateCooldown {
 			continue
@@ -896,7 +925,7 @@ func (m *modelScheduler) availabilitySummaryLocked(model string, predicate func(
 			earliest = entry.nextRetryAt
 		}
 	}
-	return total, cooldownCount, ineligibleCount, earliest
+	return total, cooldownCount, 0, earliest
 }
 
 // rebuildIndexesLocked reconstructs ready and blocked views from the current entry map.
@@ -959,28 +988,34 @@ func buildReadyBucket(providerKey string, entries []*scheduledAuth) *readyBucket
 	bucket.ws = buildReadyView(wsEntries)
 	providerKey = strings.ToLower(strings.TrimSpace(providerKey))
 	if providerKey == "codex" && len(entries) > 0 {
+		paidEntries := make([]*scheduledAuth, 0, len(entries))
 		freeEntries := make([]*scheduledAuth, 0, len(entries))
 		for _, entry := range entries {
 			if entry == nil || entry.meta == nil || entry.auth == nil {
 				continue
 			}
 			if entry.meta.codexPaidPlan {
+				paidEntries = append(paidEntries, entry)
 				continue
 			}
 			freeEntries = append(freeEntries, entry)
 		}
+		bucket.paid = buildReadyView(paidEntries)
 		bucket.free = buildReadyView(freeEntries)
 
+		wsPaidEntries := make([]*scheduledAuth, 0, len(wsEntries))
 		wsFreeEntries := make([]*scheduledAuth, 0, len(wsEntries))
 		for _, entry := range wsEntries {
 			if entry == nil || entry.meta == nil || entry.auth == nil {
 				continue
 			}
 			if entry.meta.codexPaidPlan {
+				wsPaidEntries = append(wsPaidEntries, entry)
 				continue
 			}
 			wsFreeEntries = append(wsFreeEntries, entry)
 		}
+		bucket.wsPaid = buildReadyView(wsPaidEntries)
 		bucket.wsFree = buildReadyView(wsFreeEntries)
 	}
 	return bucket

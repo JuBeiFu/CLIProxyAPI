@@ -148,11 +148,48 @@ func (c *Client) GetUsage() (map[string]any, error) {
 // GetAuthFiles lists auth credential files.
 // API returns {"files": [...]}.
 func (c *Client) GetAuthFiles() ([]map[string]any, error) {
-	wrapper, err := c.getJSON("/v0/management/auth-files")
-	if err != nil {
-		return nil, err
+	const pageSize = 500
+	offset := 0
+	out := make([]map[string]any, 0)
+	for {
+		path := "/v0/management/auth-files"
+		query := url.Values{}
+		query.Set("limit", strconv.Itoa(pageSize))
+		query.Set("offset", strconv.Itoa(offset))
+		path += "?" + query.Encode()
+
+		wrapper, err := c.getJSON(path)
+		if err != nil {
+			return nil, err
+		}
+		batch, errList := extractList(wrapper, "files")
+		if errList != nil {
+			return nil, errList
+		}
+		out = append(out, batch...)
+
+		total := len(out)
+		if rawTotal, ok := wrapper["total"]; ok {
+			switch value := rawTotal.(type) {
+			case float64:
+				total = int(value)
+			case int:
+				total = value
+			case int64:
+				total = int(value)
+			case json.Number:
+				if parsed, errParse := value.Int64(); errParse == nil {
+					total = int(parsed)
+				}
+			}
+		}
+
+		offset += len(batch)
+		if len(batch) == 0 || offset >= total {
+			break
+		}
 	}
-	return extractList(wrapper, "files")
+	return out, nil
 }
 
 // DeleteAuthFile deletes a single auth file by name.

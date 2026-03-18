@@ -19,7 +19,7 @@ import (
 )
 
 const (
-	DefaultPanelGitHubRepository = "https://github.com/router-for-me/Cli-Proxy-API-Management-Center"
+	DefaultPanelGitHubRepository = "https://github.com/JuBeiFu/Cli-Proxy-API-Management-Center"
 	DefaultPprofAddr             = "127.0.0.1:8316"
 )
 
@@ -74,6 +74,16 @@ type Config struct {
 	MaxRetryCredentials int `yaml:"max-retry-credentials" json:"max-retry-credentials"`
 	// MaxRetryInterval defines the maximum wait time in seconds before retrying a cooled-down credential.
 	MaxRetryInterval int `yaml:"max-retry-interval" json:"max-retry-interval"`
+	// ExecuteTimeoutSeconds defines the maximum time budget for a single non-streaming upstream execution attempt.
+	// <= 0 disables the manager-level execution timeout.
+	ExecuteTimeoutSeconds int `yaml:"execute-timeout-seconds" json:"execute-timeout-seconds"`
+	// CountTimeoutSeconds defines the maximum time budget for a single token-count upstream execution attempt.
+	// <= 0 disables the manager-level token-count timeout.
+	CountTimeoutSeconds int `yaml:"count-timeout-seconds" json:"count-timeout-seconds"`
+	// StreamConnectTimeoutSeconds defines the maximum time budget for establishing a streaming upstream request,
+	// including receiving response headers and the initial stream handle.
+	// <= 0 disables the manager-level stream-connect timeout.
+	StreamConnectTimeoutSeconds int `yaml:"stream-connect-timeout-seconds" json:"stream-connect-timeout-seconds"`
 
 	// QuotaExceeded defines the behavior when a quota is exceeded.
 	QuotaExceeded QuotaExceeded `yaml:"quota-exceeded" json:"quota-exceeded"`

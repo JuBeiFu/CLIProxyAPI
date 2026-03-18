@@ -13,6 +13,10 @@ import (
 
 type schedulerTestExecutor struct{}
 
+type recordingSchedulerExecutor struct {
+	authIDs []string
+}
+
 func (schedulerTestExecutor) Identifier() string { return "test" }
 
 func (schedulerTestExecutor) Execute(ctx context.Context, auth *Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
@@ -32,6 +36,30 @@ func (schedulerTestExecutor) CountTokens(ctx context.Context, auth *Auth, req cl
 }
 
 func (schedulerTestExecutor) HttpRequest(ctx context.Context, auth *Auth, req *http.Request) (*http.Response, error) {
+	return nil, nil
+}
+
+func (e *recordingSchedulerExecutor) Identifier() string { return "codex" }
+
+func (e *recordingSchedulerExecutor) Execute(ctx context.Context, auth *Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	e.authIDs = append(e.authIDs, auth.ID)
+	return cliproxyexecutor.Response{Payload: []byte(`{"ok":true}`)}, nil
+}
+
+func (e *recordingSchedulerExecutor) ExecuteStream(ctx context.Context, auth *Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
+	return nil, nil
+}
+
+func (e *recordingSchedulerExecutor) Refresh(ctx context.Context, auth *Auth) (*Auth, error) {
+	return auth, nil
+}
+
+func (e *recordingSchedulerExecutor) CountTokens(ctx context.Context, auth *Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	e.authIDs = append(e.authIDs, auth.ID)
+	return cliproxyexecutor.Response{Payload: []byte(`{"ok":true}`)}, nil
+}
+
+func (e *recordingSchedulerExecutor) HttpRequest(ctx context.Context, auth *Auth, req *http.Request) (*http.Response, error) {
 	return nil, nil
 }
 
@@ -273,12 +301,10 @@ func TestSchedulerPick_MixedProvidersPrefersHighestPriorityTier(t *testing.T) {
 	}
 }
 
-func TestSchedulerPick_AllPlanIneligibleReturnsAuthPlanRestricted(t *testing.T) {
+func TestSchedulerPick_AllUnsupportedReturnsAuthNotFound(t *testing.T) {
 	t.Parallel()
 
 	model := "gpt-5.4"
-	registerSchedulerModels(t, "codex", model, "free-a", "free-b")
-
 	scheduler := newSchedulerForTest(
 		&RoundRobinSelector{},
 		&Auth{ID: "free-a", Provider: "codex", Metadata: map[string]any{metadataPlanTypeKey: "free"}},
@@ -296,51 +322,25 @@ func TestSchedulerPick_AllPlanIneligibleReturnsAuthPlanRestricted(t *testing.T) 
 	if !errors.As(errPick, &authErr) {
 		t.Fatalf("pickSingle() error = %T, want *Error", errPick)
 	}
-	if authErr.Code != "auth_plan_restricted" {
-		t.Fatalf("error.Code = %q, want %q", authErr.Code, "auth_plan_restricted")
-	}
-	if authErr.HTTPStatus != http.StatusForbidden {
-		t.Fatalf("error.HTTPStatus = %d, want %d", authErr.HTTPStatus, http.StatusForbidden)
+	if authErr.Code != "auth_not_found" {
+		t.Fatalf("error.Code = %q, want %q", authErr.Code, "auth_not_found")
 	}
 }
 
-func TestSchedulerPick_PlanIneligibleDoesNotBlockCooldownError(t *testing.T) {
+func TestSchedulerPick_FreeFallbackForGPT54(t *testing.T) {
 	t.Parallel()
 
 	model := "gpt-5.4"
 	now := time.Now()
 	next := now.Add(20 * time.Second)
+	freeID := "gpt54-fallback-free"
+	paidID := "gpt54-fallback-paid"
 
-	registerSchedulerModels(t, "codex", model, "free", "paid")
+	registerSchedulerModels(t, "codex", model, freeID, paidID)
 	scheduler := newSchedulerForTest(
 		&FillFirstSelector{},
-		&Auth{ID: "free", Provider: "codex", Metadata: map[string]any{metadataPlanTypeKey: "free"}},
-		&Auth{ID: "paid", Provider: "codex", Metadata: map[string]any{metadataPlanTypeKey: "team"}, Quota: QuotaState{Exceeded: true, NextRecoverAt: next}},
-	)
-
-	got, errPick := scheduler.pickSingle(context.Background(), "codex", model, cliproxyexecutor.Options{}, nil)
-	if errPick == nil {
-		t.Fatalf("pickSingle() error = nil")
-	}
-	if got != nil {
-		t.Fatalf("pickSingle() auth = %#v, want nil", got)
-	}
-	var cooldownErr *modelCooldownError
-	if !errors.As(errPick, &cooldownErr) {
-		t.Fatalf("pickSingle() error = %T, want *modelCooldownError", errPick)
-	}
-}
-
-func TestSchedulerPick_CodexPrefersFreeForNonRestrictedGPTModels(t *testing.T) {
-	t.Parallel()
-
-	model := "gpt-5.2"
-	registerSchedulerModels(t, "codex", model, "free", "paid")
-
-	scheduler := newSchedulerForTest(
-		&RoundRobinSelector{},
-		&Auth{ID: "paid", Provider: "codex", Attributes: map[string]string{"priority": "10"}, Metadata: map[string]any{metadataPlanTypeKey: "team"}},
-		&Auth{ID: "free", Provider: "codex", Attributes: map[string]string{"priority": "0"}, Metadata: map[string]any{metadataPlanTypeKey: "free"}},
+		&Auth{ID: freeID, Provider: "codex", Metadata: map[string]any{metadataPlanTypeKey: "free"}},
+		&Auth{ID: paidID, Provider: "codex", Metadata: map[string]any{metadataPlanTypeKey: "team"}, Quota: QuotaState{Exceeded: true, NextRecoverAt: next}},
 	)
 
 	got, errPick := scheduler.pickSingle(context.Background(), "codex", model, cliproxyexecutor.Options{}, nil)
@@ -350,8 +350,61 @@ func TestSchedulerPick_CodexPrefersFreeForNonRestrictedGPTModels(t *testing.T) {
 	if got == nil {
 		t.Fatalf("pickSingle() auth = nil")
 	}
-	if got.ID != "free" {
-		t.Fatalf("pickSingle() auth.ID = %q, want %q", got.ID, "free")
+	if got.ID != freeID {
+		t.Fatalf("pickSingle() auth.ID = %q, want %q", got.ID, freeID)
+	}
+}
+
+func TestSchedulerPick_CodexPrefersPaidForGPT54(t *testing.T) {
+	t.Parallel()
+
+	model := "gpt-5.4"
+	freeID := "gpt54-prefer-free"
+	paidID := "gpt54-prefer-paid"
+	registerSchedulerModels(t, "codex", model, freeID, paidID)
+
+	scheduler := newSchedulerForTest(
+		&RoundRobinSelector{},
+		&Auth{ID: paidID, Provider: "codex", Attributes: map[string]string{"priority": "10"}, Metadata: map[string]any{metadataPlanTypeKey: "team"}},
+		&Auth{ID: freeID, Provider: "codex", Attributes: map[string]string{"priority": "0"}, Metadata: map[string]any{metadataPlanTypeKey: "free"}},
+	)
+
+	got, errPick := scheduler.pickSingle(context.Background(), "codex", model, cliproxyexecutor.Options{}, nil)
+	if errPick != nil {
+		t.Fatalf("pickSingle() error = %v", errPick)
+	}
+	if got == nil {
+		t.Fatalf("pickSingle() auth = nil")
+	}
+	if got.ID != paidID {
+		t.Fatalf("pickSingle() auth.ID = %q, want %q", got.ID, paidID)
+	}
+}
+
+func TestSchedulerPick_CodexWebsocketKeepsPaidPreferenceForGPT54(t *testing.T) {
+	t.Parallel()
+
+	model := "gpt-5.4"
+	freeID := "gpt54-ws-free"
+	paidID := "gpt54-ws-paid"
+	registerSchedulerModels(t, "codex", model, freeID, paidID)
+
+	scheduler := newSchedulerForTest(
+		&RoundRobinSelector{},
+		&Auth{ID: paidID, Provider: "codex", Attributes: map[string]string{"priority": "0"}, Metadata: map[string]any{metadataPlanTypeKey: "team"}},
+		&Auth{ID: freeID, Provider: "codex", Attributes: map[string]string{"priority": "10", "websockets": "true"}, Metadata: map[string]any{metadataPlanTypeKey: "free"}},
+	)
+
+	ctx := cliproxyexecutor.WithDownstreamWebsocket(context.Background())
+	got, errPick := scheduler.pickSingle(ctx, "codex", model, cliproxyexecutor.Options{}, nil)
+	if errPick != nil {
+		t.Fatalf("pickSingle() error = %v", errPick)
+	}
+	if got == nil {
+		t.Fatalf("pickSingle() auth = nil")
+	}
+	if got.ID != paidID {
+		t.Fatalf("pickSingle() auth.ID = %q, want %q", got.ID, paidID)
 	}
 }
 
@@ -582,5 +635,58 @@ func TestManager_SchedulerTracksMarkResultCooldownAndRecovery(t *testing.T) {
 	}
 	if len(seen) != 2 {
 		t.Fatalf("len(seen) = %d, want %d", len(seen), 2)
+	}
+}
+
+func TestSchedulerPick_DeprioritizesQuotaPressureAuth(t *testing.T) {
+	t.Parallel()
+
+	scheduler := newSchedulerForTest(
+		&FillFirstSelector{},
+		&Auth{ID: "quota-pressure", Provider: "codex", Attributes: map[string]string{"priority": "10"}, QuotaPriorityPenalty: 4},
+		&Auth{ID: "healthy", Provider: "codex", Attributes: map[string]string{"priority": "10"}},
+	)
+
+	got, errPick := scheduler.pickSingle(context.Background(), "codex", "", cliproxyexecutor.Options{}, nil)
+	if errPick != nil {
+		t.Fatalf("pickSingle() error = %v", errPick)
+	}
+	if got == nil {
+		t.Fatalf("pickSingle() auth = nil")
+	}
+	if got.ID != "healthy" {
+		t.Fatalf("pickSingle() auth.ID = %q, want %q", got.ID, "healthy")
+	}
+}
+
+func TestManager_ExecuteMixedOnce_SkipsStaleQuotaBlockedAuthBeforeExecute(t *testing.T) {
+	t.Parallel()
+
+	exec := &recordingSchedulerExecutor{}
+	manager := NewManager(nil, &FillFirstSelector{}, nil)
+	manager.RegisterExecutor(exec)
+	if _, errRegister := manager.Register(context.Background(), &Auth{ID: "a", Provider: "codex"}); errRegister != nil {
+		t.Fatalf("Register(a) error = %v", errRegister)
+	}
+	if _, errRegister := manager.Register(context.Background(), &Auth{ID: "b", Provider: "codex"}); errRegister != nil {
+		t.Fatalf("Register(b) error = %v", errRegister)
+	}
+	registerSchedulerModels(t, "codex", "gpt-5", "a", "b")
+
+	manager.mu.Lock()
+	manager.auths["a"].TransientCooldownUntil = time.Now().Add(2 * time.Minute)
+	manager.auths["a"].QuotaPriorityPenalty = 4
+	manager.mu.Unlock()
+	manager.syncScheduler()
+
+	_, errExec := manager.executeMixedOnce(context.Background(), []string{"codex"}, cliproxyexecutor.Request{Model: "gpt-5"}, cliproxyexecutor.Options{}, 5)
+	if errExec != nil {
+		t.Fatalf("executeMixedOnce() error = %v", errExec)
+	}
+	if len(exec.authIDs) != 1 {
+		t.Fatalf("execute auth count = %d, want 1", len(exec.authIDs))
+	}
+	if exec.authIDs[0] != "b" {
+		t.Fatalf("execute auth ID = %q, want %q", exec.authIDs[0], "b")
 	}
 }

@@ -3,6 +3,7 @@ package management
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -352,5 +353,149 @@ func TestAPICall_Codex401RefreshesAndRetries(t *testing.T) {
 	}
 	if got := stringValue(updated.Metadata, "refresh_token"); got != "rt2" {
 		t.Fatalf("expected refresh token persisted, got %q", got)
+	}
+}
+
+func TestAPICall_Codex401DeactivatedDeletesAuthAndSkipsRefresh(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	originalRefresh := refreshCodexTokensWithRetry
+	refreshCalls := 0
+	refreshCodexTokensWithRetry = func(ctx context.Context, h *Handler, refreshToken string, maxRetries int) (*codexauth.CodexTokenData, error) {
+		_ = ctx
+		_ = h
+		refreshCalls++
+		return nil, fmt.Errorf("unexpected refresh call")
+	}
+	t.Cleanup(func() { refreshCodexTokensWithRetry = originalRefresh })
+
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte(`{"error":{"message":"Your OpenAI account has been deactivated, please check your email for more information.","type":"invalid_request_error","code":"account_deactivated","param":null},"status":401}`))
+	}))
+	t.Cleanup(target.Close)
+
+	store := &memoryAuthStore{}
+	manager := coreauth.NewManager(store, nil, nil)
+	auth := &coreauth.Auth{
+		ID:       "codex-deactivated.json",
+		FileName: "codex-deactivated.json",
+		Provider: "codex",
+		Metadata: map[string]any{
+			"type":          "codex",
+			"access_token":  "old-token",
+			"refresh_token": "rt",
+			"account_id":    "acct-old",
+		},
+	}
+	if _, err := manager.Register(context.Background(), auth); err != nil {
+		t.Fatalf("register auth: %v", err)
+	}
+	stored, ok := manager.GetByID(auth.ID)
+	if !ok || stored == nil {
+		t.Fatalf("expected stored auth")
+	}
+	authIndex := stored.EnsureIndex()
+
+	h := &Handler{authManager: manager}
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	requestBody := `{"authIndex":"` + authIndex + `","method":"GET","url":"` + target.URL + `","header":{"Authorization":"Bearer $TOKEN$"}}`
+	request := httptest.NewRequest(http.MethodPost, "/v0/management/api-call", strings.NewReader(requestBody))
+	request.Header.Set("Content-Type", "application/json")
+	ctx.Request = request
+
+	h.APICall(ctx)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	var payload apiCallResponse
+	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("unmarshal response: %v", err)
+	}
+	if payload.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expected upstream status 401, got %d", payload.StatusCode)
+	}
+	if !payload.AuthRevokedDeleted {
+		t.Fatalf("expected auth_revoked_deleted to be true")
+	}
+	if refreshCalls != 0 {
+		t.Fatalf("expected 0 refresh calls, got %d", refreshCalls)
+	}
+	if _, ok := manager.GetByID(auth.ID); ok {
+		t.Fatalf("expected auth deleted from manager after deactivation response")
+	}
+}
+
+func TestAPICall_CodexDeactivatedWorkspaceDeletesAuthAndSkipsRefresh(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	originalRefresh := refreshCodexTokensWithRetry
+	refreshCalls := 0
+	refreshCodexTokensWithRetry = func(ctx context.Context, h *Handler, refreshToken string, maxRetries int) (*codexauth.CodexTokenData, error) {
+		_ = ctx
+		_ = h
+		refreshCalls++
+		return nil, fmt.Errorf("unexpected refresh call")
+	}
+	t.Cleanup(func() { refreshCodexTokensWithRetry = originalRefresh })
+
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte(`{"detail":{"code":"deactivated_workspace"}}`))
+	}))
+	t.Cleanup(target.Close)
+
+	store := &memoryAuthStore{}
+	manager := coreauth.NewManager(store, nil, nil)
+	auth := &coreauth.Auth{
+		ID:       "codex-deactivated-workspace.json",
+		FileName: "codex-deactivated-workspace.json",
+		Provider: "codex",
+		Metadata: map[string]any{
+			"type":          "codex",
+			"access_token":  "old-token",
+			"refresh_token": "rt",
+			"account_id":    "acct-old",
+		},
+	}
+	if _, err := manager.Register(context.Background(), auth); err != nil {
+		t.Fatalf("register auth: %v", err)
+	}
+	stored, ok := manager.GetByID(auth.ID)
+	if !ok || stored == nil {
+		t.Fatalf("expected stored auth")
+	}
+	authIndex := stored.EnsureIndex()
+
+	h := &Handler{authManager: manager}
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	requestBody := `{"authIndex":"` + authIndex + `","method":"GET","url":"` + target.URL + `","header":{"Authorization":"Bearer $TOKEN$"}}`
+	request := httptest.NewRequest(http.MethodPost, "/v0/management/api-call", strings.NewReader(requestBody))
+	request.Header.Set("Content-Type", "application/json")
+	ctx.Request = request
+
+	h.APICall(ctx)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	var payload apiCallResponse
+	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("unmarshal response: %v", err)
+	}
+	if payload.StatusCode != http.StatusForbidden {
+		t.Fatalf("expected upstream status 403, got %d", payload.StatusCode)
+	}
+	if !payload.AuthRevokedDeleted {
+		t.Fatalf("expected auth_revoked_deleted to be true")
+	}
+	if refreshCalls != 0 {
+		t.Fatalf("expected 0 refresh calls, got %d", refreshCalls)
+	}
+	if _, ok := manager.GetByID(auth.ID); ok {
+		t.Fatalf("expected auth deleted from manager after deactivated_workspace response")
 	}
 }

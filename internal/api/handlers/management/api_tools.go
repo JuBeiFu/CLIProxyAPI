@@ -12,6 +12,8 @@ import (
 
 	"github.com/gin-gonic/gin"
 	codexauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/codex"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/proxyrouting"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/proxystats"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/geminicli"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
@@ -64,6 +66,7 @@ type apiCallResponse struct {
 	AuthRefreshAttempted bool                `json:"auth_refresh_attempted,omitempty"`
 	AuthRefreshSucceeded bool                `json:"auth_refresh_succeeded,omitempty"`
 	AuthRefreshError     string              `json:"auth_refresh_error,omitempty"`
+	AuthRevokedDeleted   bool                `json:"auth_revoked_deleted,omitempty"`
 }
 
 // APICall makes a generic HTTP request on behalf of the management API caller.
@@ -182,6 +185,19 @@ func (h *Handler) APICall(c *gin.Context) {
 			log.Errorf("response body close error: %v", errClose)
 		}
 
+		// Deactivated/revoked accounts should be removed immediately instead of attempting
+		// token refresh (which is guaranteed to fail and only adds load).
+		if auth != nil && isAuthRevokedResponse(originalStatusCode, originalBody) {
+			authRevokedDeleted := h.deleteRevokedAuthFromAPICall(c.Request.Context(), auth, originalStatusCode, originalBody)
+			c.JSON(http.StatusOK, apiCallResponse{
+				StatusCode:         originalStatusCode,
+				Header:             originalHeader,
+				Body:               string(originalBody),
+				AuthRevokedDeleted: authRevokedDeleted,
+			})
+			return
+		}
+
 		authRefreshAttempted = true
 		refreshedToken, errRefresh := h.refreshCodexOAuthAccessToken(c.Request.Context(), auth)
 		if errRefresh != nil {
@@ -233,6 +249,11 @@ func (h *Handler) APICall(c *gin.Context) {
 		return
 	}
 
+	authRevokedDeleted := false
+	if auth != nil && isAuthRevokedResponse(resp.StatusCode, respBody) {
+		authRevokedDeleted = h.deleteRevokedAuthFromAPICall(c.Request.Context(), auth, resp.StatusCode, respBody)
+	}
+
 	c.JSON(http.StatusOK, apiCallResponse{
 		StatusCode:           resp.StatusCode,
 		Header:               resp.Header,
@@ -240,7 +261,62 @@ func (h *Handler) APICall(c *gin.Context) {
 		AuthRefreshAttempted: authRefreshAttempted,
 		AuthRefreshSucceeded: authRefreshSucceeded,
 		AuthRefreshError:     authRefreshError,
+		AuthRevokedDeleted:   authRevokedDeleted,
 	})
+}
+
+func isAuthRevokedResponse(statusCode int, body []byte) bool {
+	if len(body) == 0 {
+		return false
+	}
+	message := strings.ToLower(strings.TrimSpace(string(body)))
+	if message == "" {
+		return false
+	}
+	if strings.Contains(message, "deactivated_workspace") && statusCode >= 400 && statusCode < 500 {
+		return true
+	}
+	if statusCode != http.StatusUnauthorized {
+		return false
+	}
+	for _, needle := range []string{
+		"token_revoked",
+		"token_invalidated",
+		"account_deactivated",
+		"encountered invalidated oauth token for user",
+		"your authentication token has been invalidated. please try signing in again.",
+		"your openai account has been deactivated",
+		"account has been deactivated",
+	} {
+		if strings.Contains(message, needle) {
+			return true
+		}
+	}
+	return false
+}
+
+func (h *Handler) deleteRevokedAuthFromAPICall(ctx context.Context, auth *coreauth.Auth, statusCode int, body []byte) bool {
+	if h == nil || h.authManager == nil || auth == nil {
+		return false
+	}
+	message := strings.TrimSpace(string(body))
+	if message == "" {
+		return false
+	}
+	h.authManager.MarkResult(ctx, coreauth.Result{
+		AuthID:   auth.ID,
+		Provider: auth.Provider,
+		Model:    "",
+		Success:  false,
+		Error: &coreauth.Error{
+			Code:       "account_deactivated",
+			Message:    message,
+			Retryable:  false,
+			HTTPStatus: statusCode,
+		},
+	})
+	_, ok := h.authManager.GetByID(auth.ID)
+	return !ok
 }
 
 func firstNonEmptyString(values ...*string) string {
@@ -804,17 +880,11 @@ func (h *Handler) authByIndex(authIndex string) *coreauth.Auth {
 }
 
 func (h *Handler) apiCallTransport(auth *coreauth.Auth) http.RoundTripper {
-	if auth != nil {
-		if proxyStr := strings.TrimSpace(auth.ProxyURL); proxyStr != "" {
-			if transport := util.NewProxyPoolTransport(proxyStr); transport != nil {
-				return transport
-			}
-		}
-	}
 	if h != nil && h.cfg != nil {
-		if proxyStr := strings.TrimSpace(h.cfg.ProxyURL); proxyStr != "" {
-			if transport := util.NewProxyPoolTransport(proxyStr); transport != nil {
-				return transport
+		selection := proxyrouting.Resolve(h.cfg, auth)
+		if selection.HasProxy() {
+			if transport := util.NewProxyPoolTransport(selection.ProxyURL); transport != nil {
+				return proxystats.AttachRoundTripperMetadata(transport, selection.StatsMetadata())
 			}
 		}
 	}

@@ -244,19 +244,108 @@ func (h *Handler) ListAuthFiles(c *gin.Context) {
 		h.listAuthFilesFromDisk(c)
 		return
 	}
+
+	// Optional query params:
+	// - q: case-insensitive substring match against name/type/provider/email/label/account
+	// - provider/type: exact provider filter
+	// - plan: exact plan_type filter
+	// - limit: page size (default 200)
+	// - offset: start index (default 0)
+	rawQuery := strings.TrimSpace(c.Query("q"))
+	query := strings.ToLower(rawQuery)
+	providerFilter := strings.ToLower(strings.TrimSpace(c.Query("provider")))
+	if providerFilter == "" {
+		providerFilter = strings.ToLower(strings.TrimSpace(c.Query("type")))
+	}
+	planFilter := strings.ToLower(strings.TrimSpace(c.Query("plan")))
+
+	limit := 200
+	if raw := strings.TrimSpace(c.Query("limit")); raw != "" {
+		if parsed, err := strconv.Atoi(raw); err == nil && parsed > 0 {
+			limit = parsed
+		} else {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid limit"})
+			return
+		}
+	}
+	if limit > 2000 {
+		limit = 2000
+	}
+
+	offset := 0
+	if raw := strings.TrimSpace(c.Query("offset")); raw != "" {
+		if parsed, err := strconv.Atoi(raw); err == nil && parsed >= 0 {
+			offset = parsed
+		} else {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid offset"})
+			return
+		}
+	}
+
 	auths := h.authManager.List()
 	files := make([]gin.H, 0, len(auths))
 	for _, auth := range auths {
-		if entry := h.buildAuthFileEntry(auth); entry != nil {
-			files = append(files, entry)
+		entry := h.buildAuthFileEntry(auth)
+		if entry == nil {
+			continue
 		}
+
+		if providerFilter != "" && !strings.EqualFold(strings.TrimSpace(fmt.Sprint(entry["provider"])), providerFilter) {
+			continue
+		}
+		if planFilter != "" && !strings.EqualFold(strings.TrimSpace(fmt.Sprint(entry["plan_type"])), planFilter) {
+			continue
+		}
+
+		if query != "" {
+			parts := []string{
+				strings.TrimSpace(fmt.Sprint(entry["name"])),
+				strings.TrimSpace(fmt.Sprint(entry["type"])),
+				strings.TrimSpace(fmt.Sprint(entry["provider"])),
+				strings.TrimSpace(fmt.Sprint(entry["email"])),
+				strings.TrimSpace(fmt.Sprint(entry["account"])),
+				strings.TrimSpace(fmt.Sprint(entry["label"])),
+			}
+			matched := false
+			for _, part := range parts {
+				if part == "" {
+					continue
+				}
+				if strings.Contains(strings.ToLower(part), query) {
+					matched = true
+					break
+				}
+			}
+			if !matched {
+				continue
+			}
+		}
+
+		files = append(files, entry)
 	}
 	sort.Slice(files, func(i, j int) bool {
 		nameI, _ := files[i]["name"].(string)
 		nameJ, _ := files[j]["name"].(string)
 		return strings.ToLower(nameI) < strings.ToLower(nameJ)
 	})
-	c.JSON(200, gin.H{"files": files})
+
+	total := len(files)
+	if offset > total {
+		offset = total
+	}
+	end := offset + limit
+	if end > total {
+		end = total
+	}
+	paged := files[offset:end]
+
+	c.JSON(http.StatusOK, gin.H{
+		"files":  paged,
+		"total":  total,
+		"limit":  limit,
+		"offset": offset,
+		"q":      rawQuery,
+	})
 }
 
 // GetAuthFileModels returns the models supported by a specific auth file
@@ -338,7 +427,12 @@ func (h *Handler) listAuthFilesFromDisk(c *gin.Context) {
 			files = append(files, fileData)
 		}
 	}
-	c.JSON(200, gin.H{"files": files})
+	sort.Slice(files, func(i, j int) bool {
+		nameI, _ := files[i]["name"].(string)
+		nameJ, _ := files[j]["name"].(string)
+		return strings.ToLower(nameI) < strings.ToLower(nameJ)
+	})
+	c.JSON(200, gin.H{"files": files, "total": len(files), "limit": len(files), "offset": 0, "q": ""})
 }
 
 func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
@@ -488,6 +582,11 @@ func authEmail(auth *coreauth.Auth) string {
 		return ""
 	}
 	if auth.Metadata != nil {
+		if v, ok := auth.Metadata["account"].(string); ok {
+			if trimmed := strings.TrimSpace(v); trimmed != "" {
+				return trimmed
+			}
+		}
 		if v, ok := auth.Metadata["email"].(string); ok {
 			return strings.TrimSpace(v)
 		}
@@ -501,6 +600,76 @@ func authEmail(auth *coreauth.Auth) string {
 		}
 	}
 	return ""
+}
+
+func authImportID(provider, path string, metadata map[string]any) string {
+	provider = strings.ToLower(strings.TrimSpace(provider))
+	if provider == "codex" {
+		if id := codex.CredentialID(metadata); id != "" {
+			return id
+		}
+	}
+	return ""
+}
+
+func authImportFileName(provider string, metadata map[string]any, fallback string) string {
+	provider = strings.ToLower(strings.TrimSpace(provider))
+	if provider == "codex" {
+		if name := codex.CredentialFileNameFromMetadata(metadata, true); name != "" {
+			return name
+		}
+	}
+	return filepath.Base(strings.TrimSpace(fallback))
+}
+
+func (h *Handler) removeConflictingAuthFiles(ctx context.Context, provider, nextID, nextPath, nextName string) {
+	if h == nil || h.authManager == nil {
+		return
+	}
+	if !strings.EqualFold(strings.TrimSpace(provider), "codex") {
+		return
+	}
+	normalizedID := strings.TrimSpace(nextID)
+	if normalizedID == "" {
+		return
+	}
+	normalizedPath := strings.TrimSpace(nextPath)
+	normalizedName := strings.TrimSpace(nextName)
+	for _, auth := range h.authManager.List() {
+		if auth == nil {
+			continue
+		}
+		if !strings.EqualFold(strings.TrimSpace(auth.Provider), "codex") {
+			continue
+		}
+		path := strings.TrimSpace(authAttribute(auth, "path"))
+		matchID := strings.TrimSpace(auth.ID)
+		if !strings.EqualFold(matchID, normalizedID) {
+			matchID = strings.TrimSpace(authImportID(provider, path, auth.Metadata))
+		}
+		if !strings.EqualFold(matchID, normalizedID) {
+			continue
+		}
+		if normalizedPath != "" && path != "" && strings.EqualFold(path, normalizedPath) {
+			continue
+		}
+		if normalizedName != "" && strings.EqualFold(strings.TrimSpace(auth.FileName), normalizedName) {
+			continue
+		}
+		if path != "" {
+			if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+				log.WithError(err).Warnf("failed to remove conflicting auth file %s", path)
+			}
+			if err := h.deleteTokenRecord(ctx, path); err != nil {
+				log.WithError(err).Warnf("failed to delete token record for conflicting auth file %s", path)
+			}
+		}
+		if auth.ID != "" {
+			h.disableAuth(ctx, auth.ID)
+		} else if path != "" {
+			h.disableAuth(ctx, path)
+		}
+	}
 }
 
 func authAttribute(auth *coreauth.Auth, key string) string {
@@ -549,63 +718,81 @@ func (h *Handler) UploadAuthFile(c *gin.Context) {
 		return
 	}
 	ctx := c.Request.Context()
+
+	var (
+		name string
+		data []byte
+	)
+
 	if file, err := c.FormFile("file"); err == nil && file != nil {
-		name := filepath.Base(file.Filename)
+		name = filepath.Base(file.Filename)
 		if !strings.HasSuffix(strings.ToLower(name), ".json") {
 			c.JSON(400, gin.H{"error": "file must be .json"})
 			return
 		}
-		dst := filepath.Join(h.cfg.AuthDir, name)
-		if !filepath.IsAbs(dst) {
-			if abs, errAbs := filepath.Abs(dst); errAbs == nil {
-				dst = abs
-			}
-		}
-		if errSave := c.SaveUploadedFile(file, dst); errSave != nil {
-			c.JSON(500, gin.H{"error": fmt.Sprintf("failed to save file: %v", errSave)})
+		src, errOpen := file.Open()
+		if errOpen != nil {
+			c.JSON(500, gin.H{"error": fmt.Sprintf("failed to open upload: %v", errOpen)})
 			return
 		}
-		data, errRead := os.ReadFile(dst)
+		defer src.Close()
+		var errRead error
+		data, errRead = io.ReadAll(src)
 		if errRead != nil {
-			c.JSON(500, gin.H{"error": fmt.Sprintf("failed to read saved file: %v", errRead)})
+			c.JSON(400, gin.H{"error": "failed to read upload"})
 			return
 		}
-		if errReg := h.registerAuthFromFile(ctx, dst, data); errReg != nil {
-			c.JSON(500, gin.H{"error": errReg.Error()})
+	} else {
+		name = c.Query("name")
+		if name == "" || strings.Contains(name, string(os.PathSeparator)) {
+			c.JSON(400, gin.H{"error": "invalid name"})
 			return
 		}
-		c.JSON(200, gin.H{"status": "ok"})
+		if !strings.HasSuffix(strings.ToLower(name), ".json") {
+			c.JSON(400, gin.H{"error": "name must end with .json"})
+			return
+		}
+		var err error
+		data, err = io.ReadAll(c.Request.Body)
+		if err != nil {
+			c.JSON(400, gin.H{"error": "failed to read body"})
+			return
+		}
+	}
+
+	metadata := make(map[string]any)
+	if err := json.Unmarshal(data, &metadata); err != nil {
+		c.JSON(400, gin.H{"error": fmt.Sprintf("invalid auth file: %v", err)})
 		return
 	}
-	name := c.Query("name")
-	if name == "" || strings.Contains(name, string(os.PathSeparator)) {
-		c.JSON(400, gin.H{"error": "invalid name"})
-		return
+	provider, _ := metadata["type"].(string)
+	if provider == "" {
+		provider = "unknown"
 	}
-	if !strings.HasSuffix(strings.ToLower(name), ".json") {
-		c.JSON(400, gin.H{"error": "name must end with .json"})
-		return
+	resolvedName := authImportFileName(provider, metadata, name)
+	if resolvedName == "" || !strings.HasSuffix(strings.ToLower(resolvedName), ".json") {
+		resolvedName = filepath.Base(name)
 	}
-	data, err := io.ReadAll(c.Request.Body)
-	if err != nil {
-		c.JSON(400, gin.H{"error": "failed to read body"})
-		return
-	}
-	dst := filepath.Join(h.cfg.AuthDir, filepath.Base(name))
+	dst := filepath.Join(h.cfg.AuthDir, filepath.Base(resolvedName))
 	if !filepath.IsAbs(dst) {
 		if abs, errAbs := filepath.Abs(dst); errAbs == nil {
 			dst = abs
 		}
 	}
+	authID := authImportID(provider, dst, metadata)
+	if authID == "" {
+		authID = h.authIDForPath(dst)
+	}
+	h.removeConflictingAuthFiles(ctx, provider, authID, dst, filepath.Base(dst))
 	if errWrite := os.WriteFile(dst, data, 0o600); errWrite != nil {
 		c.JSON(500, gin.H{"error": fmt.Sprintf("failed to write file: %v", errWrite)})
 		return
 	}
-	if err = h.registerAuthFromFile(ctx, dst, data); err != nil {
+	if err := h.registerAuthFromFile(ctx, dst, data); err != nil {
 		c.JSON(500, gin.H{"error": err.Error()})
 		return
 	}
-	c.JSON(200, gin.H{"status": "ok"})
+	c.JSON(200, gin.H{"status": "ok", "name": filepath.Base(dst), "id": authID})
 }
 
 // Delete auth files: single by name or all
@@ -762,7 +949,10 @@ func (h *Handler) registerAuthFromFile(ctx context.Context, path string, data []
 	}
 	lastRefresh, hasLastRefresh := extractLastRefreshTimestamp(metadata)
 
-	authID := h.authIDForPath(path)
+	authID := authImportID(provider, path, metadata)
+	if authID == "" {
+		authID = h.authIDForPath(path)
+	}
 	if authID == "" {
 		authID = path
 	}

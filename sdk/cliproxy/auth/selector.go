@@ -109,18 +109,23 @@ func (e *modelCooldownError) Headers() http.Header {
 }
 
 func authPriority(auth *Auth) int {
-	if auth == nil || auth.Attributes == nil {
-		return priorityFromMetadata(auth)
+	base := priorityFromMetadata(auth)
+	if auth != nil && auth.Attributes != nil {
+		raw := strings.TrimSpace(auth.Attributes["priority"])
+		if raw != "" {
+			if parsed, err := strconv.Atoi(raw); err == nil {
+				base = parsed
+			}
+		}
 	}
-	raw := strings.TrimSpace(auth.Attributes["priority"])
-	if raw == "" {
-		return priorityFromMetadata(auth)
+	return base - quotaPriorityPenalty(auth)
+}
+
+func quotaPriorityPenalty(auth *Auth) int {
+	if auth == nil || auth.QuotaPriorityPenalty <= 0 {
+		return 0
 	}
-	parsed, err := strconv.Atoi(raw)
-	if err != nil {
-		return priorityFromMetadata(auth)
-	}
-	return parsed
+	return auth.QuotaPriorityPenalty
 }
 
 func priorityFromMetadata(auth *Auth) int {
@@ -169,11 +174,27 @@ func canonicalModelKey(model string) string {
 }
 
 func codexModelRequiresPaidPlan(model string) bool {
+	return codexModelPrefersPaidPlan(model)
+}
+
+func codexModelPrefersPaidPlan(model string) bool {
+	switch strings.ToLower(canonicalModelKey(model)) {
+	case "gpt-5.3-codex", "gpt-5.4":
+		return true
+	default:
+		return false
+	}
+}
+
+func codexModelPrefersFreePlan(model string) bool {
 	base := strings.ToLower(canonicalModelKey(model))
 	if base == "" {
 		return false
 	}
-	return strings.HasPrefix(base, "gpt-5.3") || strings.HasPrefix(base, "gpt-5.4")
+	if !strings.HasPrefix(base, "gpt-") {
+		return false
+	}
+	return !codexModelPrefersPaidPlan(base)
 }
 
 func authWebsocketsEnabled(auth *Auth) bool {
@@ -208,7 +229,7 @@ func authWebsocketsEnabled(auth *Auth) bool {
 	return false
 }
 
-func preferCodexWebsocketAuths(ctx context.Context, provider string, available []*Auth) []*Auth {
+func preferCodexWebsocketAuths(ctx context.Context, provider, model string, available []*Auth) []*Auth {
 	if len(available) == 0 {
 		return available
 	}
@@ -219,12 +240,18 @@ func preferCodexWebsocketAuths(ctx context.Context, provider string, available [
 		return available
 	}
 
+	preferPaid := codexModelPrefersPaidPlan(model)
+
 	wsEnabled := make([]*Auth, 0, len(available))
 	for i := 0; i < len(available); i++ {
 		candidate := available[i]
-		if authWebsocketsEnabled(candidate) {
-			wsEnabled = append(wsEnabled, candidate)
+		if candidate == nil || !authWebsocketsEnabled(candidate) {
+			continue
 		}
+		if preferPaid && !codexPlanIsPaid(codexPlanType(candidate)) {
+			continue
+		}
+		wsEnabled = append(wsEnabled, candidate)
 	}
 	if len(wsEnabled) > 0 {
 		return wsEnabled
@@ -261,13 +288,9 @@ func getAvailableAuths(auths []*Auth, provider, model string, now time.Time) ([]
 		return nil, &Error{Code: "auth_not_found", Message: "no auth candidates"}
 	}
 
-	availableByPriority, cooldownCount, ineligibleCount, earliest := collectAvailableByPriority(auths, model, now)
+	availableByPriority, cooldownCount, _, earliest := collectAvailableByPriority(auths, model, now)
 	if len(availableByPriority) == 0 {
-		eligibleTotal := len(auths) - ineligibleCount
-		if eligibleTotal < 0 {
-			eligibleTotal = 0
-		}
-		if eligibleTotal > 0 && cooldownCount == eligibleTotal && !earliest.IsZero() {
+		if cooldownCount == len(auths) && !earliest.IsZero() {
 			providerForError := provider
 			if providerForError == "mixed" {
 				providerForError = ""
@@ -278,38 +301,41 @@ func getAvailableAuths(auths []*Auth, provider, model string, now time.Time) ([]
 			}
 			return nil, newModelCooldownError(model, providerForError, resetIn)
 		}
-		if eligibleTotal == 0 && ineligibleCount == len(auths) && model != "" {
-			providerForError := provider
-			if providerForError == "mixed" {
-				providerForError = ""
-			}
-			message := fmt.Sprintf("No eligible credentials for model %s", model)
-			if providerForError != "" {
-				message = fmt.Sprintf("%s via provider %s", message, providerForError)
-			}
-			message = fmt.Sprintf("%s; requires a paid ChatGPT plan", message)
-			return nil, &Error{Code: "auth_plan_restricted", Message: message, HTTPStatus: http.StatusForbidden}
-		}
 		return nil, &Error{Code: "auth_unavailable", Message: "no auth available"}
 	}
 
-	// Plan preference: for non-restricted GPT models, prefer free (non-paid) Codex accounts.
-	// This preserves paid accounts for gpt-5.3/gpt-5.4 where free accounts are ineligible.
-	if strings.EqualFold(strings.TrimSpace(provider), "codex") && model != "" && !codexModelRequiresPaidPlan(model) {
-		freeByPriority := make(map[int][]*Auth)
-		for priority, entries := range availableByPriority {
-			for _, candidate := range entries {
-				if candidate == nil {
-					continue
+	// For Codex, admission is already driven by each account's registered model list.
+	// The remaining plan metadata only influences preference order:
+	// - gpt-5.3-codex / gpt-5.4: prefer paid/team first, then fall back to free
+	// - other GPT-family Codex models: prefer free first to preserve paid capacity
+	if strings.EqualFold(strings.TrimSpace(provider), "codex") && model != "" {
+		switch {
+		case codexModelPrefersPaidPlan(model):
+			paidByPriority := make(map[int][]*Auth)
+			for priority, entries := range availableByPriority {
+				for _, candidate := range entries {
+					if candidate == nil || !codexPlanIsPaid(codexPlanType(candidate)) {
+						continue
+					}
+					paidByPriority[priority] = append(paidByPriority[priority], candidate)
 				}
-				if codexPlanIsPaid(codexPlanType(candidate)) {
-					continue
-				}
-				freeByPriority[priority] = append(freeByPriority[priority], candidate)
 			}
-		}
-		if len(freeByPriority) > 0 {
-			availableByPriority = freeByPriority
+			if len(paidByPriority) > 0 {
+				availableByPriority = paidByPriority
+			}
+		case codexModelPrefersFreePlan(model):
+			freeByPriority := make(map[int][]*Auth)
+			for priority, entries := range availableByPriority {
+				for _, candidate := range entries {
+					if candidate == nil || codexPlanIsPaid(codexPlanType(candidate)) {
+						continue
+					}
+					freeByPriority[priority] = append(freeByPriority[priority], candidate)
+				}
+			}
+			if len(freeByPriority) > 0 {
+				availableByPriority = freeByPriority
+			}
 		}
 	}
 
@@ -340,7 +366,7 @@ func (s *RoundRobinSelector) Pick(ctx context.Context, provider, model string, o
 	if err != nil {
 		return nil, err
 	}
-	available = preferCodexWebsocketAuths(ctx, provider, available)
+	available = preferCodexWebsocketAuths(ctx, provider, model, available)
 	key := provider + ":" + canonicalModelKey(model)
 	s.mu.Lock()
 	if s.cursors == nil {
@@ -439,7 +465,7 @@ func (s *FillFirstSelector) Pick(ctx context.Context, provider, model string, op
 	if err != nil {
 		return nil, err
 	}
-	available = preferCodexWebsocketAuths(ctx, provider, available)
+	available = preferCodexWebsocketAuths(ctx, provider, model, available)
 	return available[0], nil
 }
 
@@ -450,10 +476,8 @@ func isAuthBlockedForModel(auth *Auth, model string, now time.Time) (bool, block
 	if auth.Disabled || auth.Status == StatusDisabled {
 		return true, blockReasonDisabled, time.Time{}
 	}
-	if model != "" && strings.EqualFold(strings.TrimSpace(auth.Provider), "codex") && codexModelRequiresPaidPlan(model) {
-		if !codexPlanIsPaid(codexPlanType(auth)) {
-			return true, blockReasonPlanIneligible, time.Time{}
-		}
+	if !auth.TransientCooldownUntil.IsZero() && auth.TransientCooldownUntil.After(now) {
+		return true, blockReasonCooldown, auth.TransientCooldownUntil
 	}
 	if until, ok := cooldownUntilFromAuthMetadata(auth.Metadata); ok && until.After(now) {
 		return true, blockReasonCooldown, until

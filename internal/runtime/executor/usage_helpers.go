@@ -3,6 +3,7 @@ package executor
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -47,7 +48,35 @@ func (r *usageReporter) publish(ctx context.Context, detail usage.Detail) {
 }
 
 func (r *usageReporter) publishFailure(ctx context.Context) {
-	r.publishWithOutcome(ctx, usage.Detail{}, true)
+	detail := usage.Detail{}
+	if statusCode := statusCodeFromContext(ctx); statusCode >= 400 {
+		detail.StatusCode = statusCode
+	}
+	r.publishWithOutcome(ctx, detail, true)
+}
+
+func (r *usageReporter) publishFailureWithError(ctx context.Context, err error) {
+	detail := usage.Detail{}
+	if err != nil {
+		type statusCoder interface {
+			StatusCode() int
+		}
+		var statusErr statusCoder
+		if errors.As(err, &statusErr) && statusErr != nil {
+			detail.StatusCode = statusErr.StatusCode()
+		}
+		message := strings.TrimSpace(err.Error())
+		if len(message) > 512 {
+			message = message[:512]
+		}
+		detail.ErrorMessage = message
+	}
+	if detail.StatusCode == 0 {
+		if statusCode := statusCodeFromContext(ctx); statusCode >= 400 {
+			detail.StatusCode = statusCode
+		}
+	}
+	r.publishWithOutcome(ctx, detail, true)
 }
 
 func (r *usageReporter) trackFailure(ctx context.Context, errPtr *error) {
@@ -55,7 +84,7 @@ func (r *usageReporter) trackFailure(ctx context.Context, errPtr *error) {
 		return
 	}
 	if *errPtr != nil {
-		r.publishFailure(ctx)
+		r.publishFailureWithError(ctx, *errPtr)
 	}
 }
 
@@ -108,6 +137,21 @@ func (r *usageReporter) ensurePublished(ctx context.Context) {
 			Detail:      usage.Detail{},
 		})
 	})
+}
+
+func statusCodeFromContext(ctx context.Context) int {
+	if ctx == nil {
+		return 0
+	}
+	ginCtx, ok := ctx.Value("gin").(*gin.Context)
+	if !ok || ginCtx == nil {
+		return 0
+	}
+	status := ginCtx.Writer.Status()
+	if status <= 0 {
+		return 0
+	}
+	return status
 }
 
 func apiKeyFromContext(ctx context.Context) string {
