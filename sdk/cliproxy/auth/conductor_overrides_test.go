@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	internalconfig "github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 )
@@ -250,6 +251,187 @@ func newSameAuthRetryTestManager(t *testing.T, retry int, err error) (*Manager, 
 	}
 
 	return m, executor
+}
+
+type executionTimeoutExecutor struct {
+	id         string
+	callCounts map[string]int
+	mu         sync.Mutex
+}
+
+type contextCauseStatusError struct {
+	status int
+	msg    string
+}
+
+func (e *contextCauseStatusError) Error() string   { return e.msg }
+func (e *contextCauseStatusError) StatusCode() int { return e.status }
+
+func (e *executionTimeoutExecutor) Identifier() string {
+	return e.id
+}
+
+func (e *executionTimeoutExecutor) Execute(ctx context.Context, auth *Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	_ = auth
+	_ = req
+	_ = opts
+	return cliproxyexecutor.Response{}, e.waitForTimeout(ctx, "execute")
+}
+
+func (e *executionTimeoutExecutor) ExecuteStream(ctx context.Context, auth *Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
+	_ = auth
+	_ = req
+	_ = opts
+	if err := e.waitForTimeout(ctx, "stream"); err != nil {
+		return nil, err
+	}
+	return nil, nil
+}
+
+func (e *executionTimeoutExecutor) Refresh(_ context.Context, auth *Auth) (*Auth, error) {
+	return auth, nil
+}
+
+func (e *executionTimeoutExecutor) CountTokens(ctx context.Context, auth *Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	_ = auth
+	_ = req
+	_ = opts
+	return cliproxyexecutor.Response{}, e.waitForTimeout(ctx, "count")
+}
+
+func (e *executionTimeoutExecutor) HttpRequest(context.Context, *Auth, *http.Request) (*http.Response, error) {
+	return nil, nil
+}
+
+func (e *executionTimeoutExecutor) waitForTimeout(ctx context.Context, key string) error {
+	e.mu.Lock()
+	if e.callCounts == nil {
+		e.callCounts = make(map[string]int)
+	}
+	e.callCounts[key]++
+	e.mu.Unlock()
+	<-ctx.Done()
+	if cause := context.Cause(ctx); cause != nil {
+		return cause
+	}
+	return ctx.Err()
+}
+
+func (e *executionTimeoutExecutor) Calls(key string) int {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.callCounts[key]
+}
+
+type bootstrapTimeoutExecutor struct {
+	id string
+
+	mu    sync.Mutex
+	calls int
+}
+
+func (e *bootstrapTimeoutExecutor) Identifier() string {
+	return e.id
+}
+
+func (e *bootstrapTimeoutExecutor) Execute(context.Context, *Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	e.mu.Lock()
+	e.calls++
+	e.mu.Unlock()
+	return cliproxyexecutor.Response{}, &Error{HTTPStatus: http.StatusUnauthorized, Message: "not used"}
+}
+
+func (e *bootstrapTimeoutExecutor) ExecuteStream(ctx context.Context, auth *Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
+	_ = ctx
+	_ = auth
+	_ = req
+	_ = opts
+	e.mu.Lock()
+	e.calls++
+	e.mu.Unlock()
+	ch := make(chan cliproxyexecutor.StreamChunk)
+	return &cliproxyexecutor.StreamResult{Chunks: ch}, nil
+}
+
+func (e *bootstrapTimeoutExecutor) Refresh(_ context.Context, auth *Auth) (*Auth, error) {
+	return auth, nil
+}
+
+func (e *bootstrapTimeoutExecutor) CountTokens(context.Context, *Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	e.mu.Lock()
+	e.calls++
+	e.mu.Unlock()
+	return cliproxyexecutor.Response{}, &Error{HTTPStatus: http.StatusUnauthorized, Message: "not used"}
+}
+
+func (e *bootstrapTimeoutExecutor) HttpRequest(context.Context, *Auth, *http.Request) (*http.Response, error) {
+	return nil, nil
+}
+
+func (e *bootstrapTimeoutExecutor) Calls() int {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.calls
+}
+
+type streamContextCancellationExecutor struct {
+	id    string
+	delay time.Duration
+
+	mu    sync.Mutex
+	calls int
+}
+
+func (e *streamContextCancellationExecutor) Identifier() string {
+	return e.id
+}
+
+func (e *streamContextCancellationExecutor) Execute(context.Context, *Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	e.recordCall()
+	return cliproxyexecutor.Response{}, &Error{HTTPStatus: http.StatusUnauthorized, Message: "not used"}
+}
+
+func (e *streamContextCancellationExecutor) ExecuteStream(ctx context.Context, auth *Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
+	_ = auth
+	_ = req
+	_ = opts
+	e.recordCall()
+	out := make(chan cliproxyexecutor.StreamChunk, 1)
+	go func() {
+		defer close(out)
+		select {
+		case <-ctx.Done():
+			out <- cliproxyexecutor.StreamChunk{Err: ctx.Err()}
+		case <-time.After(e.delay):
+			out <- cliproxyexecutor.StreamChunk{Payload: []byte("ok")}
+		}
+	}()
+	return &cliproxyexecutor.StreamResult{Chunks: out}, nil
+}
+
+func (e *streamContextCancellationExecutor) Refresh(_ context.Context, auth *Auth) (*Auth, error) {
+	return auth, nil
+}
+
+func (e *streamContextCancellationExecutor) CountTokens(context.Context, *Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	e.recordCall()
+	return cliproxyexecutor.Response{}, &Error{HTTPStatus: http.StatusUnauthorized, Message: "not used"}
+}
+
+func (e *streamContextCancellationExecutor) HttpRequest(context.Context, *Auth, *http.Request) (*http.Response, error) {
+	return nil, nil
+}
+
+func (e *streamContextCancellationExecutor) recordCall() {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.calls++
+}
+
+func (e *streamContextCancellationExecutor) Calls() int {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.calls
 }
 
 func newCredentialRetryLimitTestManager(t *testing.T, maxRetryCredentials int) (*Manager, *credentialRetryLimitExecutor) {
@@ -531,5 +713,184 @@ func TestManager_MarkResult_RespectsAuthDisableCoolingOverride(t *testing.T) {
 	}
 	if !state.NextRetryAfter.IsZero() {
 		t.Fatalf("expected NextRetryAfter to be zero when disable_cooling=true, got %v", state.NextRetryAfter)
+	}
+}
+
+func TestManager_ExecuteStream_ReturnsBootstrapTimeoutWhenNoAlternativeCredential(t *testing.T) {
+	m := NewManager(nil, nil, nil)
+	m.SetRetryConfig(0, 0, 1)
+
+	authID := uuid.NewString() + "-auth"
+	executor := &bootstrapTimeoutExecutor{id: "claude"}
+	m.RegisterExecutor(executor)
+
+	auth := &Auth{ID: authID, Provider: "claude", Status: StatusActive}
+	if _, err := m.Register(context.Background(), auth); err != nil {
+		t.Fatalf("register auth: %v", err)
+	}
+
+	reg := registry.GetGlobalRegistry()
+	reg.RegisterClient(authID, "claude", []*registry.ModelInfo{{ID: "test-model"}})
+	t.Cleanup(func() {
+		reg.UnregisterClient(authID)
+	})
+
+	ctx := context.WithValue(context.Background(), streamBootstrapTimeoutContextKey{}, 50*time.Millisecond)
+	_, err := m.ExecuteStream(ctx, []string{"claude"}, cliproxyexecutor.Request{Model: "test-model"}, cliproxyexecutor.Options{})
+	if err == nil {
+		t.Fatal("expected bootstrap timeout error")
+	}
+	var authErr *Error
+	if !errors.As(err, &authErr) {
+		t.Fatalf("error = %T %v, want *Error", err, err)
+	}
+	if authErr.Code != "stream_bootstrap_timeout" {
+		t.Fatalf("code = %q, want %q", authErr.Code, "stream_bootstrap_timeout")
+	}
+	if authErr.StatusCode() != http.StatusRequestTimeout {
+		t.Fatalf("status = %d, want %d", authErr.StatusCode(), http.StatusRequestTimeout)
+	}
+	if calls := executor.Calls(); calls != 1 {
+		t.Fatalf("expected 1 stream attempt, got %d", calls)
+	}
+}
+
+func TestManager_Execute_ReturnsExecuteTimeout(t *testing.T) {
+	m := NewManager(nil, nil, nil)
+	m.SetConfig(&internalconfig.Config{ExecuteTimeoutSeconds: 1})
+	executor := &executionTimeoutExecutor{id: "claude"}
+	m.RegisterExecutor(executor)
+	authID := uuid.NewString() + "-auth"
+	if _, err := m.Register(context.Background(), &Auth{ID: authID, Provider: "claude", Status: StatusActive}); err != nil {
+		t.Fatalf("register auth: %v", err)
+	}
+	reg := registry.GetGlobalRegistry()
+	reg.RegisterClient(authID, "claude", []*registry.ModelInfo{{ID: "test-model"}})
+	t.Cleanup(func() { reg.UnregisterClient(authID) })
+
+	start := time.Now()
+	_, err := m.Execute(context.Background(), []string{"claude"}, cliproxyexecutor.Request{Model: "test-model"}, cliproxyexecutor.Options{})
+	if err == nil {
+		t.Fatal("expected execute timeout")
+	}
+	var authErr *Error
+	if !errors.As(err, &authErr) {
+		t.Fatalf("error = %T %v, want *Error", err, err)
+	}
+	if authErr.Code != "execute_timeout" {
+		t.Fatalf("code = %q, want %q", authErr.Code, "execute_timeout")
+	}
+	if authErr.StatusCode() != http.StatusRequestTimeout {
+		t.Fatalf("status = %d, want %d", authErr.StatusCode(), http.StatusRequestTimeout)
+	}
+	if elapsed := time.Since(start); elapsed < 900*time.Millisecond || elapsed > 3*time.Second {
+		t.Fatalf("elapsed = %v, want about 1s", elapsed)
+	}
+	if calls := executor.Calls("execute"); calls != 1 {
+		t.Fatalf("execute calls = %d, want 1", calls)
+	}
+}
+
+func TestManager_ExecuteCount_ReturnsCountTimeout(t *testing.T) {
+	m := NewManager(nil, nil, nil)
+	m.SetConfig(&internalconfig.Config{CountTimeoutSeconds: 1})
+	executor := &executionTimeoutExecutor{id: "claude"}
+	m.RegisterExecutor(executor)
+	authID := uuid.NewString() + "-auth"
+	if _, err := m.Register(context.Background(), &Auth{ID: authID, Provider: "claude", Status: StatusActive}); err != nil {
+		t.Fatalf("register auth: %v", err)
+	}
+	reg := registry.GetGlobalRegistry()
+	reg.RegisterClient(authID, "claude", []*registry.ModelInfo{{ID: "test-model"}})
+	t.Cleanup(func() { reg.UnregisterClient(authID) })
+
+	_, err := m.ExecuteCount(context.Background(), []string{"claude"}, cliproxyexecutor.Request{Model: "test-model"}, cliproxyexecutor.Options{})
+	if err == nil {
+		t.Fatal("expected count timeout")
+	}
+	var authErr *Error
+	if !errors.As(err, &authErr) {
+		t.Fatalf("error = %T %v, want *Error", err, err)
+	}
+	if authErr.Code != "count_timeout" {
+		t.Fatalf("code = %q, want %q", authErr.Code, "count_timeout")
+	}
+	if authErr.StatusCode() != http.StatusRequestTimeout {
+		t.Fatalf("status = %d, want %d", authErr.StatusCode(), http.StatusRequestTimeout)
+	}
+	if calls := executor.Calls("count"); calls != 1 {
+		t.Fatalf("count calls = %d, want 1", calls)
+	}
+}
+
+func TestManager_ExecuteStream_FallsBackOnStreamConnectTimeout(t *testing.T) {
+	m := NewManager(nil, nil, nil)
+	m.SetConfig(&internalconfig.Config{StreamConnectTimeoutSeconds: 1})
+	executor := &executionTimeoutExecutor{id: "claude"}
+	m.RegisterExecutor(executor)
+	auth1 := uuid.NewString() + "-auth-1"
+	auth2 := uuid.NewString() + "-auth-2"
+	if _, err := m.Register(context.Background(), &Auth{ID: auth1, Provider: "claude", Status: StatusActive}); err != nil {
+		t.Fatalf("register auth1: %v", err)
+	}
+	if _, err := m.Register(context.Background(), &Auth{ID: auth2, Provider: "claude", Status: StatusActive}); err != nil {
+		t.Fatalf("register auth2: %v", err)
+	}
+	reg := registry.GetGlobalRegistry()
+	reg.RegisterClient(auth1, "claude", []*registry.ModelInfo{{ID: "test-model"}})
+	reg.RegisterClient(auth2, "claude", []*registry.ModelInfo{{ID: "test-model"}})
+	t.Cleanup(func() {
+		reg.UnregisterClient(auth1)
+		reg.UnregisterClient(auth2)
+	})
+
+	_, err := m.ExecuteStream(context.Background(), []string{"claude"}, cliproxyexecutor.Request{Model: "test-model"}, cliproxyexecutor.Options{})
+	if err == nil {
+		t.Fatal("expected stream connect timeout")
+	}
+	var authErr *Error
+	if !errors.As(err, &authErr) {
+		t.Fatalf("error = %T %v, want *Error", err, err)
+	}
+	if authErr.Code != "stream_connect_timeout" {
+		t.Fatalf("code = %q, want %q", authErr.Code, "stream_connect_timeout")
+	}
+	if authErr.StatusCode() != http.StatusRequestTimeout {
+		t.Fatalf("status = %d, want %d", authErr.StatusCode(), http.StatusRequestTimeout)
+	}
+	if calls := executor.Calls("stream"); calls != 2 {
+		t.Fatalf("stream calls = %d, want 2", calls)
+	}
+}
+
+func TestManager_ExecuteStream_DoesNotCancelStreamAfterSuccessfulConnect(t *testing.T) {
+	m := NewManager(nil, nil, nil)
+	m.SetConfig(&internalconfig.Config{StreamConnectTimeoutSeconds: 1})
+	executor := &streamContextCancellationExecutor{id: "claude", delay: 100 * time.Millisecond}
+	m.RegisterExecutor(executor)
+	authID := uuid.NewString() + "-auth"
+	if _, err := m.Register(context.Background(), &Auth{ID: authID, Provider: "claude", Status: StatusActive}); err != nil {
+		t.Fatalf("register auth: %v", err)
+	}
+	reg := registry.GetGlobalRegistry()
+	reg.RegisterClient(authID, "claude", []*registry.ModelInfo{{ID: "test-model"}})
+	t.Cleanup(func() { reg.UnregisterClient(authID) })
+
+	streamResult, err := m.ExecuteStream(context.Background(), []string{"claude"}, cliproxyexecutor.Request{Model: "test-model"}, cliproxyexecutor.Options{})
+	if err != nil {
+		t.Fatalf("execute stream: %v", err)
+	}
+	var payload []byte
+	for chunk := range streamResult.Chunks {
+		if chunk.Err != nil {
+			t.Fatalf("unexpected stream error: %v", chunk.Err)
+		}
+		payload = append(payload, chunk.Payload...)
+	}
+	if string(payload) != "ok" {
+		t.Fatalf("payload = %q, want %q", string(payload), "ok")
+	}
+	if calls := executor.Calls(); calls != 1 {
+		t.Fatalf("stream calls = %d, want 1", calls)
 	}
 }
