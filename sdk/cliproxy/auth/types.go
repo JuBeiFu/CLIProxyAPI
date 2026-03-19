@@ -289,6 +289,32 @@ func (a *Auth) RequestRetryOverride() (int, bool) {
 	return 0, false
 }
 
+// SameAuthRetryOverride returns the auth-file scoped same_auth_retry override when present.
+// The value is read from metadata key "same_auth_retry" (or legacy "same-auth-retry").
+// Unlike request_retry, this only controls immediate retries against the same credential.
+func (a *Auth) SameAuthRetryOverride() (int, bool) {
+	if a == nil || a.Metadata == nil {
+		return 0, false
+	}
+	if val, ok := a.Metadata["same_auth_retry"]; ok {
+		if parsed, okParse := parseIntAny(val); okParse {
+			if parsed < 0 {
+				parsed = 0
+			}
+			return parsed, true
+		}
+	}
+	if val, ok := a.Metadata["same-auth-retry"]; ok {
+		if parsed, okParse := parseIntAny(val); okParse {
+			if parsed < 0 {
+				parsed = 0
+			}
+			return parsed, true
+		}
+	}
+	return 0, false
+}
+
 func parseBoolAny(val any) (bool, bool) {
 	switch typed := val.(type) {
 	case bool:

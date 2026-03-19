@@ -69,8 +69,6 @@ const (
 	refreshFailureBackoff = 5 * time.Minute
 	quotaBackoffBase      = time.Second
 	quotaBackoffMax       = 30 * time.Minute
-	sameAuthRetryMinWait  = 5 * time.Second
-	sameAuthRetryMaxWait  = 10 * time.Second
 	revokedDeleteTimeout  = 30 * time.Second
 	revokedDeleteQueueCap = 1024
 
@@ -87,6 +85,8 @@ const (
 	defaultExecuteAttemptTimeout  = 90 * time.Second
 	defaultCountAttemptTimeout    = 30 * time.Second
 	defaultStreamConnectTimeout   = 30 * time.Second
+	sameAuthRetryMinWait          = 500 * time.Millisecond
+	sameAuthRetryMaxWait          = 1500 * time.Millisecond
 )
 
 const (
@@ -111,6 +111,9 @@ func streamBootstrapTimeout(ctx context.Context) time.Duration {
 			return override
 		}
 	}
+	if cfg := runtimeConfigFromContext(ctx); cfg != nil && cfg.Streaming.BootstrapTimeoutSeconds > 0 {
+		return time.Duration(cfg.Streaming.BootstrapTimeoutSeconds) * time.Second
+	}
 	return streamBootstrapPayloadTimeout
 }
 
@@ -131,6 +134,14 @@ func attemptTimeout(ctx context.Context, fallback time.Duration, selector func(*
 }
 
 type managerRuntimeConfigContextKey struct{}
+
+func runtimeConfigFromContext(ctx context.Context) *internalconfig.Config {
+	if ctx == nil {
+		return nil
+	}
+	cfg, _ := ctx.Value(managerRuntimeConfigContextKey{}).(*internalconfig.Config)
+	return cfg
+}
 
 func attachManagerRuntimeConfig(ctx context.Context, cfg *internalconfig.Config) context.Context {
 	if ctx == nil {
@@ -1247,7 +1258,6 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 	}
 	routeModel := req.Model
 	opts = ensureRequestedModelMetadata(opts, routeModel)
-	requestRetry, _, _ := m.retrySettings()
 	tried := make(map[string]struct{})
 	var lastErr error
 	for {
@@ -1289,7 +1299,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			execCtx = context.WithValue(execCtx, "cliproxy.roundtripper", rt)
 		}
 
-		sameAuthRetries := effectiveRequestRetry(requestRetry, auth)
+		sameAuthRetries := effectiveSameAuthRetry(auth)
 		revokedRefreshAttempted := false
 		for authAttempt := 0; ; authAttempt++ {
 			if authAttempt > 0 {
@@ -1402,7 +1412,6 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 	}
 	routeModel := req.Model
 	opts = ensureRequestedModelMetadata(opts, routeModel)
-	requestRetry, _, _ := m.retrySettings()
 	tried := make(map[string]struct{})
 	var lastErr error
 	for {
@@ -1444,7 +1453,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 			execCtx = context.WithValue(execCtx, "cliproxy.roundtripper", rt)
 		}
 
-		sameAuthRetries := effectiveRequestRetry(requestRetry, auth)
+		sameAuthRetries := effectiveSameAuthRetry(auth)
 		for authAttempt := 0; ; authAttempt++ {
 			if authAttempt > 0 {
 				preparedAuth, errPrepare = m.preparePickedAuth(auth, provider, routeModel)
@@ -1521,7 +1530,6 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 	}
 	routeModel := req.Model
 	opts = ensureRequestedModelMetadata(opts, routeModel)
-	requestRetry, _, _ := m.retrySettings()
 	tried := make(map[string]struct{})
 	var lastErr error
 	for {
@@ -1563,7 +1571,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			execCtx = context.WithValue(execCtx, "cliproxy.roundtripper", rt)
 		}
 
-		sameAuthRetries := effectiveRequestRetry(requestRetry, auth)
+		sameAuthRetries := effectiveSameAuthRetry(auth)
 		for authAttempt := 0; ; authAttempt++ {
 			if authAttempt > 0 {
 				preparedAuth, errPrepare = m.preparePickedAuth(auth, provider, routeModel)
@@ -1966,6 +1974,18 @@ func effectiveRequestRetry(defaultRetry int, auth *Auth) int {
 		return 0
 	}
 	return defaultRetry
+}
+
+func effectiveSameAuthRetry(auth *Auth) int {
+	if auth != nil {
+		if override, ok := auth.SameAuthRetryOverride(); ok {
+			if override < 0 {
+				return 0
+			}
+			return override
+		}
+	}
+	return 0
 }
 
 func isPoolExhaustedPickError(err error) bool {
@@ -2698,6 +2718,8 @@ func isRequestInvalidError(err error) bool {
 
 // shouldRetryAcrossAuths returns true only for auth/model specific restriction
 // failures where switching credentials has a reasonable chance to succeed.
+// Transport/bootstrap timeouts are deliberately excluded because they are usually
+// infrastructure or proxy-pool failures; rotating the auth pool only amplifies latency.
 func shouldRetryAcrossAuths(err error) bool {
 	if err == nil || isRequestInvalidError(err) {
 		return false
@@ -2709,7 +2731,7 @@ func shouldRetryAcrossAuths(err error) bool {
 		return false
 	}
 	switch statusCodeFromError(err) {
-	case http.StatusUnauthorized, http.StatusPaymentRequired, http.StatusForbidden, http.StatusNotFound, http.StatusRequestTimeout, http.StatusTooManyRequests:
+	case http.StatusUnauthorized, http.StatusPaymentRequired, http.StatusForbidden, http.StatusNotFound, http.StatusTooManyRequests:
 		return true
 	default:
 		return false
@@ -3455,8 +3477,27 @@ func (m *Manager) persist(ctx context.Context, auth *Auth) error {
 	if auth.Metadata == nil {
 		return nil
 	}
-	_, err := m.store.Save(ctx, auth)
+	persistAuth := sanitizeAuthForPersist(auth)
+	if persistAuth == nil || persistAuth.Metadata == nil {
+		return nil
+	}
+	_, err := m.store.Save(ctx, persistAuth)
 	return err
+}
+
+func sanitizeAuthForPersist(auth *Auth) *Auth {
+	if auth == nil {
+		return nil
+	}
+	sanitized := auth.Clone()
+	if sanitized.Metadata == nil {
+		return sanitized
+	}
+	delete(sanitized.Metadata, metadataCooldownUntilKey)
+	delete(sanitized.Metadata, metadataCooldownReasonKey)
+	delete(sanitized.Metadata, metadataQuotaProbeLastKey)
+	delete(sanitized.Metadata, metadataQuotaProbeAfterKey)
+	return sanitized
 }
 
 // StartAutoRefresh launches a background loop that evaluates auth freshness

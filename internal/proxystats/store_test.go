@@ -117,3 +117,37 @@ func TestWrapResponseRecordsResponseLifecycle(t *testing.T) {
 		t.Fatalf("recent provider = %q, want claude", snapshot.Recent[0].Provider)
 	}
 }
+
+func TestStorePreferredProxyOrder_PenalizesRecentTransportFailures(t *testing.T) {
+	store := NewStore(8)
+	now := time.Date(2026, 3, 19, 10, 0, 0, 0, time.UTC)
+
+	store.Record(Attempt{
+		Timestamp:        now.Add(-5 * time.Second),
+		StartedAt:        now.Add(-6 * time.Second),
+		CompletedAt:      now.Add(-5 * time.Second),
+		ProxyURL:         "http://proxy-a:8080",
+		ProxyDisplay:     "http://proxy-a:8080",
+		Success:          false,
+		ResponseReceived: false,
+		TotalDurationMs:  100,
+		Error:            "dial tcp timeout",
+	})
+	store.Record(Attempt{
+		Timestamp:           now.Add(-3 * time.Second),
+		StartedAt:           now.Add(-4 * time.Second),
+		CompletedAt:         now.Add(-3 * time.Second),
+		ProxyURL:            "http://proxy-b:8080",
+		ProxyDisplay:        "http://proxy-b:8080",
+		Success:             true,
+		ResponseReceived:    true,
+		StatusCode:          200,
+		FirstByteDurationMs: 20,
+		TotalDurationMs:     80,
+	})
+
+	ordered := store.PreferredProxyOrder([]string{"http://proxy-a:8080", "http://proxy-b:8080"}, 0, now)
+	if got := strings.Join(ordered, ","); got != "http://proxy-b:8080,http://proxy-a:8080" {
+		t.Fatalf("ordered proxies = %q, want healthy proxy first", got)
+	}
+}

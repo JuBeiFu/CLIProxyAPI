@@ -69,6 +69,15 @@ func TestManager_ShouldRetryAfterError_RespectsAuthRequestRetryOverride(t *testi
 	}
 }
 
+func TestShouldRetryAcrossAuths_DoesNotRetryTimeouts(t *testing.T) {
+	if shouldRetryAcrossAuths(&Error{HTTPStatus: http.StatusRequestTimeout, Message: "stream bootstrap timeout"}) {
+		t.Fatal("expected request timeout to stop cross-auth rotation")
+	}
+	if !shouldRetryAcrossAuths(&Error{HTTPStatus: http.StatusTooManyRequests, Message: "rate limited"}) {
+		t.Fatal("expected 429 to remain cross-auth retryable")
+	}
+}
+
 type credentialRetryLimitExecutor struct {
 	id string
 
@@ -226,14 +235,15 @@ func newSameAuthRetryTestManager(t *testing.T, retry int, err error) (*Manager, 
 	t.Helper()
 
 	m := NewManager(nil, nil, nil)
-	m.SetRetryConfig(retry, 30*time.Second, 0)
+	m.SetRetryConfig(0, 30*time.Second, 0)
 
 	executor := &sameAuthRetryExecutor{id: "claude", err: err}
 	m.RegisterExecutor(executor)
 
 	baseID := uuid.NewString()
-	auth1 := &Auth{ID: baseID + "-auth-1", Provider: "claude"}
-	auth2 := &Auth{ID: baseID + "-auth-2", Provider: "claude"}
+	authMeta := map[string]any{"same_auth_retry": float64(retry)}
+	auth1 := &Auth{ID: baseID + "-auth-1", Provider: "claude", Metadata: authMeta}
+	auth2 := &Auth{ID: baseID + "-auth-2", Provider: "claude", Metadata: map[string]any{"same_auth_retry": float64(retry)}}
 
 	reg := registry.GetGlobalRegistry()
 	reg.RegisterClient(auth1.ID, "claude", []*registry.ModelInfo{{ID: "test-model"}})
@@ -602,6 +612,34 @@ func TestManager_NonSwitchableErrors_RetryCurrentAuthOnly(t *testing.T) {
 	}
 }
 
+func TestManager_RequestRetry_DoesNotRetrySameAuthByDefault(t *testing.T) {
+	prevDelay := sameAuthRetryDelayFunc
+	sameAuthRetryDelayFunc = func() time.Duration { return 0 }
+	t.Cleanup(func() { sameAuthRetryDelayFunc = prevDelay })
+
+	m := NewManager(nil, nil, nil)
+	m.SetRetryConfig(2, 30*time.Second, 0)
+	executor := &sameAuthRetryExecutor{id: "claude", err: errors.New("stream disconnected before completion")}
+	m.RegisterExecutor(executor)
+
+	authID := uuid.NewString() + "-auth"
+	if _, err := m.Register(context.Background(), &Auth{ID: authID, Provider: "claude"}); err != nil {
+		t.Fatalf("register auth: %v", err)
+	}
+
+	reg := registry.GetGlobalRegistry()
+	reg.RegisterClient(authID, "claude", []*registry.ModelInfo{{ID: "test-model"}})
+	t.Cleanup(func() { reg.UnregisterClient(authID) })
+
+	_, err := m.Execute(context.Background(), []string{"claude"}, cliproxyexecutor.Request{Model: "test-model"}, cliproxyexecutor.Options{})
+	if err == nil {
+		t.Fatal("expected non-switchable error")
+	}
+	if calls := executor.Calls(); calls != 1 {
+		t.Fatalf("expected manager request-retry to avoid same-auth retries by default, got %d calls", calls)
+	}
+}
+
 func TestNextSameAuthRetryDelay_Range(t *testing.T) {
 	for i := 0; i < 32; i++ {
 		wait := nextSameAuthRetryDelay()
@@ -755,6 +793,43 @@ func TestManager_ExecuteStream_ReturnsBootstrapTimeoutWhenNoAlternativeCredentia
 	}
 }
 
+func TestManager_ExecuteStream_UsesConfiguredBootstrapTimeout(t *testing.T) {
+	m := NewManager(nil, nil, nil)
+	m.SetRetryConfig(0, 0, 1)
+	m.SetConfig(&internalconfig.Config{SDKConfig: internalconfig.SDKConfig{Streaming: internalconfig.StreamingConfig{BootstrapTimeoutSeconds: 1}}})
+
+	authID := uuid.NewString() + "-auth"
+	executor := &bootstrapTimeoutExecutor{id: "claude"}
+	m.RegisterExecutor(executor)
+
+	auth := &Auth{ID: authID, Provider: "claude", Status: StatusActive}
+	if _, err := m.Register(context.Background(), auth); err != nil {
+		t.Fatalf("register auth: %v", err)
+	}
+
+	reg := registry.GetGlobalRegistry()
+	reg.RegisterClient(authID, "claude", []*registry.ModelInfo{{ID: "test-model"}})
+	t.Cleanup(func() {
+		reg.UnregisterClient(authID)
+	})
+
+	start := time.Now()
+	_, err := m.ExecuteStream(context.Background(), []string{"claude"}, cliproxyexecutor.Request{Model: "test-model"}, cliproxyexecutor.Options{})
+	if err == nil {
+		t.Fatal("expected bootstrap timeout error")
+	}
+	var authErr *Error
+	if !errors.As(err, &authErr) {
+		t.Fatalf("error = %T %v, want *Error", err, err)
+	}
+	if authErr.Code != "stream_bootstrap_timeout" {
+		t.Fatalf("code = %q, want %q", authErr.Code, "stream_bootstrap_timeout")
+	}
+	if elapsed := time.Since(start); elapsed < 900*time.Millisecond || elapsed > 3*time.Second {
+		t.Fatalf("elapsed = %v, want about 1s configured bootstrap timeout", elapsed)
+	}
+}
+
 func TestManager_Execute_ReturnsExecuteTimeout(t *testing.T) {
 	m := NewManager(nil, nil, nil)
 	m.SetConfig(&internalconfig.Config{ExecuteTimeoutSeconds: 1})
@@ -823,7 +898,7 @@ func TestManager_ExecuteCount_ReturnsCountTimeout(t *testing.T) {
 	}
 }
 
-func TestManager_ExecuteStream_FallsBackOnStreamConnectTimeout(t *testing.T) {
+func TestManager_ExecuteStream_DoesNotRotateAuthPoolOnStreamConnectTimeout(t *testing.T) {
 	m := NewManager(nil, nil, nil)
 	m.SetConfig(&internalconfig.Config{StreamConnectTimeoutSeconds: 1})
 	executor := &executionTimeoutExecutor{id: "claude"}
@@ -858,8 +933,8 @@ func TestManager_ExecuteStream_FallsBackOnStreamConnectTimeout(t *testing.T) {
 	if authErr.StatusCode() != http.StatusRequestTimeout {
 		t.Fatalf("status = %d, want %d", authErr.StatusCode(), http.StatusRequestTimeout)
 	}
-	if calls := executor.Calls("stream"); calls != 2 {
-		t.Fatalf("stream calls = %d, want 2", calls)
+	if calls := executor.Calls("stream"); calls != 1 {
+		t.Fatalf("stream calls = %d, want 1", calls)
 	}
 }
 

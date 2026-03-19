@@ -62,6 +62,65 @@ func TestWithSkipPersist_DisablesRegisterPersistence(t *testing.T) {
 	}
 }
 
+type capturingStore struct {
+	saveCount atomic.Int32
+	lastAuth  atomic.Pointer[Auth]
+}
+
+func (s *capturingStore) List(context.Context) ([]*Auth, error) { return nil, nil }
+
+func (s *capturingStore) Save(_ context.Context, auth *Auth) (string, error) {
+	s.saveCount.Add(1)
+	if auth != nil {
+		s.lastAuth.Store(auth.Clone())
+	}
+	return "", nil
+}
+
+func (s *capturingStore) Delete(context.Context, string) error { return nil }
+
+func TestManager_Persist_StripsTransientMetadataKeys(t *testing.T) {
+	store := &capturingStore{}
+	mgr := NewManager(store, nil, nil)
+	auth := &Auth{
+		ID:       "auth-1",
+		Provider: "codex",
+		Metadata: map[string]any{
+			"type":                    "codex",
+			metadataCooldownUntilKey:  time.Now().Add(time.Minute).Unix(),
+			metadataCooldownReasonKey: "quota",
+			metadataQuotaProbeLastKey: time.Now().Unix(),
+			metadataQuotaProbeAfterKey: time.Now().
+				Add(15 * time.Minute).
+				Unix(),
+			metadataAutoDisabledReasonKey: autoDisabledReasonQuotaExhausted,
+		},
+	}
+
+	if _, err := mgr.Update(context.Background(), auth); err != nil {
+		t.Fatalf("Update returned error: %v", err)
+	}
+
+	saved := store.lastAuth.Load()
+	if saved == nil {
+		t.Fatal("expected captured auth")
+	}
+	if _, ok := saved.Metadata[metadataCooldownUntilKey]; ok {
+		t.Fatalf("expected %q to be stripped before persistence", metadataCooldownUntilKey)
+	}
+	if _, ok := saved.Metadata[metadataCooldownReasonKey]; ok {
+		t.Fatalf("expected %q to be stripped before persistence", metadataCooldownReasonKey)
+	}
+	if _, ok := saved.Metadata[metadataQuotaProbeLastKey]; ok {
+		t.Fatalf("expected %q to be stripped before persistence", metadataQuotaProbeLastKey)
+	}
+	if _, ok := saved.Metadata[metadataQuotaProbeAfterKey]; ok {
+		t.Fatalf("expected %q to be stripped before persistence", metadataQuotaProbeAfterKey)
+	}
+	if got := saved.Metadata[metadataAutoDisabledReasonKey]; got != autoDisabledReasonQuotaExhausted {
+		t.Fatalf("expected durable auto-disabled reason to remain, got %#v", got)
+	}
+}
 
 type blockingStore struct {
 	saveStarted chan struct{}

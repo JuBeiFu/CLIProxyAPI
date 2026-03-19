@@ -99,11 +99,19 @@ type proxyMetrics struct {
 	PlanTypes           map[string]int64
 	AuthKinds           map[string]int64
 	SelectionSources    map[string]int64
+	LastSuccessAt       time.Time
+	LastTransportFailAt time.Time
+	TransportFailStreak int
 }
 
 var defaultStore = NewStore(400)
 
 func DefaultStore() *Store { return defaultStore }
+
+const (
+	transportFailureCooldownBase = 15 * time.Second
+	transportFailureCooldownMax  = 2 * time.Minute
+)
 
 func NewStore(maxRecent int) *Store {
 	if maxRecent <= 0 {
@@ -171,8 +179,16 @@ func (s *Store) Record(attempt Attempt) {
 	}
 	if attempt.ResponseReceived {
 		metric.ResponseCount++
+		if !attempt.CompletedAt.IsZero() {
+			metric.LastSuccessAt = attempt.CompletedAt
+		}
+		metric.TransportFailStreak = 0
 	} else {
 		metric.TransportErrorCount++
+		if !attempt.CompletedAt.IsZero() {
+			metric.LastTransportFailAt = attempt.CompletedAt
+		}
+		metric.TransportFailStreak++
 	}
 	if attempt.ResponseReceived && attempt.StatusCode >= 400 {
 		metric.HTTPErrorCount++
@@ -265,6 +281,83 @@ func (s *Store) Snapshot() Snapshot {
 	return snapshot
 }
 
+// PreferredProxyOrder returns the proxy list reordered by current health, while
+// still rotating healthy peers to avoid hot-spotting a single proxy.
+func (s *Store) PreferredProxyOrder(proxyURLs []string, seed uint64, now time.Time) []string {
+	if len(proxyURLs) <= 1 {
+		return append([]string(nil), proxyURLs...)
+	}
+	type candidate struct {
+		index         int
+		proxyURL      string
+		cooldownUntil time.Time
+		failStreak    int
+		successRate   float64
+		totalAttempts int64
+	}
+
+	candidates := make([]candidate, 0, len(proxyURLs))
+	if now.IsZero() {
+		now = time.Now()
+	}
+
+	s.mu.RLock()
+	for idx, raw := range proxyURLs {
+		display := strings.TrimSpace(RedactProxyURL(raw))
+		item := candidate{
+			index:    idx,
+			proxyURL: raw,
+		}
+		if metric := s.proxies[display]; metric != nil {
+			item.failStreak = metric.TransportFailStreak
+			item.totalAttempts = metric.TotalAttempts
+			if metric.TotalAttempts > 0 {
+				item.successRate = float64(metric.SuccessCount) / float64(metric.TotalAttempts)
+			}
+			item.cooldownUntil = transportFailureCooldownUntil(metric)
+		}
+		candidates = append(candidates, item)
+	}
+	s.mu.RUnlock()
+
+	sort.SliceStable(candidates, func(i, j int) bool {
+		iCooling := candidates[i].cooldownUntil.After(now)
+		jCooling := candidates[j].cooldownUntil.After(now)
+		if iCooling != jCooling {
+			return !iCooling
+		}
+		if iCooling && jCooling && !candidates[i].cooldownUntil.Equal(candidates[j].cooldownUntil) {
+			return candidates[i].cooldownUntil.Before(candidates[j].cooldownUntil)
+		}
+		if candidates[i].failStreak != candidates[j].failStreak {
+			return candidates[i].failStreak < candidates[j].failStreak
+		}
+		if candidates[i].successRate != candidates[j].successRate {
+			return candidates[i].successRate > candidates[j].successRate
+		}
+		if candidates[i].totalAttempts != candidates[j].totalAttempts {
+			return candidates[i].totalAttempts < candidates[j].totalAttempts
+		}
+		return candidates[i].index < candidates[j].index
+	})
+
+	healthy := make([]string, 0, len(candidates))
+	cooling := make([]string, 0, len(candidates))
+	for _, item := range candidates {
+		if item.cooldownUntil.After(now) {
+			cooling = append(cooling, item.proxyURL)
+			continue
+		}
+		healthy = append(healthy, item.proxyURL)
+	}
+	healthy = rotateProxyURLs(healthy, seed)
+	cooling = rotateProxyURLs(cooling, seed)
+	ordered := make([]string, 0, len(proxyURLs))
+	ordered = append(ordered, healthy...)
+	ordered = append(ordered, cooling...)
+	return ordered
+}
+
 func normalizeAttempt(attempt Attempt) Attempt {
 	attempt.ProxyURL = strings.TrimSpace(RedactProxyURL(attempt.ProxyURL))
 	attempt.ProxyDisplay = strings.TrimSpace(attempt.ProxyDisplay)
@@ -321,4 +414,33 @@ func RedactProxyURL(raw string) string {
 		parsed.User = nil
 	}
 	return parsed.String()
+}
+
+func rotateProxyURLs(proxyURLs []string, seed uint64) []string {
+	if len(proxyURLs) <= 1 {
+		return append([]string(nil), proxyURLs...)
+	}
+	start := int(seed % uint64(len(proxyURLs)))
+	rotated := make([]string, 0, len(proxyURLs))
+	rotated = append(rotated, proxyURLs[start:]...)
+	rotated = append(rotated, proxyURLs[:start]...)
+	return rotated
+}
+
+func transportFailureCooldownUntil(metric *proxyMetrics) time.Time {
+	if metric == nil || metric.TransportFailStreak <= 0 || metric.LastTransportFailAt.IsZero() {
+		return time.Time{}
+	}
+	if !metric.LastSuccessAt.IsZero() && metric.LastSuccessAt.After(metric.LastTransportFailAt) {
+		return time.Time{}
+	}
+	cooldown := transportFailureCooldownBase
+	for step := 1; step < metric.TransportFailStreak; step++ {
+		cooldown *= 2
+		if cooldown >= transportFailureCooldownMax {
+			cooldown = transportFailureCooldownMax
+			break
+		}
+	}
+	return metric.LastTransportFailAt.Add(cooldown)
 }

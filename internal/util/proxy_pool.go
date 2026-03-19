@@ -70,11 +70,8 @@ func OrderedProxyURLs(raw string) []string {
 	if len(proxies) <= 1 {
 		return proxies
 	}
-	start := int(proxyPoolCounter.Add(1)-1) % len(proxies)
-	ordered := make([]string, 0, len(proxies))
-	ordered = append(ordered, proxies[start:]...)
-	ordered = append(ordered, proxies[:start]...)
-	return ordered
+	seed := proxyPoolCounter.Add(1) - 1
+	return proxystats.DefaultStore().PreferredProxyOrder(proxies, seed, time.Now())
 }
 
 // NewProxyPoolTransport creates a RoundTripper that load-balances across the
@@ -187,22 +184,21 @@ func (p *proxyPoolTransport) RoundTrip(req *http.Request) (*http.Response, error
 		return nil, errors.New("proxy pool transport: nil request")
 	}
 	var lastErr error
-	start := 0
+	seed := uint64(0)
 	if len(p.entries) > 1 {
-		start = int(proxyPoolCounter.Add(1)-1) % len(p.entries)
+		seed = proxyPoolCounter.Add(1) - 1
 	}
-	for attempt := 0; attempt < len(p.entries); attempt++ {
-		idx := (start + attempt) % len(p.entries)
+	for attempt, entry := range p.orderedEntries(seed) {
 		retryReq, errClone := cloneRequestForRetry(req)
 		if errClone != nil {
 			return nil, errClone
 		}
 		attemptStarted := time.Now()
-		resp, err := p.entries[idx].transport.RoundTrip(retryReq)
+		resp, err := entry.transport.RoundTrip(retryReq)
 		if err == nil {
-			return proxystats.WrapResponse(req.Context(), p.entries[idx].proxyURL, attemptStarted, resp), nil
+			return proxystats.WrapResponse(req.Context(), entry.proxyURL, attemptStarted, resp), nil
 		}
-		proxystats.RecordTransportFailure(req.Context(), p.entries[idx].proxyURL, attemptStarted, err)
+		proxystats.RecordTransportFailure(req.Context(), entry.proxyURL, attemptStarted, err)
 		lastErr = err
 		if attempt+1 >= len(p.entries) || !isRetryableProxyTransportError(err) {
 			return nil, err
@@ -217,13 +213,12 @@ func (p *proxyPoolTransport) RoundTrip(req *http.Request) (*http.Response, error
 
 func (p *proxyPoolDialer) Dial(network, addr string) (net.Conn, error) {
 	var lastErr error
-	start := 0
+	seed := uint64(0)
 	if len(p.entries) > 1 {
-		start = int(proxyPoolCounter.Add(1)-1) % len(p.entries)
+		seed = proxyPoolCounter.Add(1) - 1
 	}
-	for attempt := 0; attempt < len(p.entries); attempt++ {
-		idx := (start + attempt) % len(p.entries)
-		conn, err := p.entries[idx].dialer.Dial(network, addr)
+	for attempt, entry := range p.orderedEntries(seed) {
+		conn, err := entry.dialer.Dial(network, addr)
 		if err == nil {
 			return conn, nil
 		}
@@ -255,6 +250,52 @@ func buildProxyDialer(proxyURL string, forward proxy.Dialer) (proxy.Dialer, bool
 		return nil, false
 	}
 	return dialer, true
+}
+
+func (p *proxyPoolTransport) orderedEntries(seed uint64) []proxyTransportEntry {
+	if p == nil || len(p.entries) == 0 {
+		return nil
+	}
+	if len(p.entries) == 1 {
+		return []proxyTransportEntry{p.entries[0]}
+	}
+	proxyURLs := make([]string, 0, len(p.entries))
+	entryByURL := make(map[string]proxyTransportEntry, len(p.entries))
+	for _, entry := range p.entries {
+		proxyURLs = append(proxyURLs, entry.proxyURL)
+		entryByURL[entry.proxyURL] = entry
+	}
+	orderedURLs := proxystats.DefaultStore().PreferredProxyOrder(proxyURLs, seed, time.Now())
+	ordered := make([]proxyTransportEntry, 0, len(orderedURLs))
+	for _, proxyURL := range orderedURLs {
+		if entry, ok := entryByURL[proxyURL]; ok {
+			ordered = append(ordered, entry)
+		}
+	}
+	return ordered
+}
+
+func (p *proxyPoolDialer) orderedEntries(seed uint64) []proxyDialerEntry {
+	if p == nil || len(p.entries) == 0 {
+		return nil
+	}
+	if len(p.entries) == 1 {
+		return []proxyDialerEntry{p.entries[0]}
+	}
+	proxyURLs := make([]string, 0, len(p.entries))
+	entryByURL := make(map[string]proxyDialerEntry, len(p.entries))
+	for _, entry := range p.entries {
+		proxyURLs = append(proxyURLs, entry.proxyURL)
+		entryByURL[entry.proxyURL] = entry
+	}
+	orderedURLs := proxystats.DefaultStore().PreferredProxyOrder(proxyURLs, seed, time.Now())
+	ordered := make([]proxyDialerEntry, 0, len(orderedURLs))
+	for _, proxyURL := range orderedURLs {
+		if entry, ok := entryByURL[proxyURL]; ok {
+			ordered = append(ordered, entry)
+		}
+	}
+	return ordered
 }
 
 func cloneDefaultTransport() *http.Transport {

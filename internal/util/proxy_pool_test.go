@@ -7,6 +7,9 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/proxystats"
 )
 
 type roundTripperFunc func(*http.Request) (*http.Response, error)
@@ -17,6 +20,7 @@ func (fn roundTripperFunc) RoundTrip(req *http.Request) (*http.Response, error) 
 
 func TestOrderedProxyURLs_RotatesStartIndex(t *testing.T) {
 	proxyPoolCounter.Store(0)
+	proxystats.DefaultStore().Reset()
 
 	first := OrderedProxyURLs("http://proxy-1,http://proxy-2,http://proxy-3")
 	second := OrderedProxyURLs("http://proxy-1,http://proxy-2,http://proxy-3")
@@ -29,7 +33,35 @@ func TestOrderedProxyURLs_RotatesStartIndex(t *testing.T) {
 	}
 }
 
+func TestOrderedProxyURLs_PrefersHealthyProxyOverCoolingProxy(t *testing.T) {
+	proxyPoolCounter.Store(0)
+	proxystats.DefaultStore().Reset()
+	t.Cleanup(func() { proxystats.DefaultStore().Reset() })
+
+	now := time.Now()
+	proxystats.DefaultStore().Record(proxystats.Attempt{
+		Timestamp:        now,
+		StartedAt:        now.Add(-100 * time.Millisecond),
+		CompletedAt:      now,
+		ProxyURL:         "http://proxy-1",
+		ProxyDisplay:     "http://proxy-1",
+		Success:          false,
+		ResponseReceived: false,
+		TotalDurationMs:  100,
+		Error:            "dial tcp timeout",
+	})
+
+	ordered := OrderedProxyURLs("http://proxy-1,http://proxy-2")
+	if got, want := strings.Join(ordered, ","), "http://proxy-2,http://proxy-1"; got != want {
+		t.Fatalf("ordered = %q, want %q", got, want)
+	}
+}
+
 func TestProxyPoolTransport_FallsBackAndReplaysBody(t *testing.T) {
+	proxyPoolCounter.Store(0)
+	proxystats.DefaultStore().Reset()
+	t.Cleanup(func() { proxystats.DefaultStore().Reset() })
+
 	var seenBodies []string
 	transport := &proxyPoolTransport{
 		entries: []proxyTransportEntry{
@@ -80,6 +112,8 @@ func TestProxyPoolTransport_FallsBackAndReplaysBody(t *testing.T) {
 
 func TestProxyPoolTransport_DoesNotFallbackOnContextCancellation(t *testing.T) {
 	proxyPoolCounter.Store(0)
+	proxystats.DefaultStore().Reset()
+	t.Cleanup(func() { proxystats.DefaultStore().Reset() })
 
 	transport := &proxyPoolTransport{
 		entries: []proxyTransportEntry{
