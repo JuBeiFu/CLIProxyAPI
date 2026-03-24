@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/proxystats"
+	"golang.org/x/net/proxy"
 )
 
 type roundTripperFunc func(*http.Request) (*http.Response, error)
@@ -144,5 +145,56 @@ func TestProxyPoolTransport_DoesNotFallbackOnContextCancellation(t *testing.T) {
 
 	if _, errRoundTrip := transport.RoundTrip(canceledReq); !errors.Is(errRoundTrip, context.Canceled) {
 		t.Fatalf("expected context.Canceled, got %v", errRoundTrip)
+	}
+}
+
+func TestNewProxyPoolTransport_DirectModeDisablesEnvironmentProxy(t *testing.T) {
+	rt := NewProxyPoolTransport("direct")
+	transport, ok := rt.(*http.Transport)
+	if !ok || transport == nil {
+		t.Fatalf("expected *http.Transport, got %T", rt)
+	}
+	if transport.Proxy != nil {
+		t.Fatal("expected direct transport to disable proxy function")
+	}
+}
+
+func TestNewProxyDialer_DirectModeReturnsDirectDialer(t *testing.T) {
+	if got := NewProxyDialer("none", nil); got != proxy.Direct {
+		t.Fatalf("expected proxy.Direct, got %T", got)
+	}
+}
+
+func TestBuildProxyTransport_DirectModeDisablesEnvironmentProxy(t *testing.T) {
+	transport := BuildProxyTransport("direct")
+	if transport == nil {
+		t.Fatal("expected non-nil transport")
+	}
+	if transport.Proxy != nil {
+		t.Fatal("expected direct transport to disable proxy function")
+	}
+	if transport.DialContext == nil {
+		t.Fatal("expected cloned transport to preserve dial context")
+	}
+}
+
+func TestHasUsableProxyConfig(t *testing.T) {
+	tests := []struct {
+		name string
+		raw  string
+		want bool
+	}{
+		{name: "empty", raw: "", want: false},
+		{name: "direct", raw: "direct", want: true},
+		{name: "none", raw: "none", want: true},
+		{name: "http", raw: "http://proxy.example.com:8080", want: true},
+		{name: "poolWithOneValid", raw: "bad-value, http://proxy.example.com:8080", want: true},
+		{name: "invalid", raw: "bad-value", want: false},
+	}
+
+	for _, tt := range tests {
+		if got := HasUsableProxyConfig(tt.raw); got != tt.want {
+			t.Fatalf("%s: HasUsableProxyConfig(%q) = %v, want %v", tt.name, tt.raw, got, tt.want)
+		}
 	}
 }

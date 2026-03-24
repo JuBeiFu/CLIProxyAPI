@@ -244,6 +244,9 @@ func ToolNameMapFromClaudeRequest(rawJSON []byte) map[string]string {
 	tools.ForEach(func(_, tool gjson.Result) bool {
 		name := strings.TrimSpace(tool.Get("name").String())
 		if name == "" {
+			name = strings.TrimSpace(tool.Get("function.name").String())
+		}
+		if name == "" {
 			return true
 		}
 		key := CanonicalToolName(name)
@@ -270,4 +273,52 @@ func MapToolName(toolNameMap map[string]string, name string) string {
 		return mapped
 	}
 	return name
+}
+
+// SanitizedToolNameMap builds a sanitized-name -> original-name map from request tools.
+// It supports both Claude-format tools[].name and OpenAI-format tools[].function.name.
+func SanitizedToolNameMap(rawJSON []byte) map[string]string {
+	if len(rawJSON) == 0 || !gjson.ValidBytes(rawJSON) {
+		return nil
+	}
+
+	tools := gjson.GetBytes(rawJSON, "tools")
+	if !tools.Exists() || !tools.IsArray() {
+		return nil
+	}
+
+	out := make(map[string]string)
+	tools.ForEach(func(_, tool gjson.Result) bool {
+		name := strings.TrimSpace(tool.Get("name").String())
+		if name == "" {
+			name = strings.TrimSpace(tool.Get("function.name").String())
+		}
+		if name == "" {
+			return true
+		}
+		sanitized := SanitizeFunctionName(name)
+		if sanitized == "" || sanitized == name {
+			return true
+		}
+		if _, exists := out[sanitized]; !exists {
+			out[sanitized] = name
+		}
+		return true
+	})
+
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// RestoreSanitizedToolName restores an original client-facing tool name when available.
+func RestoreSanitizedToolName(toolNameMap map[string]string, sanitizedName string) string {
+	if sanitizedName == "" || toolNameMap == nil {
+		return sanitizedName
+	}
+	if original, ok := toolNameMap[sanitizedName]; ok && original != "" {
+		return original
+	}
+	return sanitizedName
 }

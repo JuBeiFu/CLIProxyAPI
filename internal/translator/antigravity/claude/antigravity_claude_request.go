@@ -12,6 +12,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/translator/gemini/common"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
+	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
@@ -67,6 +68,7 @@ func ConvertClaudeRequestToAntigravity(modelName string, inputRawJSON []byte, _ 
 	// contents
 	contentsJSON := "[]"
 	hasContents := false
+	toolNameByID := make(map[string]string)
 
 	messagesResult := gjson.GetBytes(rawJSON, "messages")
 	if messagesResult.IsArray() {
@@ -166,9 +168,12 @@ func ConvertClaudeRequestToAntigravity(modelName string, inputRawJSON []byte, _ 
 						// NOTE: Do NOT inject dummy thinking blocks here.
 						// Antigravity API validates signatures, so dummy values are rejected.
 
-						functionName := contentResult.Get("name").String()
+						functionName := util.SanitizeFunctionName(contentResult.Get("name").String())
 						argsResult := contentResult.Get("input")
 						functionID := contentResult.Get("id").String()
+						if functionID != "" && functionName != "" {
+							toolNameByID[functionID] = functionName
+						}
 
 						// Handle both object and string input formats
 						var argsRaw string
@@ -206,16 +211,22 @@ func ConvertClaudeRequestToAntigravity(modelName string, inputRawJSON []byte, _ 
 					} else if contentTypeResult.Type == gjson.String && contentTypeResult.String() == "tool_result" {
 						toolCallID := contentResult.Get("tool_use_id").String()
 						if toolCallID != "" {
-							funcName := toolCallID
-							toolCallIDs := strings.Split(toolCallID, "-")
-							if len(toolCallIDs) > 1 {
-								funcName = strings.Join(toolCallIDs[0:len(toolCallIDs)-2], "-")
+							funcName, ok := toolNameByID[toolCallID]
+							if !ok {
+								parts := strings.Split(toolCallID, "-")
+								if len(parts) > 2 {
+									funcName = strings.Join(parts[:len(parts)-2], "-")
+								}
+								if funcName == "" {
+									funcName = toolCallID
+								}
+								log.Warnf("antigravity claude request: tool_result references unknown tool_use_id=%s, derived function name=%s", toolCallID, funcName)
 							}
 							functionResponseResult := contentResult.Get("content")
 
 							functionResponseJSON := `{}`
 							functionResponseJSON, _ = sjson.Set(functionResponseJSON, "id", toolCallID)
-							functionResponseJSON, _ = sjson.Set(functionResponseJSON, "name", funcName)
+							functionResponseJSON, _ = sjson.Set(functionResponseJSON, "name", util.SanitizeFunctionName(funcName))
 
 							responseData := ""
 							if functionResponseResult.Type == gjson.String {
@@ -380,6 +391,7 @@ func ConvertClaudeRequestToAntigravity(modelName string, inputRawJSON []byte, _ 
 				inputSchema := util.CleanJSONSchemaForAntigravity(inputSchemaResult.Raw)
 				tool, _ := sjson.Delete(toolResult.Raw, "input_schema")
 				tool, _ = sjson.SetRaw(tool, "parametersJsonSchema", inputSchema)
+				tool, _ = sjson.Set(tool, "name", util.SanitizeFunctionName(gjson.Get(tool, "name").String()))
 				for toolKey := range gjson.Parse(tool).Map() {
 					if util.InArray(allowedToolKeys, toolKey) {
 						continue
@@ -453,7 +465,7 @@ func ConvertClaudeRequestToAntigravity(modelName string, inputRawJSON []byte, _ 
 		case "tool":
 			out, _ = sjson.Set(out, "request.toolConfig.functionCallingConfig.mode", "ANY")
 			if toolChoiceName != "" {
-				out, _ = sjson.Set(out, "request.toolConfig.functionCallingConfig.allowedFunctionNames", []string{toolChoiceName})
+				out, _ = sjson.Set(out, "request.toolConfig.functionCallingConfig.allowedFunctionNames", []string{util.SanitizeFunctionName(toolChoiceName)})
 			}
 		}
 	}

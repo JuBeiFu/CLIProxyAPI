@@ -21,6 +21,7 @@ import (
 	"github.com/gorilla/websocket"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/misc"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/proxyrouting"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
@@ -192,7 +193,7 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 	}
 
 	body, wsHeaders := applyCodexPromptCacheHeaders(from, req, body)
-	wsHeaders = applyCodexWebsocketHeaders(ctx, wsHeaders, auth, apiKey)
+	wsHeaders = applyCodexWebsocketHeaders(ctx, wsHeaders, auth, apiKey, e.cfg)
 
 	var authID, authLabel, authType, authValue string
 	if auth != nil {
@@ -387,7 +388,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 	}
 
 	body, wsHeaders := applyCodexPromptCacheHeaders(from, req, body)
-	wsHeaders = applyCodexWebsocketHeaders(ctx, wsHeaders, auth, apiKey)
+	wsHeaders = applyCodexWebsocketHeaders(ctx, wsHeaders, auth, apiKey, e.cfg)
 
 	var authID, authLabel, authType, authValue string
 	authID = auth.ID
@@ -724,6 +725,10 @@ func newProxyAwareWebsocketDialer(proxyURL string) (*websocket.Dialer, bool) {
 	if proxyURL == "" {
 		return dialer, true
 	}
+	if util.IsDirectProxyMode(proxyURL) {
+		dialer.Proxy = nil
+		return dialer, true
+	}
 
 	parsedURL, errParse := url.Parse(proxyURL)
 	if errParse != nil {
@@ -759,13 +764,9 @@ func newProxyAwareWebsocketDialer(proxyURL string) (*websocket.Dialer, bool) {
 }
 
 func resolveProxyPoolURLs(cfg *config.Config, auth *cliproxyauth.Auth) []string {
-	if auth != nil {
-		if proxyURL := strings.TrimSpace(auth.ProxyURL); proxyURL != "" {
-			return util.OrderedProxyURLs(proxyURL)
-		}
-	}
-	if cfg != nil {
-		return util.OrderedProxyURLs(cfg.ProxyURL)
+	selection := proxyrouting.Resolve(cfg, auth)
+	if proxyURL := strings.TrimSpace(selection.ProxyURL); proxyURL != "" {
+		return util.OrderedProxyURLs(proxyURL)
 	}
 	return nil
 }
@@ -830,7 +831,7 @@ func applyCodexPromptCacheHeaders(from sdktranslator.Format, req cliproxyexecuto
 	return rawJSON, headers
 }
 
-func applyCodexWebsocketHeaders(ctx context.Context, headers http.Header, auth *cliproxyauth.Auth, token string) http.Header {
+func applyCodexWebsocketHeaders(ctx context.Context, headers http.Header, auth *cliproxyauth.Auth, token string, cfg *config.Config) http.Header {
 	if headers == nil {
 		headers = http.Header{}
 	}
@@ -843,7 +844,8 @@ func applyCodexWebsocketHeaders(ctx context.Context, headers http.Header, auth *
 		ginHeaders = ginCtx.Request.Header
 	}
 
-	misc.EnsureHeader(headers, ginHeaders, "x-codex-beta-features", "")
+	cfgUserAgent, cfgBetaFeatures := codexHeaderDefaults(cfg, auth)
+	ensureHeaderWithPriority(headers, ginHeaders, "x-codex-beta-features", cfgBetaFeatures, "")
 	misc.EnsureHeader(headers, ginHeaders, "x-codex-turn-state", "")
 	misc.EnsureHeader(headers, ginHeaders, "x-codex-turn-metadata", "")
 	misc.EnsureHeader(headers, ginHeaders, "x-responsesapi-include-timing-metrics", "")
@@ -858,7 +860,7 @@ func applyCodexWebsocketHeaders(ctx context.Context, headers http.Header, auth *
 	}
 	headers.Set("OpenAI-Beta", betaHeader)
 	misc.EnsureHeader(headers, ginHeaders, "Session_id", uuid.NewString())
-	misc.EnsureHeader(headers, ginHeaders, "User-Agent", codexUserAgent)
+	ensureHeaderWithConfigPrecedence(headers, ginHeaders, "User-Agent", cfgUserAgent, codexUserAgent)
 
 	isAPIKey := false
 	if auth != nil && auth.Attributes != nil {
@@ -884,6 +886,62 @@ func applyCodexWebsocketHeaders(ctx context.Context, headers http.Header, auth *
 	util.ApplyCustomHeadersFromAttrs(&http.Request{Header: headers}, attrs)
 
 	return headers
+}
+
+func codexHeaderDefaults(cfg *config.Config, auth *cliproxyauth.Auth) (string, string) {
+	if cfg == nil || auth == nil {
+		return "", ""
+	}
+	if auth.Attributes != nil {
+		if v := strings.TrimSpace(auth.Attributes["api_key"]); v != "" {
+			return "", ""
+		}
+	}
+	return strings.TrimSpace(cfg.CodexHeaderDefaults.UserAgent), strings.TrimSpace(cfg.CodexHeaderDefaults.BetaFeatures)
+}
+
+func ensureHeaderWithPriority(target http.Header, source http.Header, key, configValue, fallbackValue string) {
+	if target == nil {
+		return
+	}
+	if strings.TrimSpace(target.Get(key)) != "" {
+		return
+	}
+	if source != nil {
+		if val := strings.TrimSpace(source.Get(key)); val != "" {
+			target.Set(key, val)
+			return
+		}
+	}
+	if val := strings.TrimSpace(configValue); val != "" {
+		target.Set(key, val)
+		return
+	}
+	if val := strings.TrimSpace(fallbackValue); val != "" {
+		target.Set(key, val)
+	}
+}
+
+func ensureHeaderWithConfigPrecedence(target http.Header, source http.Header, key, configValue, fallbackValue string) {
+	if target == nil {
+		return
+	}
+	if strings.TrimSpace(target.Get(key)) != "" {
+		return
+	}
+	if val := strings.TrimSpace(configValue); val != "" {
+		target.Set(key, val)
+		return
+	}
+	if source != nil {
+		if val := strings.TrimSpace(source.Get(key)); val != "" {
+			target.Set(key, val)
+			return
+		}
+	}
+	if val := strings.TrimSpace(fallbackValue); val != "" {
+		target.Set(key, val)
+	}
 }
 
 type statusErrWithHeaders struct {

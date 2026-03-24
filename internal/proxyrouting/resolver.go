@@ -6,6 +6,7 @@ import (
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/proxystats"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 )
 
@@ -31,9 +32,11 @@ func Resolve(cfg *config.Config, auth *coreauth.Auth) Selection {
 		selection.AuthIndex = strings.TrimSpace(auth.EnsureIndex())
 
 		if proxyURL := strings.TrimSpace(auth.ProxyURL); proxyURL != "" {
-			selection.ProxyURL = proxyURL
-			selection.SelectionSource = "auth-proxy-url"
-			return selection
+			if util.HasUsableProxyConfig(proxyURL) {
+				selection.ProxyURL = proxyURL
+				selection.SelectionSource = "auth-proxy-url"
+				return selection
+			}
 		}
 
 		if profile := strings.TrimSpace(auth.ProxyProfile()); profile != "" {

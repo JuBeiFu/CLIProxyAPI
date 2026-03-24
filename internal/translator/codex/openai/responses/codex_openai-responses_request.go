@@ -13,8 +13,8 @@ func ConvertOpenAIResponsesRequestToCodex(modelName string, inputRawJSON []byte,
 
 	inputResult := gjson.GetBytes(rawJSON, "input")
 	if inputResult.Type == gjson.String {
-		input, _ := sjson.Set(`[{"type":"message","role":"user","content":[{"type":"input_text","text":""}]}]`, "0.content.0.text", inputResult.String())
-		rawJSON, _ = sjson.SetRawBytes(rawJSON, "input", []byte(input))
+		input, _ := sjson.SetBytes([]byte(`[{"type":"message","role":"user","content":[{"type":"input_text","text":""}]}]`), "0.content.0.text", inputResult.String())
+		rawJSON, _ = sjson.SetRawBytes(rawJSON, "input", input)
 	}
 
 	rawJSON, _ = sjson.SetBytes(rawJSON, "stream", true)
@@ -32,6 +32,7 @@ func ConvertOpenAIResponsesRequestToCodex(modelName string, inputRawJSON []byte,
 	}
 	rawJSON, _ = sjson.SetBytes(rawJSON, "parallel_tool_calls", true)
 	rawJSON, _ = sjson.SetBytes(rawJSON, "include", []string{"reasoning.encrypted_content"})
+	rawJSON = normalizeCodexBuiltinTools(rawJSON)
 	// Codex Responses rejects token limit fields, so strip them out before forwarding.
 	rawJSON, _ = sjson.DeleteBytes(rawJSON, "max_output_tokens")
 	rawJSON, _ = sjson.DeleteBytes(rawJSON, "max_completion_tokens")
@@ -132,4 +133,51 @@ func convertSystemRoleToDeveloper(rawJSON []byte) []byte {
 	}
 
 	return result
+}
+
+func normalizeCodexBuiltinTools(rawJSON []byte) []byte {
+	result := rawJSON
+
+	tools := gjson.GetBytes(result, "tools")
+	if tools.IsArray() {
+		toolArray := tools.Array()
+		for i := 0; i < len(toolArray); i++ {
+			typePath := fmt.Sprintf("tools.%d.type", i)
+			if normalized := normalizeCodexBuiltinToolType(gjson.GetBytes(result, typePath).String()); normalized != "" {
+				if updated, err := sjson.SetBytes(result, typePath, normalized); err == nil {
+					result = updated
+				}
+			}
+		}
+	}
+
+	if normalized := normalizeCodexBuiltinToolType(gjson.GetBytes(result, "tool_choice.type").String()); normalized != "" {
+		if updated, err := sjson.SetBytes(result, "tool_choice.type", normalized); err == nil {
+			result = updated
+		}
+	}
+
+	toolChoiceTools := gjson.GetBytes(result, "tool_choice.tools")
+	if toolChoiceTools.IsArray() {
+		toolArray := toolChoiceTools.Array()
+		for i := 0; i < len(toolArray); i++ {
+			typePath := fmt.Sprintf("tool_choice.tools.%d.type", i)
+			if normalized := normalizeCodexBuiltinToolType(gjson.GetBytes(result, typePath).String()); normalized != "" {
+				if updated, err := sjson.SetBytes(result, typePath, normalized); err == nil {
+					result = updated
+				}
+			}
+		}
+	}
+
+	return result
+}
+
+func normalizeCodexBuiltinToolType(toolType string) string {
+	switch toolType {
+	case "web_search_preview", "web_search_preview_2025_03_11":
+		return "web_search"
+	default:
+		return ""
+	}
 }

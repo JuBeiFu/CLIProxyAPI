@@ -73,3 +73,29 @@ func TestResolveFallsBackToGlobalProxyURL(t *testing.T) {
 		t.Fatalf("selection.SelectionSource = %q", selection.SelectionSource)
 	}
 }
+
+func TestResolveInvalidExplicitAuthProxyFallsBackToGlobalProxy(t *testing.T) {
+	cfg := &config.Config{SDKConfig: config.SDKConfig{ProxyURL: "http://global:8080"}}
+	auth := &coreauth.Auth{Provider: "codex", ProxyURL: "bad-value"}
+
+	selection := Resolve(cfg, auth)
+	if selection.ProxyURL != "http://global:8080" {
+		t.Fatalf("selection.ProxyURL = %q, want global proxy", selection.ProxyURL)
+	}
+	if selection.SelectionSource != "global-proxy-url" {
+		t.Fatalf("selection.SelectionSource = %q, want global-proxy-url", selection.SelectionSource)
+	}
+}
+
+func TestResolveDirectExplicitAuthProxyOverridesGlobalProxy(t *testing.T) {
+	cfg := &config.Config{SDKConfig: config.SDKConfig{ProxyURL: "http://global:8080"}}
+	auth := &coreauth.Auth{Provider: "codex", ProxyURL: "direct"}
+
+	selection := Resolve(cfg, auth)
+	if selection.ProxyURL != "direct" {
+		t.Fatalf("selection.ProxyURL = %q, want direct", selection.ProxyURL)
+	}
+	if selection.SelectionSource != "auth-proxy-url" {
+		t.Fatalf("selection.SelectionSource = %q, want auth-proxy-url", selection.SelectionSource)
+	}
+}

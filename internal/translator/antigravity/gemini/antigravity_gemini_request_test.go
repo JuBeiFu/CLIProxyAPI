@@ -171,3 +171,46 @@ func TestFixCLIToolResponse_PreservesFunctionResponseParts(t *testing.T) {
 		t.Errorf("Expected response.result 'Screenshot taken', got '%s'", funcResp.Get("response.result").String())
 	}
 }
+
+func TestFixCLIToolResponse_BackfillsEmptyFunctionResponseName(t *testing.T) {
+	input := `{
+		"model": "gemini-3-pro-preview",
+		"request": {
+			"contents": [
+				{
+					"role": "model",
+					"parts": [
+						{"functionCall": {"name": "Bash", "args": {"cmd": "ls"}}}
+					]
+				},
+				{
+					"role": "function",
+					"parts": [
+						{"functionResponse": {"name": "", "response": {"output": "file1.txt"}}}
+					]
+				}
+			]
+		}
+	}`
+
+	result, err := fixCLIToolResponse(input)
+	if err != nil {
+		t.Fatalf("fixCLIToolResponse failed: %v", err)
+	}
+
+	contents := gjson.Get(result, "request.contents").Array()
+	var funcContent gjson.Result
+	for _, c := range contents {
+		if c.Get("role").String() == "function" {
+			funcContent = c
+			break
+		}
+	}
+	if !funcContent.Exists() {
+		t.Fatal("function role content should exist in output")
+	}
+
+	if got := funcContent.Get("parts.0.functionResponse.name").String(); got != "Bash" {
+		t.Fatalf("Expected backfilled name 'Bash', got %q", got)
+	}
+}

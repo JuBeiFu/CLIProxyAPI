@@ -288,7 +288,7 @@ func (s *authScheduler) pickMixed(ctx context.Context, providers []string, model
 		if shard == nil {
 			continue
 		}
-		priorityReady, okPriority := shard.highestReadyPriorityLocked(false, predicate)
+		priorityReady, okPriority := shard.highestPreferredReadyPriorityLocked(false, predicate)
 		if !okPriority {
 			continue
 		}
@@ -307,7 +307,7 @@ func (s *authScheduler) pickMixed(ctx context.Context, providers []string, model
 			if shard == nil {
 				continue
 			}
-			picked := shard.pickReadyAtPriorityLocked(false, bestPriority, s.strategy, predicate)
+			picked := shard.pickReadyAtPriorityPreferredLocked(false, bestPriority, s.strategy, predicate)
 			if picked != nil {
 				return picked, providerKey, nil
 			}
@@ -327,7 +327,7 @@ func (s *authScheduler) pickMixed(ctx context.Context, providers []string, model
 		if shard == nil {
 			continue
 		}
-		picked := shard.pickReadyAtPriorityLocked(false, bestPriority, schedulerStrategyRoundRobin, predicate)
+		picked := shard.pickReadyAtPriorityPreferredLocked(false, bestPriority, schedulerStrategyRoundRobin, predicate)
 		if picked == nil {
 			continue
 		}
@@ -826,6 +826,100 @@ func (m *modelScheduler) pickReadyPreferFreeLocked(preferWebsocket bool, strateg
 		return picked.auth
 	}
 	return nil
+}
+
+func (m *modelScheduler) highestPreferredReadyPriorityLocked(preferWebsocket bool, predicate func(*scheduledAuth) bool) (int, bool) {
+	if m == nil {
+		return 0, false
+	}
+	if m.shouldPreferCodexPaid() {
+		for _, priority := range m.priorityOrder {
+			view := m.preferredReadyViewForPriorityLocked(priority, preferWebsocket, true)
+			if view != nil && view.pickFirst(predicate) != nil {
+				return priority, true
+			}
+		}
+	}
+	if m.shouldPreferCodexFree() {
+		for _, priority := range m.priorityOrder {
+			view := m.preferredReadyViewForPriorityLocked(priority, preferWebsocket, false)
+			if view != nil && view.pickFirst(predicate) != nil {
+				return priority, true
+			}
+		}
+	}
+	return m.highestReadyPriorityLocked(preferWebsocket, predicate)
+}
+
+func (m *modelScheduler) pickReadyAtPriorityPreferredLocked(preferWebsocket bool, priority int, strategy schedulerStrategy, predicate func(*scheduledAuth) bool) *Auth {
+	if m == nil {
+		return nil
+	}
+	if m.shouldPreferCodexPaid() {
+		if picked := m.pickPreferredReadyAtPriorityLocked(priority, preferWebsocket, strategy, predicate, true); picked != nil {
+			return picked
+		}
+	}
+	if m.shouldPreferCodexFree() {
+		if picked := m.pickPreferredReadyAtPriorityLocked(priority, preferWebsocket, strategy, predicate, false); picked != nil {
+			return picked
+		}
+	}
+	return m.pickReadyAtPriorityLocked(preferWebsocket, priority, strategy, predicate)
+}
+
+func (m *modelScheduler) pickPreferredReadyAtPriorityLocked(priority int, preferWebsocket bool, strategy schedulerStrategy, predicate func(*scheduledAuth) bool, preferPaid bool) *Auth {
+	view := m.preferredReadyViewForPriorityLocked(priority, preferWebsocket, preferPaid)
+	if view == nil {
+		return nil
+	}
+	var picked *scheduledAuth
+	if strategy == schedulerStrategyFillFirst {
+		picked = view.pickFirst(predicate)
+	} else {
+		picked = view.pickRoundRobin(predicate)
+	}
+	if picked == nil || picked.auth == nil {
+		return nil
+	}
+	return picked.auth
+}
+
+func (m *modelScheduler) preferredReadyViewForPriorityLocked(priority int, preferWebsocket bool, preferPaid bool) *readyView {
+	if m == nil {
+		return nil
+	}
+	bucket := m.readyByPriority[priority]
+	if bucket == nil {
+		return nil
+	}
+	useWebsocketView := preferWebsocket && len(bucket.ws.flat) > 0
+	if preferPaid {
+		if useWebsocketView {
+			switch {
+			case len(bucket.wsPaid.flat) > 0:
+				return &bucket.wsPaid
+			case len(bucket.paid.flat) > 0:
+				return &bucket.paid
+			default:
+				return nil
+			}
+		}
+		if len(bucket.paid.flat) == 0 {
+			return nil
+		}
+		return &bucket.paid
+	}
+	if useWebsocketView {
+		if len(bucket.wsFree.flat) == 0 {
+			return nil
+		}
+		return &bucket.wsFree
+	}
+	if len(bucket.free.flat) == 0 {
+		return nil
+	}
+	return &bucket.free
 }
 
 // highestReadyPriorityLocked returns the highest priority bucket that still has a matching ready auth.

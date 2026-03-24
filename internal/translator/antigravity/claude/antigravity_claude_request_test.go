@@ -229,6 +229,49 @@ func TestConvertClaudeRequestToAntigravity_ToolChoice_SpecificTool(t *testing.T)
 	}
 }
 
+func TestConvertClaudeRequestToAntigravity_SanitizesToolNamesForGeminiCompatibility(t *testing.T) {
+	inputJSON := []byte(`{
+		"model": "gemini-3-flash-preview",
+		"messages": [
+			{
+				"role": "assistant",
+				"content": [
+					{
+						"type": "tool_use",
+						"id": "mcp/server/read-1",
+						"name": "mcp/server/read",
+						"input": "{\"path\": \"/tmp/a\"}"
+					}
+				]
+			}
+		],
+		"tools": [
+			{
+				"name": "mcp/server/read",
+				"description": "Read a file",
+				"input_schema": {
+					"type": "object",
+					"properties": {"path": {"type": "string"}}
+				}
+			}
+		],
+		"tool_choice": {"type": "tool", "name": "mcp/server/read"}
+	}`)
+
+	output := ConvertClaudeRequestToAntigravity("gemini-3-flash-preview", inputJSON, false)
+	outputStr := string(output)
+
+	if got := gjson.Get(outputStr, "request.contents.0.parts.0.functionCall.name").String(); got != "mcp_server_read" {
+		t.Fatalf("functionCall.name = %q, want %q", got, "mcp_server_read")
+	}
+	if got := gjson.Get(outputStr, "request.tools.0.functionDeclarations.0.name").String(); got != "mcp_server_read" {
+		t.Fatalf("functionDeclarations.0.name = %q, want %q", got, "mcp_server_read")
+	}
+	if got := gjson.Get(outputStr, "request.toolConfig.functionCallingConfig.allowedFunctionNames.0").String(); got != "mcp_server_read" {
+		t.Fatalf("allowedFunctionNames.0 = %q, want %q", got, "mcp_server_read")
+	}
+}
+
 func TestConvertClaudeRequestToAntigravity_ToolUse(t *testing.T) {
 	inputJSON := []byte(`{
 		"model": "claude-3-5-sonnet-20240620",
@@ -366,6 +409,17 @@ func TestConvertClaudeRequestToAntigravity_ToolResult(t *testing.T) {
 		"model": "claude-3-5-sonnet-20240620",
 		"messages": [
 			{
+				"role": "assistant",
+				"content": [
+					{
+						"type": "tool_use",
+						"id": "get_weather-call-123",
+						"name": "get_weather",
+						"input": {"location": "Paris"}
+					}
+				]
+			},
+			{
 				"role": "user",
 				"content": [
 					{
@@ -382,12 +436,136 @@ func TestConvertClaudeRequestToAntigravity_ToolResult(t *testing.T) {
 	outputStr := string(output)
 
 	// Check function response conversion
-	funcResp := gjson.Get(outputStr, "request.contents.0.parts.0.functionResponse")
+	funcResp := gjson.Get(outputStr, "request.contents.1.parts.0.functionResponse")
 	if !funcResp.Exists() {
 		t.Error("functionResponse should exist")
 	}
 	if funcResp.Get("id").String() != "get_weather-call-123" {
 		t.Errorf("Expected function id, got '%s'", funcResp.Get("id").String())
+	}
+	if funcResp.Get("name").String() != "get_weather" {
+		t.Errorf("Expected function name 'get_weather', got '%s'", funcResp.Get("name").String())
+	}
+}
+
+func TestConvertClaudeRequestToAntigravity_ToolResultName_TooluFormat(t *testing.T) {
+	inputJSON := []byte(`{
+		"model": "claude-haiku-4-5-20251001",
+		"messages": [
+			{
+				"role": "assistant",
+				"content": [
+					{
+						"type": "tool_use",
+						"id": "toolu_tool-48fca351f12844eabf49dad8b63886d2",
+						"name": "Glob",
+						"input": {"pattern": "**/*.py"}
+					},
+					{
+						"type": "tool_use",
+						"id": "toolu_tool-cf2d061f75f845c49aacc18ee75ee708",
+						"name": "Bash",
+						"input": {"command": "ls"}
+					}
+				]
+			},
+			{
+				"role": "user",
+				"content": [
+					{
+						"type": "tool_result",
+						"tool_use_id": "toolu_tool-48fca351f12844eabf49dad8b63886d2",
+						"content": "file1.py\nfile2.py"
+					},
+					{
+						"type": "tool_result",
+						"tool_use_id": "toolu_tool-cf2d061f75f845c49aacc18ee75ee708",
+						"content": "total 10"
+					}
+				]
+			}
+		]
+	}`)
+
+	output := ConvertClaudeRequestToAntigravity("claude-haiku-4-5-20251001", inputJSON, false)
+	outputStr := string(output)
+
+	funcResp0 := gjson.Get(outputStr, "request.contents.1.parts.0.functionResponse")
+	if !funcResp0.Exists() {
+		t.Fatal("first functionResponse should exist")
+	}
+	if got := funcResp0.Get("name").String(); got != "Glob" {
+		t.Errorf("Expected name 'Glob' for toolu_ format, got '%s'", got)
+	}
+
+	funcResp1 := gjson.Get(outputStr, "request.contents.1.parts.1.functionResponse")
+	if !funcResp1.Exists() {
+		t.Fatal("second functionResponse should exist")
+	}
+	if got := funcResp1.Get("name").String(); got != "Bash" {
+		t.Errorf("Expected name 'Bash' for toolu_ format, got '%s'", got)
+	}
+}
+
+func TestConvertClaudeRequestToAntigravity_ToolResultName_NoMatchingToolUseHeuristic(t *testing.T) {
+	inputJSON := []byte(`{
+		"model": "claude-sonnet-4-5",
+		"messages": [
+			{
+				"role": "user",
+				"content": [
+					{
+						"type": "tool_result",
+						"tool_use_id": "get_weather-call-123",
+						"content": "22C sunny"
+					}
+				]
+			}
+		]
+	}`)
+
+	output := ConvertClaudeRequestToAntigravity("claude-sonnet-4-5", inputJSON, false)
+	outputStr := string(output)
+
+	funcResp := gjson.Get(outputStr, "request.contents.0.parts.0.functionResponse")
+	if !funcResp.Exists() {
+		t.Fatal("functionResponse should exist")
+	}
+	if got := funcResp.Get("name").String(); got != "get_weather" {
+		t.Errorf("Expected heuristic-derived name 'get_weather', got '%s'", got)
+	}
+}
+
+func TestConvertClaudeRequestToAntigravity_ToolResultName_NoMatchingToolUseRawIDFallback(t *testing.T) {
+	inputJSON := []byte(`{
+		"model": "claude-sonnet-4-5",
+		"messages": [
+			{
+				"role": "user",
+				"content": [
+					{
+						"type": "tool_result",
+						"tool_use_id": "toolu_tool-48fca351f12844eabf49dad8b63886d2",
+						"content": "result data"
+					}
+				]
+			}
+		]
+	}`)
+
+	output := ConvertClaudeRequestToAntigravity("claude-sonnet-4-5", inputJSON, false)
+	outputStr := string(output)
+
+	funcResp := gjson.Get(outputStr, "request.contents.0.parts.0.functionResponse")
+	if !funcResp.Exists() {
+		t.Fatal("functionResponse should exist")
+	}
+	got := funcResp.Get("name").String()
+	if got == "" {
+		t.Fatal("functionResponse.name must not be empty")
+	}
+	if got != "toolu_tool-48fca351f12844eabf49dad8b63886d2" {
+		t.Errorf("Expected raw ID fallback, got '%s'", got)
 	}
 }
 

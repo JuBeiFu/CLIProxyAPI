@@ -202,6 +202,13 @@ func synthesizeFileAuths(ctx *SynthesisContext, fullPath string, data []byte) []
 			}
 		}
 	}
+	if rawNote, ok := metadata["note"]; ok {
+		if note, isStr := rawNote.(string); isStr {
+			if trimmed := strings.TrimSpace(note); trimmed != "" {
+				a.Attributes["note"] = trimmed
+			}
+		}
+	}
 	ApplyAuthExcludedModelsMeta(a, cfg, perAccountExcluded, "oauth")
 	if provider == "gemini-cli" {
 		if virtuals := SynthesizeGeminiVirtualAuths(a, metadata, now); len(virtuals) > 0 {
@@ -263,6 +270,10 @@ func SynthesizeGeminiVirtualAuths(primary *coreauth.Auth, metadata map[string]an
 		// Propagate priority from primary auth to virtual auths
 		if priorityVal, hasPriority := primary.Attributes["priority"]; hasPriority && priorityVal != "" {
 			attrs["priority"] = priorityVal
+		}
+		// Propagate note from primary auth to virtual auths
+		if noteVal, hasNote := primary.Attributes["note"]; hasNote && noteVal != "" {
+			attrs["note"] = noteVal
 		}
 		metadataCopy := map[string]any{
 			"email":             email,

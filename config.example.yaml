@@ -62,7 +62,9 @@ error-logs-max-files: 10
 # When false, disable in-memory usage statistics aggregation
 usage-statistics-enabled: false
 
-# Proxy URL. Supports socks5/http/https protocols. Example: socks5://user:pass@192.168.1.1:1080/
+# Proxy URL. Supports socks5/http/https protocols.
+# Set to "direct" or "none" to explicitly bypass proxies (including environment proxies).
+# Example: socks5://user:pass@192.168.1.1:1080/
 proxy-url: ""
 
 # Named proxy profiles that proxy-routing rules can reference.
@@ -201,6 +203,14 @@ nonstream-keepalive-interval: 0
 #   package-version: "0.74.0"
 #   runtime-version: "v24.3.0"
 #   timeout: "600"
+
+# Default headers for Codex OAuth model requests.
+# These are used only for file-backed/OAuth Codex requests when the client
+# does not send the header. `user-agent` applies to HTTP and websocket requests;
+# `beta-features` only applies to websocket requests. They do not apply to codex-api-key entries.
+# codex-header-defaults:
+#   user-agent: "my-codex-client/1.0"
+#   beta-features: "feature-a,feature-b"
 
 # OpenAI compatibility providers
 # openai-compatibility:

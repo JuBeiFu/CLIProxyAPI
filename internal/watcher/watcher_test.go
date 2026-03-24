@@ -19,6 +19,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/watcher/synthesizer"
 	sdkAuth "github.com/router-for-me/CLIProxyAPI/v6/sdk/auth"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
+	log "github.com/sirupsen/logrus"
 	"gopkg.in/yaml.v3"
 )
 
@@ -540,6 +541,45 @@ func TestAuthSliceToMap(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestReloadClientsUsesIDSetWithoutCachingAuthContentsOutsideDebug(t *testing.T) {
+	tmpDir := t.TempDir()
+	authFile := filepath.Join(tmpDir, "one.json")
+	if err := os.WriteFile(authFile, []byte(`{"type":"claude","email":"u@example.com"}`), 0o644); err != nil {
+		t.Fatalf("failed to write auth file: %v", err)
+	}
+
+	origLevel := log.GetLevel()
+	log.SetLevel(log.InfoLevel)
+	defer log.SetLevel(origLevel)
+
+	w := &Watcher{
+		authDir: tmpDir,
+		config:  &config.Config{AuthDir: tmpDir},
+	}
+
+	w.reloadClients(true, nil, false)
+
+	normalized := w.normalizeAuthPath(authFile)
+
+	w.clientsMutex.RLock()
+	defer w.clientsMutex.RUnlock()
+	if w.lastAuthContents != nil {
+		t.Fatal("expected auth contents cache to stay nil outside debug level")
+	}
+	pathAuths, ok := w.fileAuthsByPath[normalized]
+	if !ok || len(pathAuths) == 0 {
+		t.Fatalf("expected synthesized auth ids for %s", normalized)
+	}
+	for id, auth := range pathAuths {
+		if strings.TrimSpace(id) == "" {
+			t.Fatal("expected non-empty auth id")
+		}
+		if auth != nil {
+			t.Fatalf("expected id-set entry for %s to have nil auth payload", id)
+		}
 	}
 }
 

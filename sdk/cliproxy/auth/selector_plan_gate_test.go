@@ -136,6 +136,51 @@ func TestSelectorPick_CodexPrefersPaidForGPT54(t *testing.T) {
 	}
 }
 
+func TestSelectorPick_CodexPrefersPaidForGPT53Codex(t *testing.T) {
+	t.Parallel()
+
+	selector := &FillFirstSelector{}
+	auths := []*Auth{
+		{ID: "paid", Provider: "codex", Attributes: map[string]string{"priority": "10"}, Metadata: map[string]any{metadataPlanTypeKey: "team"}},
+		{ID: "free", Provider: "codex", Attributes: map[string]string{"priority": "0"}, Metadata: map[string]any{metadataPlanTypeKey: "free"}},
+	}
+
+	got, err := selector.Pick(context.Background(), "codex", "gpt-5.3-codex", cliproxyexecutor.Options{}, auths)
+	if err != nil {
+		t.Fatalf("Pick() error = %v", err)
+	}
+	if got == nil {
+		t.Fatalf("Pick() auth = nil")
+	}
+	if got.ID != "paid" {
+		t.Fatalf("Pick() auth.ID = %q, want %q", got.ID, "paid")
+	}
+}
+
+func TestSelectorPick_FreeFallbackForGPT53Codex(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now()
+	next := now.Add(30 * time.Second)
+
+	selector := &FillFirstSelector{}
+	auths := []*Auth{
+		{ID: "free", Provider: "codex", Metadata: map[string]any{metadataPlanTypeKey: "free"}},
+		{ID: "paid", Provider: "codex", Metadata: map[string]any{metadataPlanTypeKey: "team"}, Quota: QuotaState{Exceeded: true, NextRecoverAt: next}},
+	}
+
+	got, err := selector.Pick(context.Background(), "codex", "gpt-5.3-codex", cliproxyexecutor.Options{}, auths)
+	if err != nil {
+		t.Fatalf("Pick() error = %v", err)
+	}
+	if got == nil {
+		t.Fatalf("Pick() auth = nil")
+	}
+	if got.ID != "free" {
+		t.Fatalf("Pick() auth.ID = %q, want %q", got.ID, "free")
+	}
+}
+
 func TestSelectorPick_CodexWebsocketKeepsPaidPreferenceForGPT54(t *testing.T) {
 	t.Parallel()
 
@@ -155,5 +200,49 @@ func TestSelectorPick_CodexWebsocketKeepsPaidPreferenceForGPT54(t *testing.T) {
 	}
 	if got.ID != "paid-http" {
 		t.Fatalf("Pick() auth.ID = %q, want %q", got.ID, "paid-http")
+	}
+}
+
+func TestSelectorPick_CodexPrefersPaidWebsocketForGPT54WhenAvailable(t *testing.T) {
+	t.Parallel()
+
+	selector := &FillFirstSelector{}
+	auths := []*Auth{
+		{ID: "paid-http", Provider: "codex", Attributes: map[string]string{"priority": "0"}, Metadata: map[string]any{metadataPlanTypeKey: "team"}},
+		{ID: "paid-ws", Provider: "codex", Attributes: map[string]string{"priority": "0", "websockets": "true"}, Metadata: map[string]any{metadataPlanTypeKey: "team"}},
+		{ID: "free-ws", Provider: "codex", Attributes: map[string]string{"priority": "10", "websockets": "true"}, Metadata: map[string]any{metadataPlanTypeKey: "free"}},
+	}
+
+	ctx := cliproxyexecutor.WithDownstreamWebsocket(context.Background())
+	got, err := selector.Pick(ctx, "codex", "gpt-5.4", cliproxyexecutor.Options{}, auths)
+	if err != nil {
+		t.Fatalf("Pick() error = %v", err)
+	}
+	if got == nil {
+		t.Fatalf("Pick() auth = nil")
+	}
+	if got.ID != "paid-ws" {
+		t.Fatalf("Pick() auth.ID = %q, want %q", got.ID, "paid-ws")
+	}
+}
+
+func TestSelectorPick_CodexPrefersFreeForRegularGPTModel(t *testing.T) {
+	t.Parallel()
+
+	selector := &FillFirstSelector{}
+	auths := []*Auth{
+		{ID: "paid", Provider: "codex", Attributes: map[string]string{"priority": "0"}, Metadata: map[string]any{metadataPlanTypeKey: "team"}},
+		{ID: "free", Provider: "codex", Attributes: map[string]string{"priority": "10"}, Metadata: map[string]any{metadataPlanTypeKey: "free"}},
+	}
+
+	got, err := selector.Pick(context.Background(), "codex", "gpt-5.4-mini", cliproxyexecutor.Options{}, auths)
+	if err != nil {
+		t.Fatalf("Pick() error = %v", err)
+	}
+	if got == nil {
+		t.Fatalf("Pick() auth = nil")
+	}
+	if got.ID != "free" {
+		t.Fatalf("Pick() auth.ID = %q, want %q", got.ID, "free")
 	}
 }

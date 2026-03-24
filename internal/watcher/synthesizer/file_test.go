@@ -741,6 +741,86 @@ func TestFileSynthesizer_Synthesize_CodexDuplicateAccountPrefersNewestFile(t *te
 	}
 }
 
+func TestSynthesizeGeminiVirtualAuths_NotePropagated(t *testing.T) {
+	now := time.Now()
+	primary := &coreauth.Auth{
+		ID:       "primary-id",
+		Provider: "gemini-cli",
+		Label:    "test@example.com",
+		Attributes: map[string]string{
+			"source":   "test-source",
+			"path":     "/path/to/auth",
+			"priority": "5",
+			"note":     "my test note",
+		},
+	}
+	metadata := map[string]any{
+		"project_id": "proj-a, proj-b",
+		"email":      "test@example.com",
+		"type":       "gemini",
+	}
+
+	virtuals := SynthesizeGeminiVirtualAuths(primary, metadata, now)
+	if len(virtuals) != 2 {
+		t.Fatalf("expected 2 virtuals, got %d", len(virtuals))
+	}
+	for i, v := range virtuals {
+		if got := v.Attributes["note"]; got != "my test note" {
+			t.Errorf("virtual %d: expected note %q, got %q", i, "my test note", got)
+		}
+		if got := v.Attributes["priority"]; got != "5" {
+			t.Errorf("virtual %d: expected priority %q, got %q", i, "5", got)
+		}
+	}
+}
+
+func TestFileSynthesizer_Synthesize_MultiProjectGeminiWithNote(t *testing.T) {
+	tempDir := t.TempDir()
+
+	authData := map[string]any{
+		"type":       "gemini",
+		"email":      "multi@example.com",
+		"project_id": "project-a, project-b",
+		"priority":   5,
+		"note":       "production keys",
+	}
+	data, _ := json.Marshal(authData)
+	err := os.WriteFile(filepath.Join(tempDir, "gemini-multi.json"), data, 0644)
+	if err != nil {
+		t.Fatalf("failed to write auth file: %v", err)
+	}
+
+	synth := NewFileSynthesizer()
+	ctx := &SynthesisContext{
+		Config:      &config.Config{},
+		AuthDir:     tempDir,
+		Now:         time.Now(),
+		IDGenerator: NewStableIDGenerator(),
+	}
+
+	auths, err := synth.Synthesize(ctx)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(auths) != 3 {
+		t.Fatalf("expected 3 auths (1 primary + 2 virtuals), got %d", len(auths))
+	}
+
+	primary := auths[0]
+	if gotNote := primary.Attributes["note"]; gotNote != "production keys" {
+		t.Errorf("expected primary note %q, got %q", "production keys", gotNote)
+	}
+	for i := 1; i < len(auths); i++ {
+		v := auths[i]
+		if gotNote := v.Attributes["note"]; gotNote != "production keys" {
+			t.Errorf("expected virtual %d note %q, got %q", i, "production keys", gotNote)
+		}
+		if gotPriority := v.Attributes["priority"]; gotPriority != "5" {
+			t.Errorf("expected virtual %d priority %q, got %q", i, "5", gotPriority)
+		}
+	}
+}
+
 func TestBuildGeminiVirtualID(t *testing.T) {
 	tests := []struct {
 		name      string

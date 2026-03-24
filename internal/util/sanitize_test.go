@@ -54,3 +54,54 @@ func TestSanitizeFunctionName(t *testing.T) {
 		})
 	}
 }
+
+func TestSanitizedToolNameMap(t *testing.T) {
+	t.Run("claude tools", func(t *testing.T) {
+		raw := []byte(`{"tools":[
+			{"name":"valid_tool","input_schema":{}},
+			{"name":"mcp/server/read","input_schema":{}},
+			{"name":"tool@v2","input_schema":{}}
+		]}`)
+		m := SanitizedToolNameMap(raw)
+		if m == nil {
+			t.Fatal("expected non-nil map")
+		}
+		if m["mcp_server_read"] != "mcp/server/read" {
+			t.Fatalf("expected mcp_server_read mapping, got %q", m["mcp_server_read"])
+		}
+		if m["tool_v2"] != "tool@v2" {
+			t.Fatalf("expected tool_v2 mapping, got %q", m["tool_v2"])
+		}
+		if _, exists := m["valid_tool"]; exists {
+			t.Fatal("valid_tool should not require mapping")
+		}
+	})
+
+	t.Run("openai tools", func(t *testing.T) {
+		raw := []byte(`{"tools":[
+			{"type":"function","function":{"name":"mcp/server/read","parameters":{"type":"object"}}}
+		]}`)
+		m := SanitizedToolNameMap(raw)
+		if m == nil {
+			t.Fatal("expected non-nil map")
+		}
+		if m["mcp_server_read"] != "mcp/server/read" {
+			t.Fatalf("expected OpenAI tool mapping, got %q", m["mcp_server_read"])
+		}
+	})
+}
+
+func TestRestoreSanitizedToolName(t *testing.T) {
+	m := map[string]string{
+		"mcp_server_read": "mcp/server/read",
+	}
+	if got := RestoreSanitizedToolName(m, "mcp_server_read"); got != "mcp/server/read" {
+		t.Fatalf("expected restored name, got %q", got)
+	}
+	if got := RestoreSanitizedToolName(m, "plain_name"); got != "plain_name" {
+		t.Fatalf("expected passthrough name, got %q", got)
+	}
+	if got := RestoreSanitizedToolName(nil, "plain_name"); got != "plain_name" {
+		t.Fatalf("expected nil-map passthrough, got %q", got)
+	}
+}

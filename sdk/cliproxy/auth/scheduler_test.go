@@ -381,6 +381,89 @@ func TestSchedulerPick_CodexPrefersPaidForGPT54(t *testing.T) {
 	}
 }
 
+func TestSchedulerPick_CodexPrefersPaidForGPT53Codex(t *testing.T) {
+	t.Parallel()
+
+	model := "gpt-5.3-codex"
+	freeID := "gpt53-prefer-free"
+	paidID := "gpt53-prefer-paid"
+	registerSchedulerModels(t, "codex", model, freeID, paidID)
+
+	scheduler := newSchedulerForTest(
+		&RoundRobinSelector{},
+		&Auth{ID: paidID, Provider: "codex", Attributes: map[string]string{"priority": "10"}, Metadata: map[string]any{metadataPlanTypeKey: "team"}},
+		&Auth{ID: freeID, Provider: "codex", Attributes: map[string]string{"priority": "0"}, Metadata: map[string]any{metadataPlanTypeKey: "free"}},
+	)
+
+	got, errPick := scheduler.pickSingle(context.Background(), "codex", model, cliproxyexecutor.Options{}, nil)
+	if errPick != nil {
+		t.Fatalf("pickSingle() error = %v", errPick)
+	}
+	if got == nil {
+		t.Fatalf("pickSingle() auth = nil")
+	}
+	if got.ID != paidID {
+		t.Fatalf("pickSingle() auth.ID = %q, want %q", got.ID, paidID)
+	}
+}
+
+func TestSchedulerPickMixed_CodexSingleProviderPrefersPaidForGPT53Codex(t *testing.T) {
+	t.Parallel()
+
+	model := "gpt-5.3-codex"
+	freeID := "gpt53-mixed-free"
+	paidID := "gpt53-mixed-paid"
+	registerSchedulerModels(t, "codex", model, freeID, paidID)
+
+	scheduler := newSchedulerForTest(
+		&RoundRobinSelector{},
+		&Auth{ID: paidID, Provider: "codex", Attributes: map[string]string{"priority": "10"}, Metadata: map[string]any{metadataPlanTypeKey: "team"}},
+		&Auth{ID: freeID, Provider: "codex", Attributes: map[string]string{"priority": "0"}, Metadata: map[string]any{metadataPlanTypeKey: "free"}},
+	)
+
+	got, provider, errPick := scheduler.pickMixed(context.Background(), []string{"codex"}, model, cliproxyexecutor.Options{}, nil)
+	if errPick != nil {
+		t.Fatalf("pickMixed() error = %v", errPick)
+	}
+	if provider != "codex" {
+		t.Fatalf("pickMixed() provider = %q, want %q", provider, "codex")
+	}
+	if got == nil {
+		t.Fatalf("pickMixed() auth = nil")
+	}
+	if got.ID != paidID {
+		t.Fatalf("pickMixed() auth.ID = %q, want %q", got.ID, paidID)
+	}
+}
+
+func TestSchedulerPick_FreeFallbackForGPT53Codex(t *testing.T) {
+	t.Parallel()
+
+	model := "gpt-5.3-codex"
+	now := time.Now()
+	next := now.Add(20 * time.Second)
+	freeID := "gpt53-fallback-free"
+	paidID := "gpt53-fallback-paid"
+
+	registerSchedulerModels(t, "codex", model, freeID, paidID)
+	scheduler := newSchedulerForTest(
+		&FillFirstSelector{},
+		&Auth{ID: freeID, Provider: "codex", Metadata: map[string]any{metadataPlanTypeKey: "free"}},
+		&Auth{ID: paidID, Provider: "codex", Metadata: map[string]any{metadataPlanTypeKey: "team"}, Quota: QuotaState{Exceeded: true, NextRecoverAt: next}},
+	)
+
+	got, errPick := scheduler.pickSingle(context.Background(), "codex", model, cliproxyexecutor.Options{}, nil)
+	if errPick != nil {
+		t.Fatalf("pickSingle() error = %v", errPick)
+	}
+	if got == nil {
+		t.Fatalf("pickSingle() auth = nil")
+	}
+	if got.ID != freeID {
+		t.Fatalf("pickSingle() auth.ID = %q, want %q", got.ID, freeID)
+	}
+}
+
 func TestSchedulerPick_CodexWebsocketKeepsPaidPreferenceForGPT54(t *testing.T) {
 	t.Parallel()
 
@@ -405,6 +488,226 @@ func TestSchedulerPick_CodexWebsocketKeepsPaidPreferenceForGPT54(t *testing.T) {
 	}
 	if got.ID != paidID {
 		t.Fatalf("pickSingle() auth.ID = %q, want %q", got.ID, paidID)
+	}
+}
+
+func TestSchedulerPick_CodexPrefersPaidWebsocketForGPT54WhenAvailable(t *testing.T) {
+	t.Parallel()
+
+	model := "gpt-5.4"
+	paidHTTPID := "gpt54-ws-paid-http"
+	paidWSID := "gpt54-ws-paid"
+	freeWSID := "gpt54-ws-free"
+	registerSchedulerModels(t, "codex", model, paidHTTPID, paidWSID, freeWSID)
+
+	scheduler := newSchedulerForTest(
+		&RoundRobinSelector{},
+		&Auth{ID: paidHTTPID, Provider: "codex", Attributes: map[string]string{"priority": "0"}, Metadata: map[string]any{metadataPlanTypeKey: "team"}},
+		&Auth{ID: paidWSID, Provider: "codex", Attributes: map[string]string{"priority": "0", "websockets": "true"}, Metadata: map[string]any{metadataPlanTypeKey: "team"}},
+		&Auth{ID: freeWSID, Provider: "codex", Attributes: map[string]string{"priority": "10", "websockets": "true"}, Metadata: map[string]any{metadataPlanTypeKey: "free"}},
+	)
+
+	ctx := cliproxyexecutor.WithDownstreamWebsocket(context.Background())
+	got, errPick := scheduler.pickSingle(ctx, "codex", model, cliproxyexecutor.Options{}, nil)
+	if errPick != nil {
+		t.Fatalf("pickSingle() error = %v", errPick)
+	}
+	if got == nil {
+		t.Fatalf("pickSingle() auth = nil")
+	}
+	if got.ID != paidWSID {
+		t.Fatalf("pickSingle() auth.ID = %q, want %q", got.ID, paidWSID)
+	}
+}
+
+func TestSchedulerPick_CodexPrefersFreeForRegularGPTModel(t *testing.T) {
+	t.Parallel()
+
+	model := "gpt-5.4-mini"
+	paidID := "gpt54mini-paid"
+	freeID := "gpt54mini-free"
+	registerSchedulerModels(t, "codex", model, paidID, freeID)
+
+	scheduler := newSchedulerForTest(
+		&FillFirstSelector{},
+		&Auth{ID: paidID, Provider: "codex", Attributes: map[string]string{"priority": "0"}, Metadata: map[string]any{metadataPlanTypeKey: "team"}},
+		&Auth{ID: freeID, Provider: "codex", Attributes: map[string]string{"priority": "10"}, Metadata: map[string]any{metadataPlanTypeKey: "free"}},
+	)
+
+	got, errPick := scheduler.pickSingle(context.Background(), "codex", model, cliproxyexecutor.Options{}, nil)
+	if errPick != nil {
+		t.Fatalf("pickSingle() error = %v", errPick)
+	}
+	if got == nil {
+		t.Fatalf("pickSingle() auth = nil")
+	}
+	if got.ID != freeID {
+		t.Fatalf("pickSingle() auth.ID = %q, want %q", got.ID, freeID)
+	}
+}
+
+func TestSchedulerPick_PinnedAuthBypassesGeneralCodexPreference(t *testing.T) {
+	t.Parallel()
+
+	model := "gpt-5.4"
+	paidID := "gpt54-pinned-paid"
+	freeID := "gpt54-pinned-free"
+	registerSchedulerModels(t, "codex", model, paidID, freeID)
+
+	scheduler := newSchedulerForTest(
+		&RoundRobinSelector{},
+		&Auth{ID: paidID, Provider: "codex", Attributes: map[string]string{"priority": "10"}, Metadata: map[string]any{metadataPlanTypeKey: "team"}},
+		&Auth{ID: freeID, Provider: "codex", Attributes: map[string]string{"priority": "0"}, Metadata: map[string]any{metadataPlanTypeKey: "free"}},
+	)
+
+	opts := cliproxyexecutor.Options{
+		Metadata: map[string]any{
+			cliproxyexecutor.PinnedAuthMetadataKey: freeID,
+		},
+	}
+	got, errPick := scheduler.pickSingle(context.Background(), "codex", model, opts, nil)
+	if errPick != nil {
+		t.Fatalf("pickSingle() error = %v", errPick)
+	}
+	if got == nil {
+		t.Fatalf("pickSingle() auth = nil")
+	}
+	if got.ID != freeID {
+		t.Fatalf("pickSingle() auth.ID = %q, want %q", got.ID, freeID)
+	}
+}
+
+func TestSchedulerPick_RegistryAdmissionWinsOverPaidPlanForGPT54(t *testing.T) {
+	t.Parallel()
+
+	model := "gpt-5.4"
+	paidID := "gpt54-registry-paid-unregistered"
+	freeID := "gpt54-registry-free-registered"
+	registerSchedulerModels(t, "codex", model, freeID)
+
+	scheduler := newSchedulerForTest(
+		&RoundRobinSelector{},
+		&Auth{ID: paidID, Provider: "codex", Attributes: map[string]string{"priority": "10"}, Metadata: map[string]any{metadataPlanTypeKey: "team"}},
+		&Auth{ID: freeID, Provider: "codex", Attributes: map[string]string{"priority": "0"}, Metadata: map[string]any{metadataPlanTypeKey: "free"}},
+	)
+
+	got, errPick := scheduler.pickSingle(context.Background(), "codex", model, cliproxyexecutor.Options{}, nil)
+	if errPick != nil {
+		t.Fatalf("pickSingle() error = %v", errPick)
+	}
+	if got == nil {
+		t.Fatalf("pickSingle() auth = nil")
+	}
+	if got.ID != freeID {
+		t.Fatalf("pickSingle() auth.ID = %q, want %q", got.ID, freeID)
+	}
+}
+
+func TestSchedulerPick_CodexPlanChangeFreeToPaidRebuildsReadyBuckets(t *testing.T) {
+	t.Parallel()
+
+	model := "gpt-5.4"
+	authID := "gpt54-plan-upgrade"
+	registerSchedulerModels(t, "codex", model, authID)
+
+	auth := &Auth{
+		ID:       authID,
+		Provider: "codex",
+		Metadata: map[string]any{metadataPlanTypeKey: "free"},
+	}
+	scheduler := newSchedulerForTest(&RoundRobinSelector{}, auth)
+
+	got, errPick := scheduler.pickSingle(context.Background(), "codex", model, cliproxyexecutor.Options{}, nil)
+	if errPick != nil {
+		t.Fatalf("pickSingle() before plan change error = %v", errPick)
+	}
+	if got == nil || got.ID != authID {
+		t.Fatalf("pickSingle() before plan change auth = %v, want %q", got, authID)
+	}
+
+	updated := auth.Clone()
+	updated.Metadata = map[string]any{metadataPlanTypeKey: "team"}
+	scheduler.upsertAuth(updated)
+
+	got, errPick = scheduler.pickSingle(context.Background(), "codex", model, cliproxyexecutor.Options{}, nil)
+	if errPick != nil {
+		t.Fatalf("pickSingle() after plan change error = %v", errPick)
+	}
+	if got == nil || got.ID != authID {
+		t.Fatalf("pickSingle() after plan change auth = %v, want %q", got, authID)
+	}
+
+	providerState := scheduler.providers["codex"]
+	if providerState == nil {
+		t.Fatal("provider scheduler for codex not found")
+	}
+	shard := providerState.modelShards[canonicalModelKey(model)]
+	if shard == nil {
+		t.Fatalf("model shard %q not found", canonicalModelKey(model))
+	}
+	bucket := shard.readyByPriority[0]
+	if bucket == nil {
+		t.Fatal("ready bucket for default priority not found")
+	}
+	if len(bucket.paid.flat) != 1 || bucket.paid.flat[0].auth.ID != authID {
+		t.Fatalf("paid bucket = %#v, want only %q", bucket.paid.flat, authID)
+	}
+	if len(bucket.free.flat) != 0 {
+		t.Fatalf("free bucket = %#v, want empty after upgrade", bucket.free.flat)
+	}
+}
+
+func TestSchedulerPick_CodexPlanChangePaidToFreeRebuildsReadyBuckets(t *testing.T) {
+	t.Parallel()
+
+	model := "gpt-5.4"
+	authID := "gpt54-plan-downgrade"
+	registerSchedulerModels(t, "codex", model, authID)
+
+	auth := &Auth{
+		ID:       authID,
+		Provider: "codex",
+		Metadata: map[string]any{metadataPlanTypeKey: "team"},
+	}
+	scheduler := newSchedulerForTest(&RoundRobinSelector{}, auth)
+
+	got, errPick := scheduler.pickSingle(context.Background(), "codex", model, cliproxyexecutor.Options{}, nil)
+	if errPick != nil {
+		t.Fatalf("pickSingle() before plan change error = %v", errPick)
+	}
+	if got == nil || got.ID != authID {
+		t.Fatalf("pickSingle() before plan change auth = %v, want %q", got, authID)
+	}
+
+	updated := auth.Clone()
+	updated.Metadata = map[string]any{metadataPlanTypeKey: "free"}
+	scheduler.upsertAuth(updated)
+
+	got, errPick = scheduler.pickSingle(context.Background(), "codex", model, cliproxyexecutor.Options{}, nil)
+	if errPick != nil {
+		t.Fatalf("pickSingle() after plan change error = %v", errPick)
+	}
+	if got == nil || got.ID != authID {
+		t.Fatalf("pickSingle() after plan change auth = %v, want %q", got, authID)
+	}
+
+	providerState := scheduler.providers["codex"]
+	if providerState == nil {
+		t.Fatal("provider scheduler for codex not found")
+	}
+	shard := providerState.modelShards[canonicalModelKey(model)]
+	if shard == nil {
+		t.Fatalf("model shard %q not found", canonicalModelKey(model))
+	}
+	bucket := shard.readyByPriority[0]
+	if bucket == nil {
+		t.Fatal("ready bucket for default priority not found")
+	}
+	if len(bucket.free.flat) != 1 || bucket.free.flat[0].auth.ID != authID {
+		t.Fatalf("free bucket = %#v, want only %q", bucket.free.flat, authID)
+	}
+	if len(bucket.paid.flat) != 0 {
+		t.Fatalf("paid bucket = %#v, want empty after downgrade", bucket.paid.flat)
 	}
 }
 

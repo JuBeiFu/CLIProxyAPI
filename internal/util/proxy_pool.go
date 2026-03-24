@@ -23,6 +23,11 @@ var (
 	proxyTransportCache sync.Map
 )
 
+const (
+	directProxyMode = "direct"
+	noneProxyMode   = "none"
+)
+
 type proxyTransportEntry struct {
 	proxyURL  string
 	transport http.RoundTripper
@@ -82,6 +87,9 @@ func NewProxyPoolTransport(raw string) http.RoundTripper {
 	if raw == "" {
 		return nil
 	}
+	if IsDirectProxyMode(raw) {
+		return cloneDirectTransport()
+	}
 	if cached, ok := proxyTransportCache.Load(raw); ok {
 		if rt, okCast := cached.(http.RoundTripper); okCast && rt != nil {
 			return rt
@@ -114,6 +122,10 @@ func NewProxyDialer(raw string, forward proxy.Dialer) proxy.Dialer {
 	if forward == nil {
 		forward = proxy.Direct
 	}
+	raw = strings.TrimSpace(raw)
+	if IsDirectProxyMode(raw) {
+		return proxy.Direct
+	}
 	proxies := SplitProxyURLs(raw)
 	entries := make([]proxyDialerEntry, 0, len(proxies))
 	for i := range proxies {
@@ -138,6 +150,9 @@ func BuildProxyTransport(proxyURL string) *http.Transport {
 	proxyURL = strings.TrimSpace(proxyURL)
 	if proxyURL == "" {
 		return nil
+	}
+	if IsDirectProxyMode(proxyURL) {
+		return cloneDirectTransport()
 	}
 
 	parsedURL, errParse := url.Parse(proxyURL)
@@ -177,6 +192,60 @@ func BuildProxyTransport(proxyURL string) *http.Transport {
 	}
 
 	return transport
+}
+
+func IsDirectProxyMode(raw string) bool {
+	trimmed := strings.TrimSpace(raw)
+	return strings.EqualFold(trimmed, directProxyMode) || strings.EqualFold(trimmed, noneProxyMode)
+}
+
+func HasUsableProxyConfig(raw string) bool {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return false
+	}
+	if IsDirectProxyMode(raw) {
+		return true
+	}
+	proxies := SplitProxyURLs(raw)
+	if len(proxies) == 0 {
+		return false
+	}
+	for _, proxyURL := range proxies {
+		if isSupportedProxyURL(proxyURL) {
+			return true
+		}
+	}
+	return false
+}
+
+func cloneDirectTransport() *http.Transport {
+	transport := cloneDefaultTransport()
+	transport.Proxy = nil
+	return transport
+}
+
+func isSupportedProxyURL(proxyURL string) bool {
+	proxyURL = strings.TrimSpace(proxyURL)
+	if proxyURL == "" {
+		return false
+	}
+	if IsDirectProxyMode(proxyURL) {
+		return true
+	}
+	parsedURL, errParse := url.Parse(proxyURL)
+	if errParse != nil {
+		return false
+	}
+	if parsedURL.Scheme == "" || parsedURL.Host == "" {
+		return false
+	}
+	switch parsedURL.Scheme {
+	case "socks5", "socks5h", "http", "https":
+		return true
+	default:
+		return false
+	}
 }
 
 func (p *proxyPoolTransport) RoundTrip(req *http.Request) (*http.Response, error) {

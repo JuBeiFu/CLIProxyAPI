@@ -34,7 +34,9 @@ func newUtlsRoundTripper(cfg *config.SDKConfig) *utlsRoundTripper {
 	if cfg != nil && cfg.ProxyURL != "" {
 		pDialer := util.NewProxyDialer(cfg.ProxyURL, proxy.Direct)
 		if pDialer == proxy.Direct {
-			log.Debug("failed to create uTLS proxy dialer from configured proxy pool, falling back to direct dialer")
+			if !util.IsDirectProxyMode(cfg.ProxyURL) {
+				log.Debug("failed to create uTLS proxy dialer from configured proxy pool, falling back to direct dialer")
+			}
 		} else {
 			dialer = pDialer
 		}
