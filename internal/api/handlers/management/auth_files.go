@@ -49,6 +49,13 @@ const (
 	codexCallbackPort     = 1455
 	geminiCLIEndpoint     = "https://cloudcode-pa.googleapis.com"
 	geminiCLIVersion      = "v1internal"
+	metadataQuotaAutoDisabledReasonKey = "cliproxy_auto_disabled_reason"
+	autoDisabledReasonQuotaExhausted   = "quota_exhausted"
+	autoDisabledReasonQuotaLowBalance  = "quota_low_balance"
+	metadataCodexUsageLastKey          = "cliproxy_codex_usage_last"
+	metadataCodexUsageAfterKey         = "cliproxy_codex_usage_after"
+	metadataCodexUsagePayloadKey       = "cliproxy_codex_usage_payload"
+	metadataCodexUsageRemainingKey     = "cliproxy_codex_usage_remaining_percent"
 )
 
 type callbackForwarder struct {
@@ -576,6 +583,9 @@ func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
 	if claims := extractCodexIDTokenClaims(auth); claims != nil {
 		entry["id_token"] = claims
 	}
+	if quotaCache := buildQuotaCacheEntry(auth); quotaCache != nil {
+		entry["quota_cache"] = quotaCache
+	}
 	return entry
 }
 
@@ -617,6 +627,120 @@ func extractCodexIDTokenClaims(auth *coreauth.Auth) gin.H {
 		return nil
 	}
 	return result
+}
+
+func buildQuotaCacheEntry(auth *coreauth.Auth) gin.H {
+	if auth == nil || auth.Metadata == nil {
+		return nil
+	}
+	if !strings.EqualFold(strings.TrimSpace(auth.Provider), "codex") {
+		return nil
+	}
+	payloadRaw, ok := auth.Metadata[metadataCodexUsagePayloadKey].(string)
+	if !ok {
+		return nil
+	}
+	payloadRaw = strings.TrimSpace(payloadRaw)
+	if payloadRaw == "" {
+		return nil
+	}
+
+	var payload any
+	if err := json.Unmarshal([]byte(payloadRaw), &payload); err != nil {
+		return nil
+	}
+
+	entry := gin.H{
+		"provider": "codex",
+		"payload":  payload,
+	}
+	if fetchedAt, ok := quotaCacheMetadataTime(auth.Metadata, metadataCodexUsageLastKey); ok && !fetchedAt.IsZero() {
+		entry["fetched_at"] = fetchedAt
+	}
+	if nextRefreshAt, ok := quotaCacheMetadataTime(auth.Metadata, metadataCodexUsageAfterKey); ok && !nextRefreshAt.IsZero() {
+		entry["next_refresh_after"] = nextRefreshAt
+	}
+	if remainingPct, ok := quotaCacheMetadataFloat(auth.Metadata, metadataCodexUsageRemainingKey); ok {
+		entry["remaining_percent"] = remainingPct
+	}
+	if planType := strings.TrimSpace(auth.PlanType()); planType != "" {
+		entry["plan_type"] = planType
+	}
+	if rawReason, ok := auth.Metadata[metadataQuotaAutoDisabledReasonKey].(string); ok {
+		reason := strings.TrimSpace(rawReason)
+		if reason != "" {
+			entry["auto_disabled_reason"] = reason
+			entry["auto_disabled"] = strings.EqualFold(reason, autoDisabledReasonQuotaExhausted) || strings.EqualFold(reason, autoDisabledReasonQuotaLowBalance)
+		}
+	}
+	return entry
+}
+
+func quotaCacheMetadataTime(meta map[string]any, key string) (time.Time, bool) {
+	raw, ok := meta[key]
+	if !ok {
+		return time.Time{}, false
+	}
+	switch value := raw.(type) {
+	case time.Time:
+		return value, !value.IsZero()
+	case int:
+		return time.Unix(int64(value), 0), true
+	case int32:
+		return time.Unix(int64(value), 0), true
+	case int64:
+		return time.Unix(value, 0), true
+	case float64:
+		return time.Unix(int64(value), 0), true
+	case json.Number:
+		if unixSeconds, err := value.Int64(); err == nil {
+			return time.Unix(unixSeconds, 0), true
+		}
+	case string:
+		trimmed := strings.TrimSpace(value)
+		if trimmed == "" {
+			return time.Time{}, false
+		}
+		if parsed, err := time.Parse(time.RFC3339Nano, trimmed); err == nil {
+			return parsed, true
+		}
+		if unixSeconds, err := strconv.ParseInt(trimmed, 10, 64); err == nil {
+			return time.Unix(unixSeconds, 0), true
+		}
+	}
+	return time.Time{}, false
+}
+
+func quotaCacheMetadataFloat(meta map[string]any, key string) (float64, bool) {
+	raw, ok := meta[key]
+	if !ok {
+		return 0, false
+	}
+	switch value := raw.(type) {
+	case float64:
+		return value, true
+	case float32:
+		return float64(value), true
+	case int:
+		return float64(value), true
+	case int32:
+		return float64(value), true
+	case int64:
+		return float64(value), true
+	case json.Number:
+		if floatValue, err := value.Float64(); err == nil {
+			return floatValue, true
+		}
+	case string:
+		trimmed := strings.TrimSpace(value)
+		if trimmed == "" {
+			return 0, false
+		}
+		if floatValue, err := strconv.ParseFloat(trimmed, 64); err == nil {
+			return floatValue, true
+		}
+	}
+	return 0, false
 }
 
 func authEmail(auth *coreauth.Auth) string {

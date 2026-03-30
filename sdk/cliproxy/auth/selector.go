@@ -69,17 +69,10 @@ func (e *modelCooldownError) Error() string {
 	if resetSeconds < 0 {
 		resetSeconds = 0
 	}
-	displayDuration := e.resetIn
-	if displayDuration > 0 && displayDuration < time.Second {
-		displayDuration = time.Second
-	} else {
-		displayDuration = displayDuration.Round(time.Second)
-	}
 	errorBody := map[string]any{
 		"code":          "model_cooldown",
 		"message":       message,
 		"model":         e.model,
-		"reset_time":    displayDuration.String(),
 		"reset_seconds": resetSeconds,
 	}
 	if e.provider != "" {
@@ -118,7 +111,7 @@ func authPriority(auth *Auth) int {
 			}
 		}
 	}
-	return base - quotaPriorityPenalty(auth)
+	return base - quotaPriorityPenalty(auth) - slowRequestPriorityPenalty(auth)
 }
 
 func quotaPriorityPenalty(auth *Auth) int {
@@ -126,6 +119,13 @@ func quotaPriorityPenalty(auth *Auth) int {
 		return 0
 	}
 	return auth.QuotaPriorityPenalty
+}
+
+func slowRequestPriorityPenalty(auth *Auth) int {
+	if auth == nil || auth.SlowRequestPriorityPenalty <= 0 {
+		return 0
+	}
+	return auth.SlowRequestPriorityPenalty
 }
 
 func priorityFromMetadata(auth *Auth) int {
@@ -473,24 +473,33 @@ func isAuthBlockedForModel(auth *Auth, model string, now time.Time) (bool, block
 	if auth == nil {
 		return true, blockReasonOther, time.Time{}
 	}
+	if expireAt, expired := freeCodexAuthExpired(auth, now); expired {
+		return true, blockReasonDisabled, expireAt
+	}
 	if auth.Disabled || auth.Status == StatusDisabled {
 		return true, blockReasonDisabled, time.Time{}
 	}
-	if !auth.TransientCooldownUntil.IsZero() && auth.TransientCooldownUntil.After(now) {
-		return true, blockReasonCooldown, auth.TransientCooldownUntil
-	}
-	if until, ok := cooldownUntilFromAuthMetadata(auth.Metadata); ok && until.After(now) {
-		return true, blockReasonCooldown, until
-	}
-	// Treat quota cooldown as global for the auth: Codex "usage_limit_reached" and
-	// similar 429 quota signals are account-level, so we must avoid reusing the
-	// same credential across other models until it recovers.
-	if auth.Quota.Exceeded && !auth.Quota.NextRecoverAt.IsZero() && auth.Quota.NextRecoverAt.After(now) {
-		next := auth.Quota.NextRecoverAt
-		if next.Before(now) {
-			next = now
+	disableCooling := quotaCooldownDisabledForAuth(auth)
+	if !disableCooling {
+		if !auth.TransientCooldownUntil.IsZero() && auth.TransientCooldownUntil.After(now) {
+			return true, blockReasonCooldown, auth.TransientCooldownUntil
 		}
-		return true, blockReasonCooldown, next
+		if !auth.SlowRequestCooldownUntil.IsZero() && auth.SlowRequestCooldownUntil.After(now) {
+			return true, blockReasonCooldown, auth.SlowRequestCooldownUntil
+		}
+		if until, ok := cooldownUntilFromAuthMetadata(auth.Metadata); ok && until.After(now) {
+			return true, blockReasonCooldown, until
+		}
+		// Treat quota cooldown as global for the auth: Codex "usage_limit_reached" and
+		// similar 429 quota signals are account-level, so we must avoid reusing the
+		// same credential across other models until it recovers.
+		if auth.Quota.Exceeded && !auth.Quota.NextRecoverAt.IsZero() && auth.Quota.NextRecoverAt.After(now) {
+			next := auth.Quota.NextRecoverAt
+			if next.Before(now) {
+				next = now
+			}
+			return true, blockReasonCooldown, next
+		}
 	}
 	if model != "" {
 		if len(auth.ModelStates) > 0 {
@@ -510,6 +519,9 @@ func isAuthBlockedForModel(auth *Auth, model string, now time.Time) (bool, block
 						return false, blockReasonNone, time.Time{}
 					}
 					if state.NextRetryAfter.After(now) {
+						if disableCooling {
+							return false, blockReasonNone, time.Time{}
+						}
 						next := state.NextRetryAfter
 						if !state.Quota.NextRecoverAt.IsZero() && state.Quota.NextRecoverAt.After(now) {
 							next = state.Quota.NextRecoverAt
@@ -529,6 +541,9 @@ func isAuthBlockedForModel(auth *Auth, model string, now time.Time) (bool, block
 		return false, blockReasonNone, time.Time{}
 	}
 	if auth.Unavailable && auth.NextRetryAfter.After(now) {
+		if disableCooling {
+			return false, blockReasonNone, time.Time{}
+		}
 		next := auth.NextRetryAfter
 		if !auth.Quota.NextRecoverAt.IsZero() && auth.Quota.NextRecoverAt.After(now) {
 			next = auth.Quota.NextRecoverAt

@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	internalconfig "github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 )
@@ -33,6 +34,21 @@ func (s *deletingStore) Deleted() []string {
 	out := make([]string, len(s.deleted))
 	copy(out, s.deleted)
 	return out
+}
+
+func newPersistedFreeCodexAuth(id string) *Auth {
+	return &Auth{
+		ID:       id,
+		FileName: id,
+		Provider: "codex",
+		Attributes: map[string]string{
+			"path": "/tmp/" + id,
+		},
+		Metadata: map[string]any{
+			"type":      "codex",
+			"plan_type": "free",
+		},
+	}
 }
 
 func waitForDeletedIDs(t *testing.T, store *deletingStore, want []string) {
@@ -229,6 +245,53 @@ func TestManager_MarkResult_DeletesDeactivatedWorkspacePersistedAuth(t *testing.
 	}
 }
 
+func TestManager_MarkResult_DeletesOrgRequiredPersistedAuth(t *testing.T) {
+	store := &deletingStore{}
+	mgr := NewManager(store, nil, nil)
+	auth := &Auth{
+		ID:       "auths/org-required.json",
+		FileName: "auths/org-required.json",
+		Provider: "codex",
+		Attributes: map[string]string{
+			"path": "/tmp/org-required.json",
+		},
+		Metadata: map[string]any{
+			"type": "codex",
+		},
+	}
+
+	if _, err := mgr.Register(WithSkipPersist(context.Background()), auth); err != nil {
+		t.Fatalf("Register returned error: %v", err)
+	}
+
+	reg := registry.GetGlobalRegistry()
+	reg.RegisterClient(auth.ID, "codex", []*registry.ModelInfo{{ID: "gpt-5"}})
+	t.Cleanup(func() {
+		reg.UnregisterClient(auth.ID)
+	})
+
+	mgr.MarkResult(context.Background(), Result{
+		AuthID:   auth.ID,
+		Provider: "codex",
+		Model:    "gpt-5",
+		Success:  false,
+		Error: &Error{
+			HTTPStatus: 401,
+			Message:    `{"error":{"message":"You must be a member of an organization to use the API."},"status":401}`,
+		},
+	})
+
+	if _, ok := mgr.GetByID(auth.ID); ok {
+		t.Fatalf("expected org-required auth to be removed from manager")
+	}
+
+	waitForDeletedIDs(t, store, []string{auth.ID})
+
+	if models := reg.GetModelsForClient(auth.ID); len(models) != 0 {
+		t.Fatalf("expected org-required auth models to be unregistered, got %d", len(models))
+	}
+}
+
 func TestManager_MarkResult_KeepsAuthForGeneric401(t *testing.T) {
 	store := &deletingStore{}
 	mgr := NewManager(store, nil, nil)
@@ -395,6 +458,52 @@ func TestManager_RefreshAuth_DeletesDeactivatedPersistedAuth(t *testing.T) {
 	}
 }
 
+func TestManager_RefreshAuth_DeletesOrgRequiredPersistedAuth(t *testing.T) {
+	store := &deletingStore{}
+	mgr := NewManager(store, nil, nil)
+	mgr.RegisterExecutor(&revokedRefreshExecutor{
+		id: "codex",
+		err: &Error{
+			HTTPStatus: 401,
+			Message:    `{"error":{"message":"You must be a member of an organization to use the API."},"status":401}`,
+		},
+	})
+
+	auth := &Auth{
+		ID:       "auths/refresh-org-required.json",
+		FileName: "auths/refresh-org-required.json",
+		Provider: "codex",
+		Attributes: map[string]string{
+			"path": "/tmp/refresh-org-required.json",
+		},
+		Metadata: map[string]any{
+			"type": "codex",
+		},
+	}
+
+	if _, err := mgr.Register(WithSkipPersist(context.Background()), auth); err != nil {
+		t.Fatalf("Register returned error: %v", err)
+	}
+
+	reg := registry.GetGlobalRegistry()
+	reg.RegisterClient(auth.ID, "codex", []*registry.ModelInfo{{ID: "gpt-5"}})
+	t.Cleanup(func() {
+		reg.UnregisterClient(auth.ID)
+	})
+
+	mgr.refreshAuth(context.Background(), auth.ID)
+
+	if _, ok := mgr.GetByID(auth.ID); ok {
+		t.Fatalf("expected org-required auth to be removed after refresh failure")
+	}
+
+	waitForDeletedIDs(t, store, []string{auth.ID})
+
+	if models := reg.GetModelsForClient(auth.ID); len(models) != 0 {
+		t.Fatalf("expected org-required auth models to be unregistered after refresh, got %d", len(models))
+	}
+}
+
 func TestManager_RefreshAuth_PreservesDetailedFailureState(t *testing.T) {
 	store := &deletingStore{}
 	mgr := NewManager(store, nil, nil)
@@ -451,5 +560,276 @@ func TestManager_RefreshAuth_PreservesDetailedFailureState(t *testing.T) {
 	}
 	if deleted := store.Deleted(); len(deleted) != 0 {
 		t.Fatalf("expected no deleted auths, got %v", deleted)
+	}
+}
+
+func TestManager_MarkResult_DeletesFreeCodexAuthOn403(t *testing.T) {
+	store := &deletingStore{}
+	mgr := NewManager(store, nil, nil)
+	auth := newPersistedFreeCodexAuth("auths/free-403.json")
+	if _, err := mgr.Register(WithSkipPersist(context.Background()), auth); err != nil {
+		t.Fatalf("Register returned error: %v", err)
+	}
+
+	reg := registry.GetGlobalRegistry()
+	reg.RegisterClient(auth.ID, "codex", []*registry.ModelInfo{{ID: "gpt-5.4"}})
+	t.Cleanup(func() { reg.UnregisterClient(auth.ID) })
+
+	mgr.MarkResult(context.Background(), Result{
+		AuthID:   auth.ID,
+		Provider: "codex",
+		Model:    "gpt-5.4",
+		Success:  false,
+		Error:    &Error{HTTPStatus: http.StatusForbidden, Message: "authorization lost"},
+	})
+
+	if _, ok := mgr.GetByID(auth.ID); ok {
+		t.Fatalf("expected free auth to be removed on 403")
+	}
+	waitForDeletedIDs(t, store, []string{auth.ID})
+}
+
+func TestManager_MarkResult_DeletesFreeCodexAuthOn429(t *testing.T) {
+	store := &deletingStore{}
+	mgr := NewManager(store, nil, nil)
+	auth := newPersistedFreeCodexAuth("auths/free-429.json")
+	if _, err := mgr.Register(WithSkipPersist(context.Background()), auth); err != nil {
+		t.Fatalf("Register returned error: %v", err)
+	}
+
+	reg := registry.GetGlobalRegistry()
+	reg.RegisterClient(auth.ID, "codex", []*registry.ModelInfo{{ID: "gpt-5.4"}})
+	t.Cleanup(func() { reg.UnregisterClient(auth.ID) })
+
+	mgr.MarkResult(context.Background(), Result{
+		AuthID:   auth.ID,
+		Provider: "codex",
+		Model:    "gpt-5.4",
+		Success:  false,
+		Error:    &Error{HTTPStatus: http.StatusTooManyRequests, Message: "Selected model is at capacity. Please try a different model."},
+	})
+
+	if _, ok := mgr.GetByID(auth.ID); ok {
+		t.Fatalf("expected free auth to be removed on 429/capacity")
+	}
+	waitForDeletedIDs(t, store, []string{auth.ID})
+}
+
+func TestManager_MarkResult_DeletesFreeCodexAuthOn429WhenPlanTypeOnlyInErrorPayload(t *testing.T) {
+	store := &deletingStore{}
+	mgr := NewManager(store, nil, nil)
+	auth := &Auth{
+		ID:       "auths/free-429-error-payload.json",
+		FileName: "auths/free-429-error-payload.json",
+		Provider: "codex",
+		Attributes: map[string]string{
+			"path": "/tmp/free-429-error-payload.json",
+		},
+		Metadata: map[string]any{
+			"type": "codex",
+		},
+	}
+	if _, err := mgr.Register(WithSkipPersist(context.Background()), auth); err != nil {
+		t.Fatalf("Register returned error: %v", err)
+	}
+
+	reg := registry.GetGlobalRegistry()
+	reg.RegisterClient(auth.ID, "codex", []*registry.ModelInfo{{ID: "gpt-5.4"}})
+	t.Cleanup(func() { reg.UnregisterClient(auth.ID) })
+
+	mgr.MarkResult(context.Background(), Result{
+		AuthID:   auth.ID,
+		Provider: "codex",
+		Model:    "gpt-5.4",
+		Success:  false,
+		Error: &Error{
+			HTTPStatus: http.StatusTooManyRequests,
+			Message:    `{"error":{"type":"usage_limit_reached","message":"The usage limit has been reached","plan_type":"free","resets_in_seconds":600},"status":429}`,
+		},
+	})
+
+	if _, ok := mgr.GetByID(auth.ID); ok {
+		t.Fatalf("expected free auth to be removed when plan_type is only present in error payload")
+	}
+	waitForDeletedIDs(t, store, []string{auth.ID})
+}
+
+func TestManager_MarkResult_DoesNotDeleteFreeCodexAuthAfterLegacyCallCountMetadata(t *testing.T) {
+	store := &deletingStore{}
+	mgr := NewManager(store, nil, nil)
+	auth := newPersistedFreeCodexAuth("auths/free-call-limit.json")
+	auth.Metadata["cliproxy_free_call_count"] = 300
+	if _, err := mgr.Register(WithSkipPersist(context.Background()), auth); err != nil {
+		t.Fatalf("Register returned error: %v", err)
+	}
+
+	reg := registry.GetGlobalRegistry()
+	reg.RegisterClient(auth.ID, "codex", []*registry.ModelInfo{{ID: "gpt-5.4"}})
+	t.Cleanup(func() { reg.UnregisterClient(auth.ID) })
+
+	mgr.MarkResult(context.Background(), Result{
+		AuthID:   auth.ID,
+		Provider: "codex",
+		Model:    "gpt-5.4",
+		Success:  true,
+	})
+
+	stored, ok := mgr.GetByID(auth.ID)
+	if !ok {
+		t.Fatalf("expected free auth to remain registered")
+	}
+	if got := stored.Metadata["cliproxy_free_call_count"]; got != 300 {
+		t.Fatalf("legacy free call count metadata = %v, want unchanged 300", got)
+	}
+	if deleted := store.Deleted(); len(deleted) != 0 {
+		t.Fatalf("expected no deleted auths, got %v", deleted)
+	}
+}
+
+func TestManager_MarkResult_SchedulesFreeCodexExpiryAfterFirstUse(t *testing.T) {
+	store := &deletingStore{}
+	mgr := NewManager(store, nil, nil)
+	auth := newPersistedFreeCodexAuth("auths/free-expiry.json")
+	if _, err := mgr.Register(WithSkipPersist(context.Background()), auth); err != nil {
+		t.Fatalf("Register returned error: %v", err)
+	}
+
+	reg := registry.GetGlobalRegistry()
+	reg.RegisterClient(auth.ID, "codex", []*registry.ModelInfo{{ID: "gpt-5.4"}})
+	t.Cleanup(func() { reg.UnregisterClient(auth.ID) })
+
+	mgr.noteFreeCodexUse(context.Background(), auth.ID)
+
+	stored, ok := mgr.GetByID(auth.ID)
+	if !ok {
+		t.Fatalf("expected free auth to remain registered long enough to inspect expiry")
+	}
+	firstUsedAt, ok := freeCodexFirstUsedAt(stored)
+	if !ok {
+		t.Fatalf("expected first-used timestamp to be recorded")
+	}
+	expireAt := scheduledFreeAuthExpiryAt(t, mgr, auth.ID)
+	if !expireAt.Equal(firstUsedAt.Add(freeCodexAuthTTL)) {
+		t.Fatalf("expiry time = %s, want %s", expireAt.Format(time.RFC3339Nano), firstUsedAt.Add(freeCodexAuthTTL).Format(time.RFC3339Nano))
+	}
+
+	mgr.expireFreeAuth(auth.ID, expireAt)
+
+	waitForDeletedIDs(t, store, []string{auth.ID})
+	if _, ok := mgr.GetByID(auth.ID); ok {
+		t.Fatalf("expected free auth to be removed by expiry timer")
+	}
+}
+
+func TestManager_MarkResult_DoesNotDeleteFreeCodexAuthWhenAutoDeleteDisabled(t *testing.T) {
+	store := &deletingStore{}
+	mgr := NewManager(store, nil, nil)
+	mgr.SetConfig(&internalconfig.Config{
+		Routing: internalconfig.RoutingConfig{
+			DisableFreeCodexAutoDelete: true,
+		},
+	})
+	auth := newPersistedFreeCodexAuth("auths/free-autodelete-disabled.json")
+	if _, err := mgr.Register(WithSkipPersist(context.Background()), auth); err != nil {
+		t.Fatalf("Register returned error: %v", err)
+	}
+
+	reg := registry.GetGlobalRegistry()
+	reg.RegisterClient(auth.ID, "codex", []*registry.ModelInfo{{ID: "gpt-5.4"}})
+	t.Cleanup(func() { reg.UnregisterClient(auth.ID) })
+
+	mgr.MarkResult(context.Background(), Result{
+		AuthID:   auth.ID,
+		Provider: "codex",
+		Model:    "gpt-5.4",
+		Success:  false,
+		Error:    &Error{HTTPStatus: http.StatusTooManyRequests, Message: "Selected model is at capacity. Please try a different model."},
+	})
+
+	if _, ok := mgr.GetByID(auth.ID); !ok {
+		t.Fatal("expected free auth to remain registered when auto-delete disabled")
+	}
+	if deleted := store.Deleted(); len(deleted) != 0 {
+		t.Fatalf("expected no deleted auths, got %v", deleted)
+	}
+}
+
+func TestManager_MarkResult_AutoDisablesFreeCodexAuthOnUsageLimitWhenAutoDeleteDisabled(t *testing.T) {
+	store := &deletingStore{}
+	mgr := NewManager(store, nil, nil)
+	mgr.SetConfig(&internalconfig.Config{
+		Routing: internalconfig.RoutingConfig{
+			DisableFreeCodexAutoDelete: true,
+		},
+	})
+	auth := newPersistedFreeCodexAuth("auths/free-usage-limit-disabled.json")
+	if _, err := mgr.Register(WithSkipPersist(context.Background()), auth); err != nil {
+		t.Fatalf("Register returned error: %v", err)
+	}
+
+	reg := registry.GetGlobalRegistry()
+	reg.RegisterClient(auth.ID, "codex", []*registry.ModelInfo{{ID: "gpt-5.4"}})
+	t.Cleanup(func() { reg.UnregisterClient(auth.ID) })
+
+	retryAfter := 10 * time.Minute
+	mgr.MarkResult(context.Background(), Result{
+		AuthID:     auth.ID,
+		Provider:   "codex",
+		Model:      "gpt-5.4",
+		Success:    false,
+		RetryAfter: &retryAfter,
+		Error: &Error{
+			HTTPStatus: http.StatusTooManyRequests,
+			Message:    `{"error":{"type":"usage_limit_reached","message":"The usage limit has been reached","plan_type":"free","resets_in_seconds":600},"status":429}`,
+		},
+	})
+
+	stored, ok := mgr.GetByID(auth.ID)
+	if !ok {
+		t.Fatal("expected free auth to remain registered when auto-delete disabled")
+	}
+	if !stored.Disabled || stored.Status != StatusDisabled {
+		t.Fatalf("expected free auth to be auto-disabled, got disabled=%v status=%q", stored.Disabled, stored.Status)
+	}
+	if !quotaProbeAutoDisabled(stored) {
+		t.Fatal("expected free auth to carry quota auto-disabled marker")
+	}
+	if !stored.Quota.Exceeded || stored.Quota.NextRecoverAt.IsZero() {
+		t.Fatalf("expected durable quota state to be recorded, got %+v", stored.Quota)
+	}
+	if stored.Quota.NextRecoverAt.Before(time.Now().Add(9 * time.Minute)) {
+		t.Fatalf("expected quota recovery to honor retry-after, got %v", stored.Quota.NextRecoverAt)
+	}
+	if deleted := store.Deleted(); len(deleted) != 0 {
+		t.Fatalf("expected no deleted auths, got %v", deleted)
+	}
+}
+
+func TestManager_NoteFreeCodexUse_DoesNotScheduleExpiryWhenAutoDeleteDisabled(t *testing.T) {
+	store := &deletingStore{}
+	mgr := NewManager(store, nil, nil)
+	mgr.SetConfig(&internalconfig.Config{
+		Routing: internalconfig.RoutingConfig{
+			DisableFreeCodexAutoDelete: true,
+		},
+	})
+	auth := newPersistedFreeCodexAuth("auths/free-expiry-disabled.json")
+	if _, err := mgr.Register(WithSkipPersist(context.Background()), auth); err != nil {
+		t.Fatalf("Register returned error: %v", err)
+	}
+
+	mgr.noteFreeCodexUse(context.Background(), auth.ID)
+
+	stored, ok := mgr.GetByID(auth.ID)
+	if !ok {
+		t.Fatal("expected free auth to remain registered")
+	}
+	if _, ok := freeCodexFirstUsedAt(stored); ok {
+		t.Fatal("expected first-used timestamp to remain unset when auto-delete disabled")
+	}
+	mgr.mu.RLock()
+	defer mgr.mu.RUnlock()
+	if item := mgr.freeAuthExpiryIndex[auth.ID]; item != nil {
+		t.Fatalf("expected no expiry timer scheduled, got %+v", item)
 	}
 }

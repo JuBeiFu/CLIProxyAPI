@@ -124,6 +124,32 @@ func TestSchedulerPick_RoundRobinHighestPriority(t *testing.T) {
 	}
 }
 
+func TestSchedulerPick_RoundRobinPrefersNewerCreatedAtWithinPriority(t *testing.T) {
+	t.Parallel()
+
+	base := time.Now().UTC()
+	scheduler := newSchedulerForTest(
+		&RoundRobinSelector{},
+		&Auth{ID: "old", Provider: "gemini", CreatedAt: base.Add(-2 * time.Hour)},
+		&Auth{ID: "new", Provider: "gemini", CreatedAt: base.Add(-1 * time.Hour)},
+		&Auth{ID: "newest", Provider: "gemini", CreatedAt: base},
+	)
+
+	want := []string{"newest", "new", "old", "newest"}
+	for index, wantID := range want {
+		got, errPick := scheduler.pickSingle(context.Background(), "gemini", "", cliproxyexecutor.Options{}, nil)
+		if errPick != nil {
+			t.Fatalf("pickSingle() #%d error = %v", index, errPick)
+		}
+		if got == nil {
+			t.Fatalf("pickSingle() #%d auth = nil", index)
+		}
+		if got.ID != wantID {
+			t.Fatalf("pickSingle() #%d auth.ID = %q, want %q", index, got.ID, wantID)
+		}
+	}
+}
+
 func TestSchedulerPick_FillFirstSticksToFirstReady(t *testing.T) {
 	t.Parallel()
 
@@ -144,6 +170,31 @@ func TestSchedulerPick_FillFirstSticksToFirstReady(t *testing.T) {
 		}
 		if got.ID != "a" {
 			t.Fatalf("pickSingle() #%d auth.ID = %q, want %q", index, got.ID, "a")
+		}
+	}
+}
+
+func TestSchedulerPick_FillFirstPrefersNewestCreatedAtWithinPriority(t *testing.T) {
+	t.Parallel()
+
+	base := time.Now().UTC()
+	scheduler := newSchedulerForTest(
+		&FillFirstSelector{},
+		&Auth{ID: "old", Provider: "gemini", CreatedAt: base.Add(-2 * time.Hour)},
+		&Auth{ID: "newest", Provider: "gemini", CreatedAt: base},
+		&Auth{ID: "new", Provider: "gemini", CreatedAt: base.Add(-1 * time.Hour)},
+	)
+
+	for index := 0; index < 3; index++ {
+		got, errPick := scheduler.pickSingle(context.Background(), "gemini", "", cliproxyexecutor.Options{}, nil)
+		if errPick != nil {
+			t.Fatalf("pickSingle() #%d error = %v", index, errPick)
+		}
+		if got == nil {
+			t.Fatalf("pickSingle() #%d auth = nil", index)
+		}
+		if got.ID != "newest" {
+			t.Fatalf("pickSingle() #%d auth.ID = %q, want %q", index, got.ID, "newest")
 		}
 	}
 }
@@ -240,15 +291,16 @@ func TestSchedulerPick_CodexWebsocketPrefersWebsocketEnabledSubset(t *testing.T)
 func TestSchedulerPick_MixedProvidersUsesProviderRotationOverReadyCandidates(t *testing.T) {
 	t.Parallel()
 
+	base := time.Now().UTC()
 	scheduler := newSchedulerForTest(
 		&RoundRobinSelector{},
-		&Auth{ID: "gemini-a", Provider: "gemini"},
-		&Auth{ID: "gemini-b", Provider: "gemini"},
-		&Auth{ID: "claude-a", Provider: "claude"},
+		&Auth{ID: "gemini-a", Provider: "gemini", CreatedAt: base.Add(-2 * time.Hour)},
+		&Auth{ID: "gemini-b", Provider: "gemini", CreatedAt: base.Add(-1 * time.Hour)},
+		&Auth{ID: "claude-a", Provider: "claude", CreatedAt: base},
 	)
 
 	wantProviders := []string{"gemini", "claude", "gemini", "claude"}
-	wantIDs := []string{"gemini-a", "claude-a", "gemini-b", "claude-a"}
+	wantIDs := []string{"gemini-b", "claude-a", "gemini-a", "claude-a"}
 	for index := range wantProviders {
 		got, provider, errPick := scheduler.pickMixed(context.Background(), []string{"gemini", "claude"}, "", cliproxyexecutor.Options{}, nil)
 		if errPick != nil {
@@ -714,21 +766,22 @@ func TestSchedulerPick_CodexPlanChangePaidToFreeRebuildsReadyBuckets(t *testing.
 func TestManager_PickNextMixed_UsesProviderRotationBeforeCredentialRotation(t *testing.T) {
 	t.Parallel()
 
+	base := time.Now().UTC()
 	manager := NewManager(nil, &RoundRobinSelector{}, nil)
 	manager.executors["gemini"] = schedulerTestExecutor{}
 	manager.executors["claude"] = schedulerTestExecutor{}
-	if _, errRegister := manager.Register(context.Background(), &Auth{ID: "gemini-a", Provider: "gemini"}); errRegister != nil {
+	if _, errRegister := manager.Register(context.Background(), &Auth{ID: "gemini-a", Provider: "gemini", CreatedAt: base.Add(-2 * time.Hour)}); errRegister != nil {
 		t.Fatalf("Register(gemini-a) error = %v", errRegister)
 	}
-	if _, errRegister := manager.Register(context.Background(), &Auth{ID: "gemini-b", Provider: "gemini"}); errRegister != nil {
+	if _, errRegister := manager.Register(context.Background(), &Auth{ID: "gemini-b", Provider: "gemini", CreatedAt: base.Add(-1 * time.Hour)}); errRegister != nil {
 		t.Fatalf("Register(gemini-b) error = %v", errRegister)
 	}
-	if _, errRegister := manager.Register(context.Background(), &Auth{ID: "claude-a", Provider: "claude"}); errRegister != nil {
+	if _, errRegister := manager.Register(context.Background(), &Auth{ID: "claude-a", Provider: "claude", CreatedAt: base}); errRegister != nil {
 		t.Fatalf("Register(claude-a) error = %v", errRegister)
 	}
 
 	wantProviders := []string{"gemini", "claude", "gemini", "claude"}
-	wantIDs := []string{"gemini-a", "claude-a", "gemini-b", "claude-a"}
+	wantIDs := []string{"gemini-b", "claude-a", "gemini-a", "claude-a"}
 	for index := range wantProviders {
 		got, _, provider, errPick := manager.pickNextMixed(context.Background(), []string{"gemini", "claude"}, "", cliproxyexecutor.Options{}, map[string]struct{}{})
 		if errPick != nil {
@@ -825,21 +878,22 @@ func TestManager_SchedulerTracksRegisterAndUpdate(t *testing.T) {
 func TestManager_PickNextMixed_UsesSchedulerRotation(t *testing.T) {
 	t.Parallel()
 
+	base := time.Now().UTC()
 	manager := NewManager(nil, &RoundRobinSelector{}, nil)
 	manager.executors["gemini"] = schedulerTestExecutor{}
 	manager.executors["claude"] = schedulerTestExecutor{}
-	if _, errRegister := manager.Register(context.Background(), &Auth{ID: "gemini-a", Provider: "gemini"}); errRegister != nil {
+	if _, errRegister := manager.Register(context.Background(), &Auth{ID: "gemini-a", Provider: "gemini", CreatedAt: base.Add(-2 * time.Hour)}); errRegister != nil {
 		t.Fatalf("Register(gemini-a) error = %v", errRegister)
 	}
-	if _, errRegister := manager.Register(context.Background(), &Auth{ID: "gemini-b", Provider: "gemini"}); errRegister != nil {
+	if _, errRegister := manager.Register(context.Background(), &Auth{ID: "gemini-b", Provider: "gemini", CreatedAt: base.Add(-1 * time.Hour)}); errRegister != nil {
 		t.Fatalf("Register(gemini-b) error = %v", errRegister)
 	}
-	if _, errRegister := manager.Register(context.Background(), &Auth{ID: "claude-a", Provider: "claude"}); errRegister != nil {
+	if _, errRegister := manager.Register(context.Background(), &Auth{ID: "claude-a", Provider: "claude", CreatedAt: base}); errRegister != nil {
 		t.Fatalf("Register(claude-a) error = %v", errRegister)
 	}
 
 	wantProviders := []string{"gemini", "claude", "gemini", "claude"}
-	wantIDs := []string{"gemini-a", "claude-a", "gemini-b", "claude-a"}
+	wantIDs := []string{"gemini-b", "claude-a", "gemini-a", "claude-a"}
 	for index := range wantProviders {
 		got, _, provider, errPick := manager.pickNextMixed(context.Background(), []string{"gemini", "claude"}, "", cliproxyexecutor.Options{}, nil)
 		if errPick != nil {

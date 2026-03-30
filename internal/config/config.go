@@ -141,10 +141,13 @@ type Config struct {
 // ClaudeHeaderDefaults configures default header values injected into Claude API requests
 // when the client does not send them. Update these when Claude Code releases a new version.
 type ClaudeHeaderDefaults struct {
-	UserAgent      string `yaml:"user-agent" json:"user-agent"`
-	PackageVersion string `yaml:"package-version" json:"package-version"`
-	RuntimeVersion string `yaml:"runtime-version" json:"runtime-version"`
-	Timeout        string `yaml:"timeout" json:"timeout"`
+	UserAgent              string `yaml:"user-agent" json:"user-agent"`
+	PackageVersion         string `yaml:"package-version" json:"package-version"`
+	RuntimeVersion         string `yaml:"runtime-version" json:"runtime-version"`
+	OS                     string `yaml:"os" json:"os"`
+	Arch                   string `yaml:"arch" json:"arch"`
+	StabilizeDeviceProfile *bool  `yaml:"stabilize-device-profile,omitempty" json:"stabilize-device-profile,omitempty"`
+	Timeout                string `yaml:"timeout" json:"timeout"`
 }
 
 // CodexHeaderDefaults configures fallback header values injected into Codex
@@ -201,6 +204,56 @@ type RoutingConfig struct {
 	// Strategy selects the credential selection strategy.
 	// Supported values: "round-robin" (default), "fill-first".
 	Strategy string `yaml:"strategy,omitempty" json:"strategy,omitempty"`
+	// MaxInflightPerAuth limits concurrent live requests that may execute against
+	// the same auth entry at the same time. <= 0 disables the limiter.
+	MaxInflightPerAuth int `yaml:"max-inflight-per-auth,omitempty" json:"max-inflight-per-auth,omitempty"`
+	// AllowInflightOverflowWhenExhausted permits temporary overflow above
+	// MaxInflightPerAuth only when every otherwise-eligible auth for the request
+	// is already blocked by the in-flight limit.
+	AllowInflightOverflowWhenExhausted bool `yaml:"allow-inflight-overflow-when-exhausted,omitempty" json:"allow-inflight-overflow-when-exhausted,omitempty"`
+	// NewAuthFirst controls tie-breaking order within the same priority bucket.
+	// When omitted or true, newer auths are preferred before older ones.
+	// Set it to false to restore older-first ordering.
+	NewAuthFirst *bool `yaml:"new-auth-first,omitempty" json:"new-auth-first,omitempty"`
+	// IdleProbeAfterHours defines how long an auth may remain unused before it is
+	// eligible for background health probing. <= 0 disables idle-age-triggered probing.
+	IdleProbeAfterHours int `yaml:"idle-probe-after-hours,omitempty" json:"idle-probe-after-hours,omitempty"`
+	// SlowRequestPenaltyEnabled enables runtime demotion for repeatedly slow auths.
+	SlowRequestPenaltyEnabled *bool `yaml:"slow-request-penalty-enabled,omitempty" json:"slow-request-penalty-enabled,omitempty"`
+	// SlowRequestThresholdMs is the latency threshold above which a request counts as slow.
+	SlowRequestThresholdMs int `yaml:"slow-request-threshold-ms,omitempty" json:"slow-request-threshold-ms,omitempty"`
+	// SlowRequestWindowSeconds is the accumulation window for slow requests.
+	SlowRequestWindowSeconds int `yaml:"slow-request-window-seconds,omitempty" json:"slow-request-window-seconds,omitempty"`
+	// SlowRequestTriggerCount is how many slow requests in the window trigger a penalty.
+	SlowRequestTriggerCount int `yaml:"slow-request-trigger-count,omitempty" json:"slow-request-trigger-count,omitempty"`
+	// SlowRequestPenaltyStep is the per-trigger priority penalty increment.
+	SlowRequestPenaltyStep int `yaml:"slow-request-penalty-step,omitempty" json:"slow-request-penalty-step,omitempty"`
+	// SlowRequestPenaltyMax caps the accumulated slow-request priority penalty.
+	SlowRequestPenaltyMax int `yaml:"slow-request-penalty-max,omitempty" json:"slow-request-penalty-max,omitempty"`
+	// SlowRequestPenaltyRecover is how many penalty points are recovered on success.
+	SlowRequestPenaltyRecover int `yaml:"slow-request-penalty-recover,omitempty" json:"slow-request-penalty-recover,omitempty"`
+	// SlowRequestCooldownSeconds temporarily cools an auth after repeated slow requests.
+	SlowRequestCooldownSeconds int `yaml:"slow-request-cooldown-seconds,omitempty" json:"slow-request-cooldown-seconds,omitempty"`
+	// DisableFreeCodexAutoDelete disables automatic deletion of persisted free Codex auths.
+	// When enabled, the manager will not remove free Codex auths on the legacy 1-hour expiry
+	// path or on terminal upstream errors such as unauthorized / usage-limit / capacity.
+	DisableFreeCodexAutoDelete bool `yaml:"disable-free-codex-auto-delete,omitempty" json:"disable-free-codex-auto-delete,omitempty"`
+}
+
+// PreferNewAuthFirst returns whether same-priority auth ordering should favor newer auths.
+func (cfg RoutingConfig) PreferNewAuthFirst() bool {
+	if cfg.NewAuthFirst == nil {
+		return true
+	}
+	return *cfg.NewAuthFirst
+}
+
+// SlowPenaltyEnabled returns whether slow-request runtime penalties are enabled.
+func (cfg RoutingConfig) SlowPenaltyEnabled() bool {
+	if cfg.SlowRequestPenaltyEnabled == nil {
+		return true
+	}
+	return *cfg.SlowRequestPenaltyEnabled
 }
 
 // OAuthModelAlias defines a model ID alias for a specific channel.
@@ -664,6 +717,9 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	// Sanitize Codex header defaults.
 	cfg.SanitizeCodexHeaderDefaults()
 
+	// Sanitize Claude header defaults.
+	cfg.SanitizeClaudeHeaderDefaults()
+
 	// Sanitize Claude key headers
 	cfg.SanitizeClaudeKeys()
 
@@ -764,6 +820,20 @@ func (cfg *Config) SanitizeCodexHeaderDefaults() {
 	}
 	cfg.CodexHeaderDefaults.UserAgent = strings.TrimSpace(cfg.CodexHeaderDefaults.UserAgent)
 	cfg.CodexHeaderDefaults.BetaFeatures = strings.TrimSpace(cfg.CodexHeaderDefaults.BetaFeatures)
+}
+
+// SanitizeClaudeHeaderDefaults trims surrounding whitespace from the
+// configured Claude fingerprint baseline values.
+func (cfg *Config) SanitizeClaudeHeaderDefaults() {
+	if cfg == nil {
+		return
+	}
+	cfg.ClaudeHeaderDefaults.UserAgent = strings.TrimSpace(cfg.ClaudeHeaderDefaults.UserAgent)
+	cfg.ClaudeHeaderDefaults.PackageVersion = strings.TrimSpace(cfg.ClaudeHeaderDefaults.PackageVersion)
+	cfg.ClaudeHeaderDefaults.RuntimeVersion = strings.TrimSpace(cfg.ClaudeHeaderDefaults.RuntimeVersion)
+	cfg.ClaudeHeaderDefaults.OS = strings.TrimSpace(cfg.ClaudeHeaderDefaults.OS)
+	cfg.ClaudeHeaderDefaults.Arch = strings.TrimSpace(cfg.ClaudeHeaderDefaults.Arch)
+	cfg.ClaudeHeaderDefaults.Timeout = strings.TrimSpace(cfg.ClaudeHeaderDefaults.Timeout)
 }
 
 // SanitizeOAuthModelAlias normalizes and deduplicates global OAuth model name aliases.

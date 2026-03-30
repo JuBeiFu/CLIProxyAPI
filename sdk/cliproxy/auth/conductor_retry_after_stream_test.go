@@ -39,7 +39,7 @@ func TestWrapStreamResult_PropagatesRetryAfterFromStreamError(t *testing.T) {
 	remaining <- cliproxyexecutor.StreamChunk{Err: wrapped}
 	close(remaining)
 
-	stream := mgr.wrapStreamResult(ctx, &Auth{ID: "auth-1"}, "codex", "gpt-5", http.Header{}, nil, remaining)
+	stream := mgr.wrapStreamResult(ctx, &Auth{ID: "auth-1"}, "codex", "gpt-5", 0, http.Header{}, nil, remaining)
 	for range stream.Chunks {
 	}
 
@@ -66,4 +66,3 @@ func TestWrapStreamResult_PropagatesRetryAfterFromStreamError(t *testing.T) {
 		t.Fatalf("expected NextRetryAfter >= ~1h in future, got %v", time.Until(state.NextRetryAfter))
 	}
 }
-

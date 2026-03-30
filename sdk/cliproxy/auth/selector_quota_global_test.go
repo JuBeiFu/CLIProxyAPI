@@ -99,3 +99,44 @@ func TestIsAuthBlockedForModel_TransientCooldownBlocksAllModels(t *testing.T) {
 		t.Fatalf("expected next=%v, got %v", until, next)
 	}
 }
+
+func TestIsAuthBlockedForModel_DisableCoolingIgnoresExistingCooldownState(t *testing.T) {
+	t.Parallel()
+
+	prev := quotaCooldownDisabled.Load()
+	quotaCooldownDisabled.Store(true)
+	t.Cleanup(func() { quotaCooldownDisabled.Store(prev) })
+
+	now := time.Now()
+	until := now.Add(45 * time.Minute)
+	auth := &Auth{
+		ID:                    "auth-disable-cooling",
+		TransientCooldownUntil: until,
+		SlowRequestCooldownUntil: until,
+		Unavailable:           true,
+		NextRetryAfter:        until,
+		Quota: QuotaState{
+			Exceeded:      true,
+			NextRecoverAt: until,
+		},
+		Metadata: map[string]any{
+			metadataCooldownUntilKey: until.Unix(),
+		},
+		ModelStates: map[string]*ModelState{
+			"gpt-5": {
+				Status:         StatusError,
+				Unavailable:    true,
+				NextRetryAfter: until,
+				Quota: QuotaState{
+					Exceeded:      true,
+					NextRecoverAt: until,
+				},
+			},
+		},
+	}
+
+	blocked, reason, next := isAuthBlockedForModel(auth, "gpt-5", now)
+	if blocked {
+		t.Fatalf("expected auth not to be blocked when disable-cooling=true, got reason=%v next=%v", reason, next)
+	}
+}

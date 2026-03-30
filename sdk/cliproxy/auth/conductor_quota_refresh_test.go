@@ -1,12 +1,15 @@
 package auth
 
 import (
+	"bytes"
 	"context"
+	"io"
 	"errors"
 	"net/http"
 	"testing"
 	"time"
 
+	internalconfig "github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 )
@@ -15,6 +18,7 @@ type quotaProbeTestExecutor struct {
 	id       string
 	attempts int
 	execute  func(context.Context, *Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (cliproxyexecutor.Response, error)
+	httpRequest func(context.Context, *Auth, *http.Request) (*http.Response, error)
 }
 
 func (e *quotaProbeTestExecutor) Identifier() string { return e.id }
@@ -38,7 +42,10 @@ func (e *quotaProbeTestExecutor) CountTokens(context.Context, *Auth, cliproxyexe
 	return cliproxyexecutor.Response{}, nil
 }
 
-func (e *quotaProbeTestExecutor) HttpRequest(context.Context, *Auth, *http.Request) (*http.Response, error) {
+func (e *quotaProbeTestExecutor) HttpRequest(ctx context.Context, auth *Auth, req *http.Request) (*http.Response, error) {
+	if e.httpRequest != nil {
+		return e.httpRequest(ctx, auth, req)
+	}
 	return nil, nil
 }
 
@@ -53,6 +60,30 @@ func (e quotaProbeStatusError) Error() string { return e.message }
 func (e quotaProbeStatusError) StatusCode() int { return e.status }
 
 func (e quotaProbeStatusError) RetryAfter() *time.Duration { return e.retryAfter }
+
+func newCodexUsageHTTPResponse(status int, body string, headers map[string]string) *http.Response {
+	resp := &http.Response{
+		StatusCode: status,
+		Header:     make(http.Header),
+		Body:       io.NopCloser(bytes.NewBufferString(body)),
+	}
+	for key, value := range headers {
+		resp.Header.Set(key, value)
+	}
+	return resp
+}
+
+func metadataTimeValue(t *testing.T, auth *Auth, key string) time.Time {
+	t.Helper()
+	if auth == nil || auth.Metadata == nil {
+		t.Fatalf("metadataTimeValue(%s): auth metadata is nil", key)
+	}
+	value, ok := lookupMetadataTime(auth.Metadata, key)
+	if !ok {
+		t.Fatalf("metadataTimeValue(%s): key not found", key)
+	}
+	return value
+}
 
 func TestPickQuotaProbeModel_UsesRegisteredCodexModelForFreePlan(t *testing.T) {
 	auth := &Auth{ID: "quota-model-free", Provider: "codex", Metadata: map[string]any{"type": "codex", "plan_type": "free"}}
@@ -160,8 +191,37 @@ func TestManager_QuotaRefresh_DeletesPersistedAuthOnDeactivatedWorkspace(t *test
 		t.Fatalf("expected deactivated_workspace quota probe auth to be removed")
 	}
 	waitForDeletedIDs(t, store, []string{auth.ID})
-	if exec.attempts != quotaProbeRetryLimit+1 {
-		t.Fatalf("attempts = %d, want %d", exec.attempts, quotaProbeRetryLimit+1)
+	if exec.attempts != 1 {
+		t.Fatalf("attempts = %d, want 1", exec.attempts)
+	}
+}
+
+func TestManager_QuotaRefresh_DeletesPersistedAuthOnOrgRequired(t *testing.T) {
+	store := &deletingStore{}
+	exec := &quotaProbeTestExecutor{
+		id: "codex",
+		execute: func(context.Context, *Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+			return cliproxyexecutor.Response{}, quotaProbeStatusError{status: http.StatusUnauthorized, message: `{"error":{"message":"You must be a member of an organization to use the API."},"status":401}`}
+		},
+	}
+	mgr := NewManager(store, nil, nil)
+	mgr.RegisterExecutor(exec)
+	auth := &Auth{ID: "auths/quota-org-required.json", FileName: "auths/quota-org-required.json", Provider: "codex", Attributes: map[string]string{"path": "/tmp/quota-org-required.json"}, Metadata: map[string]any{"type": "codex"}}
+	if _, err := mgr.Register(WithSkipPersist(context.Background()), auth); err != nil {
+		t.Fatalf("Register returned error: %v", err)
+	}
+
+	reg := registry.GetGlobalRegistry()
+	reg.RegisterClient(auth.ID, "codex", []*registry.ModelInfo{{ID: "gpt-5"}})
+	t.Cleanup(func() { reg.UnregisterClient(auth.ID) })
+	mgr.refreshQuotaAuth(context.Background(), auth.ID)
+
+	if _, ok := mgr.GetByID(auth.ID); ok {
+		t.Fatalf("expected org-required quota probe auth to be removed")
+	}
+	waitForDeletedIDs(t, store, []string{auth.ID})
+	if exec.attempts != 1 {
+		t.Fatalf("attempts = %d, want 1", exec.attempts)
 	}
 }
 
@@ -344,6 +404,192 @@ func TestManager_QuotaRefresh_RetriesTransientFailuresTwice(t *testing.T) {
 	}
 }
 
+func TestManager_MarkResult_CodexSuccessSchedulesUsageRefreshAfterFiveMinutes(t *testing.T) {
+	store := &deletingStore{}
+	mgr := NewManager(store, nil, nil)
+	auth := &Auth{
+		ID:       "auths/codex-usage-schedule.json",
+		FileName: "auths/codex-usage-schedule.json",
+		Provider: "codex",
+		Status:   StatusActive,
+		Metadata: map[string]any{"type": "codex"},
+	}
+	if _, err := mgr.Register(WithSkipPersist(context.Background()), auth); err != nil {
+		t.Fatalf("Register returned error: %v", err)
+	}
+
+	before := time.Now()
+	mgr.MarkResult(context.Background(), Result{
+		AuthID:   auth.ID,
+		Provider: auth.Provider,
+		Model:    "gpt-5",
+		Success:  true,
+	})
+
+	stored, ok := mgr.GetByID(auth.ID)
+	if !ok {
+		t.Fatalf("expected auth to remain registered")
+	}
+	nextRefresh := metadataTimeValue(t, stored, metadataCodexUsageAfterKey)
+	if nextRefresh.Before(before.Add(4*time.Minute + 50*time.Second)) {
+		t.Fatalf("codex usage next refresh = %v, want about 5 minutes after %v", nextRefresh, before)
+	}
+	lastUsed := metadataTimeValue(t, stored, metadataLastUsedAtKey)
+	if lastUsed.Before(before.Add(-5 * time.Second)) || lastUsed.After(time.Now().Add(5*time.Second)) {
+		t.Fatalf("last used timestamp looks incorrect: %v", lastUsed)
+	}
+}
+
+func TestCodexUsageRefreshSchedule_EnforcesFiveMinuteFetchCooldown(t *testing.T) {
+	now := time.Now().UTC()
+	auth := &Auth{
+		ID:       "auths/codex-usage-cooldown.json",
+		Provider: "codex",
+		Metadata: map[string]any{
+			metadataLastUsedAtKey:      now.Add(-2 * time.Minute).Format(time.RFC3339Nano),
+			metadataCodexUsageLastKey:  now.Add(-1 * time.Minute).Unix(),
+			metadataCodexUsageAfterKey: now.Add(-30 * time.Second).Unix(),
+		},
+	}
+
+	due, last := codexUsageRefreshSchedule(auth)
+	if last.IsZero() {
+		t.Fatalf("expected last fetch to be recorded")
+	}
+	minDue := last.Add(codexUsageRefreshDelay)
+	if due.IsZero() {
+		t.Fatalf("expected codex usage refresh to be scheduled")
+	}
+	if due.Sub(minDue) < -time.Second || due.Sub(minDue) > time.Second {
+		t.Fatalf("due = %v, want %v", due, minDue)
+	}
+}
+
+func TestManager_QuotaRefresh_CodexLowBalanceAutoDisablesWhenUnusedForFiveMinutes(t *testing.T) {
+	store := &deletingStore{}
+	exec := &quotaProbeTestExecutor{
+		id: "codex",
+		httpRequest: func(_ context.Context, auth *Auth, req *http.Request) (*http.Response, error) {
+			if req == nil {
+				t.Fatalf("expected usage refresh request")
+			}
+			if got := req.Header.Get("Chatgpt-Account-Id"); got != "acct-low-balance" {
+				t.Fatalf("Chatgpt-Account-Id = %q, want %q", got, "acct-low-balance")
+			}
+			return newCodexUsageHTTPResponse(http.StatusOK, `{
+				"plan_type":"team",
+				"rate_limit":{
+					"primary_window":{"used_percent":94,"limit_window_seconds":18000,"reset_after_seconds":900},
+					"secondary_window":{"used_percent":91,"limit_window_seconds":604800,"reset_after_seconds":7200}
+				}
+			}`, nil), nil
+		},
+	}
+	mgr := NewManager(store, nil, nil)
+	mgr.RegisterExecutor(exec)
+	now := time.Now().UTC()
+	auth := &Auth{
+		ID:       "auths/codex-low-balance.json",
+		FileName: "auths/codex-low-balance.json",
+		Provider: "codex",
+		Status:   StatusActive,
+		Metadata: map[string]any{
+			"type":                    "codex",
+			"account_id":              "acct-low-balance",
+			metadataLastUsedAtKey:     now.Add(-6 * time.Minute).Format(time.RFC3339Nano),
+			metadataCodexUsageAfterKey: now.Add(-time.Minute).Unix(),
+		},
+	}
+	if _, err := mgr.Register(WithSkipPersist(context.Background()), auth); err != nil {
+		t.Fatalf("Register returned error: %v", err)
+	}
+
+	mgr.refreshQuotaAuth(context.Background(), auth.ID)
+	stored, ok := mgr.GetByID(auth.ID)
+	if !ok {
+		t.Fatalf("expected auth to remain registered")
+	}
+	if !stored.Disabled || stored.Status != StatusDisabled {
+		t.Fatalf("expected low-balance auth to be disabled, got disabled=%v status=%q", stored.Disabled, stored.Status)
+	}
+	if !quotaProbeAutoDisabled(stored) {
+		t.Fatalf("expected low-balance auth to carry auto-disabled marker")
+	}
+	if reason := quotaAutoDisabledReason(stored); reason != autoDisabledReasonQuotaLowBalance {
+		t.Fatalf("auto-disabled reason = %q, want %q", reason, autoDisabledReasonQuotaLowBalance)
+	}
+	if stored.Quota.NextRecoverAt.IsZero() {
+		t.Fatalf("expected quota next recover at to be set")
+	}
+	if remaining, ok := stored.Metadata[metadataCodexUsageRemainingKey].(float64); !ok || remaining >= codexLowRemainingThresholdPct {
+		t.Fatalf("remaining percent metadata = %#v, want value below %.1f", stored.Metadata[metadataCodexUsageRemainingKey], codexLowRemainingThresholdPct)
+	}
+	if _, ok := stored.Metadata[metadataCodexUsagePayloadKey].(string); !ok {
+		t.Fatalf("expected usage payload to be cached")
+	}
+}
+
+func TestManager_QuotaRefresh_CodexUsageSuccessReenablesLowBalanceAutoDisabledAuth(t *testing.T) {
+	store := &deletingStore{}
+	exec := &quotaProbeTestExecutor{
+		id: "codex",
+		httpRequest: func(context.Context, *Auth, *http.Request) (*http.Response, error) {
+			return newCodexUsageHTTPResponse(http.StatusOK, `{
+				"plan_type":"team",
+				"rate_limit":{
+					"primary_window":{"used_percent":40,"limit_window_seconds":18000,"reset_after_seconds":900},
+					"secondary_window":{"used_percent":30,"limit_window_seconds":604800,"reset_after_seconds":7200}
+				}
+			}`, nil), nil
+		},
+	}
+	mgr := NewManager(store, nil, nil)
+	mgr.RegisterExecutor(exec)
+	now := time.Now().UTC()
+	auth := &Auth{
+		ID:       "auths/codex-low-balance-recover.json",
+		FileName: "auths/codex-low-balance-recover.json",
+		Provider: "codex",
+		Disabled: true,
+		Status:   StatusDisabled,
+		Quota: QuotaState{
+			Exceeded:      true,
+			Reason:        autoDisabledReasonQuotaLowBalance,
+			NextRecoverAt: now.Add(2 * time.Hour),
+		},
+		Metadata: map[string]any{
+			"type":                         "codex",
+			"account_id":                   "acct-recover",
+			metadataAutoDisabledReasonKey:  autoDisabledReasonQuotaLowBalance,
+			metadataCodexUsageAfterKey:     now.Add(-time.Minute).Unix(),
+			metadataCodexUsagePayloadKey:   `{"stale":true}`,
+			metadataCodexUsageRemainingKey: 3.2,
+		},
+	}
+	if _, err := mgr.Register(WithSkipPersist(context.Background()), auth); err != nil {
+		t.Fatalf("Register returned error: %v", err)
+	}
+
+	mgr.refreshQuotaAuth(context.Background(), auth.ID)
+	stored, ok := mgr.GetByID(auth.ID)
+	if !ok {
+		t.Fatalf("expected auth to remain registered")
+	}
+	if stored.Disabled || stored.Status != StatusActive {
+		t.Fatalf("expected auth to be re-enabled, got disabled=%v status=%q", stored.Disabled, stored.Status)
+	}
+	if quotaProbeAutoDisabled(stored) {
+		t.Fatalf("expected auto-disabled reason to be cleared")
+	}
+	if stored.Quota.Exceeded {
+		t.Fatalf("expected quota exceeded flag to be cleared, got %+v", stored.Quota)
+	}
+	remaining, ok := stored.Metadata[metadataCodexUsageRemainingKey].(float64)
+	if !ok || remaining <= codexLowRemainingThresholdPct {
+		t.Fatalf("remaining percent metadata = %#v, want value above %.1f", stored.Metadata[metadataCodexUsageRemainingKey], codexLowRemainingThresholdPct)
+	}
+}
+
 func TestManager_RecordResult_QuotaErrorSchedulesRecoveryProbeAndPenalty(t *testing.T) {
 	store := &deletingStore{}
 	mgr := NewManager(store, nil, nil)
@@ -442,5 +688,252 @@ func TestManager_QuotaRefresh_DoesNotHoldManagerLockWhilePersisting(t *testing.T
 	case <-done:
 	case <-time.After(2 * time.Second):
 		t.Fatal("refreshQuotaAuth did not finish after Save was released")
+	}
+}
+
+func TestManager_QuotaRefresh_DeletesFreeCodexAuthOn403(t *testing.T) {
+	store := &deletingStore{}
+	exec := &quotaProbeTestExecutor{
+		id: "codex",
+		execute: func(context.Context, *Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+			return cliproxyexecutor.Response{}, quotaProbeStatusError{status: http.StatusForbidden, message: "authorization lost"}
+		},
+	}
+	mgr := NewManager(store, nil, nil)
+	mgr.RegisterExecutor(exec)
+	auth := &Auth{
+		ID:       "auths/quota-free-403.json",
+		FileName: "auths/quota-free-403.json",
+		Provider: "codex",
+		Attributes: map[string]string{
+			"path": "/tmp/quota-free-403.json",
+		},
+		Metadata: map[string]any{"type": "codex", "plan_type": "free"},
+	}
+	if _, err := mgr.Register(WithSkipPersist(context.Background()), auth); err != nil {
+		t.Fatalf("Register returned error: %v", err)
+	}
+	reg := registry.GetGlobalRegistry()
+	reg.RegisterClient(auth.ID, "codex", []*registry.ModelInfo{{ID: "gpt-5.4"}})
+	t.Cleanup(func() { reg.UnregisterClient(auth.ID) })
+
+	mgr.refreshQuotaAuth(context.Background(), auth.ID)
+
+	if _, ok := mgr.GetByID(auth.ID); ok {
+		t.Fatalf("expected free quota probe auth to be removed on 403")
+	}
+	waitForDeletedIDs(t, store, []string{auth.ID})
+	if exec.attempts != 1 {
+		t.Fatalf("attempts = %d, want 1", exec.attempts)
+	}
+}
+
+func TestQuotaProbeSchedule_UsesPersistedQuotaRecoveryWhenTransientMetadataMissing(t *testing.T) {
+	now := time.Now().UTC()
+	auth := &Auth{
+		ID:       "auths/quota-persisted-recovery.json",
+		Provider: "codex",
+		Disabled: true,
+		Status:   StatusDisabled,
+		Metadata: map[string]any{
+			"type":                         "codex",
+			metadataAutoDisabledReasonKey: autoDisabledReasonQuotaExhausted,
+		},
+		Quota: QuotaState{
+			Exceeded:      true,
+			Reason:        "quota",
+			NextRecoverAt: now.Add(6 * time.Hour),
+		},
+		NextRetryAfter: now.Add(6 * time.Hour),
+	}
+
+	nextProbe, lastProbe := quotaProbeSchedule(auth)
+	if lastProbe != (time.Time{}) {
+		t.Fatalf("expected no last probe timestamp from stripped metadata, got %v", lastProbe)
+	}
+	if nextProbe.IsZero() {
+		t.Fatal("expected persisted quota recovery time to be used as next probe")
+	}
+	if nextProbe.Sub(auth.Quota.NextRecoverAt) > time.Second || auth.Quota.NextRecoverAt.Sub(nextProbe) > time.Second {
+		t.Fatalf("next probe = %v, want %v", nextProbe, auth.Quota.NextRecoverAt)
+	}
+}
+
+func TestManager_QuotaRefresh_DeletesFreeCodexAuthOn429(t *testing.T) {
+	store := &deletingStore{}
+	exec := &quotaProbeTestExecutor{
+		id: "codex",
+		execute: func(context.Context, *Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+			return cliproxyexecutor.Response{}, quotaProbeStatusError{status: http.StatusTooManyRequests, message: "Selected model is at capacity. Please try a different model."}
+		},
+	}
+	mgr := NewManager(store, nil, nil)
+	mgr.RegisterExecutor(exec)
+	auth := &Auth{
+		ID:       "auths/quota-free-429.json",
+		FileName: "auths/quota-free-429.json",
+		Provider: "codex",
+		Attributes: map[string]string{
+			"path": "/tmp/quota-free-429.json",
+		},
+		Metadata: map[string]any{"type": "codex", "plan_type": "free"},
+	}
+	if _, err := mgr.Register(WithSkipPersist(context.Background()), auth); err != nil {
+		t.Fatalf("Register returned error: %v", err)
+	}
+	reg := registry.GetGlobalRegistry()
+	reg.RegisterClient(auth.ID, "codex", []*registry.ModelInfo{{ID: "gpt-5.4"}})
+	t.Cleanup(func() { reg.UnregisterClient(auth.ID) })
+
+	mgr.refreshQuotaAuth(context.Background(), auth.ID)
+
+	if _, ok := mgr.GetByID(auth.ID); ok {
+		t.Fatalf("expected free quota probe auth to be removed on 429")
+	}
+	waitForDeletedIDs(t, store, []string{auth.ID})
+	if exec.attempts != 1 {
+		t.Fatalf("attempts = %d, want 1", exec.attempts)
+	}
+}
+
+func TestManager_PickQuotaRefreshBatch_SelectsIdleAuthsBeforeNormalDue(t *testing.T) {
+	now := time.Now().UTC()
+	mgr := NewManager(nil, nil, nil)
+	mgr.SetConfig(&internalconfig.Config{
+		Routing: internalconfig.RoutingConfig{
+			IdleProbeAfterHours: 24,
+		},
+	})
+	mgr.RegisterExecutor(&quotaProbeTestExecutor{id: "codex"})
+
+	idleAuth := &Auth{
+		ID:        "idle-auth",
+		Provider:  "codex",
+		CreatedAt: now.Add(-72 * time.Hour),
+		Metadata: map[string]any{
+			metadataPlanTypeKey:      "team",
+			metadataQuotaProbeAfterKey: now.Add(2 * time.Hour).Unix(),
+			metadataQuotaProbeLastKey:  now.Add(-30 * time.Minute).Unix(),
+			metadataLastUsedAtKey:      now.Add(-48 * time.Hour).Format(time.RFC3339Nano),
+		},
+	}
+	if _, err := mgr.Register(WithSkipPersist(context.Background()), idleAuth); err != nil {
+		t.Fatalf("Register(idleAuth) error = %v", err)
+	}
+
+	dueAuth := &Auth{
+		ID:        "due-auth",
+		Provider:  "codex",
+		CreatedAt: now.Add(-2 * time.Hour),
+		Metadata: map[string]any{
+			metadataPlanTypeKey:      "team",
+			metadataQuotaProbeAfterKey: now.Add(-5 * time.Minute).Unix(),
+			metadataQuotaProbeLastKey:  now.Add(-2 * time.Hour).Unix(),
+			metadataLastUsedAtKey:      now.Add(-30 * time.Minute).Format(time.RFC3339Nano),
+		},
+	}
+	if _, err := mgr.Register(WithSkipPersist(context.Background()), dueAuth); err != nil {
+		t.Fatalf("Register(dueAuth) error = %v", err)
+	}
+
+	selected := mgr.pickQuotaRefreshBatch(now, 2)
+	if len(selected) != 2 {
+		t.Fatalf("len(selected) = %d, want 2", len(selected))
+	}
+	if selected[0] != idleAuth.ID {
+		t.Fatalf("selected[0] = %q, want %q", selected[0], idleAuth.ID)
+	}
+	if selected[1] != dueAuth.ID {
+		t.Fatalf("selected[1] = %q, want %q", selected[1], dueAuth.ID)
+	}
+}
+
+func TestManager_PickQuotaRefreshBatch_PrefersLongestIdleAuthFirst(t *testing.T) {
+	now := time.Now().UTC()
+	mgr := NewManager(nil, nil, nil)
+	mgr.SetConfig(&internalconfig.Config{
+		Routing: internalconfig.RoutingConfig{
+			IdleProbeAfterHours: 24,
+		},
+	})
+	mgr.RegisterExecutor(&quotaProbeTestExecutor{id: "codex"})
+
+	longIdleAuth := &Auth{
+		ID:        "long-idle-auth",
+		Provider:  "codex",
+		CreatedAt: now.Add(-10 * 24 * time.Hour),
+		Metadata: map[string]any{
+			metadataPlanTypeKey:      "team",
+			metadataQuotaProbeAfterKey: now.Add(3 * time.Hour).Unix(),
+			metadataQuotaProbeLastKey:  now.Add(-15 * time.Minute).Unix(),
+			metadataLastUsedAtKey:      now.Add(-96 * time.Hour).Format(time.RFC3339Nano),
+		},
+	}
+	if _, err := mgr.Register(WithSkipPersist(context.Background()), longIdleAuth); err != nil {
+		t.Fatalf("Register(longIdleAuth) error = %v", err)
+	}
+
+	shortIdleAuth := &Auth{
+		ID:        "short-idle-auth",
+		Provider:  "codex",
+		CreatedAt: now.Add(-5 * 24 * time.Hour),
+		Metadata: map[string]any{
+			metadataPlanTypeKey:      "team",
+			metadataQuotaProbeAfterKey: now.Add(3 * time.Hour).Unix(),
+			metadataQuotaProbeLastKey:  now.Add(-15 * time.Minute).Unix(),
+			metadataLastUsedAtKey:      now.Add(-30 * time.Hour).Format(time.RFC3339Nano),
+		},
+	}
+	if _, err := mgr.Register(WithSkipPersist(context.Background()), shortIdleAuth); err != nil {
+		t.Fatalf("Register(shortIdleAuth) error = %v", err)
+	}
+
+	selected := mgr.pickQuotaRefreshBatch(now, 2)
+	if len(selected) != 2 {
+		t.Fatalf("len(selected) = %d, want 2", len(selected))
+	}
+	if selected[0] != longIdleAuth.ID {
+		t.Fatalf("selected[0] = %q, want %q", selected[0], longIdleAuth.ID)
+	}
+	if selected[1] != shortIdleAuth.ID {
+		t.Fatalf("selected[1] = %q, want %q", selected[1], shortIdleAuth.ID)
+	}
+}
+
+func TestManager_PickQuotaRefreshBatch_DoesNotIdleProbeAutoDisabledQuotaAuthBeforeRecovery(t *testing.T) {
+	now := time.Now().UTC()
+	mgr := NewManager(nil, nil, nil)
+	mgr.SetConfig(&internalconfig.Config{
+		Routing: internalconfig.RoutingConfig{
+			IdleProbeAfterHours: 24,
+		},
+	})
+	mgr.RegisterExecutor(&quotaProbeTestExecutor{id: "codex"})
+
+	autoDisabled := &Auth{
+		ID:        "auto-disabled-quota-auth",
+		Provider:  "codex",
+		Disabled:  true,
+		Status:    StatusDisabled,
+		CreatedAt: now.Add(-10 * 24 * time.Hour),
+		Metadata: map[string]any{
+			metadataPlanTypeKey:           "free",
+			metadataAutoDisabledReasonKey: autoDisabledReasonQuotaExhausted,
+			metadataLastUsedAtKey:         now.Add(-96 * time.Hour).Format(time.RFC3339Nano),
+		},
+		Quota: QuotaState{
+			Exceeded:      true,
+			Reason:        "quota",
+			NextRecoverAt: now.Add(3 * time.Hour),
+		},
+		NextRetryAfter: now.Add(3 * time.Hour),
+	}
+	if _, err := mgr.Register(WithSkipPersist(context.Background()), autoDisabled); err != nil {
+		t.Fatalf("Register(autoDisabled) error = %v", err)
+	}
+
+	selected := mgr.pickQuotaRefreshBatch(now, 1)
+	if len(selected) != 0 {
+		t.Fatalf("expected auto-disabled quota auth to stay unscheduled before recovery, got %v", selected)
 	}
 }

@@ -81,3 +81,31 @@ func TestParseCodexWebsocketError_MissingStatusAndNotUsageLimitIsIgnored(t *test
 		t.Fatalf("expected no parsed error, got ok=%v err=%v", ok, err)
 	}
 }
+
+func TestParseCodexWebsocketError_CapacityErrorNormalizesTo429(t *testing.T) {
+	payload := []byte(`{"type":"error","status":500,"error":{"type":"server_error","message":"Selected model is at capacity. Please try a different model."}}`)
+	err, ok := parseCodexWebsocketError(payload)
+	if !ok || err == nil {
+		t.Fatalf("expected websocket error, got ok=%v err=%v", ok, err)
+	}
+
+	sc, ok := err.(interface{ StatusCode() int })
+	if !ok {
+		t.Fatalf("expected StatusCode() on error, got %T", err)
+	}
+	if sc.StatusCode() != http.StatusTooManyRequests {
+		t.Fatalf("expected status 429, got %d", sc.StatusCode())
+	}
+
+	rap, ok := err.(interface{ RetryAfter() *time.Duration })
+	if !ok {
+		t.Fatalf("expected RetryAfter() on error, got %T", err)
+	}
+	retryAfter := rap.RetryAfter()
+	if retryAfter == nil {
+		t.Fatalf("expected retryAfter, got nil")
+	}
+	if want := 5 * time.Second; *retryAfter != want {
+		t.Fatalf("expected retryAfter %v, got %v", want, *retryAfter)
+	}
+}

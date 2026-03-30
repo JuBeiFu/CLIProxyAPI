@@ -30,7 +30,8 @@ import (
 
 const (
 	codexClientVersion = "0.101.0"
-	codexUserAgent     = "codex_cli_rs/0.101.0 (Mac OS 26.0.1; arm64) Apple_Terminal/464"
+	codexUserAgent     = "codex_cli_rs/0.116.0 (Mac OS 26.0.1; arm64) Apple_Terminal/464"
+	codexOriginator    = "codex_cli_rs"
 )
 
 var dataTag = []byte("data:")
@@ -75,7 +76,11 @@ func (e *CodexExecutor) HttpRequest(ctx context.Context, auth *cliproxyauth.Auth
 		return nil, err
 	}
 	httpClient := newProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
-	return httpClient.Do(httpReq)
+	httpResp, err := httpClient.Do(httpReq)
+	if err != nil {
+		return nil, normalizeCodexDoRequestErr(err)
+	}
+	return httpResp, nil
 }
 
 func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (resp cliproxyexecutor.Response, err error) {
@@ -144,6 +149,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	httpClient := newProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
 	httpResp, err := httpClient.Do(httpReq)
 	if err != nil {
+		err = normalizeCodexDoRequestErr(err)
 		recordAPIResponseError(ctx, e.cfg, err)
 		return resp, err
 	}
@@ -248,6 +254,7 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 	httpClient := newProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
 	httpResp, err := httpClient.Do(httpReq)
 	if err != nil {
+		err = normalizeCodexDoRequestErr(err)
 		recordAPIResponseError(ctx, e.cfg, err)
 		return resp, err
 	}
@@ -344,6 +351,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 	httpClient := newProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
 	httpResp, err := httpClient.Do(httpReq)
 	if err != nil {
+		err = normalizeCodexDoRequestErr(err)
 		recordAPIResponseError(ctx, e.cfg, err)
 		return nil, err
 	}
@@ -392,6 +400,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 			}
 		}
 		if errScan := scanner.Err(); errScan != nil {
+			errScan = normalizeCodexDoRequestErr(errScan)
 			recordAPIResponseError(ctx, e.cfg, errScan)
 			reporter.publishFailure(ctx)
 			out <- cliproxyexecutor.StreamChunk{Err: errScan}
@@ -625,6 +634,27 @@ func normalizeCodexRefreshErr(err error) error {
 	return newCodexStatusErr(statusCode, []byte(body))
 }
 
+func normalizeCodexDoRequestErr(err error) error {
+	if err == nil {
+		return nil
+	}
+	raw := strings.TrimSpace(err.Error())
+	if raw == "" {
+		return err
+	}
+	message := strings.ToLower(raw)
+	if strings.Contains(message, "goaway") || strings.Contains(message, "protocol_error") {
+		return statusErr{code: http.StatusBadGateway, msg: "transport error: stream disconnected before completion: " + raw}
+	}
+	if strings.Contains(message, "error sending request for url") {
+		return statusErr{code: http.StatusBadGateway, msg: "transport error: stream disconnected before completion: " + raw}
+	}
+	if strings.Contains(message, "stream disconnected before completion") || strings.Contains(message, "stream closed before response.completed") {
+		return statusErr{code: http.StatusRequestTimeout, msg: raw}
+	}
+	return err
+}
+
 func (e *CodexExecutor) cacheHelper(ctx context.Context, from sdktranslator.Format, url string, req cliproxyexecutor.Request, rawJSON []byte) (*http.Request, error) {
 	var cache codexCache
 	if from == "claude" {
@@ -674,8 +704,10 @@ func applyCodexHeaders(r *http.Request, auth *cliproxyauth.Auth, token string, s
 		ginHeaders = ginCtx.Request.Header
 	}
 
-	misc.EnsureHeader(r.Header, ginHeaders, "Version", codexClientVersion)
+	misc.EnsureHeader(r.Header, ginHeaders, "Version", "")
 	misc.EnsureHeader(r.Header, ginHeaders, "Session_id", uuid.NewString())
+	misc.EnsureHeader(r.Header, ginHeaders, "X-Codex-Turn-Metadata", "")
+	misc.EnsureHeader(r.Header, ginHeaders, "X-Client-Request-Id", "")
 	cfgUserAgent, _ := codexHeaderDefaults(cfg, auth)
 	ensureHeaderWithConfigPrecedence(r.Header, ginHeaders, "User-Agent", cfgUserAgent, codexUserAgent)
 
@@ -692,8 +724,12 @@ func applyCodexHeaders(r *http.Request, auth *cliproxyauth.Auth, token string, s
 			isAPIKey = true
 		}
 	}
+	if originator := strings.TrimSpace(ginHeaders.Get("Originator")); originator != "" {
+		r.Header.Set("Originator", originator)
+	} else if !isAPIKey {
+		r.Header.Set("Originator", codexOriginator)
+	}
 	if !isAPIKey {
-		r.Header.Set("Originator", "codex_cli_rs")
 		if auth != nil && auth.Metadata != nil {
 			if accountID, ok := auth.Metadata["account_id"].(string); ok {
 				r.Header.Set("Chatgpt-Account-Id", accountID)
@@ -708,14 +744,17 @@ func applyCodexHeaders(r *http.Request, auth *cliproxyauth.Auth, token string, s
 }
 
 func newCodexStatusErr(statusCode int, body []byte) statusErr {
-	if isCodexUsageLimitError(body) {
+	if isCodexUsageLimitError(body) || isCodexCapacityError(body) {
 		// Normalize provider-specific quota exhaustion responses so the auth manager
-		// can suspend the credential until the upstream reset window expires.
+		// can rotate away from the current credential for transient capacity/quota issues.
 		statusCode = http.StatusTooManyRequests
 	}
 	err := statusErr{code: statusCode, msg: string(body)}
 	if retryAfter := parseCodexRetryAfter(statusCode, body, time.Now()); retryAfter != nil {
 		err.retryAfter = retryAfter
+	} else if isCodexCapacityError(body) {
+		retryAfter := 5 * time.Second
+		err.retryAfter = &retryAfter
 	}
 	return err
 }
@@ -753,6 +792,17 @@ func isCodexUsageLimitError(errorBody []byte) bool {
 	}
 	message := strings.ToLower(strings.TrimSpace(gjson.GetBytes(errorBody, "error.message").String()))
 	return strings.Contains(message, "usage limit has been reached")
+}
+
+func isCodexCapacityError(errorBody []byte) bool {
+	if len(errorBody) == 0 {
+		return false
+	}
+	message := strings.ToLower(strings.TrimSpace(gjson.GetBytes(errorBody, "error.message").String()))
+	if message == "" {
+		message = strings.ToLower(strings.TrimSpace(string(errorBody)))
+	}
+	return strings.Contains(message, "selected model is at capacity")
 }
 
 func codexCreds(a *cliproxyauth.Auth) (apiKey, baseURL string) {

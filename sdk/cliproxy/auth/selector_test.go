@@ -276,6 +276,12 @@ func TestSelectorPick_AllCooldownReturnsModelCooldownError(t *testing.T) {
 		if got, _ := rawErr["code"].(string); got != "model_cooldown" {
 			t.Fatalf("Error().error.code = %q, want %q", got, "model_cooldown")
 		}
+		if _, ok := rawErr["reset_time"]; ok {
+			t.Fatalf("Error().error.reset_time should be omitted, got %v", rawErr["reset_time"])
+		}
+		if _, ok := rawErr["reset_seconds"]; !ok {
+			t.Fatalf("Error().error.reset_seconds missing")
+		}
 		if _, ok := rawErr["provider"]; ok {
 			t.Fatalf("Error().error.provider exists for mixed provider: %v", rawErr["provider"])
 		}
@@ -302,6 +308,9 @@ func TestSelectorPick_AllCooldownReturnsModelCooldownError(t *testing.T) {
 		rawErr, ok := payload["error"].(map[string]any)
 		if !ok {
 			t.Fatalf("Error() payload missing error object: %v", payload)
+		}
+		if _, ok := rawErr["reset_time"]; ok {
+			t.Fatalf("Error().error.reset_time should be omitted, got %v", rawErr["reset_time"])
 		}
 		if got, _ := rawErr["provider"].(string); got != "gemini" {
 			t.Fatalf("Error().error.provider = %q, want %q", got, "gemini")

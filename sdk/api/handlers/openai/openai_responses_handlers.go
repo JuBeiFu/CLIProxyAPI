@@ -257,7 +257,7 @@ func responsesChunkHasCompleted(chunk []byte) bool {
 func responsesIncompleteStreamError() *interfaces.ErrorMessage {
 	return &interfaces.ErrorMessage{
 		StatusCode: http.StatusRequestTimeout,
-		Error:      fmt.Errorf("stream closed before response.completed"),
+		Error:      fmt.Errorf("stream disconnected before completion: stream closed before response.completed"),
 	}
 }
 

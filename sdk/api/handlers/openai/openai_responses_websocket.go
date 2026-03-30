@@ -81,6 +81,7 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 	var lastRequest []byte
 	lastResponseOutput := []byte("[]")
 	pinnedAuthID := ""
+	pinnedExecutionSessionID := ""
 
 	for {
 		msgType, payload, errReadMessage := conn.ReadMessage()
@@ -172,7 +173,9 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 		modelName := gjson.GetBytes(requestJSON, "model").String()
 		cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
 		cliCtx = cliproxyexecutor.WithDownstreamWebsocket(cliCtx)
-		cliCtx = handlers.WithExecutionSessionID(cliCtx, passthroughSessionID)
+		if pinnedExecutionSessionID != "" {
+			cliCtx = handlers.WithExecutionSessionID(cliCtx, pinnedExecutionSessionID)
+		}
 		if pinnedAuthID != "" {
 			cliCtx = handlers.WithPinnedAuthID(cliCtx, pinnedAuthID)
 		} else {
@@ -187,6 +190,7 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 				}
 				if websocketUpstreamSupportsIncrementalInput(selectedAuth.Attributes, selectedAuth.Metadata) {
 					pinnedAuthID = authID
+					pinnedExecutionSessionID = passthroughSessionID
 				}
 			})
 		}
@@ -700,7 +704,7 @@ func (h *OpenAIResponsesAPIHandler) forwardResponsesWebsocket(
 				if !completed {
 					errMsg := &interfaces.ErrorMessage{
 						StatusCode: http.StatusRequestTimeout,
-						Error:      fmt.Errorf("stream closed before response.completed"),
+						Error:      fmt.Errorf("stream disconnected before completion: stream closed before response.completed"),
 					}
 					h.LoggingAPIResponseError(context.WithValue(context.Background(), "gin", c), errMsg)
 					markAPIResponseTimestamp(c)

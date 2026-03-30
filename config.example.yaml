@@ -115,6 +115,17 @@ quota-exceeded:
 # Routing strategy for selecting credentials when multiple match.
 routing:
   strategy: "round-robin" # round-robin (default), fill-first
+  allow-inflight-overflow-when-exhausted: false # temporarily exceed max-inflight-per-auth only when every eligible auth is already busy
+  new-auth-first: true # tie-break same-priority auths by newer created_at first
+  idle-probe-after-hours: 24 # background probe auths not used for this many hours
+  slow-request-penalty-enabled: true # runtime-demote auths that repeatedly have high latency
+  slow-request-threshold-ms: 20000 # requests slower than this count as "slow"
+  slow-request-window-seconds: 300 # rolling accumulation window for slow requests
+  slow-request-trigger-count: 2 # slow requests in window needed to trigger penalty
+  slow-request-penalty-step: 2 # priority penalty added per trigger
+  slow-request-penalty-max: 8 # cap for accumulated slow-request penalty
+  slow-request-penalty-recover: 1 # penalty points recovered on successful requests
+  slow-request-cooldown-seconds: 300 # temporary cooldown after a trigger; 0 disables cooldown
 
 # When true, enable authentication for the WebSocket API (/v1/ws).
 ws-auth: false

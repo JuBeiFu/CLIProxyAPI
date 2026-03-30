@@ -34,6 +34,7 @@ const (
 type authScheduler struct {
 	mu            sync.Mutex
 	strategy      schedulerStrategy
+	newAuthFirst  bool
 	providers     map[string]*providerScheduler
 	authProviders map[string]string
 	mixedCursors  map[string]int
@@ -42,6 +43,7 @@ type authScheduler struct {
 // providerScheduler stores auth metadata and model shards for a single provider.
 type providerScheduler struct {
 	providerKey string
+	newAuthFirst bool
 	auths       map[string]*scheduledAuthMeta
 	modelShards map[string]*modelScheduler
 }
@@ -62,6 +64,7 @@ type modelScheduler struct {
 	providerKey     string
 	modelKey        string
 	includeAllAuths bool
+	newAuthFirst    bool
 	entries         map[string]*scheduledAuth
 	priorityOrder   []int
 	readyByPriority map[int]*readyBucket
@@ -110,6 +113,7 @@ type cooldownQueue []*scheduledAuth
 func newAuthScheduler(selector Selector) *authScheduler {
 	return &authScheduler{
 		strategy:      selectorStrategy(selector),
+		newAuthFirst:  true,
 		providers:     make(map[string]*providerScheduler),
 		authProviders: make(map[string]string),
 		mixedCursors:  make(map[string]int),
@@ -137,6 +141,16 @@ func (s *authScheduler) setSelector(selector Selector) {
 	defer s.mu.Unlock()
 	s.strategy = selectorStrategy(selector)
 	clear(s.mixedCursors)
+}
+
+// setNewAuthFirst updates whether same-priority scheduling prefers newer auths first.
+func (s *authScheduler) setNewAuthFirst(enabled bool) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.newAuthFirst = enabled
 }
 
 // rebuild recreates the complete scheduler state from an auth snapshot.
@@ -461,11 +475,18 @@ func (s *authScheduler) ensureProviderLocked(providerKey string) *providerSchedu
 	providerState := s.providers[providerKey]
 	if providerState == nil {
 		providerState = &providerScheduler{
-			providerKey: providerKey,
-			auths:       make(map[string]*scheduledAuthMeta),
-			modelShards: make(map[string]*modelScheduler),
+			providerKey:  providerKey,
+			newAuthFirst: s.newAuthFirst,
+			auths:        make(map[string]*scheduledAuthMeta),
+			modelShards:  make(map[string]*modelScheduler),
 		}
 		s.providers[providerKey] = providerState
+	}
+	providerState.newAuthFirst = s.newAuthFirst
+	for _, shard := range providerState.modelShards {
+		if shard != nil {
+			shard.newAuthFirst = s.newAuthFirst
+		}
 	}
 	return providerState
 }
@@ -562,6 +583,7 @@ func (p *providerScheduler) ensureModelLocked(shardKey string, modelKey string, 
 		providerKey:     p.providerKey,
 		modelKey:        modelKey,
 		includeAllAuths: includeAllAuths,
+		newAuthFirst:    p.newAuthFirst,
 		entries:         make(map[string]*scheduledAuth, len(p.auths)),
 		readyByPriority: make(map[int]*readyBucket),
 	}
@@ -1042,7 +1064,26 @@ func (m *modelScheduler) rebuildIndexesLocked() {
 	}
 	for priority, entries := range priorityBuckets {
 		sort.Slice(entries, func(i, j int) bool {
-			return entries[i].auth.ID < entries[j].auth.ID
+			left := entries[i]
+			right := entries[j]
+			if left == nil || left.auth == nil || right == nil || right.auth == nil {
+				return left != nil && left.auth != nil
+			}
+			leftCreated := left.auth.CreatedAt
+			rightCreated := right.auth.CreatedAt
+			if !leftCreated.Equal(rightCreated) {
+				if leftCreated.IsZero() {
+					return !m.newAuthFirst
+				}
+				if rightCreated.IsZero() {
+					return m.newAuthFirst
+				}
+				if m.newAuthFirst {
+					return leftCreated.After(rightCreated)
+				}
+				return leftCreated.Before(rightCreated)
+			}
+			return left.auth.ID < right.auth.ID
 		})
 		m.readyByPriority[priority] = buildReadyBucket(m.providerKey, entries)
 		m.priorityOrder = append(m.priorityOrder, priority)
@@ -1057,6 +1098,18 @@ func (m *modelScheduler) rebuildIndexesLocked() {
 			return left != nil
 		}
 		if left.nextRetryAt.Equal(right.nextRetryAt) {
+			if left.auth != nil && right.auth != nil && !left.auth.CreatedAt.Equal(right.auth.CreatedAt) {
+				if left.auth.CreatedAt.IsZero() {
+					return !m.newAuthFirst
+				}
+				if right.auth.CreatedAt.IsZero() {
+					return m.newAuthFirst
+				}
+				if m.newAuthFirst {
+					return left.auth.CreatedAt.After(right.auth.CreatedAt)
+				}
+				return left.auth.CreatedAt.Before(right.auth.CreatedAt)
+			}
 			return left.auth.ID < right.auth.ID
 		}
 		if left.nextRetryAt.IsZero() {

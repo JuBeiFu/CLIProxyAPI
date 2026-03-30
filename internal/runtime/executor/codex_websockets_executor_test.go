@@ -176,6 +176,67 @@ func TestApplyCodexHeadersUsesConfigUserAgentForOAuth(t *testing.T) {
 	}
 }
 
+func TestApplyCodexHeadersPassesThroughClientIdentityHeadersForOAuth(t *testing.T) {
+	req, err := http.NewRequest(http.MethodPost, "https://example.com/responses", nil)
+	if err != nil {
+		t.Fatalf("NewRequest() error = %v", err)
+	}
+	auth := &cliproxyauth.Auth{
+		Provider: "codex",
+		Metadata: map[string]any{"account_id": "acct-123"},
+	}
+	req = req.WithContext(contextWithGinHeaders(map[string]string{
+		"Originator":            "codex_cli_rs_alt",
+		"Version":               "0.116.0",
+		"X-Codex-Turn-Metadata": "{\"turn_id\":\"t1\"}",
+		"X-Client-Request-Id":   "req-123",
+	}))
+
+	applyCodexHeaders(req, auth, "oauth-token", true, nil)
+
+	if got := req.Header.Get("Originator"); got != "codex_cli_rs_alt" {
+		t.Fatalf("Originator = %s, want %s", got, "codex_cli_rs_alt")
+	}
+	if got := req.Header.Get("Version"); got != "0.116.0" {
+		t.Fatalf("Version = %s, want %s", got, "0.116.0")
+	}
+	if got := req.Header.Get("X-Codex-Turn-Metadata"); got != "{\"turn_id\":\"t1\"}" {
+		t.Fatalf("X-Codex-Turn-Metadata = %q, want %q", got, "{\"turn_id\":\"t1\"}")
+	}
+	if got := req.Header.Get("X-Client-Request-Id"); got != "req-123" {
+		t.Fatalf("X-Client-Request-Id = %q, want %q", got, "req-123")
+	}
+	if got := req.Header.Get("Chatgpt-Account-Id"); got != "acct-123" {
+		t.Fatalf("Chatgpt-Account-Id = %q, want %q", got, "acct-123")
+	}
+}
+
+func TestApplyCodexHeadersDoesNotInjectEmptyIdentityHeadersWithoutClientValues(t *testing.T) {
+	req, err := http.NewRequest(http.MethodPost, "https://example.com/responses", nil)
+	if err != nil {
+		t.Fatalf("NewRequest() error = %v", err)
+	}
+	auth := &cliproxyauth.Auth{
+		Provider: "codex",
+		Metadata: map[string]any{"account_id": "acct-123"},
+	}
+
+	applyCodexHeaders(req, auth, "oauth-token", true, nil)
+
+	if got := req.Header.Get("Version"); got != "" {
+		t.Fatalf("Version = %q, want empty", got)
+	}
+	if got := req.Header.Get("X-Codex-Turn-Metadata"); got != "" {
+		t.Fatalf("X-Codex-Turn-Metadata = %q, want empty", got)
+	}
+	if got := req.Header.Get("X-Client-Request-Id"); got != "" {
+		t.Fatalf("X-Client-Request-Id = %q, want empty", got)
+	}
+	if got := req.Header.Get("Originator"); got != codexOriginator {
+		t.Fatalf("Originator = %q, want %q", got, codexOriginator)
+	}
+}
+
 func contextWithGinHeaders(headers map[string]string) context.Context {
 	gin.SetMode(gin.TestMode)
 	recorder := httptest.NewRecorder()
