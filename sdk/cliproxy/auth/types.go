@@ -316,6 +316,34 @@ func (a *Auth) ToolPrefixDisabled() bool {
 	return false
 }
 
+// WebsocketsEnabled reports whether this auth should be considered websocket-capable.
+// Explicit websocket flags take precedence. For Codex OAuth/auth-file credentials,
+// websocket support defaults to enabled unless explicitly disabled.
+func (a *Auth) WebsocketsEnabled() bool {
+	if a == nil {
+		return false
+	}
+	if a.Attributes != nil {
+		if raw := strings.TrimSpace(a.Attributes["websockets"]); raw != "" {
+			if parsed, ok := parseBoolAny(raw); ok {
+				return parsed
+			}
+		}
+	}
+	if a.Metadata != nil {
+		if raw, ok := a.Metadata["websockets"]; ok {
+			if parsed, okParse := parseBoolAny(raw); okParse {
+				return parsed
+			}
+		}
+	}
+	if !strings.EqualFold(strings.TrimSpace(a.Provider), "codex") {
+		return false
+	}
+	accountType, _ := a.AccountInfo()
+	return strings.EqualFold(strings.TrimSpace(accountType), "oauth")
+}
+
 // RequestRetryOverride returns the auth-file scoped request_retry override when present.
 // The value is read from metadata key "request_retry" (or legacy "request-retry").
 func (a *Auth) RequestRetryOverride() (int, bool) {

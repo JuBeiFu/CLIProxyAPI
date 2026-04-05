@@ -3,11 +3,13 @@ package executor
 import (
 	"context"
 	"io"
+	"net/http"
 	"net/http/httptest"
 	"testing"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v6/sdk/translator"
 	"github.com/tidwall/gjson"
@@ -60,5 +62,131 @@ func TestCodexExecutorCacheHelper_OpenAIChatCompletions_StablePromptCacheKeyFrom
 	gotKey2 := gjson.GetBytes(body2, "prompt_cache_key").String()
 	if gotKey2 != expectedKey {
 		t.Fatalf("prompt_cache_key (second call) = %q, want %q", gotKey2, expectedKey)
+	}
+}
+
+func TestCodexExecutorPreservesPreviousResponseIDForNewAPIWebsocketDownstream(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	ginCtx, _ := gin.CreateTestContext(recorder)
+	ginCtx.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	ginCtx.Request.Header.Set("X-NewAPI-Downstream-Transport", "websocket")
+
+	ctx := context.WithValue(context.Background(), "gin", ginCtx)
+
+	executor := &CodexExecutor{}
+	auth := &cliproxyauth.Auth{
+		Provider:   "codex",
+		Attributes: map[string]string{"websockets": "true"},
+	}
+	rawJSON := []byte(`{"model":"gpt-5.4","previous_response_id":"resp-1","input":[{"type":"function_call_output","call_id":"call-1","output":"ok"}]}`)
+	req := cliproxyexecutor.Request{
+		Model:   "gpt-5.4",
+		Payload: rawJSON,
+	}
+	url := "https://example.com/responses"
+
+	httpReq, err := executor.cacheHelper(ctx, sdktranslator.FromString("openai-response"), url, req, rawJSON)
+	if err != nil {
+		t.Fatalf("cacheHelper error: %v", err)
+	}
+
+	body, errRead := io.ReadAll(httpReq.Body)
+	if errRead != nil {
+		t.Fatalf("read request body: %v", errRead)
+	}
+
+	body = stripCodexUnsupportedResponseFields(body, shouldPreserveCodexPreviousResponseID(ctx, auth))
+	if got := gjson.GetBytes(body, "previous_response_id").String(); got != "resp-1" {
+		t.Fatalf("previous_response_id = %q, want %q", got, "resp-1")
+	}
+}
+
+func TestShouldPreserveCodexPreviousResponseID_TrueForNewAPIWebsocketHeader(t *testing.T) {
+	ctx := contextWithGinHeaders(map[string]string{
+		"X-NewAPI-Downstream-Transport": "websocket",
+	})
+	auth := &cliproxyauth.Auth{
+		Provider:   "codex",
+		Attributes: map[string]string{"websockets": "true"},
+	}
+
+	if !shouldPreserveCodexPreviousResponseID(ctx, auth) {
+		t.Fatal("expected websocket downstream header to preserve previous_response_id")
+	}
+}
+
+func TestShouldPreserveCodexPreviousResponseID_FalseForNewAPISSEHeader(t *testing.T) {
+	ctx := contextWithGinHeaders(map[string]string{
+		"X-NewAPI-Downstream-Transport": "sse",
+	})
+	auth := &cliproxyauth.Auth{
+		Provider:   "codex",
+		Attributes: map[string]string{"websockets": "true"},
+	}
+
+	if shouldPreserveCodexPreviousResponseID(ctx, auth) {
+		t.Fatal("expected sse downstream header to delete previous_response_id")
+	}
+}
+
+func TestShouldPreserveCodexPreviousResponseID_FalseWhenAuthDisablesWebsockets(t *testing.T) {
+	ctx := contextWithGinHeaders(map[string]string{
+		"X-NewAPI-Downstream-Transport": "websocket",
+	})
+	auth := &cliproxyauth.Auth{
+		Provider:   "codex",
+		Attributes: map[string]string{"websockets": "false"},
+	}
+
+	if shouldPreserveCodexPreviousResponseID(ctx, auth) {
+		t.Fatal("expected websocket bridge header to be ignored when auth does not support websockets")
+	}
+}
+
+func TestShouldPreserveCodexPreviousResponseID_TrueForCodexOAuthWithoutExplicitWebsocketFlag(t *testing.T) {
+	ctx := contextWithGinHeaders(map[string]string{
+		"X-NewAPI-Downstream-Transport": "websocket",
+	})
+	auth := &cliproxyauth.Auth{
+		Provider: "codex",
+		Metadata: map[string]any{
+			"email": "user@example.com",
+		},
+	}
+
+	if !shouldPreserveCodexPreviousResponseID(ctx, auth) {
+		t.Fatal("expected codex oauth auth to preserve previous_response_id for websocket bridge")
+	}
+}
+
+func TestStripCodexUnsupportedResponseFields_PreservesPreviousResponseIDWhenRequested(t *testing.T) {
+	body := []byte(`{"previous_response_id":"resp-1","prompt_cache_retention":"retained","safety_identifier":"safe","input":[]}`)
+
+	got := stripCodexUnsupportedResponseFields(body, true)
+
+	if prev := gjson.GetBytes(got, "previous_response_id").String(); prev != "resp-1" {
+		t.Fatalf("previous_response_id = %q, want %q", prev, "resp-1")
+	}
+	if gjson.GetBytes(got, "prompt_cache_retention").Exists() {
+		t.Fatalf("prompt_cache_retention should be removed: %s", got)
+	}
+	if gjson.GetBytes(got, "safety_identifier").Exists() {
+		t.Fatalf("safety_identifier should be removed: %s", got)
+	}
+}
+
+func TestStripCodexUnsupportedResponseFields_RemovesPreviousResponseIDWhenNotPreserved(t *testing.T) {
+	body := []byte(`{"previous_response_id":"resp-1","prompt_cache_retention":"retained","safety_identifier":"safe","input":[]}`)
+
+	got := stripCodexUnsupportedResponseFields(body, false)
+
+	if gjson.GetBytes(got, "previous_response_id").Exists() {
+		t.Fatalf("previous_response_id should be removed: %s", got)
+	}
+	if gjson.GetBytes(got, "prompt_cache_retention").Exists() {
+		t.Fatalf("prompt_cache_retention should be removed: %s", got)
+	}
+	if gjson.GetBytes(got, "safety_identifier").Exists() {
+		t.Fatalf("safety_identifier should be removed: %s", got)
 	}
 }

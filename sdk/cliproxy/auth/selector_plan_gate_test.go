@@ -203,6 +203,42 @@ func TestSelectorPick_CodexWebsocketKeepsPaidPreferenceForGPT54(t *testing.T) {
 	}
 }
 
+func TestSelectorPick_CodexOAuthDefaultsToWebsocketForBridgeRequests(t *testing.T) {
+	t.Parallel()
+
+	selector := &FillFirstSelector{}
+	auths := []*Auth{
+		{
+			ID:         "codex-apikey",
+			Provider:   "codex",
+			Attributes: map[string]string{"api_key": "sk-test"},
+			Metadata: map[string]any{
+				metadataPlanTypeKey: "team",
+			},
+		},
+		{
+			ID:       "codex-authfile",
+			Provider: "codex",
+			Metadata: map[string]any{
+				"email":             "user@example.com",
+				metadataPlanTypeKey: "team",
+			},
+		},
+	}
+
+	ctx := cliproxyexecutor.WithDownstreamWebsocket(context.Background())
+	got, err := selector.Pick(ctx, "codex", "gpt-5.4", cliproxyexecutor.Options{}, auths)
+	if err != nil {
+		t.Fatalf("Pick() error = %v", err)
+	}
+	if got == nil {
+		t.Fatalf("Pick() auth = nil")
+	}
+	if got.ID != "codex-authfile" {
+		t.Fatalf("Pick() auth.ID = %q, want %q", got.ID, "codex-authfile")
+	}
+}
+
 func TestSelectorPick_CodexPrefersPaidWebsocketForGPT54WhenAvailable(t *testing.T) {
 	t.Parallel()
 

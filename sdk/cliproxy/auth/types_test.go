@@ -96,3 +96,34 @@ func TestEnsureIndexUsesCredentialIdentity(t *testing.T) {
 		t.Fatalf("duplicate config entries should be separated by source-derived seed, got %q", geminiIndex)
 	}
 }
+
+func TestWebsocketsEnabledDefaultsToTrueForCodexOAuth(t *testing.T) {
+	t.Parallel()
+
+	auth := &Auth{
+		Provider: "codex",
+		Metadata: map[string]any{
+			"email": "user@example.com",
+		},
+	}
+
+	if !auth.WebsocketsEnabled() {
+		t.Fatal("expected codex oauth auth to default to websocket enabled")
+	}
+}
+
+func TestWebsocketsEnabledRespectsExplicitDisableForCodexOAuth(t *testing.T) {
+	t.Parallel()
+
+	auth := &Auth{
+		Provider:   "codex",
+		Attributes: map[string]string{"websockets": "false"},
+		Metadata: map[string]any{
+			"email": "user@example.com",
+		},
+	}
+
+	if auth.WebsocketsEnabled() {
+		t.Fatal("expected explicit websockets=false to disable codex oauth websocket support")
+	}
+}
