@@ -56,6 +56,8 @@ type codexWebsocketSession struct {
 
 	reqMu sync.Mutex
 
+	lastRequest []byte
+
 	connMu sync.Mutex
 	conn   *websocket.Conn
 	wsURL  string
@@ -209,7 +211,14 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 		defer sess.reqMu.Unlock()
 	}
 
+	if sess != nil && shouldEnrichCodexWebsocketBridgeFollowupRequest(ctx, executionSessionID) {
+		body = enrichCodexWebsocketBridgeFollowupRequest(body, sess.lastRequest)
+	}
+
 	wsReqBody := buildCodexWebsocketRequestBody(body)
+	if sess != nil {
+		sess.lastRequest = bytes.Clone(body)
+	}
 	recordAPIRequest(ctx, e.cfg, upstreamRequestLog{
 		URL:       wsURL,
 		Method:    "WEBSOCKET",
@@ -300,7 +309,6 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 			return resp, errSend
 		}
 	}
-
 	for {
 		if ctx != nil && ctx.Err() != nil {
 			return resp, ctx.Err()
@@ -370,7 +378,13 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 
 	from := opts.SourceFormat
 	to := sdktranslator.FromString("codex")
-	body := req.Payload
+	originalPayloadSource := req.Payload
+	if len(opts.OriginalRequest) > 0 {
+		originalPayloadSource = opts.OriginalRequest
+	}
+	originalPayload := originalPayloadSource
+	originalTranslated := sdktranslator.TranslateRequest(from, to, baseModel, originalPayload, true)
+	body := sdktranslator.TranslateRequest(from, to, baseModel, req.Payload, true)
 
 	body, err = thinking.ApplyThinking(body, req.Model, from.String(), to.String(), e.Identifier())
 	if err != nil {
@@ -378,7 +392,13 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 	}
 
 	requestedModel := payloadRequestedModel(opts, req.Model)
-	body = applyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", body, body, requestedModel)
+	body = applyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", body, originalTranslated, requestedModel)
+	body = stripCodexUnsupportedResponseFields(body, shouldPreserveCodexPreviousResponseID(ctx, auth))
+	body, _ = sjson.SetBytes(body, "model", baseModel)
+	body, _ = sjson.SetBytes(body, "stream", true)
+	if !gjson.GetBytes(body, "instructions").Exists() {
+		body, _ = sjson.SetBytes(body, "instructions", "")
+	}
 
 	httpURL := strings.TrimSuffix(baseURL, "/") + "/responses"
 	wsURL, err := buildCodexResponsesWebsocketURL(httpURL)
@@ -403,7 +423,14 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 		}
 	}
 
+	if sess != nil && shouldEnrichCodexWebsocketBridgeFollowupRequest(ctx, executionSessionID) {
+		body = enrichCodexWebsocketBridgeFollowupRequest(body, sess.lastRequest)
+	}
+
 	wsReqBody := buildCodexWebsocketRequestBody(body)
+	if sess != nil {
+		sess.lastRequest = bytes.Clone(body)
+	}
 	recordAPIRequest(ctx, e.cfg, upstreamRequestLog{
 		URL:       wsURL,
 		Method:    "WEBSOCKET",
@@ -493,7 +520,6 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 			return nil, errSend
 		}
 	}
-
 	out := make(chan cliproxyexecutor.StreamChunk)
 	go func() {
 		terminateReason := "completed"
@@ -591,7 +617,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 			}
 
 			line := encodeCodexWebsocketAsSSE(payload)
-			chunks := sdktranslator.TranslateStream(ctx, to, from, req.Model, body, body, line, &param)
+			chunks := sdktranslator.TranslateStream(ctx, to, from, req.Model, originalPayload, body, line, &param)
 			for i := range chunks {
 				if !send(cliproxyexecutor.StreamChunk{Payload: []byte(chunks[i])}) {
 					terminateReason = "context_done"
@@ -673,6 +699,44 @@ func buildCodexWebsocketRequestBody(body []byte) []byte {
 	fallback := bytes.Clone(body)
 	fallback, _ = sjson.SetBytes(fallback, "type", "response.create")
 	return fallback
+}
+
+func shouldEnrichCodexWebsocketBridgeFollowupRequest(ctx context.Context, executionSessionID string) bool {
+	if strings.TrimSpace(executionSessionID) == "" {
+		return false
+	}
+	return apihandlers.DownstreamWebsocketBridge(ctx)
+}
+
+func enrichCodexWebsocketBridgeFollowupRequest(body []byte, lastRequest []byte) []byte {
+	if len(body) == 0 || len(lastRequest) == 0 {
+		return body
+	}
+	if strings.TrimSpace(gjson.GetBytes(body, "previous_response_id").String()) == "" {
+		return body
+	}
+
+	enriched := bytes.Clone(body)
+	instructionsResult := gjson.GetBytes(enriched, "instructions")
+	if !instructionsResult.Exists() || strings.TrimSpace(instructionsResult.String()) == "" {
+		instructions := gjson.GetBytes(lastRequest, "instructions")
+		if instructions.Exists() && strings.TrimSpace(instructions.String()) != "" {
+			enriched, _ = sjson.SetRawBytes(enriched, "instructions", []byte(instructions.Raw))
+		}
+	}
+	if !gjson.GetBytes(enriched, "tools").Exists() {
+		tools := gjson.GetBytes(lastRequest, "tools")
+		if tools.Exists() {
+			enriched, _ = sjson.SetRawBytes(enriched, "tools", []byte(tools.Raw))
+		}
+	}
+	if !gjson.GetBytes(enriched, "tool_choice").Exists() {
+		toolChoice := gjson.GetBytes(lastRequest, "tool_choice")
+		if toolChoice.Exists() {
+			enriched, _ = sjson.SetRawBytes(enriched, "tool_choice", []byte(toolChoice.Raw))
+		}
+	}
+	return enriched
 }
 
 func readCodexWebsocketMessage(ctx context.Context, sess *codexWebsocketSession, conn *websocket.Conn, readCh chan codexWebsocketRead) (int, []byte, error) {

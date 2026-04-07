@@ -5,10 +5,12 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	_ "github.com/router-for-me/CLIProxyAPI/v6/internal/translator"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v6/sdk/translator"
@@ -138,8 +140,8 @@ func TestShouldPreserveCodexPreviousResponseID_FalseWhenAuthDisablesWebsockets(t
 		Attributes: map[string]string{"websockets": "false"},
 	}
 
-	if shouldPreserveCodexPreviousResponseID(ctx, auth) {
-		t.Fatal("expected websocket bridge header to be ignored when auth does not support websockets")
+	if !shouldPreserveCodexPreviousResponseID(ctx, auth) {
+		t.Fatal("expected websocket bridge header to preserve previous_response_id even when selected auth uses HTTP upstream")
 	}
 }
 
@@ -188,5 +190,47 @@ func TestStripCodexUnsupportedResponseFields_RemovesPreviousResponseIDWhenNotPre
 	}
 	if gjson.GetBytes(got, "safety_identifier").Exists() {
 		t.Fatalf("safety_identifier should be removed: %s", got)
+	}
+}
+
+func TestCodexExecutorExecuteNonStreamUsesAccumulatedOutputTextWhenCompletedOutputEmpty(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, err := io.WriteString(w,
+			"data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_123\",\"created_at\":1700000000,\"model\":\"gpt-5.4\"}}\n\n"+
+				"data: {\"type\":\"response.output_text.delta\",\"delta\":\"hello world\"}\n\n"+
+				"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_123\",\"created_at\":1700000000,\"model\":\"gpt-5.4\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":7,\"output_tokens\":13,\"total_tokens\":20}}}\n\n")
+		if err != nil {
+			t.Fatalf("WriteString() error = %v", err)
+		}
+	}))
+	defer server.Close()
+
+	executor := &CodexExecutor{}
+	auth := &cliproxyauth.Auth{
+		Provider: "codex",
+		Attributes: map[string]string{
+			"api_key":  "sk-test",
+			"base_url": server.URL,
+		},
+	}
+	req := cliproxyexecutor.Request{
+		Model:   "gpt-5.4",
+		Payload: []byte(`{"model":"gpt-5.4","messages":[{"role":"user","content":"hi"}]}`),
+	}
+	opts := cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("openai"),
+	}
+
+	resp, err := executor.Execute(context.Background(), auth, req, opts)
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+
+	if got := gjson.GetBytes(resp.Payload, "choices.0.message.content").String(); got != "hello world" {
+		t.Fatalf("message.content = %q, want hello world; payload=%s", got, strings.TrimSpace(string(resp.Payload)))
+	}
+	if got := gjson.GetBytes(resp.Payload, "choices.0.finish_reason").String(); got != "stop" {
+		t.Fatalf("finish_reason = %q, want stop; payload=%s", got, strings.TrimSpace(string(resp.Payload)))
 	}
 }

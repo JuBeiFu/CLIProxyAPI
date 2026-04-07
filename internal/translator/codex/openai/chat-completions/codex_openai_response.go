@@ -26,6 +26,8 @@ type ConvertCliToOpenAIParams struct {
 	FunctionCallIndex         int
 	HasReceivedArgumentsDelta bool
 	HasToolCallAnnounced      bool
+	ContentText               string
+	ReasoningText             string
 }
 
 // ConvertCodexResponseToOpenAI translates a single chunk of a streaming response from the
@@ -51,6 +53,8 @@ func ConvertCodexResponseToOpenAI(_ context.Context, modelName string, originalR
 			FunctionCallIndex:         -1,
 			HasReceivedArgumentsDelta: false,
 			HasToolCallAnnounced:      false,
+			ContentText:               "",
+			ReasoningText:             "",
 		}
 	}
 
@@ -70,6 +74,8 @@ func ConvertCodexResponseToOpenAI(_ context.Context, modelName string, originalR
 		(*param).(*ConvertCliToOpenAIParams).ResponseID = rootResult.Get("response.id").String()
 		(*param).(*ConvertCliToOpenAIParams).CreatedAt = rootResult.Get("response.created_at").Int()
 		(*param).(*ConvertCliToOpenAIParams).Model = rootResult.Get("response.model").String()
+		(*param).(*ConvertCliToOpenAIParams).ContentText = ""
+		(*param).(*ConvertCliToOpenAIParams).ReasoningText = ""
 		return []string{}
 	}
 
@@ -109,14 +115,17 @@ func ConvertCodexResponseToOpenAI(_ context.Context, modelName string, originalR
 
 	if dataType == "response.reasoning_summary_text.delta" {
 		if deltaResult := rootResult.Get("delta"); deltaResult.Exists() {
+			(*param).(*ConvertCliToOpenAIParams).ReasoningText += deltaResult.String()
 			template, _ = sjson.Set(template, "choices.0.delta.role", "assistant")
 			template, _ = sjson.Set(template, "choices.0.delta.reasoning_content", deltaResult.String())
 		}
 	} else if dataType == "response.reasoning_summary_text.done" {
+		(*param).(*ConvertCliToOpenAIParams).ReasoningText += "\n\n"
 		template, _ = sjson.Set(template, "choices.0.delta.role", "assistant")
 		template, _ = sjson.Set(template, "choices.0.delta.reasoning_content", "\n\n")
 	} else if dataType == "response.output_text.delta" {
 		if deltaResult := rootResult.Get("delta"); deltaResult.Exists() {
+			(*param).(*ConvertCliToOpenAIParams).ContentText += deltaResult.String()
 			template, _ = sjson.Set(template, "choices.0.delta.role", "assistant")
 			template, _ = sjson.Set(template, "choices.0.delta.content", deltaResult.String())
 		}
@@ -234,7 +243,7 @@ func ConvertCodexResponseToOpenAI(_ context.Context, modelName string, originalR
 //
 // Returns:
 //   - string: An OpenAI-compatible JSON response containing all message content and metadata
-func ConvertCodexResponseToOpenAINonStream(_ context.Context, _ string, originalRequestRawJSON, requestRawJSON, rawJSON []byte, _ *any) string {
+func ConvertCodexResponseToOpenAINonStream(_ context.Context, _ string, originalRequestRawJSON, requestRawJSON, rawJSON []byte, param *any) string {
 	rootResult := gjson.ParseBytes(rawJSON)
 	// Verify this is a response.completed event
 	if rootResult.Get("type").String() != "response.completed" {
@@ -343,11 +352,17 @@ func ConvertCodexResponseToOpenAINonStream(_ context.Context, _ string, original
 		}
 
 		// Set content and reasoning content if found
+		if contentText == "" && param != nil && *param != nil {
+			contentText = (*param).(*ConvertCliToOpenAIParams).ContentText
+		}
 		if contentText != "" {
 			template, _ = sjson.Set(template, "choices.0.message.content", contentText)
 			template, _ = sjson.Set(template, "choices.0.message.role", "assistant")
 		}
 
+		if reasoningText == "" && param != nil && *param != nil {
+			reasoningText = (*param).(*ConvertCliToOpenAIParams).ReasoningText
+		}
 		if reasoningText != "" {
 			template, _ = sjson.Set(template, "choices.0.message.reasoning_content", reasoningText)
 			template, _ = sjson.Set(template, "choices.0.message.role", "assistant")
