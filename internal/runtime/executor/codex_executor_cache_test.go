@@ -234,3 +234,53 @@ func TestCodexExecutorExecuteNonStreamUsesAccumulatedOutputTextWhenCompletedOutp
 		t.Fatalf("finish_reason = %q, want stop; payload=%s", got, strings.TrimSpace(string(resp.Payload)))
 	}
 }
+
+func TestCodexExecutorExecuteNonStreamSynthesizesFunctionCallOutputWhenCompletedOutputEmpty(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, err := io.WriteString(w,
+			"data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"id\":\"fc_1\",\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"ping\"}}\n\n"+
+				"data: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":0,\"item_id\":\"fc_1\",\"delta\":\"{\\\"city\\\":\"}\n\n"+
+				"data: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":0,\"item_id\":\"fc_1\",\"delta\":\"\\\"Tokyo\\\"}\"}\n\n"+
+				"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_123\",\"created_at\":1700000000,\"model\":\"gpt-5.4\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":7,\"output_tokens\":13,\"total_tokens\":20}}}\n\n")
+		if err != nil {
+			t.Fatalf("WriteString() error = %v", err)
+		}
+	}))
+	defer server.Close()
+
+	executor := &CodexExecutor{}
+	auth := &cliproxyauth.Auth{
+		Provider: "codex",
+		Attributes: map[string]string{
+			"api_key":  "sk-test",
+			"base_url": server.URL,
+		},
+	}
+	req := cliproxyexecutor.Request{
+		Model: "gpt-5.4",
+		Payload: []byte(`{
+			"model":"gpt-5.4",
+			"input":"hello",
+			"tools":[{"type":"function","function":{"name":"ping","description":"Return pong","parameters":{"type":"object","properties":{},"additionalProperties":false}}}]
+		}`),
+	}
+	opts := cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("openai-response"),
+	}
+
+	resp, err := executor.Execute(context.Background(), auth, req, opts)
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+
+	if got := gjson.GetBytes(resp.Payload, "output.0.type").String(); got != "function_call" {
+		t.Fatalf("output[0].type = %q, want function_call; payload=%s", got, strings.TrimSpace(string(resp.Payload)))
+	}
+	if got := gjson.GetBytes(resp.Payload, "output.0.call_id").String(); got != "call_1" {
+		t.Fatalf("output[0].call_id = %q, want call_1; payload=%s", got, strings.TrimSpace(string(resp.Payload)))
+	}
+	if got := gjson.GetBytes(resp.Payload, "output.0.arguments").String(); got != `{"city":"Tokyo"}` {
+		t.Fatalf("output[0].arguments = %q, want %q; payload=%s", got, `{"city":"Tokyo"}`, strings.TrimSpace(string(resp.Payload)))
+	}
+}

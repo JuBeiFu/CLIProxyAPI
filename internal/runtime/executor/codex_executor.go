@@ -204,6 +204,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 
 	lines := bytes.Split(data, []byte("\n"))
 	var param any
+	aggregator := newCodexNonStreamAggregator()
 	for _, line := range lines {
 		if !bytes.HasPrefix(line, dataTag) {
 			continue
@@ -215,12 +216,14 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 			continue
 		}
 
+		aggregator.ingest(line)
 		eventType := gjson.GetBytes(line, "type").String()
 		if eventType != "response.completed" {
 			sdktranslator.TranslateStream(ctx, to, from, req.Model, originalPayload, body, rawLine, &param)
 			continue
 		}
 
+		line = aggregator.applyCompleted(line)
 		if detail, ok := parseCodexUsage(line); ok {
 			reporter.publish(ctx, detail)
 		}
