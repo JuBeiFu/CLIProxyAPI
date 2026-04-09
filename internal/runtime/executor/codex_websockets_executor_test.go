@@ -456,6 +456,217 @@ func TestCodexWebsocketExecuteStreamTranslatesOpenAIResponsesRequest(t *testing.
 	t.Fatal("stream completed without response.completed payload")
 }
 
+func TestCodexWebsocketExecuteNonStreamSynthesizesChatCompletionContent(t *testing.T) {
+	upgrader := websocket.Upgrader{
+		CheckOrigin: func(r *http.Request) bool { return true },
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !websocket.IsWebSocketUpgrade(r) {
+			http.Error(w, "upgrade required", http.StatusUpgradeRequired)
+			return
+		}
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Errorf("Upgrade() error = %v", err)
+			return
+		}
+		defer conn.Close()
+
+		if _, _, err := conn.ReadMessage(); err != nil {
+			t.Errorf("ReadMessage() error = %v", err)
+			return
+		}
+
+		frames := [][]byte{
+			[]byte(`{"type":"response.output_text.delta","delta":"hello world"}`),
+			[]byte(`{"type":"response.done","response":{"id":"resp-chat","created_at":1700000000,"model":"gpt-5.4","status":"completed","output":[],"usage":{"input_tokens":7,"output_tokens":13,"total_tokens":20}}}`),
+		}
+		for _, frame := range frames {
+			if err := conn.WriteMessage(websocket.TextMessage, frame); err != nil {
+				t.Errorf("WriteMessage() error = %v", err)
+				return
+			}
+		}
+	}))
+	defer server.Close()
+
+	exec := NewCodexWebsocketsExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{
+		ID:       "auth-1",
+		Provider: "codex",
+		Attributes: map[string]string{
+			"api_key":    "sk-test",
+			"base_url":   server.URL,
+			"websockets": "true",
+		},
+	}
+	req := cliproxyexecutor.Request{
+		Model:   "gpt-5.4",
+		Payload: []byte(`{"model":"gpt-5.4","messages":[{"role":"user","content":"hi"}]}`),
+	}
+	opts := cliproxyexecutor.Options{
+		Stream:       false,
+		SourceFormat: sdktranslator.FromString("openai"),
+	}
+
+	resp, err := exec.Execute(context.Background(), auth, req, opts)
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+
+	if got := gjson.GetBytes(resp.Payload, "choices.0.message.content").String(); got != "hello world" {
+		t.Fatalf("choices[0].message.content = %q, want %q; payload=%s", got, "hello world", resp.Payload)
+	}
+}
+
+func TestCodexWebsocketExecuteNonStreamSynthesizesResponsesFunctionCallOutput(t *testing.T) {
+	upgrader := websocket.Upgrader{
+		CheckOrigin: func(r *http.Request) bool { return true },
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !websocket.IsWebSocketUpgrade(r) {
+			http.Error(w, "upgrade required", http.StatusUpgradeRequired)
+			return
+		}
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Errorf("Upgrade() error = %v", err)
+			return
+		}
+		defer conn.Close()
+
+		if _, _, err := conn.ReadMessage(); err != nil {
+			t.Errorf("ReadMessage() error = %v", err)
+			return
+		}
+
+		frames := [][]byte{
+			[]byte(`{"type":"response.output_item.added","output_index":0,"item":{"id":"fc_1","type":"function_call","call_id":"call_1","name":"ping"}}`),
+			[]byte(`{"type":"response.function_call_arguments.delta","output_index":0,"item_id":"fc_1","delta":"{\"city\":"}`),
+			[]byte(`{"type":"response.function_call_arguments.delta","output_index":0,"item_id":"fc_1","delta":"\"Tokyo\"}"}`),
+			[]byte(`{"type":"response.done","response":{"id":"resp-resp","created_at":1700000000,"model":"gpt-5.4","status":"completed","output":[],"usage":{"input_tokens":7,"output_tokens":13,"total_tokens":20}}}`),
+		}
+		for _, frame := range frames {
+			if err := conn.WriteMessage(websocket.TextMessage, frame); err != nil {
+				t.Errorf("WriteMessage() error = %v", err)
+				return
+			}
+		}
+	}))
+	defer server.Close()
+
+	exec := NewCodexWebsocketsExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{
+		ID:       "auth-1",
+		Provider: "codex",
+		Attributes: map[string]string{
+			"api_key":    "sk-test",
+			"base_url":   server.URL,
+			"websockets": "true",
+		},
+	}
+	req := cliproxyexecutor.Request{
+		Model: "gpt-5.4",
+		Payload: []byte(`{
+			"model":"gpt-5.4",
+			"input":"hello",
+			"tools":[{"type":"function","function":{"name":"ping","description":"Return pong","parameters":{"type":"object","properties":{},"additionalProperties":false}}}]
+		}`),
+	}
+	opts := cliproxyexecutor.Options{
+		Stream:       false,
+		SourceFormat: sdktranslator.FromString("openai-response"),
+	}
+
+	resp, err := exec.Execute(context.Background(), auth, req, opts)
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+
+	if got := gjson.GetBytes(resp.Payload, "output.0.type").String(); got != "function_call" {
+		t.Fatalf("output[0].type = %q, want %q; payload=%s", got, "function_call", resp.Payload)
+	}
+	if got := gjson.GetBytes(resp.Payload, "output.0.call_id").String(); got != "call_1" {
+		t.Fatalf("output[0].call_id = %q, want %q; payload=%s", got, "call_1", resp.Payload)
+	}
+	if got := gjson.GetBytes(resp.Payload, "output.0.name").String(); got != "ping" {
+		t.Fatalf("output[0].name = %q, want %q; payload=%s", got, "ping", resp.Payload)
+	}
+	if got := gjson.GetBytes(resp.Payload, "output.0.arguments").String(); got != `{"city":"Tokyo"}` {
+		t.Fatalf("output[0].arguments = %q, want %q; payload=%s", got, `{"city":"Tokyo"}`, resp.Payload)
+	}
+}
+
+func TestCodexWebsocketExecuteNonStreamDoesNotDuplicateMessageOutput(t *testing.T) {
+	upgrader := websocket.Upgrader{
+		CheckOrigin: func(r *http.Request) bool { return true },
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !websocket.IsWebSocketUpgrade(r) {
+			http.Error(w, "upgrade required", http.StatusUpgradeRequired)
+			return
+		}
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Errorf("Upgrade() error = %v", err)
+			return
+		}
+		defer conn.Close()
+
+		if _, _, err := conn.ReadMessage(); err != nil {
+			t.Errorf("ReadMessage() error = %v", err)
+			return
+		}
+
+		frames := [][]byte{
+			[]byte(`{"type":"response.output_text.delta","delta":"hello world"}`),
+			[]byte(`{"type":"response.output_item.done","output_index":0,"item":{"id":"msg_1","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"hello world"}]}}`),
+			[]byte(`{"type":"response.done","response":{"id":"resp-msg","created_at":1700000000,"model":"gpt-5.4","status":"completed","output":[],"usage":{"input_tokens":7,"output_tokens":13,"total_tokens":20}}}`),
+		}
+		for _, frame := range frames {
+			if err := conn.WriteMessage(websocket.TextMessage, frame); err != nil {
+				t.Errorf("WriteMessage() error = %v", err)
+				return
+			}
+		}
+	}))
+	defer server.Close()
+
+	exec := NewCodexWebsocketsExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{
+		ID:       "auth-1",
+		Provider: "codex",
+		Attributes: map[string]string{
+			"api_key":    "sk-test",
+			"base_url":   server.URL,
+			"websockets": "true",
+		},
+	}
+	req := cliproxyexecutor.Request{
+		Model: "gpt-5.4",
+		Payload: []byte(`{
+			"model":"gpt-5.4",
+			"input":"hello"
+		}`),
+	}
+	opts := cliproxyexecutor.Options{
+		Stream:       false,
+		SourceFormat: sdktranslator.FromString("openai-response"),
+	}
+
+	resp, err := exec.Execute(context.Background(), auth, req, opts)
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+
+	if got := len(gjson.GetBytes(resp.Payload, "output").Array()); got != 1 {
+		t.Fatalf("output len = %d, want 1; payload=%s", got, resp.Payload)
+	}
+	if got := gjson.GetBytes(resp.Payload, "output.0.content.0.text").String(); got != "hello world" {
+		t.Fatalf("output[0].content[0].text = %q, want %q; payload=%s", got, "hello world", resp.Payload)
+	}
+}
+
 func contextWithGinHeaders(headers map[string]string) context.Context {
 	gin.SetMode(gin.TestMode)
 	recorder := httptest.NewRecorder()

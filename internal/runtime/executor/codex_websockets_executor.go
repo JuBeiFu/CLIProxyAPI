@@ -5,6 +5,7 @@ package executor
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -87,6 +88,14 @@ type codexWebsocketRead struct {
 	err     error
 }
 
+type codexNonStreamAggregator struct {
+	messageText   strings.Builder
+	reasoningText strings.Builder
+	itemsByID     map[string]map[string]any
+	order         []string
+	itemIDByCall  map[string]string
+}
+
 func (s *codexWebsocketSession) setActive(ch chan codexWebsocketRead) {
 	if s == nil {
 		return
@@ -144,6 +153,351 @@ func (s *codexWebsocketSession) configureConn(conn *websocket.Conn) {
 		// Reply pongs from the same write lock to avoid concurrent writes.
 		return conn.WriteControl(websocket.PongMessage, []byte(appData), time.Now().Add(10*time.Second))
 	})
+}
+
+func newCodexNonStreamAggregator() *codexNonStreamAggregator {
+	return &codexNonStreamAggregator{
+		itemsByID:    make(map[string]map[string]any),
+		order:        make([]string, 0, 4),
+		itemIDByCall: make(map[string]string),
+	}
+}
+
+func (a *codexNonStreamAggregator) ensureItem(id string, itemType string) map[string]any {
+	if a == nil {
+		return nil
+	}
+	id = strings.TrimSpace(id)
+	if id == "" {
+		id = fmt.Sprintf("__idx_%d", len(a.order))
+	}
+	if item, ok := a.itemsByID[id]; ok {
+		if itemType != "" && strings.TrimSpace(asString(item["type"])) == "" {
+			item["type"] = itemType
+		}
+		if rawID := strings.TrimSpace(asString(item["id"])); rawID == "" && !strings.HasPrefix(id, "__idx_") {
+			item["id"] = id
+		}
+		return item
+	}
+
+	item := map[string]any{}
+	if itemType != "" {
+		item["type"] = itemType
+	}
+	if !strings.HasPrefix(id, "__idx_") {
+		item["id"] = id
+	}
+	a.itemsByID[id] = item
+	a.order = append(a.order, id)
+	return item
+}
+
+func (a *codexNonStreamAggregator) ingest(payload []byte) {
+	if a == nil || len(bytes.TrimSpace(payload)) == 0 {
+		return
+	}
+	root := gjson.ParseBytes(payload)
+	switch root.Get("type").String() {
+	case "response.output_text.delta":
+		a.messageText.WriteString(root.Get("delta").String())
+	case "response.reasoning_summary_text.delta":
+		a.reasoningText.WriteString(root.Get("delta").String())
+	case "response.output_item.added", "response.output_item.done":
+		item := root.Get("item")
+		if !item.Exists() || !item.IsObject() {
+			return
+		}
+		itemID := strings.TrimSpace(item.Get("id").String())
+		if itemID == "" {
+			itemID = strings.TrimSpace(root.Get("item_id").String())
+		}
+		itemType := strings.TrimSpace(item.Get("type").String())
+		dst := a.ensureItem(itemID, itemType)
+		if dst == nil {
+			return
+		}
+		mergeJSONObject(dst, item)
+		if callID := strings.TrimSpace(item.Get("call_id").String()); callID != "" {
+			a.itemIDByCall[callID] = itemID
+		}
+	case "response.function_call_arguments.delta":
+		itemID := strings.TrimSpace(root.Get("item_id").String())
+		if itemID == "" {
+			if callID := strings.TrimSpace(root.Get("call_id").String()); callID != "" {
+				itemID = a.itemIDByCall[callID]
+			}
+		}
+		if itemID == "" {
+			return
+		}
+		dst := a.ensureItem(itemID, "function_call")
+		if dst == nil {
+			return
+		}
+		existingArgs := asString(dst["arguments"])
+		dst["arguments"] = existingArgs + root.Get("delta").String()
+	case "response.function_call_arguments.done":
+		itemID := strings.TrimSpace(root.Get("item_id").String())
+		if itemID == "" {
+			if callID := strings.TrimSpace(root.Get("call_id").String()); callID != "" {
+				itemID = a.itemIDByCall[callID]
+			}
+		}
+		if itemID == "" {
+			return
+		}
+		dst := a.ensureItem(itemID, "function_call")
+		if dst == nil {
+			return
+		}
+		if args := root.Get("arguments"); args.Exists() {
+			dst["arguments"] = args.String()
+		}
+	}
+}
+
+func (a *codexNonStreamAggregator) applyCompleted(payload []byte) []byte {
+	if a == nil || len(bytes.TrimSpace(payload)) == 0 {
+		return payload
+	}
+
+	responseNode := gjson.GetBytes(payload, "response")
+	if !responseNode.Exists() || !responseNode.IsObject() {
+		return payload
+	}
+
+	outputNode := responseNode.Get("output")
+	if outputNode.Exists() && outputNode.IsArray() && len(outputNode.Array()) > 0 {
+		return payload
+	}
+
+	output := a.materializeOutput()
+	if len(output) == 0 {
+		return payload
+	}
+
+	raw, err := json.Marshal(output)
+	if err != nil {
+		return payload
+	}
+	updated, err := sjson.SetRawBytes(payload, "response.output", raw)
+	if err != nil {
+		return payload
+	}
+	return updated
+}
+
+func (a *codexNonStreamAggregator) materializeOutput() []map[string]any {
+	if a == nil {
+		return nil
+	}
+
+	output := make([]map[string]any, 0, len(a.order)+2)
+
+	message := strings.TrimSpace(a.messageText.String())
+	reasoning := strings.TrimSpace(a.reasoningText.String())
+
+	for _, id := range a.order {
+		item := a.itemsByID[id]
+		if item == nil {
+			continue
+		}
+		cloned := cloneJSONObject(item)
+		if strings.TrimSpace(asString(cloned["status"])) == "" {
+			cloned["status"] = "completed"
+		}
+		switch strings.TrimSpace(asString(cloned["type"])) {
+		case "message":
+			if message != "" && !messageItemHasContent(cloned) {
+				cloned["role"] = "assistant"
+				cloned["content"] = []map[string]any{
+					{
+						"type": "output_text",
+						"text": message,
+					},
+				}
+			}
+			if message != "" {
+				message = ""
+			}
+		case "reasoning":
+			if reasoning != "" && !reasoningItemHasSummary(cloned) {
+				cloned["summary"] = []map[string]any{
+					{
+						"type": "summary_text",
+						"text": reasoning,
+					},
+				}
+			}
+			if reasoning != "" {
+				reasoning = ""
+			}
+		}
+		output = append(output, cloned)
+	}
+
+	if message != "" {
+		output = append(output, map[string]any{
+			"type":   "message",
+			"role":   "assistant",
+			"status": "completed",
+			"content": []map[string]any{
+				{
+					"type": "output_text",
+					"text": message,
+				},
+			},
+		})
+	}
+
+	if reasoning != "" {
+		output = append(output, map[string]any{
+			"type": "reasoning",
+			"summary": []map[string]any{
+				{
+					"type": "summary_text",
+					"text": reasoning,
+				},
+			},
+		})
+	}
+
+	return output
+}
+
+func messageItemHasContent(item map[string]any) bool {
+	content, ok := item["content"]
+	if !ok || content == nil {
+		return false
+	}
+	raw, err := json.Marshal(content)
+	if err != nil {
+		return false
+	}
+	contentNode := gjson.ParseBytes(raw)
+	if !contentNode.IsArray() {
+		return false
+	}
+	for _, child := range contentNode.Array() {
+		if child.Get("type").String() == "output_text" && strings.TrimSpace(child.Get("text").String()) != "" {
+			return true
+		}
+	}
+	return false
+}
+
+func reasoningItemHasSummary(item map[string]any) bool {
+	summary, ok := item["summary"]
+	if !ok || summary == nil {
+		return false
+	}
+	raw, err := json.Marshal(summary)
+	if err != nil {
+		return false
+	}
+	summaryNode := gjson.ParseBytes(raw)
+	if !summaryNode.IsArray() {
+		return false
+	}
+	for _, child := range summaryNode.Array() {
+		if child.Get("type").String() == "summary_text" && strings.TrimSpace(child.Get("text").String()) != "" {
+			return true
+		}
+	}
+	return false
+}
+
+func mergeJSONObject(dst map[string]any, src gjson.Result) {
+	if dst == nil || !src.Exists() || !src.IsObject() {
+		return
+	}
+	src.ForEach(func(key, value gjson.Result) bool {
+		k := strings.TrimSpace(key.String())
+		if k == "" {
+			return true
+		}
+		switch {
+		case value.IsObject():
+			child, _ := dst[k].(map[string]any)
+			if child == nil {
+				child = map[string]any{}
+			}
+			mergeJSONObject(child, value)
+			dst[k] = child
+		case value.IsArray():
+			var arr any
+			if err := json.Unmarshal([]byte(value.Raw), &arr); err == nil {
+				dst[k] = arr
+			}
+		default:
+			dst[k] = scalarValue(value)
+		}
+		return true
+	})
+}
+
+func cloneJSONObject(src map[string]any) map[string]any {
+	if src == nil {
+		return nil
+	}
+	out := make(map[string]any, len(src))
+	for key, value := range src {
+		out[key] = cloneJSONValue(value)
+	}
+	return out
+}
+
+func cloneJSONValue(value any) any {
+	switch v := value.(type) {
+	case map[string]any:
+		return cloneJSONObject(v)
+	case []any:
+		out := make([]any, len(v))
+		for i := range v {
+			out[i] = cloneJSONValue(v[i])
+		}
+		return out
+	case []map[string]any:
+		out := make([]map[string]any, len(v))
+		for i := range v {
+			out[i] = cloneJSONObject(v[i])
+		}
+		return out
+	default:
+		return v
+	}
+}
+
+func scalarValue(value gjson.Result) any {
+	switch value.Type {
+	case gjson.String:
+		return value.String()
+	case gjson.Number:
+		return value.Value()
+	case gjson.True:
+		return true
+	case gjson.False:
+		return false
+	case gjson.Null:
+		return nil
+	default:
+		return value.Value()
+	}
+}
+
+func asString(value any) string {
+	switch v := value.(type) {
+	case string:
+		return v
+	case []byte:
+		return string(v)
+	default:
+		if v == nil {
+			return ""
+		}
+		return fmt.Sprint(v)
+	}
 }
 
 func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (resp cliproxyexecutor.Response, err error) {
@@ -309,6 +663,7 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 			return resp, errSend
 		}
 	}
+	aggregator := newCodexNonStreamAggregator()
 	for {
 		if ctx != nil && ctx.Err() != nil {
 			return resp, ctx.Err()
@@ -345,8 +700,10 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 		}
 
 		payload = normalizeCodexWebsocketCompletion(payload)
+		aggregator.ingest(payload)
 		eventType := gjson.GetBytes(payload, "type").String()
 		if eventType == "response.completed" {
+			payload = aggregator.applyCompleted(payload)
 			if detail, ok := parseCodexUsage(payload); ok {
 				reporter.publish(ctx, detail)
 			}
