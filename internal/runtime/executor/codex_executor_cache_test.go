@@ -97,7 +97,7 @@ func TestCodexExecutorPreservesPreviousResponseIDForNewAPIWebsocketDownstream(t 
 		t.Fatalf("read request body: %v", errRead)
 	}
 
-	body = stripCodexUnsupportedResponseFields(body, shouldPreserveCodexPreviousResponseID(ctx, auth))
+	body = stripCodexUnsupportedResponseFields(body, shouldPreserveCodexPreviousResponseID(ctx, auth, sdktranslator.FromString("openai-response"), body))
 	if got := gjson.GetBytes(body, "previous_response_id").String(); got != "resp-1" {
 		t.Fatalf("previous_response_id = %q, want %q", got, "resp-1")
 	}
@@ -112,12 +112,27 @@ func TestShouldPreserveCodexPreviousResponseID_TrueForNewAPIWebsocketHeader(t *t
 		Attributes: map[string]string{"websockets": "true"},
 	}
 
-	if !shouldPreserveCodexPreviousResponseID(ctx, auth) {
+	if !shouldPreserveCodexPreviousResponseID(ctx, auth, sdktranslator.FromString("openai"), nil) {
 		t.Fatal("expected websocket downstream header to preserve previous_response_id")
 	}
 }
 
-func TestShouldPreserveCodexPreviousResponseID_FalseForNewAPISSEHeader(t *testing.T) {
+func TestShouldPreserveCodexPreviousResponseID_TrueForOpenAIResponsesFollowupOverHTTP(t *testing.T) {
+	ctx := contextWithGinHeaders(map[string]string{
+		"X-NewAPI-Downstream-Transport": "sse",
+	})
+	auth := &cliproxyauth.Auth{
+		Provider:   "codex",
+		Attributes: map[string]string{"websockets": "true"},
+	}
+	body := []byte(`{"model":"gpt-5.4","previous_response_id":"resp-1","input":[{"type":"function_call_output","call_id":"call-1","output":"ok"}]}`)
+
+	if !shouldPreserveCodexPreviousResponseID(ctx, auth, sdktranslator.FromString("openai-response"), body) {
+		t.Fatal("expected openai responses follow-up to preserve previous_response_id over HTTP")
+	}
+}
+
+func TestShouldPreserveCodexPreviousResponseID_FalseForNonResponsesSSEHeader(t *testing.T) {
 	ctx := contextWithGinHeaders(map[string]string{
 		"X-NewAPI-Downstream-Transport": "sse",
 	})
@@ -126,7 +141,7 @@ func TestShouldPreserveCodexPreviousResponseID_FalseForNewAPISSEHeader(t *testin
 		Attributes: map[string]string{"websockets": "true"},
 	}
 
-	if shouldPreserveCodexPreviousResponseID(ctx, auth) {
+	if shouldPreserveCodexPreviousResponseID(ctx, auth, sdktranslator.FromString("openai"), nil) {
 		t.Fatal("expected sse downstream header to delete previous_response_id")
 	}
 }
@@ -140,7 +155,7 @@ func TestShouldPreserveCodexPreviousResponseID_FalseWhenAuthDisablesWebsockets(t
 		Attributes: map[string]string{"websockets": "false"},
 	}
 
-	if !shouldPreserveCodexPreviousResponseID(ctx, auth) {
+	if !shouldPreserveCodexPreviousResponseID(ctx, auth, sdktranslator.FromString("openai"), nil) {
 		t.Fatal("expected websocket bridge header to preserve previous_response_id even when selected auth uses HTTP upstream")
 	}
 }
@@ -156,7 +171,7 @@ func TestShouldPreserveCodexPreviousResponseID_TrueForCodexOAuthWithoutExplicitW
 		},
 	}
 
-	if !shouldPreserveCodexPreviousResponseID(ctx, auth) {
+	if !shouldPreserveCodexPreviousResponseID(ctx, auth, sdktranslator.FromString("openai"), nil) {
 		t.Fatal("expected codex oauth auth to preserve previous_response_id for websocket bridge")
 	}
 }
@@ -174,6 +189,47 @@ func TestStripCodexUnsupportedResponseFields_PreservesPreviousResponseIDWhenRequ
 	}
 	if gjson.GetBytes(got, "safety_identifier").Exists() {
 		t.Fatalf("safety_identifier should be removed: %s", got)
+	}
+}
+
+func TestCodexExecutorExecuteNonStreamPreservesPreviousResponseIDForOpenAIResponsesFollowup(t *testing.T) {
+	var requestBody []byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var err error
+		requestBody, err = io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("ReadAll() error = %v", err)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, err = io.WriteString(w,
+			"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_123\",\"created_at\":1700000000,\"model\":\"gpt-5.4\",\"status\":\"completed\",\"output\":[{\"type\":\"message\",\"role\":\"assistant\",\"status\":\"completed\",\"content\":[{\"type\":\"output_text\",\"text\":\"done\"}]}],\"usage\":{\"input_tokens\":7,\"output_tokens\":13,\"total_tokens\":20}}}\n\n")
+		if err != nil {
+			t.Fatalf("WriteString() error = %v", err)
+		}
+	}))
+	defer server.Close()
+
+	executor := &CodexExecutor{}
+	auth := &cliproxyauth.Auth{
+		Provider: "codex",
+		Attributes: map[string]string{
+			"api_key":  "sk-test",
+			"base_url": server.URL,
+		},
+	}
+	req := cliproxyexecutor.Request{
+		Model:   "gpt-5.4",
+		Payload: []byte(`{"model":"gpt-5.4","previous_response_id":"resp-1","input":[{"type":"function_call_output","call_id":"call-1","output":"ok"}]}`),
+	}
+	opts := cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("openai-response"),
+	}
+
+	if _, err := executor.Execute(context.Background(), auth, req, opts); err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if got := gjson.GetBytes(requestBody, "previous_response_id").String(); got != "resp-1" {
+		t.Fatalf("previous_response_id = %q, want %q; request=%s", got, "resp-1", strings.TrimSpace(string(requestBody)))
 	}
 }
 
@@ -282,5 +338,117 @@ func TestCodexExecutorExecuteNonStreamSynthesizesFunctionCallOutputWhenCompleted
 	}
 	if got := gjson.GetBytes(resp.Payload, "output.0.arguments").String(); got != `{"city":"Tokyo"}` {
 		t.Fatalf("output[0].arguments = %q, want %q; payload=%s", got, `{"city":"Tokyo"}`, strings.TrimSpace(string(resp.Payload)))
+	}
+}
+
+func TestCodexExecutorExecuteStripsUnsupportedResponseInputIDsBeforeUpstream(t *testing.T) {
+	var requestBody []byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var err error
+		requestBody, err = io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("ReadAll() error = %v", err)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, err = io.WriteString(w,
+			"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_123\",\"created_at\":1700000000,\"model\":\"gpt-5.3-codex\",\"status\":\"completed\",\"output\":[{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"done\"}]}],\"usage\":{\"input_tokens\":7,\"output_tokens\":13,\"total_tokens\":20}}}\n\n")
+		if err != nil {
+			t.Fatalf("WriteString() error = %v", err)
+		}
+	}))
+	defer server.Close()
+
+	executor := &CodexExecutor{}
+	auth := &cliproxyauth.Auth{
+		Provider: "codex",
+		Attributes: map[string]string{
+			"api_key":  "sk-test",
+			"base_url": server.URL,
+		},
+	}
+	req := cliproxyexecutor.Request{
+		Model: "gpt-5.3-codex",
+		Payload: []byte(`{
+			"model":"gpt-5.3-codex",
+			"input":[
+				{"type":"message","id":"item_Ny3ONlYLeYYObL38","role":"assistant","content":[{"type":"output_text","text":"old"}]},
+				{"type":"message","id":"msg_valid","role":"user","content":[{"type":"input_text","text":"next"}]},
+				{"type":"function_call_output","id":"tool-out-1","call_id":"call-1","output":"ok"}
+			]
+		}`),
+	}
+	opts := cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("openai-response"),
+	}
+
+	if _, err := executor.Execute(context.Background(), auth, req, opts); err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if got := gjson.GetBytes(requestBody, "input.0.id").String(); got != "" {
+		t.Fatalf("input[0].id = %q, want empty; request=%s", got, strings.TrimSpace(string(requestBody)))
+	}
+	if got := gjson.GetBytes(requestBody, "input.1.id").String(); got != "msg_valid" {
+		t.Fatalf("input[1].id = %q, want msg_valid; request=%s", got, strings.TrimSpace(string(requestBody)))
+	}
+	if got := gjson.GetBytes(requestBody, "input.2.id").String(); got != "tool-out-1" {
+		t.Fatalf("input[2].id = %q, want tool-out-1; request=%s", got, strings.TrimSpace(string(requestBody)))
+	}
+}
+
+func TestCodexExecutorExecuteStripsUnsupportedRemoteImageURLBeforeUpstream(t *testing.T) {
+	var requestBody []byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var err error
+		requestBody, err = io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("ReadAll() error = %v", err)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, err = io.WriteString(w,
+			"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_123\",\"created_at\":1700000000,\"model\":\"gpt-5.4-mini\",\"status\":\"completed\",\"output\":[{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"done\"}]}],\"usage\":{\"input_tokens\":7,\"output_tokens\":13,\"total_tokens\":20}}}\n\n")
+		if err != nil {
+			t.Fatalf("WriteString() error = %v", err)
+		}
+	}))
+	defer server.Close()
+
+	executor := &CodexExecutor{}
+	auth := &cliproxyauth.Auth{
+		Provider: "codex",
+		Attributes: map[string]string{
+			"api_key":  "sk-test",
+			"base_url": server.URL,
+		},
+	}
+	req := cliproxyexecutor.Request{
+		Model: "gpt-5.4-mini",
+		Payload: []byte(`{
+			"model":"gpt-5.4-mini",
+			"messages":[
+				{
+					"role":"user",
+					"content":[
+						{"type":"image_url","image_url":{"url":"https://example.com/demo.png"}},
+						{"type":"text","text":"describe this briefly"}
+					]
+				}
+			]
+		}`),
+	}
+	opts := cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("openai"),
+	}
+
+	if _, err := executor.Execute(context.Background(), auth, req, opts); err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if got := gjson.GetBytes(requestBody, "input.0.content.#").Int(); got != 1 {
+		t.Fatalf("content item count = %d, want 1; request=%s", got, strings.TrimSpace(string(requestBody)))
+	}
+	if got := gjson.GetBytes(requestBody, "input.0.content.0.type").String(); got != "input_text" {
+		t.Fatalf("input[0].content[0].type = %q, want input_text; request=%s", got, strings.TrimSpace(string(requestBody)))
+	}
+	if gjson.GetBytes(requestBody, "input.0.content.0.image_url").Exists() {
+		t.Fatalf("unexpected image_url in forwarded request: %s", strings.TrimSpace(string(requestBody)))
 	}
 }

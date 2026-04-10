@@ -172,12 +172,15 @@ func ConvertOpenAIRequestToCodex(modelName string, inputRawJSON []byte, stream b
 						case "image_url":
 							// Map image inputs to input_image for Responses API
 							if role == "user" {
-								part := []byte(`{}`)
-								part, _ = sjson.SetBytes(part, "type", "input_image")
 								if u := it.Get("image_url.url"); u.Exists() {
-									part, _ = sjson.SetBytes(part, "image_url", u.String())
+									imageURL := strings.TrimSpace(u.String())
+									if strings.HasPrefix(strings.ToLower(imageURL), "data:image/") {
+										part := []byte(`{}`)
+										part, _ = sjson.SetBytes(part, "type", "input_image")
+										part, _ = sjson.SetBytes(part, "image_url", imageURL)
+										msg, _ = sjson.SetRawBytes(msg, "content.-1", part)
+									}
 								}
-								msg, _ = sjson.SetRawBytes(msg, "content.-1", part)
 							}
 						case "file":
 							if role == "user" {

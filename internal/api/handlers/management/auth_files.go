@@ -1343,6 +1343,82 @@ func (h *Handler) PatchAuthFileFields(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"status": "ok"})
 }
 
+// RefreshAuthFileQuota forces a live quota refresh for a supported auth file and
+// returns the updated auth-file entry so callers can refresh UI state immediately.
+func (h *Handler) RefreshAuthFileQuota(c *gin.Context) {
+	if h.authManager == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "core auth manager unavailable"})
+		return
+	}
+
+	var req struct {
+		Name string `json:"name"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
+		return
+	}
+
+	name := strings.TrimSpace(req.Name)
+	if name == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "name is required"})
+		return
+	}
+
+	var targetAuth *coreauth.Auth
+	if auth, ok := h.authManager.GetByID(name); ok {
+		targetAuth = auth
+	} else {
+		for _, auth := range h.authManager.List() {
+			if auth != nil && auth.FileName == name {
+				targetAuth = auth
+				break
+			}
+		}
+	}
+
+	if targetAuth == nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "auth file not found"})
+		return
+	}
+	if !strings.EqualFold(strings.TrimSpace(targetAuth.Provider), "codex") {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "quota refresh is only supported for codex auth files"})
+		return
+	}
+
+	ctx := c.Request.Context()
+	h.authManager.ForceRefreshQuotaAuth(ctx, targetAuth.ID)
+
+	refreshed, ok := h.authManager.GetByID(targetAuth.ID)
+	if !ok || refreshed == nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "auth file no longer exists after refresh"})
+		return
+	}
+
+	entry := h.buildAuthFileEntry(refreshed)
+	if entry == nil {
+		entry = gin.H{
+			"name":           refreshed.FileName,
+			"provider":       refreshed.Provider,
+			"type":           refreshed.Provider,
+			"disabled":       refreshed.Disabled,
+			"status":         refreshed.Status,
+			"status_message": refreshed.StatusMessage,
+		}
+		if planType := strings.TrimSpace(refreshed.PlanType()); planType != "" {
+			entry["plan_type"] = planType
+		}
+		if quotaCache := buildQuotaCacheEntry(refreshed); quotaCache != nil {
+			entry["quota_cache"] = quotaCache
+		}
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"status": "ok",
+		"file":   entry,
+	})
+}
+
 func (h *Handler) disableAuth(ctx context.Context, id string) {
 	if h == nil || h.authManager == nil {
 		return

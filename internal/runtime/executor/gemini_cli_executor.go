@@ -112,7 +112,7 @@ func (e *GeminiCLIExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth
 		return resp, err
 	}
 
-	reporter := newUsageReporter(ctx, e.Identifier(), baseModel, auth)
+	reporter := newUsageReporter(ctx, e.Identifier(), baseModel, e.cfg, auth)
 	defer reporter.trackFailure(ctx, &err)
 
 	from := opts.SourceFormat
@@ -266,7 +266,7 @@ func (e *GeminiCLIExecutor) ExecuteStream(ctx context.Context, auth *cliproxyaut
 		return nil, err
 	}
 
-	reporter := newUsageReporter(ctx, e.Identifier(), baseModel, auth)
+	reporter := newUsageReporter(ctx, e.Identifier(), baseModel, e.cfg, auth)
 	defer reporter.trackFailure(ctx, &err)
 
 	from := opts.SourceFormat

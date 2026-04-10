@@ -440,6 +440,42 @@ func TestManager_MarkResult_CodexSuccessSchedulesUsageRefreshAfterFiveMinutes(t 
 	}
 }
 
+func TestManager_MarkResult_CodexSuccessPreservesEarlierUsageRefreshSchedule(t *testing.T) {
+	store := &deletingStore{}
+	mgr := NewManager(store, nil, nil)
+	now := time.Now().UTC()
+	existingNext := now.Add(45 * time.Second)
+	auth := &Auth{
+		ID:       "auths/codex-usage-preserve.json",
+		FileName: "auths/codex-usage-preserve.json",
+		Provider: "codex",
+		Status:   StatusActive,
+		Metadata: map[string]any{
+			"type":                    "codex",
+			metadataCodexUsageAfterKey: existingNext.Unix(),
+		},
+	}
+	if _, err := mgr.Register(WithSkipPersist(context.Background()), auth); err != nil {
+		t.Fatalf("Register returned error: %v", err)
+	}
+
+	mgr.MarkResult(context.Background(), Result{
+		AuthID:   auth.ID,
+		Provider: auth.Provider,
+		Model:    "gpt-5",
+		Success:  true,
+	})
+
+	stored, ok := mgr.GetByID(auth.ID)
+	if !ok {
+		t.Fatalf("expected auth to remain registered")
+	}
+	nextRefresh := metadataTimeValue(t, stored, metadataCodexUsageAfterKey)
+	if delta := nextRefresh.Sub(existingNext); delta < -time.Second || delta > time.Second {
+		t.Fatalf("codex usage next refresh = %v, want existing schedule near %v", nextRefresh, existingNext)
+	}
+}
+
 func TestCodexUsageRefreshSchedule_EnforcesFiveMinuteFetchCooldown(t *testing.T) {
 	now := time.Now().UTC()
 	auth := &Auth{
@@ -462,6 +498,118 @@ func TestCodexUsageRefreshSchedule_EnforcesFiveMinuteFetchCooldown(t *testing.T)
 	}
 	if due.Sub(minDue) < -time.Second || due.Sub(minDue) > time.Second {
 		t.Fatalf("due = %v, want %v", due, minDue)
+	}
+}
+
+func TestShouldAutoDisableCodexAuthOnQuotaExceeded_OnlyForQuotaSignals(t *testing.T) {
+	cfg := &internalconfig.Config{}
+	auth := &Auth{ID: "codex-team", Provider: "codex", Metadata: map[string]any{"type": "codex", "plan_type": "team"}}
+
+	if shouldAutoDisableCodexAuthOnQuotaExceeded(auth, &Error{HTTPStatus: http.StatusTooManyRequests, Message: `{"detail":"Rate limit exceeded"}`}, cfg) {
+		t.Fatalf("expected generic rate limit exceeded error not to auto-disable codex auth")
+	}
+	if !shouldAutoDisableCodexAuthOnQuotaExceeded(auth, &Error{HTTPStatus: http.StatusTooManyRequests, Message: `{"error":{"type":"usage_limit_reached","message":"The usage limit has been reached"}}`}, cfg) {
+		t.Fatalf("expected usage_limit_reached error to auto-disable codex auth")
+	}
+	if shouldAutoDisableCodexAuthOnQuotaExceeded(auth, &Error{HTTPStatus: http.StatusTooManyRequests, Message: "Selected model is at capacity. Please try a different model."}, cfg) {
+		t.Fatalf("expected capacity 429 not to auto-disable codex auth")
+	}
+}
+
+func TestManager_MarkResult_CodexRateLimit429SchedulesTransientCooldownOnly(t *testing.T) {
+	store := &deletingStore{}
+	mgr := NewManager(store, nil, nil)
+	auth := &Auth{
+		ID:       "auths/codex-team-429.json",
+		FileName: "auths/codex-team-429.json",
+		Provider: "codex",
+		Status:   StatusActive,
+		Metadata: map[string]any{"type": "codex", "plan_type": "team"},
+	}
+	if _, err := mgr.Register(WithSkipPersist(context.Background()), auth); err != nil {
+		t.Fatalf("Register returned error: %v", err)
+	}
+
+	retryAfter := 30 * time.Minute
+	mgr.MarkResult(context.Background(), Result{
+		AuthID:     auth.ID,
+		Provider:   auth.Provider,
+		Model:      "gpt-5",
+		Success:    false,
+		RetryAfter: &retryAfter,
+		Error:      &Error{HTTPStatus: http.StatusTooManyRequests, Message: `{"detail":"Rate limit exceeded"}`},
+	})
+
+	stored, ok := mgr.GetByID(auth.ID)
+	if !ok {
+		t.Fatalf("expected auth to remain registered")
+	}
+	if stored.Disabled {
+		t.Fatalf("expected auth to remain enabled")
+	}
+	if stored.Status != StatusError {
+		t.Fatalf("status = %q, want %q", stored.Status, StatusError)
+	}
+	if reason := quotaAutoDisabledReason(stored); reason != "" {
+		t.Fatalf("auto-disabled reason = %q, want empty", reason)
+	}
+	if stored.TransientCooldownUntil.IsZero() || stored.TransientCooldownUntil.Before(time.Now().Add(29*time.Minute)) {
+		t.Fatalf("expected transient cooldown from retry-after, got %v", stored.TransientCooldownUntil)
+	}
+	if stored.Quota.Exceeded || !stored.Quota.NextRecoverAt.IsZero() {
+		t.Fatalf("expected no durable quota state, got %+v", stored.Quota)
+	}
+	if stored.NextRetryAfter.IsZero() || stored.NextRetryAfter.Before(time.Now().Add(29*time.Minute)) {
+		t.Fatalf("expected next retry after from retry-after, got %v", stored.NextRetryAfter)
+	}
+}
+
+func TestManager_MarkResult_CodexRateLimit429WithoutRetryAfterUses60SecondTransientCooldown(t *testing.T) {
+	store := &deletingStore{}
+	mgr := NewManager(store, nil, nil)
+	auth := &Auth{
+		ID:       "auths/codex-team-429-no-retry-after.json",
+		FileName: "auths/codex-team-429-no-retry-after.json",
+		Provider: "codex",
+		Status:   StatusActive,
+		Metadata: map[string]any{"type": "codex", "plan_type": "team"},
+	}
+	if _, err := mgr.Register(WithSkipPersist(context.Background()), auth); err != nil {
+		t.Fatalf("Register returned error: %v", err)
+	}
+
+	before := time.Now()
+	mgr.MarkResult(context.Background(), Result{
+		AuthID:   auth.ID,
+		Provider: auth.Provider,
+		Model:    "gpt-5",
+		Success:  false,
+		Error:    &Error{HTTPStatus: http.StatusTooManyRequests, Message: `{"detail":"Rate limit exceeded"}`},
+	})
+
+	stored, ok := mgr.GetByID(auth.ID)
+	if !ok {
+		t.Fatalf("expected auth to remain registered")
+	}
+	if stored.Disabled {
+		t.Fatalf("expected auth to remain enabled")
+	}
+	if stored.Status != StatusError {
+		t.Fatalf("status = %q, want %q", stored.Status, StatusError)
+	}
+	if stored.TransientCooldownUntil.IsZero() {
+		t.Fatalf("expected transient cooldown to be set")
+	}
+	minUntil := before.Add(55 * time.Second)
+	maxUntil := before.Add(65 * time.Second)
+	if stored.TransientCooldownUntil.Before(minUntil) || stored.TransientCooldownUntil.After(maxUntil) {
+		t.Fatalf("TransientCooldownUntil = %v, want around %v..%v", stored.TransientCooldownUntil, minUntil, maxUntil)
+	}
+	if stored.NextRetryAfter.Before(minUntil) || stored.NextRetryAfter.After(maxUntil) {
+		t.Fatalf("NextRetryAfter = %v, want around %v..%v", stored.NextRetryAfter, minUntil, maxUntil)
+	}
+	if stored.Quota.Exceeded || !stored.Quota.NextRecoverAt.IsZero() {
+		t.Fatalf("expected no durable quota state, got %+v", stored.Quota)
 	}
 }
 
@@ -587,6 +735,196 @@ func TestManager_QuotaRefresh_CodexUsageSuccessReenablesLowBalanceAutoDisabledAu
 	remaining, ok := stored.Metadata[metadataCodexUsageRemainingKey].(float64)
 	if !ok || remaining <= codexLowRemainingThresholdPct {
 		t.Fatalf("remaining percent metadata = %#v, want value above %.1f", stored.Metadata[metadataCodexUsageRemainingKey], codexLowRemainingThresholdPct)
+	}
+}
+
+func TestManager_QuotaRefresh_CodexUsageLowBalanceRespectsDisableCooling(t *testing.T) {
+	store := &deletingStore{}
+	exec := &quotaProbeTestExecutor{
+		id: "codex",
+		httpRequest: func(context.Context, *Auth, *http.Request) (*http.Response, error) {
+			return newCodexUsageHTTPResponse(http.StatusOK, `{
+				"plan_type":"team",
+				"rate_limit":{
+					"primary_window":{"used_percent":94,"limit_window_seconds":18000,"reset_after_seconds":900},
+					"secondary_window":{"used_percent":91,"limit_window_seconds":604800,"reset_after_seconds":7200}
+				}
+			}`, nil), nil
+		},
+	}
+	mgr := NewManager(store, nil, nil)
+	mgr.RegisterExecutor(exec)
+	now := time.Now().UTC()
+	auth := &Auth{
+		ID:       "auths/codex-low-balance-disable-cooling.json",
+		FileName: "auths/codex-low-balance-disable-cooling.json",
+		Provider: "codex",
+		Status:   StatusActive,
+		Metadata: map[string]any{
+			"type":                     "codex",
+			"account_id":               "acct-low-balance-disable-cooling",
+			"disable_cooling":          true,
+			metadataCodexUsageAfterKey: now.Add(-time.Minute).Unix(),
+		},
+	}
+	if _, err := mgr.Register(WithSkipPersist(context.Background()), auth); err != nil {
+		t.Fatalf("Register returned error: %v", err)
+	}
+
+	mgr.refreshQuotaAuth(context.Background(), auth.ID)
+	stored, ok := mgr.GetByID(auth.ID)
+	if !ok {
+		t.Fatalf("expected auth to remain registered")
+	}
+	if stored.Disabled || stored.Status != StatusActive {
+		t.Fatalf("expected low-balance auth to remain schedulable when disable_cooling=true, got disabled=%v status=%q", stored.Disabled, stored.Status)
+	}
+	if quotaProbeAutoDisabled(stored) {
+		t.Fatalf("expected low-balance auth not to carry auto-disabled marker when disable_cooling=true")
+	}
+	if stored.Quota.Exceeded {
+		t.Fatalf("expected auth quota state not to mark exceeded when disable_cooling=true, got %+v", stored.Quota)
+	}
+	if remaining, ok := stored.Metadata[metadataCodexUsageRemainingKey].(float64); !ok || remaining >= codexLowRemainingThresholdPct {
+		t.Fatalf("remaining percent metadata = %#v, want value below %.1f", stored.Metadata[metadataCodexUsageRemainingKey], codexLowRemainingThresholdPct)
+	}
+	if next, ok := stored.Metadata[metadataCodexUsageAfterKey].(int64); !ok || next <= now.Unix() {
+		t.Fatalf("expected next usage refresh to still be scheduled, got %#v", stored.Metadata[metadataCodexUsageAfterKey])
+	}
+}
+
+func TestManager_QuotaRefresh_CodexUsageDisablesWhenWeeklyWindowExhausted(t *testing.T) {
+	store := &deletingStore{}
+	exec := &quotaProbeTestExecutor{
+		id: "codex",
+		httpRequest: func(context.Context, *Auth, *http.Request) (*http.Response, error) {
+			return newCodexUsageHTTPResponse(http.StatusOK, `{
+				"plan_type":"team",
+				"rate_limit":{
+					"primary_window":{"used_percent":40,"limit_window_seconds":18000,"reset_after_seconds":900},
+					"secondary_window":{"used_percent":100,"limit_window_seconds":604800,"reset_after_seconds":7200}
+				}
+			}`, nil), nil
+		},
+	}
+	mgr := NewManager(store, nil, nil)
+	mgr.RegisterExecutor(exec)
+	now := time.Now().UTC()
+	auth := &Auth{
+		ID:       "auths/codex-weekly-exhausted.json",
+		FileName: "auths/codex-weekly-exhausted.json",
+		Provider: "codex",
+		Status:   StatusActive,
+		Metadata: map[string]any{
+			"type":                     "codex",
+			"account_id":               "acct-weekly-exhausted",
+			metadataCodexUsageAfterKey: now.Add(-time.Minute).Unix(),
+		},
+	}
+	if _, err := mgr.Register(WithSkipPersist(context.Background()), auth); err != nil {
+		t.Fatalf("Register returned error: %v", err)
+	}
+
+	mgr.refreshQuotaAuth(context.Background(), auth.ID)
+	stored, ok := mgr.GetByID(auth.ID)
+	if !ok {
+		t.Fatalf("expected auth to remain registered")
+	}
+	if !stored.Disabled || stored.Status != StatusDisabled {
+		t.Fatalf("expected weekly-exhausted auth to be disabled, got disabled=%v status=%q", stored.Disabled, stored.Status)
+	}
+	if stored.Quota.NextRecoverAt.Before(now.Add(7100 * time.Second)) {
+		t.Fatalf("expected next recover at to follow weekly window reset, got %v", stored.Quota.NextRecoverAt)
+	}
+}
+
+func TestManager_QuotaRefresh_CodexUsageKeepsAutoDisabledWhenWeeklyWindowStillBlocked(t *testing.T) {
+	store := &deletingStore{}
+	exec := &quotaProbeTestExecutor{
+		id: "codex",
+		httpRequest: func(context.Context, *Auth, *http.Request) (*http.Response, error) {
+			return newCodexUsageHTTPResponse(http.StatusOK, `{
+				"plan_type":"team",
+				"rate_limit":{
+					"primary_window":{"used_percent":0,"limit_window_seconds":18000,"reset_after_seconds":900},
+					"secondary_window":{"used_percent":100,"limit_window_seconds":604800,"reset_after_seconds":7200}
+				}
+			}`, nil), nil
+		},
+	}
+	mgr := NewManager(store, nil, nil)
+	mgr.RegisterExecutor(exec)
+	now := time.Now().UTC()
+	auth := &Auth{
+		ID:       "auths/codex-weekly-still-blocked.json",
+		FileName: "auths/codex-weekly-still-blocked.json",
+		Provider: "codex",
+		Disabled: true,
+		Status:   StatusDisabled,
+		Quota: QuotaState{
+			Exceeded:      true,
+			Reason:        autoDisabledReasonQuotaLowBalance,
+			NextRecoverAt: now.Add(2 * time.Hour),
+		},
+		Metadata: map[string]any{
+			"type":                        "codex",
+			"account_id":                  "acct-weekly-still-blocked",
+			metadataAutoDisabledReasonKey: autoDisabledReasonQuotaLowBalance,
+			metadataCodexUsageAfterKey:    now.Add(-time.Minute).Unix(),
+		},
+	}
+	if _, err := mgr.Register(WithSkipPersist(context.Background()), auth); err != nil {
+		t.Fatalf("Register returned error: %v", err)
+	}
+
+	mgr.refreshQuotaAuth(context.Background(), auth.ID)
+	stored, ok := mgr.GetByID(auth.ID)
+	if !ok {
+		t.Fatalf("expected auth to remain registered")
+	}
+	if !stored.Disabled || stored.Status != StatusDisabled {
+		t.Fatalf("expected auth to stay disabled, got disabled=%v status=%q", stored.Disabled, stored.Status)
+	}
+	if !quotaProbeAutoDisabled(stored) {
+		t.Fatalf("expected auto-disabled reason to remain present")
+	}
+}
+
+func TestManager_ForceRefreshQuotaAuth_TriggersCodexUsageImmediately(t *testing.T) {
+	store := &deletingStore{}
+	httpCalls := 0
+	exec := &quotaProbeTestExecutor{
+		id: "codex",
+		httpRequest: func(context.Context, *Auth, *http.Request) (*http.Response, error) {
+			httpCalls++
+			return newCodexUsageHTTPResponse(http.StatusOK, `{
+				"plan_type":"team",
+				"rate_limit":{
+					"primary_window":{"used_percent":20,"limit_window_seconds":18000,"reset_after_seconds":900},
+					"secondary_window":{"used_percent":10,"limit_window_seconds":604800,"reset_after_seconds":7200}
+				}
+			}`, nil), nil
+		},
+	}
+	mgr := NewManager(store, nil, nil)
+	mgr.RegisterExecutor(exec)
+	auth := &Auth{
+		ID:       "auths/codex-force-refresh.json",
+		FileName: "auths/codex-force-refresh.json",
+		Provider: "codex",
+		Status:   StatusActive,
+		Metadata: map[string]any{
+			"type":       "codex",
+			"account_id": "acct-force-refresh",
+		},
+	}
+	if _, err := mgr.Register(WithSkipPersist(context.Background()), auth); err != nil {
+		t.Fatalf("Register returned error: %v", err)
+	}
+
+	mgr.ForceRefreshQuotaAuth(context.Background(), auth.ID)
+	if httpCalls != 1 {
+		t.Fatalf("httpCalls = %d, want 1", httpCalls)
 	}
 }
 

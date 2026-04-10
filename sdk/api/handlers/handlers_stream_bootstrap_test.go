@@ -235,6 +235,51 @@ func (e *authAwareStreamExecutor) AuthIDs() []string {
 	return out
 }
 
+type fixedStreamErrorExecutor struct {
+	mu    sync.Mutex
+	calls int
+	err   error
+}
+
+func (e *fixedStreamErrorExecutor) Identifier() string { return "codex" }
+
+func (e *fixedStreamErrorExecutor) Execute(context.Context, *coreauth.Auth, coreexecutor.Request, coreexecutor.Options) (coreexecutor.Response, error) {
+	return coreexecutor.Response{}, &coreauth.Error{Code: "not_implemented", Message: "Execute not implemented"}
+}
+
+func (e *fixedStreamErrorExecutor) ExecuteStream(context.Context, *coreauth.Auth, coreexecutor.Request, coreexecutor.Options) (*coreexecutor.StreamResult, error) {
+	e.mu.Lock()
+	e.calls++
+	e.mu.Unlock()
+
+	ch := make(chan coreexecutor.StreamChunk, 1)
+	ch <- coreexecutor.StreamChunk{Err: e.err}
+	close(ch)
+	return &coreexecutor.StreamResult{Chunks: ch}, nil
+}
+
+func (e *fixedStreamErrorExecutor) Refresh(ctx context.Context, auth *coreauth.Auth) (*coreauth.Auth, error) {
+	return auth, nil
+}
+
+func (e *fixedStreamErrorExecutor) CountTokens(context.Context, *coreauth.Auth, coreexecutor.Request, coreexecutor.Options) (coreexecutor.Response, error) {
+	return coreexecutor.Response{}, &coreauth.Error{Code: "not_implemented", Message: "CountTokens not implemented"}
+}
+
+func (e *fixedStreamErrorExecutor) HttpRequest(ctx context.Context, auth *coreauth.Auth, req *http.Request) (*http.Response, error) {
+	return nil, &coreauth.Error{
+		Code:       "not_implemented",
+		Message:    "HttpRequest not implemented",
+		HTTPStatus: http.StatusNotImplemented,
+	}
+}
+
+func (e *fixedStreamErrorExecutor) Calls() int {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.calls
+}
+
 func TestExecuteStreamWithAuthManager_RetriesBeforeFirstByte(t *testing.T) {
 	executor := &failOnceStreamExecutor{}
 	manager := coreauth.NewManager(nil, nil, nil)
@@ -605,5 +650,65 @@ func TestExecuteStreamWithAuthManager_ValidatesOpenAIResponsesStreamDataJSON(t *
 	}
 	if !gotErr {
 		t.Fatalf("expected terminal error")
+	}
+}
+
+func TestExecuteStreamWithAuthManager_DoesNotBootstrapRetryRequestTimeout(t *testing.T) {
+	executor := &fixedStreamErrorExecutor{
+		err: &coreauth.Error{
+			Code:       "upstream_timeout",
+			Message:    "upstream timed out before first payload",
+			Retryable:  true,
+			HTTPStatus: http.StatusRequestTimeout,
+		},
+	}
+	manager := coreauth.NewManager(nil, nil, nil)
+	manager.RegisterExecutor(executor)
+
+	auth := &coreauth.Auth{
+		ID:       "auth1",
+		Provider: "codex",
+		Status:   coreauth.StatusActive,
+	}
+	if _, err := manager.Register(context.Background(), auth); err != nil {
+		t.Fatalf("manager.Register(auth): %v", err)
+	}
+
+	registry.GetGlobalRegistry().RegisterClient(auth.ID, auth.Provider, []*registry.ModelInfo{{ID: "test-model"}})
+	t.Cleanup(func() {
+		registry.GetGlobalRegistry().UnregisterClient(auth.ID)
+	})
+
+	handler := NewBaseAPIHandlers(&sdkconfig.SDKConfig{
+		Streaming: sdkconfig.StreamingConfig{
+			BootstrapRetries: 1,
+		},
+	}, manager)
+	dataChan, _, errChan := handler.ExecuteStreamWithAuthManager(context.Background(), "openai", "test-model", []byte(`{"model":"test-model"}`), "")
+	if dataChan == nil || errChan == nil {
+		t.Fatalf("expected non-nil channels")
+	}
+
+	for range dataChan {
+		t.Fatalf("expected no payload")
+	}
+
+	var gotErr error
+	var gotStatus int
+	for msg := range errChan {
+		if msg != nil && msg.Error != nil {
+			gotErr = msg.Error
+			gotStatus = msg.StatusCode
+		}
+	}
+
+	if gotErr == nil {
+		t.Fatal("expected terminal error")
+	}
+	if gotStatus != http.StatusRequestTimeout {
+		t.Fatalf("status = %d, want %d", gotStatus, http.StatusRequestTimeout)
+	}
+	if executor.Calls() != 1 {
+		t.Fatalf("expected 1 stream attempt, got %d", executor.Calls())
 	}
 }

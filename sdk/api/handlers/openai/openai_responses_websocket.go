@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"strconv"
 	"strings"
 	"time"
 
@@ -81,7 +80,7 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 	var lastRequest []byte
 	lastResponseOutput := []byte("[]")
 	pinnedAuthID := ""
-	pinnedExecutionSessionID := ""
+	pinnedExecutionSessionID := passthroughSessionID
 
 	for {
 		msgType, payload, errReadMessage := conn.ReadMessage()
@@ -110,7 +109,7 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 		allowIncrementalInputWithPreviousResponseID := false
 		if pinnedAuthID != "" && h != nil && h.AuthManager != nil {
 			if pinnedAuth, ok := h.AuthManager.GetByID(pinnedAuthID); ok && pinnedAuth != nil {
-				allowIncrementalInputWithPreviousResponseID = websocketUpstreamSupportsIncrementalInput(pinnedAuth.Attributes, pinnedAuth.Metadata)
+				allowIncrementalInputWithPreviousResponseID = websocketUpstreamSupportsIncrementalInput(pinnedAuth)
 			}
 		} else {
 			requestModelName := strings.TrimSpace(gjson.GetBytes(payload, "model").String())
@@ -188,10 +187,7 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 				if !ok || selectedAuth == nil {
 					return
 				}
-				if websocketUpstreamSupportsIncrementalInput(selectedAuth.Attributes, selectedAuth.Metadata) {
-					pinnedAuthID = authID
-					pinnedExecutionSessionID = passthroughSessionID
-				}
+				pinnedAuthID = authID
 			})
 		}
 		dataChan, _, errChan := h.ExecuteStreamWithAuthManager(cliCtx, h.HandlerType(), modelName, requestJSON, "")
@@ -295,10 +291,23 @@ func normalizeResponseSubsequentRequest(rawJSON []byte, lastRequest []byte, last
 					normalized, _ = sjson.SetBytes(normalized, "model", modelName)
 				}
 			}
-			if !gjson.GetBytes(normalized, "instructions").Exists() {
+			instructionsResult := gjson.GetBytes(normalized, "instructions")
+			if !instructionsResult.Exists() || strings.TrimSpace(instructionsResult.String()) == "" {
 				instructions := gjson.GetBytes(lastRequest, "instructions")
-				if instructions.Exists() {
+				if instructions.Exists() && strings.TrimSpace(instructions.String()) != "" {
 					normalized, _ = sjson.SetRawBytes(normalized, "instructions", []byte(instructions.Raw))
+				}
+			}
+			if !gjson.GetBytes(normalized, "tools").Exists() {
+				tools := gjson.GetBytes(lastRequest, "tools")
+				if tools.Exists() {
+					normalized, _ = sjson.SetRawBytes(normalized, "tools", []byte(tools.Raw))
+				}
+			}
+			if !gjson.GetBytes(normalized, "tool_choice").Exists() {
+				toolChoice := gjson.GetBytes(lastRequest, "tool_choice")
+				if toolChoice.Exists() {
+					normalized, _ = sjson.SetRawBytes(normalized, "tool_choice", []byte(toolChoice.Raw))
 				}
 			}
 			normalized, _ = sjson.SetBytes(normalized, "stream", true)
@@ -364,33 +373,11 @@ func normalizeResponseSubsequentRequest(rawJSON []byte, lastRequest []byte, last
 	return normalized, bytes.Clone(normalized), nil
 }
 
-func websocketUpstreamSupportsIncrementalInput(attributes map[string]string, metadata map[string]any) bool {
-	if len(attributes) > 0 {
-		if raw := strings.TrimSpace(attributes["websockets"]); raw != "" {
-			parsed, errParse := strconv.ParseBool(raw)
-			if errParse == nil {
-				return parsed
-			}
-		}
-	}
-	if len(metadata) == 0 {
+func websocketUpstreamSupportsIncrementalInput(auth *coreauth.Auth) bool {
+	if auth == nil {
 		return false
 	}
-	raw, ok := metadata["websockets"]
-	if !ok || raw == nil {
-		return false
-	}
-	switch value := raw.(type) {
-	case bool:
-		return value
-	case string:
-		parsed, errParse := strconv.ParseBool(strings.TrimSpace(value))
-		if errParse == nil {
-			return parsed
-		}
-	default:
-	}
-	return false
+	return auth.WebsocketsEnabled()
 }
 
 func (h *OpenAIResponsesAPIHandler) websocketUpstreamSupportsIncrementalInputForModel(modelName string) bool {
@@ -455,7 +442,7 @@ func (h *OpenAIResponsesAPIHandler) websocketUpstreamSupportsIncrementalInputFor
 		if !responsesWebsocketAuthAvailableForModel(auth, modelKey, now) {
 			continue
 		}
-		if websocketUpstreamSupportsIncrementalInput(auth.Attributes, auth.Metadata) {
+		if websocketUpstreamSupportsIncrementalInput(auth) {
 			return true
 		}
 	}

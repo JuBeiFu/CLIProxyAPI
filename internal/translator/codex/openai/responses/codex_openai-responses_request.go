@@ -25,6 +25,7 @@ func ConvertOpenAIResponsesRequestToCodex(modelName string, inputRawJSON []byte,
 	// requests with errors like:
 	// "Item with id 'rs_...' not found. Items are not persisted when `store` is set to false."
 	rawJSON = stripOutputOnlyReasoningFromInput(rawJSON)
+	rawJSON = stripUnsupportedCodexInputIDs(rawJSON)
 
 	// Preserve client preference when explicitly provided.
 	if !gjson.GetBytes(rawJSON, "store").Exists() {
@@ -95,6 +96,44 @@ func stripOutputOnlyReasoningFromInput(rawJSON []byte) []byte {
 	return updated
 }
 
+func stripUnsupportedCodexInputIDs(rawJSON []byte) []byte {
+	input := gjson.GetBytes(rawJSON, "input")
+	if !input.Exists() || !input.IsArray() {
+		return rawJSON
+	}
+
+	result := rawJSON
+	for idx, item := range input.Array() {
+		itemType := strings.ToLower(strings.TrimSpace(item.Get("type").String()))
+		itemID := strings.TrimSpace(item.Get("id").String())
+		if itemID == "" {
+			continue
+		}
+
+		keep := false
+		switch itemType {
+		case "message":
+			keep = strings.HasPrefix(itemID, "msg")
+		case "function_call":
+			keep = strings.HasPrefix(itemID, "fc_") || strings.HasPrefix(itemID, "fc-")
+		case "function_call_output":
+			keep = true
+		default:
+			keep = false
+		}
+		if keep {
+			continue
+		}
+
+		updated, err := sjson.DeleteBytes(result, fmt.Sprintf("input.%d.id", idx))
+		if err != nil {
+			return rawJSON
+		}
+		result = updated
+	}
+	return result
+}
+
 // applyResponsesCompactionCompatibility handles OpenAI Responses context_management.compaction
 // for Codex upstream compatibility.
 //
@@ -142,30 +181,78 @@ func normalizeCodexBuiltinTools(rawJSON []byte) []byte {
 	if tools.IsArray() {
 		toolArray := tools.Array()
 		for i := 0; i < len(toolArray); i++ {
-			typePath := fmt.Sprintf("tools.%d.type", i)
-			if normalized := normalizeCodexBuiltinToolType(gjson.GetBytes(result, typePath).String()); normalized != "" {
-				if updated, err := sjson.SetBytes(result, typePath, normalized); err == nil {
-					result = updated
-				}
-			}
+			result = normalizeCodexBuiltinToolObject(result, fmt.Sprintf("tools.%d", i))
 		}
 	}
 
-	if normalized := normalizeCodexBuiltinToolType(gjson.GetBytes(result, "tool_choice.type").String()); normalized != "" {
-		if updated, err := sjson.SetBytes(result, "tool_choice.type", normalized); err == nil {
-			result = updated
-		}
+	if gjson.GetBytes(result, "tool_choice").IsObject() {
+		result = normalizeCodexBuiltinToolObject(result, "tool_choice")
 	}
 
 	toolChoiceTools := gjson.GetBytes(result, "tool_choice.tools")
 	if toolChoiceTools.IsArray() {
 		toolArray := toolChoiceTools.Array()
 		for i := 0; i < len(toolArray); i++ {
-			typePath := fmt.Sprintf("tool_choice.tools.%d.type", i)
-			if normalized := normalizeCodexBuiltinToolType(gjson.GetBytes(result, typePath).String()); normalized != "" {
-				if updated, err := sjson.SetBytes(result, typePath, normalized); err == nil {
+			result = normalizeCodexBuiltinToolObject(result, fmt.Sprintf("tool_choice.tools.%d", i))
+		}
+	}
+
+	return result
+}
+
+func normalizeCodexBuiltinToolObject(rawJSON []byte, path string) []byte {
+	result := rawJSON
+	typePath := path + ".type"
+	toolType := gjson.GetBytes(result, typePath).String()
+	if normalized := normalizeCodexBuiltinToolType(toolType); normalized != "" {
+		if updated, err := sjson.SetBytes(result, typePath, normalized); err == nil {
+			result = updated
+			toolType = normalized
+		}
+	}
+
+	if toolType == "function" {
+		functionPath := path + ".function"
+		if function := gjson.GetBytes(result, functionPath); function.Exists() && function.IsObject() {
+			if name := function.Get("name"); name.Exists() && strings.TrimSpace(name.String()) != "" {
+				if updated, err := sjson.SetBytes(result, path+".name", name.String()); err == nil {
 					result = updated
 				}
+			}
+			if description := function.Get("description"); description.Exists() {
+				if updated, err := sjson.SetBytes(result, path+".description", description.Value()); err == nil {
+					result = updated
+				}
+			}
+			if parameters := function.Get("parameters"); parameters.Exists() {
+				if updated, err := sjson.SetRawBytes(result, path+".parameters", []byte(parameters.Raw)); err == nil {
+					result = updated
+				}
+			}
+			if strict := function.Get("strict"); strict.Exists() {
+				if updated, err := sjson.SetBytes(result, path+".strict", strict.Value()); err == nil {
+					result = updated
+				}
+			}
+			if updated, err := sjson.DeleteBytes(result, functionPath); err == nil {
+				result = updated
+			}
+		}
+	}
+
+	switch toolType {
+	case "tool_search":
+		// Codex app-server exposes tool_search as a native Responses tool, but
+		// OpenAI-compatible upstreams validate it as a named function tool.
+		if updated, err := sjson.SetBytes(result, typePath, "function"); err == nil {
+			result = updated
+		}
+		if updated, err := sjson.SetBytes(result, path+".name", "tool_search"); err == nil {
+			result = updated
+		}
+		if gjson.GetBytes(result, path+".execution").Exists() {
+			if updated, err := sjson.DeleteBytes(result, path+".execution"); err == nil {
+				result = updated
 			}
 		}
 	}

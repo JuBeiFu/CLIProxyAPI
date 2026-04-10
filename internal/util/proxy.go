@@ -19,8 +19,13 @@ func SetProxy(cfg *config.SDKConfig, httpClient *http.Client) *http.Client {
 	if cfg == nil {
 		return httpClient
 	}
-	if transport := NewProxyPoolTransport(cfg.ProxyURL); transport != nil {
+	proxyURL := cfg.ProxyURL
+	if transport := NewProxyPoolTransport(proxyURL); transport != nil {
 		httpClient.Transport = transport
+		return httpClient
+	}
+	if !HasUsableProxyConfig(proxyURL) {
+		httpClient.Transport = NewProxyPoolTransport("direct")
 	}
 	return httpClient
 }

@@ -16,6 +16,7 @@ type Record struct {
 	AuthID      string
 	AuthIndex   string
 	Source      string
+	RequestID   string
 	RequestedAt time.Time
 	Latency     time.Duration
 	Failed      bool
@@ -31,6 +32,24 @@ type Detail struct {
 	TotalTokens     int64
 	StatusCode      int
 	ErrorMessage    string
+	CompactFailure  *CompactFailureSample
+}
+
+// CompactFailureSample stores enhanced diagnostics for Codex /responses/compact failures.
+type CompactFailureSample struct {
+	Endpoint                 string `json:"endpoint,omitempty"`
+	UpstreamURL              string `json:"upstream_url,omitempty"`
+	FailureStage             string `json:"failure_stage,omitempty"`
+	ErrorClass               string `json:"error_class,omitempty"`
+	ProxyMode                string `json:"proxy_mode,omitempty"`
+	ProxySelectionSource     string `json:"proxy_selection_source,omitempty"`
+	ProxyProfile             string `json:"proxy_profile,omitempty"`
+	ProxyTarget              string `json:"proxy_target,omitempty"`
+	RequestBodyBytes         int    `json:"request_body_bytes,omitempty"`
+	ResponseBodyBytes        int    `json:"response_body_bytes,omitempty"`
+	ContextCanceled          bool   `json:"context_canceled,omitempty"`
+	ContextDeadlineExceeded  bool   `json:"context_deadline_exceeded,omitempty"`
+	Summary                  string `json:"summary,omitempty"`
 }
 
 // Plugin consumes usage records emitted by the proxy runtime.

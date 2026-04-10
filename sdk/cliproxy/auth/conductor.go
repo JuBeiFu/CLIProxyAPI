@@ -81,6 +81,7 @@ const (
 	quotaProbeTimeout             = 45 * time.Second
 	codexUsageRefreshDelay        = 5 * time.Minute
 	codexLowRemainingThresholdPct = 10.0
+	codexRateLimitCooldown        = 60 * time.Second
 	quotaProbeMaxConcurrency      = 20
 	quotaPriorityPenaltyStep      = 2
 	quotaPriorityPenaltyMax       = 8
@@ -99,6 +100,7 @@ const (
 	streamDisconnectRetryMinWait  = 300 * time.Millisecond
 	streamDisconnectRetryMaxWait  = 1200 * time.Millisecond
 	streamDisconnectRetryLimit    = 2
+	defaultTransientSameAuthRetry = 2
 	executionSessionAffinityTTL   = time.Hour
 	freeCodexAuthTTL              = time.Hour
 	freeAuthExpiryBatchSize       = 128
@@ -135,6 +137,8 @@ var freeAuthExpiryAfterFunc = time.AfterFunc
 var modelNotFoundPattern = regexp.MustCompile(`(?i)model\s+not\s+found\s+([A-Za-z0-9._:-]+)`)
 
 type streamBootstrapTimeoutContextKey struct{}
+type executeAttemptTimeoutContextKey struct{}
+type disableExecuteAttemptTimeoutContextKey struct{}
 
 func streamBootstrapTimeout(ctx context.Context) time.Duration {
 	if ctx != nil {
@@ -150,7 +154,13 @@ func streamBootstrapTimeout(ctx context.Context) time.Duration {
 
 func attemptTimeout(ctx context.Context, fallback time.Duration, selector func(*internalconfig.Config) int) time.Duration {
 	if ctx != nil {
+		if disabled, ok := ctx.Value(disableExecuteAttemptTimeoutContextKey{}).(bool); ok && disabled && fallback == defaultExecuteAttemptTimeout {
+			return 0
+		}
 		if override, ok := ctx.Value(streamBootstrapTimeoutContextKey{}).(time.Duration); ok && override > 0 && fallback == streamBootstrapPayloadTimeout {
+			return override
+		}
+		if override, ok := ctx.Value(executeAttemptTimeoutContextKey{}).(time.Duration); ok && override > 0 && fallback == defaultExecuteAttemptTimeout {
 			return override
 		}
 	}
@@ -182,6 +192,17 @@ func attachManagerRuntimeConfig(ctx context.Context, cfg *internalconfig.Config)
 		cfg = &internalconfig.Config{}
 	}
 	return context.WithValue(ctx, managerRuntimeConfigContextKey{}, cfg)
+}
+
+// WithExecuteAttemptTimeout overrides the manager-level non-streaming execution timeout for a single request.
+func WithExecuteAttemptTimeout(ctx context.Context, timeout time.Duration) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if timeout <= 0 {
+		return context.WithValue(ctx, disableExecuteAttemptTimeoutContextKey{}, true)
+	}
+	return context.WithValue(ctx, executeAttemptTimeoutContextKey{}, timeout)
 }
 
 func executeAttemptTimeout(ctx context.Context) time.Duration {
@@ -773,36 +794,14 @@ func shouldFallbackGPT54ByError(err error) bool {
 	if err == nil {
 		return false
 	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
 	message := strings.ToLower(strings.TrimSpace(err.Error()))
 	if message == "" {
 		return false
 	}
-	if strings.Contains(message, "selected model is at capacity") {
-		return true
-	}
-	if strings.Contains(message, "stream_bootstrap_timeout") ||
-		strings.Contains(message, "timed out waiting for first payload") ||
-		strings.Contains(message, "stream_connect_timeout") ||
-		strings.Contains(message, "upstream stream setup timed out") {
-		return true
-	}
-	for _, needle := range []string{
-		"stream closed before response.completed",
-		"error sending request for url",
-		"http2: server sent goaway",
-		"goaway",
-		"protocol_error",
-		"server had an error processing your request",
-	} {
-		if strings.Contains(message, needle) {
-			return true
-		}
-	}
-	if strings.Contains(message, "stream disconnected before completion") {
-		return strings.Contains(message, "help.openai.com") ||
-			strings.Contains(message, "an error occurred while processing your request")
-	}
-	return strings.Contains(message, "an error occurred while processing your request")
+	return strings.Contains(message, "selected model is at capacity")
 }
 
 func shouldFallbackToGPT53Codex(model string, provider string, err error) bool {
@@ -813,6 +812,28 @@ func shouldFallbackToGPT53Codex(model string, provider string, err error) bool {
 		return false
 	}
 	return shouldFallbackGPT54ByError(err)
+}
+
+func shouldAbortRetryLoop(ctx context.Context, err error) error {
+	if ctx != nil {
+		if errCtx := ctx.Err(); errCtx != nil {
+			return errCtx
+		}
+	}
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return err
+	}
+	message := strings.ToLower(strings.TrimSpace(err.Error()))
+	if message == "" {
+		return nil
+	}
+	if strings.Contains(message, "context canceled") || strings.Contains(message, "context deadline exceeded") {
+		return err
+	}
+	return nil
 }
 
 func shouldTreatAsNoAvailableModel(err error) bool {
@@ -1042,11 +1063,16 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 	for idx, execModel := range execModels {
 		execReq := req
 		execReq.Model = execModel
-		m.noteFreeCodexUse(ctx, auth.ID)
-		attemptStartedAt := time.Now()
-		streamResult, errStream := executeStreamConnectAttempt(ctx, streamConnectAttemptTimeout(ctx), func(attemptCtx context.Context) (*cliproxyexecutor.StreamResult, error) {
-			return executor.ExecuteStream(attemptCtx, auth, execReq, opts)
-		})
+		attemptExecStream := func() (*cliproxyexecutor.StreamResult, error, time.Time) {
+			m.noteFreeCodexUse(ctx, auth.ID)
+			attemptStartedAt := time.Now()
+			streamResult, errStream := executeStreamConnectAttempt(ctx, streamConnectAttemptTimeout(ctx), func(attemptCtx context.Context) (*cliproxyexecutor.StreamResult, error) {
+				return executor.ExecuteStream(attemptCtx, auth, execReq, opts)
+			})
+			return streamResult, errStream, attemptStartedAt
+		}
+
+		streamResult, errStream, attemptStartedAt := attemptExecStream()
 		if errStream != nil && !revokedRefreshAttempted {
 			rerr := &Error{Message: errStream.Error()}
 			if se, ok := errors.AsType[cliproxyexecutor.StatusError](errStream); ok && se != nil {
@@ -1061,10 +1087,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 					}
 					auth = refreshed
 					_, _ = m.Update(ctx, refreshed.Clone())
-					m.noteFreeCodexUse(ctx, auth.ID)
-					streamResult, errStream = executeStreamConnectAttempt(ctx, streamConnectAttemptTimeout(ctx), func(retryAttemptCtx context.Context) (*cliproxyexecutor.StreamResult, error) {
-						return executor.ExecuteStream(retryAttemptCtx, auth, execReq, opts)
-					})
+					streamResult, errStream, attemptStartedAt = attemptExecStream()
 				} else if errRefresh != nil {
 					log.WithError(errRefresh).Debugf("auth refresh after revoked token failed: %s", auth.ID)
 				}
@@ -1090,6 +1113,19 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 
 		buffered, closed, bootstrapErr := readStreamBootstrap(ctx, streamResult.Chunks)
 		firstPayloadLatency := time.Since(attemptStartedAt)
+		if bootstrapErr != nil && len(buffered) == 0 && isStreamDisconnectedBeforeCompletionError(bootstrapErr) {
+			discardStreamChunks(streamResult.Chunks)
+			streamResult, errStream, attemptStartedAt = attemptExecStream()
+			if errStream == nil {
+				buffered, closed, bootstrapErr = readStreamBootstrap(ctx, streamResult.Chunks)
+				firstPayloadLatency = time.Since(attemptStartedAt)
+			} else {
+				bootstrapErr = errStream
+				buffered = nil
+				closed = false
+				firstPayloadLatency = time.Since(attemptStartedAt)
+			}
+		}
 		if bootstrapErr != nil {
 			if errCtx := ctx.Err(); errCtx != nil {
 				discardStreamChunks(streamResult.Chunks)
@@ -1488,6 +1524,9 @@ func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxye
 		if errExec == nil {
 			return resp, nil
 		}
+		if abortErr := shouldAbortRetryLoop(ctx, errExec); abortErr != nil {
+			return cliproxyexecutor.Response{}, abortErr
+		}
 		lastErr = errExec
 		wait, shouldRetry := m.shouldRetryAfterError(errExec, attempt, normalized, req.Model, maxWait)
 		if !shouldRetry {
@@ -1520,6 +1559,9 @@ func (m *Manager) ExecuteCount(ctx context.Context, providers []string, req clip
 		if errExec == nil {
 			return resp, nil
 		}
+		if abortErr := shouldAbortRetryLoop(ctx, errExec); abortErr != nil {
+			return cliproxyexecutor.Response{}, abortErr
+		}
 		lastErr = errExec
 		wait, shouldRetry := m.shouldRetryAfterError(errExec, attempt, normalized, req.Model, maxWait)
 		if !shouldRetry {
@@ -1551,6 +1593,9 @@ func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cli
 		result, errStream := m.executeStreamMixedOnce(ctx, normalized, req, opts, maxRetryCredentials)
 		if errStream == nil {
 			return result, nil
+		}
+		if abortErr := shouldAbortRetryLoop(ctx, errStream); abortErr != nil {
+			return nil, abortErr
 		}
 		lastErr = errStream
 		wait, shouldRetry := m.shouldRetryAfterError(errStream, attempt, normalized, req.Model, maxWait)
@@ -1685,7 +1730,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			execCtx = context.WithValue(execCtx, "cliproxy.roundtripper", rt)
 		}
 
-		sameAuthRetries := effectiveSameAuthRetry(auth)
+		sameAuthRetries := 0
 		revokedRefreshAttempted := false
 		for authAttempt := 0; ; authAttempt++ {
 			if authAttempt > 0 {
@@ -1768,6 +1813,11 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 					}
 
 					authErr = errExec
+					if abortErr := shouldAbortRetryLoop(execCtx, errExec); abortErr != nil {
+						releaseSlot()
+						return cliproxyexecutor.Response{}, abortErr
+					}
+					sameAuthRetries = transientSameAuthRetryBudget(auth, errExec)
 					if shouldFallbackToGPT53Codex(currentRouteModel, provider, errExec) {
 						fallbackModel := resolveGPT54FallbackModelName(currentRouteModel)
 						if fallbackModel != "" && !strings.EqualFold(fallbackModel, currentRouteModel) {
@@ -1826,6 +1876,10 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 				break
 			}
 			lastErr = authErr
+			if abortErr := shouldAbortRetryLoop(execCtx, authErr); abortErr != nil {
+				releaseSlot()
+				return cliproxyexecutor.Response{}, abortErr
+			}
 			if isStreamDisconnectedBeforeCompletionError(authErr) && authAttempt >= streamDisconnectRetryLimit {
 				break
 			}
@@ -1965,12 +2019,14 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 			execCtx = context.WithValue(execCtx, "cliproxy.roundtripper", rt)
 		}
 
-		sameAuthRetries := effectiveSameAuthRetry(auth)
+		sameAuthRetries := 0
 		for authAttempt := 0; ; authAttempt++ {
 			if authAttempt > 0 {
 				preparedAuth, errPrepare = m.preparePickedAuth(auth, provider, currentRouteModel)
 				if errPrepare != nil {
-					lastErr = errPrepare
+					if lastErr == nil {
+						lastErr = errPrepare
+					}
 					break
 				}
 				auth = preparedAuth
@@ -2010,6 +2066,11 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 					}
 
 					authErr = errExec
+					if abortErr := shouldAbortRetryLoop(execCtx, errExec); abortErr != nil {
+						releaseSlot()
+						return cliproxyexecutor.Response{}, abortErr
+					}
+					sameAuthRetries = transientSameAuthRetryBudget(auth, errExec)
 					if shouldFallbackToGPT53Codex(currentRouteModel, provider, errExec) {
 						fallbackModel := resolveGPT54FallbackModelName(currentRouteModel)
 						if fallbackModel != "" && !strings.EqualFold(fallbackModel, currentRouteModel) {
@@ -2068,6 +2129,10 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 				break
 			}
 			lastErr = authErr
+			if abortErr := shouldAbortRetryLoop(execCtx, authErr); abortErr != nil {
+				releaseSlot()
+				return cliproxyexecutor.Response{}, abortErr
+			}
 			if isStreamDisconnectedBeforeCompletionError(authErr) && authAttempt >= streamDisconnectRetryLimit {
 				break
 			}
@@ -2207,7 +2272,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			execCtx = context.WithValue(execCtx, "cliproxy.roundtripper", rt)
 		}
 
-		sameAuthRetries := effectiveSameAuthRetry(auth)
+		sameAuthRetries := 0
 		for authAttempt := 0; ; authAttempt++ {
 			if authAttempt > 0 {
 				preparedAuth, errPrepare = m.preparePickedAuth(auth, provider, currentRouteModel)
@@ -2223,10 +2288,15 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 					releaseSlot()
 					return nil, errCtx
 				}
+				if abortErr := shouldAbortRetryLoop(execCtx, errStream); abortErr != nil {
+					releaseSlot()
+					return nil, abortErr
+				}
 				if isRequestInvalidError(errStream) {
 					releaseSlot()
 					return nil, errStream
 				}
+				sameAuthRetries = transientSameAuthRetryBudget(auth, errStream)
 				if shouldFallbackToGPT53Codex(currentRouteModel, provider, errStream) {
 					fallbackModel := resolveGPT54FallbackModelName(currentRouteModel)
 					if fallbackModel != "" && !strings.EqualFold(fallbackModel, currentRouteModel) {
@@ -2813,6 +2883,44 @@ func effectiveSameAuthRetry(auth *Auth) int {
 	return 0
 }
 
+func compactExecuteAttemptTimeout(cfg *internalconfig.Config) time.Duration {
+	_ = cfg
+	return 0
+}
+
+// CompactExecuteAttemptTimeout returns the recommended non-streaming timeout budget for /responses/compact.
+func CompactExecuteAttemptTimeout(cfg *internalconfig.Config) time.Duration {
+	return compactExecuteAttemptTimeout(cfg)
+}
+
+func transientSameAuthRetryBudget(auth *Auth, err error) int {
+	retries := effectiveSameAuthRetry(auth)
+	if retries > 0 {
+		return retries
+	}
+	if isStreamDisconnectedBeforeCompletionError(err) {
+		return defaultTransientSameAuthRetry
+	}
+	return 0
+}
+
+func isCompactExecuteTimeoutError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var authErr *Error
+	if errors.As(err, &authErr) && authErr != nil {
+		code := strings.ToLower(strings.TrimSpace(authErr.Code))
+		message := strings.ToLower(strings.TrimSpace(authErr.Message))
+		if code == "execute_timeout" && strings.Contains(message, "context deadline exceeded") {
+			return true
+		}
+	}
+	message := strings.ToLower(strings.TrimSpace(err.Error()))
+	return strings.Contains(message, "context deadline exceeded") &&
+		strings.Contains(message, "/responses/compact")
+}
+
 func (m *Manager) maxInflightPerAuth(ctx context.Context, auth *Auth) int {
 	if auth != nil {
 		if override, ok := auth.MaxInflightOverride(); ok {
@@ -3360,6 +3468,53 @@ func shouldAutoDisableFreeCodexAuth(auth *Auth, resultErr *Error, cfg *internalc
 		strings.Contains(msg, "selected model is at capacity")
 }
 
+func shouldAutoDisableCodexAuthOnQuotaExceeded(auth *Auth, resultErr *Error, cfg *internalconfig.Config) bool {
+	if shouldAutoDisableFreeCodexAuth(auth, resultErr, cfg) {
+		return true
+	}
+	if auth == nil || resultErr == nil {
+		return false
+	}
+	if !strings.EqualFold(strings.TrimSpace(auth.Provider), "codex") {
+		return false
+	}
+	if resultErr.StatusCode() != http.StatusTooManyRequests {
+		return false
+	}
+	msg := strings.ToLower(strings.TrimSpace(resultErr.Message))
+	if msg == "" {
+		return false
+	}
+	if strings.Contains(msg, "selected model is at capacity") {
+		return false
+	}
+	return strings.Contains(msg, "usage limit") ||
+		strings.Contains(msg, "usage_limit_reached")
+}
+
+func isGenericCodexRateLimitError(auth *Auth, resultErr *Error) bool {
+	if auth == nil || resultErr == nil {
+		return false
+	}
+	if !strings.EqualFold(strings.TrimSpace(auth.Provider), "codex") {
+		return false
+	}
+	if resultErr.StatusCode() != http.StatusTooManyRequests {
+		return false
+	}
+	msg := strings.ToLower(strings.TrimSpace(resultErr.Message))
+	if msg == "" {
+		return false
+	}
+	if strings.Contains(msg, "selected model is at capacity") {
+		return false
+	}
+	if strings.Contains(msg, "usage limit") || strings.Contains(msg, "usage_limit_reached") {
+		return false
+	}
+	return strings.Contains(msg, "rate limit exceeded")
+}
+
 func isStreamDisconnectedBeforeCompletionError(err error) bool {
 	if err == nil {
 		return false
@@ -3411,7 +3566,10 @@ func isStreamSetupTimeoutError(err error) bool {
 }
 
 func shouldRetryAcrossAuthPool(err error) bool {
-	return shouldRetryAcrossAuths(err) || isStreamSetupTimeoutError(err)
+	if isStreamSetupTimeoutError(err) {
+		return false
+	}
+	return shouldRetryAcrossAuths(err)
 }
 
 func shouldDeleteFreeCodexAuth(auth *Auth, resultErr *Error, cfg *internalconfig.Config) (bool, string) {
@@ -3779,6 +3937,13 @@ func (m *Manager) closestRetryWaitForError(err error, providers []string, model 
 		}
 		return wait, true
 	}
+	if isCompactExecuteTimeoutError(err) {
+		wait := sameAuthRetryDelayFunc()
+		if wait < 0 {
+			wait = 0
+		}
+		return wait, true
+	}
 	return m.closestCooldownWait(providers, model, attempt)
 }
 
@@ -3798,6 +3963,9 @@ func (m *Manager) shouldRetryAfterError(err error, attempt int, providers []stri
 		return 0, false
 	}
 	if isStreamDisconnectedBeforeCompletionError(err) {
+		return 0, false
+	}
+	if isCompactExecuteTimeoutError(err) {
 		return 0, false
 	}
 	if !shouldRetryAcrossAuths(err) {
@@ -3941,6 +4109,8 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 					backoffLevel := state.Quota.BackoffLevel
 					if result.RetryAfter != nil {
 						next = now.Add(*result.RetryAfter)
+					} else if isGenericCodexRateLimitError(auth, result.Error) {
+						next = now.Add(codexRateLimitCooldown)
 					} else {
 						cooldown, nextLevel := nextQuotaCooldown(backoffLevel, quotaCooldownDisabledForAuth(auth))
 						if cooldown > 0 {
@@ -3949,15 +4119,22 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 						backoffLevel = nextLevel
 					}
 					state.NextRetryAfter = next
-					state.Quota = QuotaState{
-						Exceeded:      true,
-						Reason:        "quota",
-						NextRecoverAt: next,
-						BackoffLevel:  backoffLevel,
+					if isGenericCodexRateLimitError(auth, result.Error) {
+						state.Quota = QuotaState{}
+						extendTransientQuotaCooldown(auth, next)
+						auth.NextRetryAfter = next
+						bumpQuotaPriorityPenalty(auth)
+					} else {
+						state.Quota = QuotaState{
+							Exceeded:      true,
+							Reason:        "quota",
+							NextRecoverAt: next,
+							BackoffLevel:  backoffLevel,
+						}
+						suspendReason = "quota"
+						shouldSuspendModel = true
+						setModelQuota = true
 					}
-					suspendReason = "quota"
-					shouldSuspendModel = true
-					setModelQuota = true
 				case 408, 500, 502, 503, 504:
 					if quotaCooldownDisabledForAuth(auth) {
 						state.NextRetryAfter = time.Time{}
@@ -3973,13 +4150,13 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 				auth.UpdatedAt = now
 				updateAggregatedAvailability(auth, now)
 				syncCooldownMetadata(auth, now)
-				if shouldAutoDisableFreeCodexAuth(auth, result.Error, m.CurrentConfig()) {
+				if shouldAutoDisableCodexAuthOnQuotaExceeded(auth, result.Error, m.CurrentConfig()) {
 					applyAutoDisabledQuotaExceededState(auth, result.Error, result.RetryAfter, now)
 				}
 			} else {
 				applyAuthFailureState(auth, result.Error, result.RetryAfter, now)
 				syncCooldownMetadata(auth, now)
-				if shouldAutoDisableFreeCodexAuth(auth, result.Error, m.CurrentConfig()) {
+				if shouldAutoDisableCodexAuthOnQuotaExceeded(auth, result.Error, m.CurrentConfig()) {
 					applyAutoDisabledQuotaExceededState(auth, result.Error, result.RetryAfter, now)
 				}
 			}
@@ -4838,11 +5015,11 @@ func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Durati
 		if strings.TrimSpace(auth.StatusMessage) == "" {
 			auth.StatusMessage = "quota exhausted"
 		}
-		auth.Quota.Exceeded = true
-		auth.Quota.Reason = "quota"
 		var next time.Time
 		if retryAfter != nil {
 			next = now.Add(*retryAfter)
+		} else if isGenericCodexRateLimitError(auth, resultErr) {
+			next = now.Add(codexRateLimitCooldown)
 		} else {
 			cooldown, nextLevel := nextQuotaCooldown(auth.Quota.BackoffLevel, quotaCooldownDisabledForAuth(auth))
 			if cooldown > 0 {
@@ -4850,11 +5027,20 @@ func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Durati
 			}
 			auth.Quota.BackoffLevel = nextLevel
 		}
-		auth.Quota.NextRecoverAt = next
 		auth.NextRetryAfter = next
 		extendTransientQuotaCooldown(auth, next)
 		bumpQuotaPriorityPenalty(auth)
-		scheduleQuotaProbeAfter(auth, next)
+		if isGenericCodexRateLimitError(auth, resultErr) {
+			auth.Quota.Exceeded = false
+			auth.Quota.Reason = ""
+			auth.Quota.NextRecoverAt = time.Time{}
+			auth.Quota.BackoffLevel = 0
+		} else {
+			auth.Quota.Exceeded = true
+			auth.Quota.Reason = "quota"
+			auth.Quota.NextRecoverAt = next
+			scheduleQuotaProbeAfter(auth, next)
+		}
 	case 408, 500, 502, 503, 504:
 		if strings.TrimSpace(auth.StatusMessage) == "" {
 			auth.StatusMessage = "transient upstream error"
@@ -6028,6 +6214,12 @@ func setCodexUsageNextRefresh(auth *Auth, next time.Time) {
 		delete(auth.Metadata, metadataCodexUsageAfterKey)
 		return
 	}
+	if currentNext, ok := lookupMetadataTime(auth.Metadata, metadataCodexUsageAfterKey); ok && !currentNext.IsZero() {
+		lastFetch, _ := lookupMetadataTime(auth.Metadata, metadataCodexUsageLastKey)
+		if (lastFetch.IsZero() || lastFetch.Before(currentNext)) && currentNext.Before(next) {
+			next = currentNext
+		}
+	}
 	auth.Metadata[metadataCodexUsageAfterKey] = next.Unix()
 }
 
@@ -6168,6 +6360,14 @@ func (m *Manager) refreshAuth(ctx context.Context, id string) {
 }
 
 func (m *Manager) refreshQuotaAuth(ctx context.Context, id string) {
+	m.refreshQuotaAuthInternal(ctx, id, false)
+}
+
+func (m *Manager) ForceRefreshQuotaAuth(ctx context.Context, id string) {
+	m.refreshQuotaAuthInternal(ctx, id, true)
+}
+
+func (m *Manager) refreshQuotaAuthInternal(ctx context.Context, id string, force bool) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -6180,6 +6380,10 @@ func (m *Manager) refreshQuotaAuth(ctx context.Context, id string) {
 	}
 	m.mu.RUnlock()
 	if auth == nil || exec == nil {
+		return
+	}
+	if force && strings.EqualFold(strings.TrimSpace(auth.Provider), "codex") {
+		m.refreshCodexUsageAuth(ctx, id, exec, auth.Clone())
 		return
 	}
 	if due, _ := codexUsageRefreshSchedule(auth); !due.IsZero() && !due.After(time.Now()) {
@@ -6409,20 +6613,38 @@ func (m *Manager) refreshCodexUsageAuth(ctx context.Context, id string, exec Pro
 				current.Metadata[metadataPlanTypeKey] = planType
 			}
 		}
-		if hasRemaining && remainingPct < codexLowRemainingThresholdPct && !authUsedWithinWindow(current, now, codexUsageRefreshDelay) {
+		quotaBlocked, quotaRecoverAt, hasQuotaRecoverAt := codexUsageQuotaBlockedStateFromPayload(payload, now)
+		lowBalance := hasRemaining && remainingPct < codexLowRemainingThresholdPct
+		disableCooling := quotaCooldownDisabledForAuth(current)
+		if quotaBlocked || lowBalance {
 			nextRecoverAt := now.Add(quotaProbeCooldown)
-			if hasNextResetAt {
+			switch {
+			case hasQuotaRecoverAt:
+				nextRecoverAt = quotaRecoverAt
+			case hasNextResetAt:
 				nextRecoverAt = nextResetAt
 			}
-			current.Disabled = true
-			current.Status = StatusDisabled
-			current.StatusMessage = "quota remaining below 10%; waiting for next refresh"
-			current.Quota = QuotaState{
-				Exceeded:      true,
-				Reason:        autoDisabledReasonQuotaLowBalance,
-				NextRecoverAt: nextRecoverAt,
+			if quotaBlocked || !disableCooling {
+				current.Disabled = true
+				current.Status = StatusDisabled
+				if quotaBlocked {
+					current.StatusMessage = "quota window exhausted; waiting for reset"
+				} else {
+					current.StatusMessage = "quota remaining below 10%; waiting for next refresh"
+				}
+				current.Quota = QuotaState{
+					Exceeded:      true,
+					Reason:        autoDisabledReasonQuotaLowBalance,
+					NextRecoverAt: nextRecoverAt,
+				}
+				setQuotaAutoDisabledReason(current, autoDisabledReasonQuotaLowBalance)
+			} else {
+				current.Disabled = false
+				current.Status = StatusActive
+				current.StatusMessage = ""
+				current.Quota = QuotaState{}
+				clearQuotaProbeAutoDisabled(current)
 			}
-			setQuotaAutoDisabledReason(current, autoDisabledReasonQuotaLowBalance)
 			setCodexUsageNextRefresh(current, nextRecoverAt)
 		} else {
 			setCodexUsageNextRefresh(current, time.Time{})

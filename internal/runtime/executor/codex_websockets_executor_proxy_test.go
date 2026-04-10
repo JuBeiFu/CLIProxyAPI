@@ -113,3 +113,20 @@ func TestResolveProxyPoolURLs_DirectExplicitAuthProxyOverridesGlobal(t *testing.
 		t.Fatalf("resolveProxyPoolURLs = %#v, want direct", got)
 	}
 }
+
+func TestNewProxyAwareWebsocketDialerWithoutExplicitProxyPrefersDirect(t *testing.T) {
+	t.Setenv("HTTP_PROXY", "http://env-proxy.example.com:8080")
+	t.Setenv("HTTPS_PROXY", "http://env-proxy.example.com:8080")
+	t.Setenv("ALL_PROXY", "socks5://env-proxy.example.com:1080")
+
+	dialer, ok := newProxyAwareWebsocketDialer("")
+	if !ok {
+		t.Fatal("expected empty proxy configuration to be accepted")
+	}
+	if dialer == nil {
+		t.Fatal("expected dialer, got nil")
+	}
+	if dialer.Proxy != nil {
+		t.Fatal("expected websocket dialer without explicit proxy to bypass environment proxy")
+	}
+}

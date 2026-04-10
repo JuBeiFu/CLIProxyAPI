@@ -47,7 +47,10 @@ type ErrorDetail struct {
 	Code string `json:"code,omitempty"`
 }
 
+const normalizedCapacityMessage = "The requested model is temporarily at capacity. Please retry shortly."
+
 const idempotencyKeyMetadataKey = "idempotency_key"
+const newAPIDownstreamTransportHeader = "X-NewAPI-Downstream-Transport"
 
 const (
 	defaultStreamingKeepAliveSeconds = 0
@@ -57,6 +60,23 @@ const (
 type pinnedAuthContextKey struct{}
 type selectedAuthCallbackContextKey struct{}
 type executionSessionContextKey struct{}
+
+// DownstreamWebsocketBridge reports whether this request should be treated as a
+// logical downstream websocket bridge, even if the immediate transport into
+// CLIProxyAPI is HTTP.
+func DownstreamWebsocketBridge(ctx context.Context) bool {
+	if ctx == nil {
+		return false
+	}
+	if coreexecutor.DownstreamWebsocket(ctx) {
+		return true
+	}
+	ginCtx, ok := ctx.Value("gin").(*gin.Context)
+	if !ok || ginCtx == nil || ginCtx.Request == nil {
+		return false
+	}
+	return strings.EqualFold(strings.TrimSpace(ginCtx.Request.Header.Get(newAPIDownstreamTransportHeader)), "websocket")
+}
 
 // WithPinnedAuthID returns a child context that requests execution on a specific auth ID.
 func WithPinnedAuthID(ctx context.Context, authID string) context.Context {
@@ -104,7 +124,10 @@ func BuildErrorResponseBody(status int, errText string) []byte {
 	}
 
 	trimmed := strings.TrimSpace(errText)
-	if trimmed != "" && json.Valid([]byte(trimmed)) {
+	if status == http.StatusTooManyRequests && isCapacityErrorText(trimmed) {
+		trimmed = normalizedCapacityMessage
+		errText = normalizedCapacityMessage
+	} else if trimmed != "" && json.Valid([]byte(trimmed)) {
 		return []byte(trimmed)
 	}
 
@@ -141,6 +164,37 @@ func BuildErrorResponseBody(status int, errText string) []byte {
 		return []byte(fmt.Sprintf(`{"error":{"message":%q,"type":"server_error","code":"internal_server_error"}}`, errText))
 	}
 	return payload
+}
+
+func isCapacityErrorText(errText string) bool {
+	msg := strings.ToLower(strings.TrimSpace(errText))
+	if msg == "" {
+		return false
+	}
+	if strings.Contains(msg, "selected model is at capacity") {
+		return true
+	}
+	if !json.Valid([]byte(strings.TrimSpace(errText))) {
+		return false
+	}
+	message := strings.ToLower(strings.TrimSpace(extractEmbeddedErrorMessage([]byte(errText))))
+	return strings.Contains(message, "selected model is at capacity")
+}
+
+func extractEmbeddedErrorMessage(body []byte) string {
+	if len(bytes.TrimSpace(body)) == 0 || !json.Valid(body) {
+		return ""
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return ""
+	}
+	errNode, _ := payload["error"].(map[string]any)
+	if errNode == nil {
+		return ""
+	}
+	message, _ := errNode["message"].(string)
+	return strings.TrimSpace(message)
 }
 
 // StreamingKeepAliveInterval returns the SSE keep-alive interval for this server.
@@ -191,9 +245,13 @@ func requestExecutionMetadata(ctx context.Context) map[string]any {
 	// Idempotency-Key is an optional client-supplied header used to correlate retries.
 	// It is forwarded as execution metadata; when absent we generate a UUID.
 	key := ""
+	executionSessionID := executionSessionIDFromContext(ctx)
 	if ctx != nil {
 		if ginCtx, ok := ctx.Value("gin").(*gin.Context); ok && ginCtx != nil && ginCtx.Request != nil {
 			key = strings.TrimSpace(ginCtx.GetHeader("Idempotency-Key"))
+			if executionSessionID == "" {
+				executionSessionID = bridgeExecutionSessionIDFromHeaders(ginCtx.Request.Header)
+			}
 		}
 	}
 	if key == "" {
@@ -207,10 +265,20 @@ func requestExecutionMetadata(ctx context.Context) map[string]any {
 	if selectedCallback := selectedAuthIDCallbackFromContext(ctx); selectedCallback != nil {
 		meta[coreexecutor.SelectedAuthCallbackMetadataKey] = selectedCallback
 	}
-	if executionSessionID := executionSessionIDFromContext(ctx); executionSessionID != "" {
+	if executionSessionID != "" {
 		meta[coreexecutor.ExecutionSessionMetadataKey] = executionSessionID
 	}
 	return meta
+}
+
+func bridgeExecutionSessionIDFromHeaders(headers http.Header) string {
+	if headers == nil {
+		return ""
+	}
+	if !strings.EqualFold(strings.TrimSpace(headers.Get(newAPIDownstreamTransportHeader)), "websocket") {
+		return ""
+	}
+	return strings.TrimSpace(headers.Get("Session_id"))
 }
 
 func pinnedAuthIDFromContext(ctx context.Context) string {
@@ -353,6 +421,9 @@ func (h *BaseAPIHandler) GetContextWithCancel(handler interfaces.APIHandler, c *
 	}
 	newCtx = context.WithValue(newCtx, "gin", c)
 	newCtx = context.WithValue(newCtx, "handler", handler)
+	if DownstreamWebsocketBridge(newCtx) {
+		newCtx = coreexecutor.WithDownstreamWebsocket(newCtx)
+	}
 	return newCtx, func(params ...interface{}) {
 		if h.Cfg.RequestLog && len(params) == 1 {
 			if existing, exists := c.Get("API_RESPONSE"); exists {
@@ -664,15 +735,12 @@ func (h *BaseAPIHandler) ExecuteStreamWithAuthManager(ctx context.Context, handl
 
 		bootstrapEligible := func(err error) bool {
 			status := statusFromError(err)
-			if status == 0 {
-				return true
-			}
 			switch status {
 			case http.StatusUnauthorized, http.StatusForbidden, http.StatusPaymentRequired,
-				http.StatusRequestTimeout, http.StatusTooManyRequests:
+				http.StatusTooManyRequests:
 				return true
 			default:
-				return status >= http.StatusInternalServerError
+				return false
 			}
 		}
 

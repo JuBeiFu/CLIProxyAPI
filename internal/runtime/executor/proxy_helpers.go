@@ -34,7 +34,12 @@ func newProxyAwareHTTPClient(ctx context.Context, cfg *config.Config, auth *clip
 
 	if rt, ok := ctx.Value("cliproxy.roundtripper").(http.RoundTripper); ok && rt != nil {
 		httpClient.Transport = rt
+		return httpClient
 	}
+
+	// When no explicit proxy is selected, prefer direct connections over
+	// inheriting process-wide HTTP(S)_PROXY settings such as warp-lb.
+	httpClient.Transport = util.NewProxyPoolTransport("direct")
 
 	return httpClient
 }

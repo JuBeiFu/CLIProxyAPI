@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -81,6 +82,39 @@ func TestShouldRetryAcrossAuths_DoesNotRetryTimeouts(t *testing.T) {
 	}
 	if !shouldRetryAcrossAuths(&Error{HTTPStatus: http.StatusRequestTimeout, Message: "stream disconnected before completion"}) {
 		t.Fatal("expected stream disconnect to be cross-auth retryable")
+	}
+}
+
+func TestManager_ShouldRetryAfterError_DoesNotRetryCompactExecuteTimeout(t *testing.T) {
+	m := NewManager(nil, nil, nil)
+	m.SetRetryConfig(2, 30*time.Second, 6)
+	err := &Error{
+		HTTPStatus: http.StatusRequestTimeout,
+		Code:       "execute_timeout",
+		Message:    `Post "https://chatgpt.com/backend-api/codex/responses/compact": context deadline exceeded`,
+	}
+	wait, shouldRetry := m.shouldRetryAfterError(err, 0, []string{"codex"}, "gpt-5.4", 6*time.Second)
+	if shouldRetry {
+		t.Fatalf("expected compact execute timeout to stop outer retry, got wait=%v", wait)
+	}
+}
+
+func TestCompactExecuteAttemptTimeout(t *testing.T) {
+	if got := CompactExecuteAttemptTimeout(&internalconfig.Config{ExecuteTimeoutSeconds: 60}); got != 0 {
+		t.Fatalf("timeout = %v, want %v", got, 0*time.Second)
+	}
+	if got := CompactExecuteAttemptTimeout(&internalconfig.Config{ExecuteTimeoutSeconds: 120}); got != 0 {
+		t.Fatalf("timeout = %v, want %v", got, 0*time.Second)
+	}
+	if got := CompactExecuteAttemptTimeout(&internalconfig.Config{ExecuteTimeoutSeconds: 400}); got != 0 {
+		t.Fatalf("timeout = %v, want %v", got, 0*time.Second)
+	}
+}
+
+func TestWithExecuteAttemptTimeout_CanDisableDefaultTimeout(t *testing.T) {
+	ctx := WithExecuteAttemptTimeout(context.Background(), 0)
+	if got := executeAttemptTimeout(ctx); got != 0 {
+		t.Fatalf("executeAttemptTimeout(ctx) = %v, want 0", got)
 	}
 }
 
@@ -472,6 +506,101 @@ func (e *streamContextCancellationExecutor) Calls() int {
 	return e.calls
 }
 
+type bootstrapEarlyDisconnectExecutor struct {
+	id string
+
+	mu    sync.Mutex
+	calls int
+}
+
+func (e *bootstrapEarlyDisconnectExecutor) Identifier() string {
+	return e.id
+}
+
+func (e *bootstrapEarlyDisconnectExecutor) Execute(context.Context, *Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	return cliproxyexecutor.Response{}, &Error{HTTPStatus: http.StatusUnauthorized, Message: "not used"}
+}
+
+func (e *bootstrapEarlyDisconnectExecutor) ExecuteStream(context.Context, *Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
+	e.mu.Lock()
+	e.calls++
+	call := e.calls
+	e.mu.Unlock()
+
+	out := make(chan cliproxyexecutor.StreamChunk, 1)
+	if call == 1 {
+		out <- cliproxyexecutor.StreamChunk{Err: errors.New("stream disconnected before completion: stream closed before response.completed")}
+		close(out)
+		return &cliproxyexecutor.StreamResult{Headers: http.Header{"X-Attempt": []string{"1"}}, Chunks: out}, nil
+	}
+	out <- cliproxyexecutor.StreamChunk{Payload: []byte("ok")}
+	close(out)
+	return &cliproxyexecutor.StreamResult{Headers: http.Header{"X-Attempt": []string{"2"}}, Chunks: out}, nil
+}
+
+func (e *bootstrapEarlyDisconnectExecutor) Refresh(_ context.Context, auth *Auth) (*Auth, error) {
+	return auth, nil
+}
+
+func (e *bootstrapEarlyDisconnectExecutor) CountTokens(context.Context, *Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	return cliproxyexecutor.Response{}, &Error{HTTPStatus: http.StatusUnauthorized, Message: "not used"}
+}
+
+func (e *bootstrapEarlyDisconnectExecutor) HttpRequest(context.Context, *Auth, *http.Request) (*http.Response, error) {
+	return nil, nil
+}
+
+func (e *bootstrapEarlyDisconnectExecutor) Calls() int {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.calls
+}
+
+type partialOutputThenDisconnectExecutor struct {
+	id string
+
+	mu    sync.Mutex
+	calls int
+}
+
+func (e *partialOutputThenDisconnectExecutor) Identifier() string {
+	return e.id
+}
+
+func (e *partialOutputThenDisconnectExecutor) Execute(context.Context, *Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	return cliproxyexecutor.Response{}, &Error{HTTPStatus: http.StatusUnauthorized, Message: "not used"}
+}
+
+func (e *partialOutputThenDisconnectExecutor) ExecuteStream(context.Context, *Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
+	e.mu.Lock()
+	e.calls++
+	e.mu.Unlock()
+
+	out := make(chan cliproxyexecutor.StreamChunk, 2)
+	out <- cliproxyexecutor.StreamChunk{Payload: []byte("partial")}
+	out <- cliproxyexecutor.StreamChunk{Err: errors.New("stream disconnected before completion: stream closed before response.completed")}
+	close(out)
+	return &cliproxyexecutor.StreamResult{Chunks: out}, nil
+}
+
+func (e *partialOutputThenDisconnectExecutor) Refresh(_ context.Context, auth *Auth) (*Auth, error) {
+	return auth, nil
+}
+
+func (e *partialOutputThenDisconnectExecutor) CountTokens(context.Context, *Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	return cliproxyexecutor.Response{}, &Error{HTTPStatus: http.StatusUnauthorized, Message: "not used"}
+}
+
+func (e *partialOutputThenDisconnectExecutor) HttpRequest(context.Context, *Auth, *http.Request) (*http.Response, error) {
+	return nil, nil
+}
+
+func (e *partialOutputThenDisconnectExecutor) Calls() int {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.calls
+}
+
 func newCredentialRetryLimitTestManager(t *testing.T, maxRetryCredentials int, err error) (*Manager, *credentialRetryLimitExecutor) {
 	t.Helper()
 
@@ -672,7 +801,7 @@ func TestManager_MaxRetryCredentials_DoesNotCountAuthTerminalErrors(t *testing.T
 	}
 }
 
-func TestManager_MaxRetryCredentials_AllowsCrossCredentialRetryOnStreamConnectTimeout(t *testing.T) {
+func TestManager_MaxRetryCredentials_DoesNotCrossCredentialRetryOnStreamConnectTimeout(t *testing.T) {
 	request := cliproxyexecutor.Request{Model: "test-model"}
 	errTimeout := &Error{HTTPStatus: http.StatusRequestTimeout, Code: "stream_connect_timeout", Message: "upstream stream setup timed out after 10s"}
 
@@ -688,8 +817,8 @@ func TestManager_MaxRetryCredentials_AllowsCrossCredentialRetryOnStreamConnectTi
 	if _, errExecute := unlimitedManager.ExecuteStream(context.Background(), []string{"claude"}, request, cliproxyexecutor.Options{}); errExecute == nil {
 		t.Fatal("expected error for unlimited retry execution")
 	}
-	if calls := unlimitedExecutor.Calls(); calls != 2 {
-		t.Fatalf("expected 2 calls with max-retry-credentials=0, got %d", calls)
+	if calls := unlimitedExecutor.Calls(); calls != 1 {
+		t.Fatalf("expected 1 call with max-retry-credentials=0, got %d", calls)
 	}
 }
 
@@ -1080,7 +1209,7 @@ func TestManager_ExecuteCount_ReturnsCountTimeout(t *testing.T) {
 	}
 }
 
-func TestManager_ExecuteStream_RotatesAuthPoolOnStreamConnectTimeout(t *testing.T) {
+func TestManager_ExecuteStream_DoesNotRotateAuthPoolOnStreamConnectTimeout(t *testing.T) {
 	m := NewManager(nil, nil, nil)
 	m.SetConfig(&internalconfig.Config{StreamConnectTimeoutSeconds: 1})
 	executor := &executionTimeoutExecutor{id: "claude"}
@@ -1115,8 +1244,8 @@ func TestManager_ExecuteStream_RotatesAuthPoolOnStreamConnectTimeout(t *testing.
 	if authErr.StatusCode() != http.StatusRequestTimeout {
 		t.Fatalf("status = %d, want %d", authErr.StatusCode(), http.StatusRequestTimeout)
 	}
-	if calls := executor.Calls("stream"); calls != 2 {
-		t.Fatalf("stream calls = %d, want 2", calls)
+	if calls := executor.Calls("stream"); calls != 1 {
+		t.Fatalf("stream calls = %d, want 1", calls)
 	}
 }
 
@@ -1146,6 +1275,88 @@ func TestManager_ExecuteStream_DoesNotCancelStreamAfterSuccessfulConnect(t *test
 	}
 	if string(payload) != "ok" {
 		t.Fatalf("payload = %q, want %q", string(payload), "ok")
+	}
+	if calls := executor.Calls(); calls != 1 {
+		t.Fatalf("stream calls = %d, want 1", calls)
+	}
+}
+
+func TestManager_ExecuteStream_RetriesOnceOnZeroOutputEarlyDisconnect(t *testing.T) {
+	prevDelay := streamDisconnectRetryDelayFunc
+	streamDisconnectRetryDelayFunc = func() time.Duration { return 0 }
+	t.Cleanup(func() { streamDisconnectRetryDelayFunc = prevDelay })
+
+	m := NewManager(nil, nil, nil)
+	executor := &bootstrapEarlyDisconnectExecutor{id: "codex"}
+	m.RegisterExecutor(executor)
+
+	authID := uuid.NewString() + "-auth"
+	if _, err := m.Register(context.Background(), &Auth{ID: authID, Provider: "codex", Status: StatusActive}); err != nil {
+		t.Fatalf("register auth: %v", err)
+	}
+	reg := registry.GetGlobalRegistry()
+	reg.RegisterClient(authID, "codex", []*registry.ModelInfo{{ID: "gpt-5.4"}})
+	t.Cleanup(func() { reg.UnregisterClient(authID) })
+
+	streamResult, err := m.ExecuteStream(context.Background(), []string{"codex"}, cliproxyexecutor.Request{Model: "gpt-5.4"}, cliproxyexecutor.Options{})
+	if err != nil {
+		t.Fatalf("execute stream: %v", err)
+	}
+	var payload []byte
+	for chunk := range streamResult.Chunks {
+		if chunk.Err != nil {
+			t.Fatalf("unexpected stream error: %v", chunk.Err)
+		}
+		payload = append(payload, chunk.Payload...)
+	}
+	if string(payload) != "ok" {
+		t.Fatalf("payload = %q, want %q", string(payload), "ok")
+	}
+	if got := streamResult.Headers.Get("X-Attempt"); got != "2" {
+		t.Fatalf("header X-Attempt = %q, want %q", got, "2")
+	}
+	if calls := executor.Calls(); calls != 2 {
+		t.Fatalf("stream calls = %d, want 2", calls)
+	}
+}
+
+func TestManager_ExecuteStream_DoesNotRetryAfterFirstPayloadOnDisconnect(t *testing.T) {
+	prevDelay := streamDisconnectRetryDelayFunc
+	streamDisconnectRetryDelayFunc = func() time.Duration { return 0 }
+	t.Cleanup(func() { streamDisconnectRetryDelayFunc = prevDelay })
+
+	m := NewManager(nil, nil, nil)
+	executor := &partialOutputThenDisconnectExecutor{id: "codex"}
+	m.RegisterExecutor(executor)
+
+	authID := uuid.NewString() + "-auth"
+	if _, err := m.Register(context.Background(), &Auth{ID: authID, Provider: "codex", Status: StatusActive}); err != nil {
+		t.Fatalf("register auth: %v", err)
+	}
+	reg := registry.GetGlobalRegistry()
+	reg.RegisterClient(authID, "codex", []*registry.ModelInfo{{ID: "gpt-5.4"}})
+	t.Cleanup(func() { reg.UnregisterClient(authID) })
+
+	streamResult, err := m.ExecuteStream(context.Background(), []string{"codex"}, cliproxyexecutor.Request{Model: "gpt-5.4"}, cliproxyexecutor.Options{})
+	if err != nil {
+		t.Fatalf("execute stream: %v", err)
+	}
+	var (
+		payload []byte
+		gotErr  error
+	)
+	for chunk := range streamResult.Chunks {
+		if chunk.Err != nil {
+			gotErr = chunk.Err
+			continue
+		}
+		payload = append(payload, chunk.Payload...)
+	}
+	if string(payload) != "partial" {
+		t.Fatalf("payload = %q, want %q", string(payload), "partial")
+	}
+	if gotErr == nil || !strings.Contains(gotErr.Error(), "stream closed before response.completed") {
+		t.Fatalf("stream error = %v, want disconnect error", gotErr)
 	}
 	if calls := executor.Calls(); calls != 1 {
 		t.Fatalf("stream calls = %d, want 1", calls)
@@ -1239,7 +1450,7 @@ func TestShouldFallbackGPT54ByError(t *testing.T) {
 	}
 }
 
-func TestShouldRetryAcrossAuthPool_RotatesOnStreamSetupTimeout(t *testing.T) {
+func TestShouldRetryAcrossAuthPool_DoesNotRotateOnStreamSetupTimeout(t *testing.T) {
 	testCases := []struct {
 		name string
 		err  error
@@ -1255,8 +1466,8 @@ func TestShouldRetryAcrossAuthPool_RotatesOnStreamSetupTimeout(t *testing.T) {
 	}
 
 	for _, tc := range testCases {
-		if got := shouldRetryAcrossAuthPool(tc.err); !got {
-			t.Fatalf("%s: shouldRetryAcrossAuthPool() = false, want true", tc.name)
+		if got := shouldRetryAcrossAuthPool(tc.err); got {
+			t.Fatalf("%s: shouldRetryAcrossAuthPool() = true, want false", tc.name)
 		}
 	}
 }
@@ -1300,7 +1511,7 @@ func TestManager_Execute_GPT54FallbackToGPT53Codex(t *testing.T) {
 	}
 }
 
-func TestManager_Execute_GPT54FallbackToGPT53Codex_OnLongStreamDisconnectError(t *testing.T) {
+func TestManager_Execute_GPT54DoesNotFallbackToGPT53Codex_OnLongStreamDisconnectError(t *testing.T) {
 	prevDelay := sameAuthRetryDelayFunc
 	sameAuthRetryDelayFunc = func() time.Duration { return 0 }
 	t.Cleanup(func() { sameAuthRetryDelayFunc = prevDelay })
@@ -1326,18 +1537,15 @@ func TestManager_Execute_GPT54FallbackToGPT53Codex_OnLongStreamDisconnectError(t
 
 	_, err := m.Execute(context.Background(), []string{"codex"}, cliproxyexecutor.Request{Model: "gpt-5.4"}, cliproxyexecutor.Options{})
 	if err == nil {
-		t.Fatal("expected fallback error")
+		t.Fatal("expected error")
 	}
 
 	models := executor.Models()
-	if len(models) < 2 {
-		t.Fatalf("expected at least 2 attempts, got %d", len(models))
+	if len(models) != 1 {
+		t.Fatalf("expected no fallback attempt, got models %v", models)
 	}
 	if models[0] != "gpt-5.4" {
 		t.Fatalf("first model = %q, want %q", models[0], "gpt-5.4")
-	}
-	if models[1] != "gpt-5.3-codex" {
-		t.Fatalf("second model = %q, want %q", models[1], "gpt-5.3-codex")
 	}
 }
 
@@ -1462,7 +1670,7 @@ func assertFallbackFirstSecondModel(t *testing.T, models []string, first string,
 	}
 }
 
-func TestManager_Execute_GPT54FallbackToGPT53Codex_OnBootstrapTimeoutError(t *testing.T) {
+func TestManager_Execute_GPT54DoesNotFallbackToGPT53Codex_OnBootstrapTimeoutError(t *testing.T) {
 	prevDelay := sameAuthRetryDelayFunc
 	sameAuthRetryDelayFunc = func() time.Duration { return 0 }
 	t.Cleanup(func() { sameAuthRetryDelayFunc = prevDelay })
@@ -1475,54 +1683,58 @@ func TestManager_Execute_GPT54FallbackToGPT53Codex_OnBootstrapTimeoutError(t *te
 
 	_, err := m.Execute(context.Background(), []string{"codex"}, cliproxyexecutor.Request{Model: "gpt-5.4"}, cliproxyexecutor.Options{})
 	if err == nil {
-		t.Fatal("expected fallback error")
+		t.Fatal("expected error")
 	}
-
-	assertFallbackFirstSecondModel(t, executor.Models(), "gpt-5.4", "gpt-5.3-codex")
+	models := executor.Models()
+	if len(models) != 1 {
+		t.Fatalf("expected no fallback attempt, got models %v", models)
+	}
+	if models[0] != "gpt-5.4" {
+		t.Fatalf("expected first model to stay gpt-5.4, got %v", models)
+	}
 }
 
-func TestManager_ExecuteCount_GPT54FallbackToGPT53Codex_MockFullErrors(t *testing.T) {
+func TestManager_ExecuteCount_GPT54FallbackToGPT53Codex_OnlyOnCapacityError(t *testing.T) {
 	prevDelay := sameAuthRetryDelayFunc
 	sameAuthRetryDelayFunc = func() time.Duration { return 0 }
 	t.Cleanup(func() { sameAuthRetryDelayFunc = prevDelay })
 
 	testCases := []struct {
-		name string
-		err  error
+		name         string
+		err          error
+		wantFallback bool
 	}{
 		{
 			name: "long_stream_disconnect",
 			err: errors.New("do request failed: upstream error: do request failed: stream disconnected before completion: " +
 				"An error occurred while processing your request. You can retry your request, or contact us through our help center at help.openai.com if the error persists. " +
 				"Please include the request ID 4730fdb2-d1a8-4496-b1f9-a271b42b9a3e in your message."),
+			wantFallback: false,
 		},
 		{
-			name: "selected_model_capacity",
-			err:  errors.New("do request failed: upstream error: do request failed: Selected model is at capacity."),
+			name:         "selected_model_capacity",
+			err:          errors.New("do request failed: upstream error: do request failed: Selected model is at capacity."),
+			wantFallback: true,
 		},
 		{
-			name: "stream_bootstrap_timeout",
-			err:  &Error{HTTPStatus: http.StatusRequestTimeout, Message: "stream_bootstrap_timeout: upstream stream timed out waiting for first payload after 30s"},
+			name:         "goaway_protocol_error",
+			err:          errors.New(`do request failed: upstream error: do request failed: Post "https://chatgpt.com/backend-api/codex/responses": http2: server sent GOAWAY and closed the connection; LastStreamID=3623, ErrCode=PROTOCOL_ERROR, debug=""`),
+			wantFallback: false,
 		},
 		{
-			name: "stream_connect_timeout",
-			err:  &Error{HTTPStatus: http.StatusRequestTimeout, Code: "stream_connect_timeout", Message: "upstream stream setup timed out after 30s"},
+			name:         "error_sending_request_for_url",
+			err:          errors.New("do request failed: upstream error: do request failed: stream disconnected before completion: error sending request for url (https://api.openai.com/v1/responses)"),
+			wantFallback: false,
 		},
 		{
-			name: "goaway_protocol_error",
-			err:  errors.New(`do request failed: upstream error: do request failed: Post "https://chatgpt.com/backend-api/codex/responses": http2: server sent GOAWAY and closed the connection; LastStreamID=3623, ErrCode=PROTOCOL_ERROR, debug=""`),
+			name:         "stream_closed_before_completed",
+			err:          errors.New("do request failed: upstream error: do request failed: stream disconnected before completion: stream closed before response.completed"),
+			wantFallback: false,
 		},
 		{
-			name: "error_sending_request_for_url",
-			err:  errors.New("do request failed: upstream error: do request failed: stream disconnected before completion: error sending request for url (https://api.openai.com/v1/responses)"),
-		},
-		{
-			name: "stream_closed_before_completed",
-			err:  errors.New("do request failed: upstream error: do request failed: stream disconnected before completion: stream closed before response.completed"),
-		},
-		{
-			name: "server_error_message",
-			err:  errors.New("HTTP 500 server_error: The server had an error processing your request."),
+			name:         "server_error_message",
+			err:          errors.New("HTTP 500 server_error: The server had an error processing your request."),
+			wantFallback: false,
 		},
 	}
 
@@ -1533,56 +1745,64 @@ func TestManager_ExecuteCount_GPT54FallbackToGPT53Codex_MockFullErrors(t *testin
 
 			_, err := m.ExecuteCount(context.Background(), []string{"codex"}, cliproxyexecutor.Request{Model: "gpt-5.4"}, cliproxyexecutor.Options{})
 			if err == nil {
-				t.Fatal("expected fallback error")
+				t.Fatal("expected error")
 			}
-
-			assertFallbackFirstSecondModel(t, executor.Models(), "gpt-5.4", "gpt-5.3-codex")
+			models := executor.Models()
+			if tc.wantFallback {
+				assertFallbackFirstSecondModel(t, models, "gpt-5.4", "gpt-5.3-codex")
+				return
+			}
+			if len(models) != 1 {
+				t.Fatalf("expected no fallback attempt, got models %v", models)
+			}
+			if models[0] != "gpt-5.4" {
+				t.Fatalf("expected first model to stay gpt-5.4, got %v", models)
+			}
 		})
 	}
 }
 
-func TestManager_ExecuteStream_GPT54FallbackToGPT53Codex_MockFullErrors(t *testing.T) {
+func TestManager_ExecuteStream_GPT54FallbackToGPT53Codex_OnlyOnCapacityError(t *testing.T) {
 	prevDelay := sameAuthRetryDelayFunc
 	sameAuthRetryDelayFunc = func() time.Duration { return 0 }
 	t.Cleanup(func() { sameAuthRetryDelayFunc = prevDelay })
 
 	testCases := []struct {
-		name string
-		err  error
+		name         string
+		err          error
+		wantFallback bool
 	}{
 		{
 			name: "long_stream_disconnect",
 			err: errors.New("do request failed: upstream error: do request failed: stream disconnected before completion: " +
 				"An error occurred while processing your request. You can retry your request, or contact us through our help center at help.openai.com if the error persists. " +
 				"Please include the request ID 4730fdb2-d1a8-4496-b1f9-a271b42b9a3e in your message."),
+			wantFallback: false,
 		},
 		{
-			name: "selected_model_capacity",
-			err:  errors.New("do request failed: upstream error: do request failed: Selected model is at capacity."),
+			name:         "selected_model_capacity",
+			err:          errors.New("do request failed: upstream error: do request failed: Selected model is at capacity."),
+			wantFallback: true,
 		},
 		{
-			name: "stream_bootstrap_timeout",
-			err:  &Error{HTTPStatus: http.StatusRequestTimeout, Message: "stream_bootstrap_timeout: upstream stream timed out waiting for first payload after 30s"},
+			name:         "goaway_protocol_error",
+			err:          errors.New(`do request failed: upstream error: do request failed: Post "https://chatgpt.com/backend-api/codex/responses": http2: server sent GOAWAY and closed the connection; LastStreamID=3623, ErrCode=PROTOCOL_ERROR, debug=""`),
+			wantFallback: false,
 		},
 		{
-			name: "stream_connect_timeout",
-			err:  &Error{HTTPStatus: http.StatusRequestTimeout, Code: "stream_connect_timeout", Message: "upstream stream setup timed out after 30s"},
+			name:         "error_sending_request_for_url",
+			err:          errors.New("do request failed: upstream error: do request failed: stream disconnected before completion: error sending request for url (https://api.openai.com/v1/responses)"),
+			wantFallback: false,
 		},
 		{
-			name: "goaway_protocol_error",
-			err:  errors.New(`do request failed: upstream error: do request failed: Post "https://chatgpt.com/backend-api/codex/responses": http2: server sent GOAWAY and closed the connection; LastStreamID=3623, ErrCode=PROTOCOL_ERROR, debug=""`),
+			name:         "stream_closed_before_completed",
+			err:          errors.New("do request failed: upstream error: do request failed: stream disconnected before completion: stream closed before response.completed"),
+			wantFallback: false,
 		},
 		{
-			name: "error_sending_request_for_url",
-			err:  errors.New("do request failed: upstream error: do request failed: stream disconnected before completion: error sending request for url (https://api.openai.com/v1/responses)"),
-		},
-		{
-			name: "stream_closed_before_completed",
-			err:  errors.New("do request failed: upstream error: do request failed: stream disconnected before completion: stream closed before response.completed"),
-		},
-		{
-			name: "server_error_message",
-			err:  errors.New("HTTP 500 server_error: The server had an error processing your request."),
+			name:         "server_error_message",
+			err:          errors.New("HTTP 500 server_error: The server had an error processing your request."),
+			wantFallback: false,
 		},
 	}
 
@@ -1593,10 +1813,85 @@ func TestManager_ExecuteStream_GPT54FallbackToGPT53Codex_MockFullErrors(t *testi
 
 			_, err := m.ExecuteStream(context.Background(), []string{"codex"}, cliproxyexecutor.Request{Model: "gpt-5.4"}, cliproxyexecutor.Options{})
 			if err == nil {
-				t.Fatal("expected fallback error")
+				t.Fatal("expected error")
+			}
+			models := executor.Models()
+			if tc.wantFallback {
+				assertFallbackFirstSecondModel(t, models, "gpt-5.4", "gpt-5.3-codex")
+				return
+			}
+			if len(models) != 1 {
+				t.Fatalf("expected no fallback attempt, got models %v", models)
+			}
+			if models[0] != "gpt-5.4" {
+				t.Fatalf("expected first model to stay gpt-5.4, got %v", models)
+			}
+		})
+	}
+}
+
+func TestManager_ExecuteStream_GPT54FallbackToGPT53Codex_DoesNotFallbackOnConnectTimeoutsOrCancellation(t *testing.T) {
+	prevDelay := sameAuthRetryDelayFunc
+	sameAuthRetryDelayFunc = func() time.Duration { return 0 }
+	t.Cleanup(func() { sameAuthRetryDelayFunc = prevDelay })
+
+	testCases := []struct {
+		name string
+		err  error
+	}{
+		{
+			name: "stream_connect_timeout",
+			err:  &Error{HTTPStatus: http.StatusRequestTimeout, Code: "stream_connect_timeout", Message: "upstream stream setup timed out after 10s"},
+		},
+		{
+			name: "stream_bootstrap_timeout",
+			err:  &Error{HTTPStatus: http.StatusRequestTimeout, Code: "stream_bootstrap_timeout", Message: "upstream stream timed out waiting for first payload after 10s"},
+		},
+		{
+			name: "context_canceled",
+			err:  errors.New(`Post "https://chatgpt.com/backend-api/codex/responses": context canceled`),
+		},
+		{
+			name: "context_deadline_exceeded",
+			err:  errors.New(`Post "https://chatgpt.com/backend-api/codex/responses": context deadline exceeded`),
+		},
+	}
+
+	for _, tc := range testCases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			m, executor := newGPT54FallbackMockManager(t, tc.err, []string{"gpt-5.4", "gpt-5.3-codex"})
+
+			_, err := m.ExecuteStream(context.Background(), []string{"codex"}, cliproxyexecutor.Request{Model: "gpt-5.4"}, cliproxyexecutor.Options{})
+			if err == nil {
+				t.Fatal("expected error")
 			}
 
-			assertFallbackFirstSecondModel(t, executor.Models(), "gpt-5.4", "gpt-5.3-codex")
+			models := executor.Models()
+			if len(models) != 1 {
+				t.Fatalf("expected no fallback attempt, got models %v", models)
+			}
+			if models[0] != "gpt-5.4" {
+				t.Fatalf("expected first model to stay gpt-5.4, got %v", models)
+			}
 		})
+	}
+}
+
+func TestManager_Execute_StopsImmediatelyWhenRetryErrorIsCanceled(t *testing.T) {
+	m, executor := newSameAuthRetryTestManager(t, 2, errors.New(`Post "https://chatgpt.com/backend-api/codex/responses": context canceled`))
+
+	_, err := m.Execute(context.Background(), []string{"claude"}, cliproxyexecutor.Request{Model: "test-model"}, cliproxyexecutor.Options{})
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !errors.Is(err, context.Canceled) && !strings.Contains(strings.ToLower(err.Error()), "context canceled") {
+		t.Fatalf("expected canceled error, got %v", err)
+	}
+	if calls := executor.Calls(); calls != 1 {
+		t.Fatalf("expected single attempt on canceled retry error, got %d", calls)
+	}
+	if auths := executor.DistinctAuths(); auths != 1 {
+		t.Fatalf("expected single auth on canceled retry error, got %d", auths)
 	}
 }

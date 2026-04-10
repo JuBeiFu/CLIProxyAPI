@@ -1,9 +1,15 @@
 package executor
 
 import (
+	"context"
+	"errors"
+	"net/http/httptest"
 	"testing"
 	"time"
 
+	"github.com/gin-gonic/gin"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
+	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/usage"
 )
 
@@ -60,5 +66,69 @@ func TestUsageReporterBuildRecordIncludesLatency(t *testing.T) {
 	}
 	if record.Latency > 3*time.Second {
 		t.Fatalf("latency = %v, want <= 3s", record.Latency)
+	}
+}
+
+func TestCompactFailureFromContextDeadlineExceeded(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	ginCtx, _ := gin.CreateTestContext(recorder)
+	ginCtx.Request = httptest.NewRequest("POST", "/v1/responses/compact", nil)
+	ginCtx.Set(apiAttemptsKey, []*upstreamAttempt{{
+		index:   1,
+		request: "=== API REQUEST 1 ===\nUpstream URL: https://chatgpt.com/backend-api/codex/responses/compact\n",
+	}})
+	ginCtx.Set(apiResponseKey, []byte("response body"))
+
+	ctx := context.WithValue(context.Background(), "gin", ginCtx)
+	sample := compactFailureFromContext(
+		ctx,
+		&config.Config{},
+		&cliproxyauth.Auth{Provider: "codex"},
+		`Post "https://chatgpt.com/backend-api/codex/responses/compact": context deadline exceeded`,
+		errors.New(`Post "https://chatgpt.com/backend-api/codex/responses/compact": context deadline exceeded`),
+	)
+	if sample == nil {
+		t.Fatal("expected compact failure sample")
+	}
+	if sample.ErrorClass != "timeout" {
+		t.Fatalf("error class = %q, want timeout", sample.ErrorClass)
+	}
+	if sample.FailureStage != "upstream_roundtrip_timeout" {
+		t.Fatalf("failure stage = %q, want upstream_roundtrip_timeout", sample.FailureStage)
+	}
+	if sample.ProxyMode != "direct" {
+		t.Fatalf("proxy mode = %q, want direct", sample.ProxyMode)
+	}
+	if sample.UpstreamURL != "https://chatgpt.com/backend-api/codex/responses/compact" {
+		t.Fatalf("upstream url = %q", sample.UpstreamURL)
+	}
+}
+
+func TestCompactFailureFromContextProxyReset(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	ginCtx, _ := gin.CreateTestContext(recorder)
+	ginCtx.Request = httptest.NewRequest("POST", "/v1/responses/compact", nil)
+	ctx := context.WithValue(context.Background(), "gin", ginCtx)
+
+	sample := compactFailureFromContext(
+		ctx,
+		&config.Config{SDKConfig: config.SDKConfig{ProxyURL: "socks5://warp-lb:1080"}},
+		&cliproxyauth.Auth{Provider: "codex"},
+		`read tcp 172.17.0.2:52642->154.40.43.194:1080: read: connection reset by peer`,
+		errors.New(`read tcp 172.17.0.2:52642->154.40.43.194:1080: read: connection reset by peer`),
+	)
+	if sample == nil {
+		t.Fatal("expected compact failure sample")
+	}
+	if sample.ErrorClass != "connection_reset" {
+		t.Fatalf("error class = %q, want connection_reset", sample.ErrorClass)
+	}
+	if sample.ProxyMode != "proxy" {
+		t.Fatalf("proxy mode = %q, want proxy", sample.ProxyMode)
+	}
+	if sample.ProxyTarget != "socks5://warp-lb:1080" {
+		t.Fatalf("proxy target = %q", sample.ProxyTarget)
 	}
 }

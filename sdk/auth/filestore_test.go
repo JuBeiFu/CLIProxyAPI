@@ -80,6 +80,38 @@ func TestFileTokenStore_ReadAuthFile_PreservesExcludedModelsMetadata(t *testing.
 	}
 }
 
+func TestFileTokenStore_Delete_RemovesCodexFileByStableID(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	store := NewFileTokenStore()
+	store.SetBaseDir(dir)
+
+	path := filepath.Join(dir, "codex-user@example.com-team.json")
+	payload := `{"type":"codex","email":"user@example.com","plan_type":"team","refresh_token":"rt"}`
+	if err := os.WriteFile(path, []byte(payload), 0o600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	auths, err := store.List(context.Background())
+	if err != nil {
+		t.Fatalf("List() error = %v", err)
+	}
+	if len(auths) != 1 {
+		t.Fatalf("len(auths) = %d, want 1", len(auths))
+	}
+	if auths[0].ID != "codex:user@example.com" {
+		t.Fatalf("auth.ID = %q, want %q", auths[0].ID, "codex:user@example.com")
+	}
+
+	if err := store.Delete(context.Background(), auths[0].ID); err != nil {
+		t.Fatalf("Delete() error = %v", err)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("expected auth file to be removed, stat err = %v", err)
+	}
+}
+
 func TestExtractAccessToken(t *testing.T) {
 	t.Parallel()
 

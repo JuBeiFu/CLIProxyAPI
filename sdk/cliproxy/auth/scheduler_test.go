@@ -1047,3 +1047,48 @@ func TestManager_ExecuteMixedOnce_SkipsStaleQuotaBlockedAuthBeforeExecute(t *tes
 		t.Fatalf("execute auth ID = %q, want %q", exec.authIDs[0], "b")
 	}
 }
+
+func TestManager_ExecuteMixedOnce_RateLimitedCodexAuthFallsThroughToOtherAuth(t *testing.T) {
+	t.Parallel()
+
+	exec := &recordingSchedulerExecutor{}
+	manager := NewManager(nil, &FillFirstSelector{}, nil)
+	manager.RegisterExecutor(exec)
+	if _, errRegister := manager.Register(context.Background(), &Auth{ID: "a", Provider: "codex"}); errRegister != nil {
+		t.Fatalf("Register(a) error = %v", errRegister)
+	}
+	if _, errRegister := manager.Register(context.Background(), &Auth{ID: "b", Provider: "codex"}); errRegister != nil {
+		t.Fatalf("Register(b) error = %v", errRegister)
+	}
+	registerSchedulerModels(t, "codex", "gpt-5", "a", "b")
+
+	manager.MarkResult(context.Background(), Result{
+		AuthID:   "a",
+		Provider: "codex",
+		Model:    "gpt-5",
+		Success:  false,
+		Error:    &Error{HTTPStatus: http.StatusTooManyRequests, Message: `{"detail":"Rate limit exceeded"}`},
+	})
+
+	stored, ok := manager.GetByID("a")
+	if !ok {
+		t.Fatalf("expected rate-limited auth to remain registered")
+	}
+	if stored.Disabled {
+		t.Fatalf("expected rate-limited auth to remain enabled")
+	}
+	if stored.TransientCooldownUntil.IsZero() {
+		t.Fatalf("expected transient cooldown to be set")
+	}
+
+	_, errExec := manager.executeMixedOnce(context.Background(), []string{"codex"}, cliproxyexecutor.Request{Model: "gpt-5"}, cliproxyexecutor.Options{}, 5)
+	if errExec != nil {
+		t.Fatalf("executeMixedOnce() error = %v", errExec)
+	}
+	if len(exec.authIDs) != 1 {
+		t.Fatalf("execute auth count = %d, want 1", len(exec.authIDs))
+	}
+	if exec.authIDs[0] != "b" {
+		t.Fatalf("execute auth ID = %q, want %q", exec.authIDs[0], "b")
+	}
+}

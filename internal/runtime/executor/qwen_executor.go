@@ -228,7 +228,7 @@ func (e *QwenExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req
 		baseURL = "https://portal.qwen.ai/v1"
 	}
 
-	reporter := newUsageReporter(ctx, e.Identifier(), baseModel, auth)
+	reporter := newUsageReporter(ctx, e.Identifier(), baseModel, e.cfg, auth)
 	defer reporter.trackFailure(ctx, &err)
 
 	from := opts.SourceFormat
@@ -331,7 +331,7 @@ func (e *QwenExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 		baseURL = "https://portal.qwen.ai/v1"
 	}
 
-	reporter := newUsageReporter(ctx, e.Identifier(), baseModel, auth)
+	reporter := newUsageReporter(ctx, e.Identifier(), baseModel, e.cfg, auth)
 	defer reporter.trackFailure(ctx, &err)
 
 	from := opts.SourceFormat

@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
@@ -20,6 +21,8 @@ type compactCaptureExecutor struct {
 	alt          string
 	sourceFormat string
 	calls        int
+	timeout      time.Duration
+	hasDeadline  bool
 }
 
 func (e *compactCaptureExecutor) Identifier() string { return "test-provider" }
@@ -28,6 +31,11 @@ func (e *compactCaptureExecutor) Execute(ctx context.Context, auth *coreauth.Aut
 	e.calls++
 	e.alt = opts.Alt
 	e.sourceFormat = opts.SourceFormat.String()
+	deadline, ok := ctx.Deadline()
+	e.hasDeadline = ok
+	if ok {
+		e.timeout = time.Until(deadline).Round(time.Second)
+	}
 	return coreexecutor.Response{Payload: []byte(`{"ok":true}`)}, nil
 }
 
@@ -113,6 +121,9 @@ func TestOpenAIResponsesCompactExecute(t *testing.T) {
 	}
 	if executor.sourceFormat != "openai-response" {
 		t.Fatalf("source format = %q, want %q", executor.sourceFormat, "openai-response")
+	}
+	if executor.hasDeadline {
+		t.Fatalf("compact request unexpectedly carried a deadline: %v", executor.timeout)
 	}
 	if strings.TrimSpace(resp.Body.String()) != `{"ok":true}` {
 		t.Fatalf("body = %s", resp.Body.String())

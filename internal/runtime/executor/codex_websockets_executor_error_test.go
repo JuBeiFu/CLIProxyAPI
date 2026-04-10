@@ -109,3 +109,18 @@ func TestParseCodexWebsocketError_CapacityErrorNormalizesTo429(t *testing.T) {
 		t.Fatalf("expected retryAfter %v, got %v", want, *retryAfter)
 	}
 }
+
+func TestNewCodexStatusErr_CapacityHandshakeErrorNormalizesTo429(t *testing.T) {
+	err := newCodexStatusErr(http.StatusInternalServerError, []byte(`{"error":{"type":"server_error","message":"Selected model is at capacity. Please try a different model."}}`))
+
+	if got := err.StatusCode(); got != http.StatusTooManyRequests {
+		t.Fatalf("expected status 429, got %d", got)
+	}
+	retryAfter := err.RetryAfter()
+	if retryAfter == nil {
+		t.Fatal("expected retryAfter, got nil")
+	}
+	if want := 5 * time.Second; *retryAfter != want {
+		t.Fatalf("expected retryAfter %v, got %v", want, *retryAfter)
+	}
+}

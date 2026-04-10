@@ -1,4 +1,6 @@
-FROM golang:1.26-alpine AS builder
+# syntax=docker/dockerfile:1
+# Force Linux/amd64 so builds on Windows do not target the host OS/arch.
+FROM --platform=linux/amd64 golang:1.26-alpine AS builder
 
 WORKDIR /app
 
@@ -12,11 +14,11 @@ ARG VERSION=dev
 ARG COMMIT=none
 ARG BUILD_DATE=unknown
 
-RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w -X 'main.Version=${VERSION}' -X 'main.Commit=${COMMIT}' -X 'main.BuildDate=${BUILD_DATE}'" -o ./CLIProxyAPI ./cmd/server/
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-s -w -X 'main.Version=${VERSION}' -X 'main.Commit=${COMMIT}' -X 'main.BuildDate=${BUILD_DATE}'" -o ./CLIProxyAPI ./cmd/server/
 
-FROM alpine:3.22.0
+FROM --platform=linux/amd64 alpine:3.22.0
 
-RUN apk add --no-cache tzdata
+RUN apk add --no-cache ca-certificates tzdata
 
 RUN mkdir /CLIProxyAPI
 
@@ -30,6 +32,9 @@ EXPOSE 8317
 
 ENV TZ=Asia/Shanghai
 
-RUN cp /usr/share/zoneinfo/${TZ} /etc/localtime && echo "${TZ}" > /etc/timezone
+RUN cp /usr/share/zoneinfo/${TZ} /etc/localtime && echo "${TZ}" > /etc/timezone \
+    && chmod +x /CLIProxyAPI/CLIProxyAPI \
+    && _elf=$(od -An -tx1 -N4 /CLIProxyAPI/CLIProxyAPI | tr -d ' \n') \
+    && test "$_elf" = "7f454c46" || (echo "CLIProxyAPI: not a Linux ELF binary (magic=$_elf)" >&2; exit 1)
 
 CMD ["./CLIProxyAPI"]

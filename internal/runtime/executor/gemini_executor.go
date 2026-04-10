@@ -110,7 +110,7 @@ func (e *GeminiExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 
 	apiKey, bearer := geminiCreds(auth)
 
-	reporter := newUsageReporter(ctx, e.Identifier(), baseModel, auth)
+	reporter := newUsageReporter(ctx, e.Identifier(), baseModel, e.cfg, auth)
 	defer reporter.trackFailure(ctx, &err)
 
 	// Official Gemini API via API key or OAuth bearer
@@ -218,7 +218,7 @@ func (e *GeminiExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 
 	apiKey, bearer := geminiCreds(auth)
 
-	reporter := newUsageReporter(ctx, e.Identifier(), baseModel, auth)
+	reporter := newUsageReporter(ctx, e.Identifier(), baseModel, e.cfg, auth)
 	defer reporter.trackFailure(ctx, &err)
 
 	from := opts.SourceFormat

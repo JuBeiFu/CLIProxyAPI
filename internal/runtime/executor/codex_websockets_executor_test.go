@@ -47,7 +47,7 @@ func TestCodexWebsocketBridgePayloadPreservesPreviousResponseID(t *testing.T) {
 	}
 	body := []byte(`{"model":"gpt-5.4","previous_response_id":"resp-1","prompt_cache_retention":"retained","safety_identifier":"safe","input":[{"type":"function_call_output","call_id":"call-1","output":"ok"}]}`)
 
-	sanitized := stripCodexUnsupportedResponseFields(body, shouldPreserveCodexPreviousResponseID(ctx, auth))
+	sanitized := stripCodexUnsupportedResponseFields(body, shouldPreserveCodexPreviousResponseID(ctx, auth, sdktranslator.FromString("openai-response"), body))
 	wsReqBody := buildCodexWebsocketRequestBody(sanitized)
 
 	if got := gjson.GetBytes(wsReqBody, "previous_response_id").String(); got != "resp-1" {

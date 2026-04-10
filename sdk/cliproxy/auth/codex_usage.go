@@ -14,6 +14,11 @@ import (
 
 const codexUsageURL = "https://chatgpt.com/backend-api/wham/usage"
 
+const (
+	codexPrimaryWindowSeconds   = 18000
+	codexSecondaryWindowSeconds = 604800
+)
+
 func hydrateCodexAccountID(auth *Auth) {
 	if auth == nil || auth.Metadata == nil {
 		return
@@ -146,6 +151,43 @@ func codexUsageNextResetFromPayload(payload map[string]any, now time.Time) (time
 	return next, true
 }
 
+func codexUsageQuotaBlockedStateFromPayload(payload map[string]any, now time.Time) (bool, time.Time, bool) {
+	rateLimit := lookupFirstMap(payload, "rate_limit", "rateLimit")
+	if rateLimit == nil {
+		return false, time.Time{}, false
+	}
+
+	primaryWindow, secondaryWindow := codexUsageClassifiedRateLimitWindows(rateLimit)
+	limitReached := normalizeBoolValue(rateLimit["limit_reached"], rateLimit["limitReached"])
+	allowed, _ := normalizeOptionalBoolValue(rateLimit["allowed"])
+
+	blockedWindows := make([]map[string]any, 0, 2)
+	if codexUsageWindowBlocked(primaryWindow, limitReached, allowed) {
+		blockedWindows = append(blockedWindows, primaryWindow)
+	}
+	if codexUsageWindowBlocked(secondaryWindow, limitReached, allowed) {
+		blockedWindows = append(blockedWindows, secondaryWindow)
+	}
+	if len(blockedWindows) == 0 {
+		return false, time.Time{}, false
+	}
+
+	nextRecoverAt := time.Time{}
+	for _, window := range blockedWindows {
+		resetAt, ok := codexUsageWindowResetAt(window, now)
+		if !ok || resetAt.IsZero() {
+			continue
+		}
+		if nextRecoverAt.IsZero() || resetAt.After(nextRecoverAt) {
+			nextRecoverAt = resetAt
+		}
+	}
+	if nextRecoverAt.IsZero() {
+		return true, time.Time{}, false
+	}
+	return true, nextRecoverAt, true
+}
+
 func codexUsagePlanTypeFromPayload(payload map[string]any) string {
 	if payload == nil {
 		return ""
@@ -214,12 +256,47 @@ func codexUsageRelevantWindows(payload map[string]any) []map[string]any {
 	if rateLimit == nil {
 		return nil
 	}
-	return collectWindowMaps(
-		rateLimit["primary_window"],
-		rateLimit["primaryWindow"],
-		rateLimit["secondary_window"],
-		rateLimit["secondaryWindow"],
-	)
+	primaryWindow, secondaryWindow := codexUsageClassifiedRateLimitWindows(rateLimit)
+	return collectWindowMaps(primaryWindow, secondaryWindow)
+}
+
+func codexUsageClassifiedRateLimitWindows(rateLimit map[string]any) (map[string]any, map[string]any) {
+	if rateLimit == nil {
+		return nil, nil
+	}
+
+	primaryWindow := asMap(firstNonNil(rateLimit["primary_window"], rateLimit["primaryWindow"]))
+	secondaryWindow := asMap(firstNonNil(rateLimit["secondary_window"], rateLimit["secondaryWindow"]))
+
+	var fiveHourWindow map[string]any
+	var weeklyWindow map[string]any
+	for _, window := range []map[string]any{primaryWindow, secondaryWindow} {
+		if window == nil {
+			continue
+		}
+		seconds, ok := codexUsageWindowSeconds(window)
+		if !ok {
+			continue
+		}
+		switch seconds {
+		case codexPrimaryWindowSeconds:
+			if fiveHourWindow == nil {
+				fiveHourWindow = window
+			}
+		case codexSecondaryWindowSeconds:
+			if weeklyWindow == nil {
+				weeklyWindow = window
+			}
+		}
+	}
+
+	if fiveHourWindow == nil && primaryWindow != nil {
+		fiveHourWindow = primaryWindow
+	}
+	if weeklyWindow == nil && secondaryWindow != nil {
+		weeklyWindow = secondaryWindow
+	}
+	return fiveHourWindow, weeklyWindow
 }
 
 func collectWindowMaps(values ...any) []map[string]any {
@@ -245,6 +322,32 @@ func codexUsageWindowUsedPercent(window map[string]any) (float64, bool) {
 		}
 	}
 	return 0, false
+}
+
+func codexUsageWindowSeconds(window map[string]any) (int64, bool) {
+	for _, key := range []string{"limit_window_seconds", "limitWindowSeconds"} {
+		raw, ok := window[key]
+		if !ok {
+			continue
+		}
+		if value, ok := normalizeInt64Value(raw); ok && value > 0 {
+			return value, true
+		}
+	}
+	return 0, false
+}
+
+func codexUsageWindowBlocked(window map[string]any, limitReached bool, allowed *bool) bool {
+	if window == nil {
+		return false
+	}
+	if allowed != nil && !*allowed {
+		return true
+	}
+	if usedPercent, ok := codexUsageWindowUsedPercent(window); ok && usedPercent >= 100 {
+		return true
+	}
+	return limitReached
 }
 
 func codexUsageWindowResetAt(window map[string]any, now time.Time) (time.Time, bool) {
@@ -372,4 +475,45 @@ func normalizeInt64Value(value any) (int64, bool) {
 		return int64(floatValue), true
 	}
 	return 0, false
+}
+
+func normalizeBoolValue(values ...any) bool {
+	for _, value := range values {
+		if parsed, ok := normalizeOptionalBoolValue(value); ok {
+			return parsed != nil && *parsed
+		}
+	}
+	return false
+}
+
+func normalizeOptionalBoolValue(value any) (*bool, bool) {
+	switch typed := value.(type) {
+	case bool:
+		return &typed, true
+	case string:
+		trimmed := strings.TrimSpace(strings.ToLower(typed))
+		switch trimmed {
+		case "true", "1", "yes", "on":
+			parsed := true
+			return &parsed, true
+		case "false", "0", "no", "off":
+			parsed := false
+			return &parsed, true
+		}
+	case json.Number:
+		if intValue, err := typed.Int64(); err == nil {
+			parsed := intValue != 0
+			return &parsed, true
+		}
+	}
+	return nil, false
+}
+
+func firstNonNil(values ...any) any {
+	for _, value := range values {
+		if value != nil {
+			return value
+		}
+	}
+	return nil
 }

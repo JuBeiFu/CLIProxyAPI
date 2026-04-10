@@ -135,7 +135,29 @@ type Config struct {
 	// Payload defines default and override rules for provider payload parameters.
 	Payload PayloadConfig `yaml:"payload" json:"payload"`
 
+	// UsagePricing stores model token pricing for management-side USD analytics.
+	UsagePricing UsagePricingConfig `yaml:"usage-pricing" json:"usage-pricing"`
+
 	legacyMigrationPending bool `yaml:"-" json:"-"`
+}
+
+// UsagePricingConfig stores persisted model pricing metadata used by the
+// management center to compute USD usage from recorded token consumption.
+type UsagePricingConfig struct {
+	NewAPIPricingURL      string                     `yaml:"new-api-pricing-url,omitempty" json:"new-api-pricing-url,omitempty"`
+	NewAPIPricingToken    string                     `yaml:"new-api-pricing-token,omitempty" json:"-"`
+	LastSyncedAt          string                     `yaml:"last-synced-at,omitempty" json:"last-synced-at,omitempty"`
+	LastSyncSource        string                     `yaml:"last-sync-source,omitempty" json:"last-sync-source,omitempty"`
+	LastSyncModelCount    int                        `yaml:"last-sync-model-count,omitempty" json:"last-sync-model-count,omitempty"`
+	LastSyncRequestModels int                        `yaml:"last-sync-request-models,omitempty" json:"last-sync-request-models,omitempty"`
+	ModelPrices           map[string]UsageModelPrice `yaml:"model-prices,omitempty" json:"model-prices,omitempty"`
+}
+
+// UsageModelPrice stores token pricing in USD per 1M tokens.
+type UsageModelPrice struct {
+	Prompt     float64 `yaml:"prompt" json:"prompt"`
+	Completion float64 `yaml:"completion" json:"completion"`
+	Cache      float64 `yaml:"cache" json:"cache"`
 }
 
 // ClaudeHeaderDefaults configures default header values injected into Claude API requests
@@ -738,6 +760,9 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	// Validate raw payload rules and drop invalid entries.
 	cfg.SanitizePayloadRules()
 
+	// Normalize persisted usage pricing records.
+	cfg.SanitizeUsagePricing()
+
 	// NOTE: Legacy migration persistence is intentionally disabled together with
 	// startup legacy migration to keep startup read-only for config.yaml.
 	// Re-enable the block below if automatic startup migration is needed again.
@@ -755,6 +780,57 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 
 	// Return the populated configuration struct.
 	return &cfg, nil
+}
+
+// SanitizeUsagePricing normalizes persisted model pricing and metadata.
+func (cfg *Config) SanitizeUsagePricing() {
+	if cfg == nil {
+		return
+	}
+	cfg.UsagePricing.NewAPIPricingURL = strings.TrimSpace(cfg.UsagePricing.NewAPIPricingURL)
+	cfg.UsagePricing.NewAPIPricingToken = strings.TrimSpace(cfg.UsagePricing.NewAPIPricingToken)
+	cfg.UsagePricing.LastSyncedAt = strings.TrimSpace(cfg.UsagePricing.LastSyncedAt)
+	cfg.UsagePricing.LastSyncSource = strings.TrimSpace(cfg.UsagePricing.LastSyncSource)
+	if cfg.UsagePricing.LastSyncModelCount < 0 {
+		cfg.UsagePricing.LastSyncModelCount = 0
+	}
+	if cfg.UsagePricing.LastSyncRequestModels < 0 {
+		cfg.UsagePricing.LastSyncRequestModels = 0
+	}
+	if len(cfg.UsagePricing.ModelPrices) == 0 {
+		cfg.UsagePricing.ModelPrices = nil
+		return
+	}
+
+	normalized := make(map[string]UsageModelPrice, len(cfg.UsagePricing.ModelPrices))
+	for model, price := range cfg.UsagePricing.ModelPrices {
+		name := strings.TrimSpace(model)
+		if name == "" {
+			continue
+		}
+		prompt := price.Prompt
+		completion := price.Completion
+		cache := price.Cache
+		if prompt < 0 {
+			prompt = 0
+		}
+		if completion < 0 {
+			completion = 0
+		}
+		if cache < 0 {
+			cache = prompt
+		}
+		normalized[name] = UsageModelPrice{
+			Prompt:     prompt,
+			Completion: completion,
+			Cache:      cache,
+		}
+	}
+	if len(normalized) == 0 {
+		cfg.UsagePricing.ModelPrices = nil
+		return
+	}
+	cfg.UsagePricing.ModelPrices = normalized
 }
 
 // SanitizePayloadRules validates raw JSON payload rule params and drops invalid rules.
@@ -1177,6 +1253,7 @@ func SaveConfigPreserveComments(configFile string, cfg *Config) error {
 
 	pruneMappingToGeneratedKeys(original.Content[0], generated.Content[0], "oauth-excluded-models")
 	pruneMappingToGeneratedKeys(original.Content[0], generated.Content[0], "oauth-model-alias")
+	pruneMappingToGeneratedKeys(original.Content[0], generated.Content[0], "usage-pricing")
 
 	// Merge generated into original in-place, preserving comments/order of existing nodes.
 	mergeMappingPreserve(original.Content[0], generated.Content[0])

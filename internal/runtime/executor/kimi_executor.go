@@ -76,7 +76,7 @@ func (e *KimiExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req
 
 	token := kimiCreds(auth)
 
-	reporter := newUsageReporter(ctx, e.Identifier(), baseModel, auth)
+	reporter := newUsageReporter(ctx, e.Identifier(), baseModel, e.cfg, auth)
 	defer reporter.trackFailure(ctx, &err)
 
 	to := sdktranslator.FromString("openai")
@@ -176,7 +176,7 @@ func (e *KimiExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 	baseModel := thinking.ParseSuffix(req.Model).ModelName
 	token := kimiCreds(auth)
 
-	reporter := newUsageReporter(ctx, e.Identifier(), baseModel, auth)
+	reporter := newUsageReporter(ctx, e.Identifier(), baseModel, e.cfg, auth)
 	defer reporter.trackFailure(ctx, &err)
 
 	to := sdktranslator.FromString("openai")

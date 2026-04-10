@@ -24,6 +24,18 @@ func TestNewProxyAwareHTTPClientDirectBypassesGlobalProxy(t *testing.T) {
 	}
 }
 
+func TestNewProxyAwareHTTPClientWithoutExplicitProxyPrefersDirect(t *testing.T) {
+	t.Setenv("HTTP_PROXY", "http://env-proxy.example.com:8080")
+	t.Setenv("HTTPS_PROXY", "http://env-proxy.example.com:8080")
+	t.Setenv("ALL_PROXY", "socks5://env-proxy.example.com:1080")
+
+	client := newProxyAwareHTTPClient(context.Background(), &config.Config{}, &cliproxyauth.Auth{}, 0)
+	transport := unwrapTransport(t, client.Transport)
+	if transport.Proxy != nil {
+		t.Fatal("expected default transport to bypass environment proxy when no explicit proxy is configured")
+	}
+}
+
 func unwrapTransport(t *testing.T, rt http.RoundTripper) *http.Transport {
 	t.Helper()
 	if transport, ok := rt.(*http.Transport); ok {

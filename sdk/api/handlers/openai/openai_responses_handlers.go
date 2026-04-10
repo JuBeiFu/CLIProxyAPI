@@ -11,12 +11,14 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	. "github.com/router-for-me/CLIProxyAPI/v6/internal/constant"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/api/handlers"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
@@ -124,17 +126,41 @@ func (h *OpenAIResponsesAPIHandler) Compact(c *gin.Context) {
 	c.Header("Content-Type", "application/json")
 	modelName := gjson.GetBytes(rawJSON, "model").String()
 	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
-	stopKeepAlive := h.StartNonStreamingKeepAlive(c, cliCtx)
-	resp, upstreamHeaders, errMsg := h.ExecuteWithAuthManager(cliCtx, h.HandlerType(), modelName, rawJSON, "responses/compact")
+	compactCtx := context.WithoutCancel(cliCtx)
+	compactCtx = coreauth.WithExecuteAttemptTimeout(compactCtx, compactExecuteTimeout(h))
+	compactCtx, compactCancel := context.WithCancel(compactCtx)
+	if c != nil && c.Request != nil {
+		requestCtx := c.Request.Context()
+		if requestCtx != nil {
+			go func() {
+				select {
+				case <-requestCtx.Done():
+					compactCancel()
+				case <-compactCtx.Done():
+				}
+			}()
+		}
+	}
+	stopKeepAlive := h.StartNonStreamingKeepAlive(c, compactCtx)
+	resp, upstreamHeaders, errMsg := h.ExecuteWithAuthManager(compactCtx, h.HandlerType(), modelName, rawJSON, "responses/compact")
 	stopKeepAlive()
 	if errMsg != nil {
+		compactCancel()
 		h.WriteErrorResponse(c, errMsg)
 		cliCancel(errMsg.Error)
 		return
 	}
 	handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
 	_, _ = c.Writer.Write(resp)
+	compactCancel()
 	cliCancel()
+}
+
+func compactExecuteTimeout(h *OpenAIResponsesAPIHandler) time.Duration {
+	if h != nil && h.AuthManager != nil {
+		return coreauth.CompactExecuteAttemptTimeout(h.AuthManager.CurrentConfig())
+	}
+	return 0
 }
 
 // handleNonStreamingResponse handles non-streaming chat completion responses
@@ -278,6 +304,21 @@ func (h *OpenAIResponsesAPIHandler) logResponsesStreamError(c *gin.Context, errM
 	markAPIResponseTimestamp(c)
 }
 
+// writeResponsesSSEChunk writes a single SSE chunk to the response writer with
+// proper \n\n termination. Each SSE event must end with a blank line so that
+// clients can delimit events.
+func writeResponsesSSEChunk(c *gin.Context, chunk []byte) {
+	if len(chunk) == 0 {
+		return
+	}
+	if bytes.HasSuffix(chunk, []byte("\n\n")) {
+		_, _ = c.Writer.Write(chunk)
+		return
+	}
+	_, _ = c.Writer.Write(chunk)
+	_, _ = c.Writer.Write([]byte("\n\n"))
+}
+
 func (h *OpenAIResponsesAPIHandler) forwardResponsesStream(c *gin.Context, flusher http.Flusher, cancel func(error), data <-chan []byte, errs <-chan *interfaces.ErrorMessage, completed bool) {
 	h.ForwardStream(c, flusher, cancel, data, errs, handlers.StreamForwardOptions{
 		WriteChunk: func(chunk []byte) {
@@ -285,11 +326,7 @@ func (h *OpenAIResponsesAPIHandler) forwardResponsesStream(c *gin.Context, flush
 				completed = true
 				markAPIResponseTimestamp(c)
 			}
-			if bytes.HasPrefix(chunk, []byte("event:")) {
-				_, _ = c.Writer.Write([]byte("\n"))
-			}
-			_, _ = c.Writer.Write(chunk)
-			_, _ = c.Writer.Write([]byte("\n"))
+			writeResponsesSSEChunk(c, chunk)
 		},
 		WriteTerminalError: func(errMsg *interfaces.ErrorMessage) {
 			if errMsg == nil {
@@ -315,7 +352,7 @@ func (h *OpenAIResponsesAPIHandler) forwardResponsesStream(c *gin.Context, flush
 				_, _ = fmt.Fprintf(c.Writer, "\nevent: error\ndata: %s\n\n", string(chunk))
 				return
 			}
-			_, _ = c.Writer.Write([]byte("\n"))
+			_, _ = c.Writer.Write([]byte("\n\n"))
 		},
 	})
 }

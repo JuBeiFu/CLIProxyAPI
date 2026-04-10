@@ -217,7 +217,7 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 	// Resolve logs directory relative to the configuration file directory.
 	var requestLogger logging.RequestLogger
 	var toggle func(bool)
-	if !cfg.CommercialMode {
+	if !cfg.CommercialMode || cfg.RequestLog {
 		if optionState.requestLoggerFactory != nil {
 			requestLogger = optionState.requestLoggerFactory(cfg, configFilePath)
 		}
@@ -489,6 +489,9 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.GET("/usage", s.mgmt.GetUsageStatistics)
 		mgmt.GET("/usage/export", s.mgmt.ExportUsageStatistics)
 		mgmt.POST("/usage/import", s.mgmt.ImportUsageStatistics)
+		mgmt.GET("/usage/model-prices", s.mgmt.GetUsageModelPrices)
+		mgmt.PUT("/usage/model-prices", s.mgmt.PutUsageModelPrices)
+		mgmt.POST("/usage/model-prices/sync", s.mgmt.SyncUsageModelPrices)
 		mgmt.GET("/proxy-stats", s.mgmt.GetProxyStatistics)
 		mgmt.GET("/config", s.mgmt.GetConfig)
 		mgmt.GET("/config.yaml", s.mgmt.GetConfigYAML)
@@ -630,6 +633,7 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.DELETE("/auth-files", s.mgmt.DeleteAuthFile)
 		mgmt.PATCH("/auth-files/status", s.mgmt.PatchAuthFileStatus)
 		mgmt.PATCH("/auth-files/fields", s.mgmt.PatchAuthFileFields)
+		mgmt.POST("/auth-files/quota-refresh", s.mgmt.RefreshAuthFileQuota)
 		mgmt.POST("/vertex/import", s.mgmt.ImportVertexCredential)
 
 		mgmt.GET("/anthropic-auth-url", s.mgmt.RequestAnthropicToken)
