@@ -110,10 +110,9 @@ func ConvertClaudeRequestToCLI(modelName string, inputRawJSON []byte, _ bool) []
 						if len(toolCallIDs) > 1 {
 							funcName = strings.Join(toolCallIDs[0:len(toolCallIDs)-1], "-")
 						}
-						funcName = util.SanitizeFunctionName(funcName)
 						responseData := contentResult.Get("content").Raw
 						part := []byte(`{"functionResponse":{"name":"","response":{"result":""}}}`)
-						part, _ = sjson.SetBytes(part, "functionResponse.name", funcName)
+						part, _ = sjson.SetBytes(part, "functionResponse.name", util.SanitizeFunctionName(funcName))
 						part, _ = sjson.SetBytes(part, "functionResponse.response.result", responseData)
 						contentJSON, _ = sjson.SetRawBytes(contentJSON, "parts.-1", part)
 
@@ -152,13 +151,13 @@ func ConvertClaudeRequestToCLI(modelName string, inputRawJSON []byte, _ bool) []
 				inputSchema := util.CleanJSONSchemaForGemini(inputSchemaResult.Raw)
 				tool, _ := sjson.DeleteBytes([]byte(toolResult.Raw), "input_schema")
 				tool, _ = sjson.SetRawBytes(tool, "parametersJsonSchema", []byte(inputSchema))
+				tool, _ = sjson.SetBytes(tool, "name", util.SanitizeFunctionName(gjson.GetBytes(tool, "name").String()))
 				tool, _ = sjson.DeleteBytes(tool, "strict")
 				tool, _ = sjson.DeleteBytes(tool, "input_examples")
 				tool, _ = sjson.DeleteBytes(tool, "type")
 				tool, _ = sjson.DeleteBytes(tool, "cache_control")
 				tool, _ = sjson.DeleteBytes(tool, "defer_loading")
 				tool, _ = sjson.DeleteBytes(tool, "eager_input_streaming")
-				tool, _ = sjson.SetBytes(tool, "name", util.SanitizeFunctionName(gjson.GetBytes(tool, "name").String()))
 				if gjson.ValidBytes(tool) && gjson.ParseBytes(tool).IsObject() {
 					if !hasTools {
 						out, _ = sjson.SetRawBytes(out, "request.tools", []byte(`[{"functionDeclarations":[]}]`))

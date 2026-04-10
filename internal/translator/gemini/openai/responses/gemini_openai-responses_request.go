@@ -289,6 +289,7 @@ func ConvertOpenAIResponsesRequestToGemini(modelName string, inputRawJSON []byte
 					one, _ = sjson.SetBytes(one, "parts.0.text", contentArray.String())
 					out, _ = sjson.SetRawBytes(out, "contents.-1", one)
 				}
+
 			case "function_call":
 				// Handle function calls - convert to model message with functionCall
 				name := util.SanitizeFunctionName(item.Get("name").String())
@@ -333,8 +334,8 @@ func ConvertOpenAIResponsesRequestToGemini(modelName string, inputRawJSON []byte
 						return true
 					})
 				}
-
 				functionName = util.SanitizeFunctionName(functionName)
+
 				functionResponse, _ = sjson.SetBytes(functionResponse, "functionResponse.name", functionName)
 				functionResponse, _ = sjson.SetBytes(functionResponse, "functionResponse.id", callID)
 

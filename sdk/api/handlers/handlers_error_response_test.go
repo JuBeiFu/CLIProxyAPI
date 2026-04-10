@@ -6,10 +6,12 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/interfaces"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	sdkconfig "github.com/router-for-me/CLIProxyAPI/v6/sdk/config"
 )
 
@@ -94,5 +96,48 @@ func TestBuildErrorResponseBody_PreservesOtherValidJSON(t *testing.T) {
 	body := BuildErrorResponseBody(http.StatusBadRequest, raw)
 	if string(body) != raw {
 		t.Fatalf("body = %q, want original JSON payload", string(body))
+	}
+}
+
+func TestEnrichAuthSelectionError_DefaultsTo503WithContext(t *testing.T) {
+	in := &coreauth.Error{Code: "auth_not_found", Message: "no auth available"}
+	out := enrichAuthSelectionError(in, []string{"claude"}, "claude-sonnet-4-6")
+
+	var got *coreauth.Error
+	if !errors.As(out, &got) || got == nil {
+		t.Fatalf("expected coreauth.Error, got %T", out)
+	}
+	if got.StatusCode() != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want %d", got.StatusCode(), http.StatusServiceUnavailable)
+	}
+	if !strings.Contains(got.Message, "providers=claude") {
+		t.Fatalf("message missing provider context: %q", got.Message)
+	}
+	if !strings.Contains(got.Message, "model=claude-sonnet-4-6") {
+		t.Fatalf("message missing model context: %q", got.Message)
+	}
+	if !strings.Contains(got.Message, "/v0/management/auth-files") {
+		t.Fatalf("message missing management hint: %q", got.Message)
+	}
+}
+
+func TestEnrichAuthSelectionError_PreservesExplicitStatus(t *testing.T) {
+	in := &coreauth.Error{Code: "auth_unavailable", Message: "no auth available", HTTPStatus: http.StatusTooManyRequests}
+	out := enrichAuthSelectionError(in, []string{"gemini"}, "gemini-2.5-pro")
+
+	var got *coreauth.Error
+	if !errors.As(out, &got) || got == nil {
+		t.Fatalf("expected coreauth.Error, got %T", out)
+	}
+	if got.StatusCode() != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want %d", got.StatusCode(), http.StatusTooManyRequests)
+	}
+}
+
+func TestEnrichAuthSelectionError_IgnoresOtherErrors(t *testing.T) {
+	in := errors.New("boom")
+	out := enrichAuthSelectionError(in, []string{"claude"}, "claude-sonnet-4-6")
+	if out != in {
+		t.Fatalf("expected original error to be returned unchanged")
 	}
 }

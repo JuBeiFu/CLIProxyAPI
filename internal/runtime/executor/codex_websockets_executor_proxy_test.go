@@ -29,10 +29,9 @@ func TestDialCodexWebsocket_AllInvalidProxiesReturnsError(t *testing.T) {
 }
 
 func TestNewProxyAwareWebsocketDialer_DirectModeDisablesProxyFunc(t *testing.T) {
-	dialer, ok := newProxyAwareWebsocketDialer("direct")
-	if !ok {
-		t.Fatal("expected direct proxy mode to be accepted")
-	}
+	cfg := &config.Config{}
+	auth := &cliproxyauth.Auth{ProxyURL: "direct"}
+	dialer := newProxyAwareWebsocketDialer(cfg, auth)
 	if dialer == nil {
 		t.Fatal("expected dialer, got nil")
 	}
@@ -42,10 +41,9 @@ func TestNewProxyAwareWebsocketDialer_DirectModeDisablesProxyFunc(t *testing.T) 
 }
 
 func TestNewProxyAwareWebsocketDialer_NoneModeDisablesProxyFunc(t *testing.T) {
-	dialer, ok := newProxyAwareWebsocketDialer("none")
-	if !ok {
-		t.Fatal("expected none proxy mode to be accepted")
-	}
+	cfg := &config.Config{}
+	auth := &cliproxyauth.Auth{ProxyURL: "none"}
+	dialer := newProxyAwareWebsocketDialer(cfg, auth)
 	if dialer == nil {
 		t.Fatal("expected dialer, got nil")
 	}
@@ -119,10 +117,9 @@ func TestNewProxyAwareWebsocketDialerWithoutExplicitProxyPrefersDirect(t *testin
 	t.Setenv("HTTPS_PROXY", "http://env-proxy.example.com:8080")
 	t.Setenv("ALL_PROXY", "socks5://env-proxy.example.com:1080")
 
-	dialer, ok := newProxyAwareWebsocketDialer("")
-	if !ok {
-		t.Fatal("expected empty proxy configuration to be accepted")
-	}
+	cfg := &config.Config{}
+	auth := &cliproxyauth.Auth{}
+	dialer := newProxyAwareWebsocketDialer(cfg, auth)
 	if dialer == nil {
 		t.Fatal("expected dialer, got nil")
 	}

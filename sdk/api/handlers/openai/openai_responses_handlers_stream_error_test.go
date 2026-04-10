@@ -33,7 +33,7 @@ func TestForwardResponsesStreamTerminalErrorUsesResponsesErrorChunk(t *testing.T
 	errs <- &interfaces.ErrorMessage{StatusCode: http.StatusInternalServerError, Error: errors.New("unexpected EOF")}
 	close(errs)
 
-	h.forwardResponsesStream(c, flusher, func(error) {}, data, errs, false)
+	h.forwardResponsesStream(c, flusher, func(error) {}, data, errs, nil)
 	body := recorder.Body.String()
 	if !strings.Contains(body, `"type":"error"`) {
 		t.Fatalf("expected responses error chunk, got: %q", body)
@@ -74,7 +74,7 @@ func TestForwardResponsesStreamClosedWithoutCompletedEmitsErrorChunk(t *testing.
 	close(data)
 	close(errs)
 
-	h.forwardResponsesStream(c, flusher, func(error) {}, data, errs, false)
+	h.forwardResponsesStream(c, flusher, func(error) {}, data, errs, nil)
 	body := recorder.Body.String()
 	if !strings.Contains(body, `stream closed before response.completed`) {
 		t.Fatalf("expected missing response.completed error, got: %q", body)
@@ -119,7 +119,7 @@ func TestForwardResponsesStreamCompletedDoesNotEmitSyntheticError(t *testing.T) 
 	close(data)
 	close(errs)
 
-	h.forwardResponsesStream(c, flusher, func(error) {}, data, errs, false)
+	h.forwardResponsesStream(c, flusher, func(error) {}, data, errs, nil)
 	body := recorder.Body.String()
 	if strings.Contains(body, `stream closed before response.completed`) {
 		t.Fatalf("unexpected synthetic error in completed stream: %q", body)

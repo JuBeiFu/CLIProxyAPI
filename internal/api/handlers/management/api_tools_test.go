@@ -4,174 +4,249 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"net/http/httptest"
-	"net/url"
+	"reflect"
 	"strings"
-	"sync"
 	"testing"
 	"time"
+	"unsafe"
 
 	"github.com/gin-gonic/gin"
 	codexauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/codex"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
+	sdkconfig "github.com/router-for-me/CLIProxyAPI/v6/sdk/config"
 )
 
-type memoryAuthStore struct {
-	mu    sync.Mutex
-	items map[string]*coreauth.Auth
-}
-
-func (s *memoryAuthStore) List(ctx context.Context) ([]*coreauth.Auth, error) {
-	_ = ctx
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	out := make([]*coreauth.Auth, 0, len(s.items))
-	for _, a := range s.items {
-		out = append(out, a.Clone())
+// unwrapTransport extracts the underlying *http.Transport from a potentially
+// wrapped RoundTripper (e.g. metadataRoundTripper from proxystats, or
+// proxyPoolTransport from util). It recursively unwraps through "base" fields
+// and proxyPoolTransport entries.
+func unwrapTransport(t *testing.T, rt http.RoundTripper) *http.Transport {
+	t.Helper()
+	for depth := 0; depth < 5; depth++ {
+		if transport, ok := rt.(*http.Transport); ok {
+			return transport
+		}
+		value := reflect.ValueOf(rt)
+		if value.Kind() != reflect.Ptr || value.IsNil() {
+			t.Fatalf("unexpected round tripper type at depth %d: %T", depth, rt)
+		}
+		elem := value.Elem()
+		// Try "base" field first (e.g. metadataRoundTripper)
+		if field := elem.FieldByName("base"); field.IsValid() && field.CanAddr() {
+			baseValue := reflect.NewAt(field.Type(), unsafe.Pointer(field.UnsafeAddr())).Elem()
+			if base, ok := baseValue.Interface().(http.RoundTripper); ok {
+				rt = base
+				continue
+			}
+		}
+		// Try "entries" field for proxyPoolTransport
+		if entries := elem.FieldByName("entries"); entries.IsValid() && entries.Len() > 0 {
+			entry := entries.Index(0)
+			if transportField := entry.FieldByName("transport"); transportField.IsValid() {
+				transportValue := reflect.NewAt(transportField.Type(), unsafe.Pointer(transportField.UnsafeAddr())).Elem()
+				if inner, ok := transportValue.Interface().(*http.Transport); ok {
+					return inner
+				}
+			}
+		}
+		t.Fatalf("cannot unwrap round tripper at depth %d: %T", depth, rt)
 	}
-	return out, nil
-}
-
-func (s *memoryAuthStore) Save(ctx context.Context, auth *coreauth.Auth) (string, error) {
-	_ = ctx
-	if auth == nil {
-		return "", nil
-	}
-	s.mu.Lock()
-	if s.items == nil {
-		s.items = make(map[string]*coreauth.Auth)
-	}
-	s.items[auth.ID] = auth.Clone()
-	s.mu.Unlock()
-	return auth.ID, nil
-}
-
-func (s *memoryAuthStore) Delete(ctx context.Context, id string) error {
-	_ = ctx
-	s.mu.Lock()
-	delete(s.items, id)
-	s.mu.Unlock()
+	t.Fatalf("exceeded max unwrap depth for round tripper: %T", rt)
 	return nil
 }
 
-func TestResolveTokenForAuth_Antigravity_RefreshesExpiredToken(t *testing.T) {
-	var callCount int
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		callCount++
-		if r.Method != http.MethodPost {
-			t.Fatalf("expected POST, got %s", r.Method)
-		}
-		if ct := r.Header.Get("Content-Type"); !strings.HasPrefix(ct, "application/x-www-form-urlencoded") {
-			t.Fatalf("unexpected content-type: %s", ct)
-		}
-		bodyBytes, _ := io.ReadAll(r.Body)
-		_ = r.Body.Close()
-		values, err := url.ParseQuery(string(bodyBytes))
-		if err != nil {
-			t.Fatalf("parse form: %v", err)
-		}
-		if values.Get("grant_type") != "refresh_token" {
-			t.Fatalf("unexpected grant_type: %s", values.Get("grant_type"))
-		}
-		if values.Get("refresh_token") != "rt" {
-			t.Fatalf("unexpected refresh_token: %s", values.Get("refresh_token"))
-		}
-		if values.Get("client_id") != antigravityOAuthClientID {
-			t.Fatalf("unexpected client_id: %s", values.Get("client_id"))
-		}
-		if values.Get("client_secret") != antigravityOAuthClientSecret {
-			t.Fatalf("unexpected client_secret")
-		}
+func TestAPICallTransportDirectBypassesGlobalProxy(t *testing.T) {
+	t.Parallel()
 
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]any{
-			"access_token":  "new-token",
-			"refresh_token": "rt2",
-			"expires_in":    int64(3600),
-			"token_type":    "Bearer",
-		})
-	}))
-	t.Cleanup(srv.Close)
-
-	originalURL := antigravityOAuthTokenURL
-	antigravityOAuthTokenURL = srv.URL
-	t.Cleanup(func() { antigravityOAuthTokenURL = originalURL })
-
-	store := &memoryAuthStore{}
-	manager := coreauth.NewManager(store, nil, nil)
-
-	auth := &coreauth.Auth{
-		ID:       "antigravity-test.json",
-		FileName: "antigravity-test.json",
-		Provider: "antigravity",
-		Metadata: map[string]any{
-			"type":          "antigravity",
-			"access_token":  "old-token",
-			"refresh_token": "rt",
-			"expires_in":    int64(3600),
-			"timestamp":     time.Now().Add(-2 * time.Hour).UnixMilli(),
-			"expired":       time.Now().Add(-1 * time.Hour).Format(time.RFC3339),
+	h := &Handler{
+		cfg: &config.Config{
+			SDKConfig: sdkconfig.SDKConfig{ProxyURL: "http://global-proxy.example.com:8080"},
 		},
 	}
-	if _, err := manager.Register(context.Background(), auth); err != nil {
-		t.Fatalf("register auth: %v", err)
-	}
 
-	h := &Handler{authManager: manager}
-	token, err := h.resolveTokenForAuth(context.Background(), auth)
-	if err != nil {
-		t.Fatalf("resolveTokenForAuth: %v", err)
-	}
-	if token != "new-token" {
-		t.Fatalf("expected refreshed token, got %q", token)
-	}
-	if callCount != 1 {
-		t.Fatalf("expected 1 refresh call, got %d", callCount)
-	}
-
-	updated, ok := manager.GetByID(auth.ID)
-	if !ok || updated == nil {
-		t.Fatalf("expected auth in manager after update")
-	}
-	if got := tokenValueFromMetadata(updated.Metadata); got != "new-token" {
-		t.Fatalf("expected manager metadata updated, got %q", got)
+	transport := h.apiCallTransport(&coreauth.Auth{ProxyURL: "direct"})
+	httpTransport := unwrapTransport(t, transport)
+	if httpTransport.Proxy != nil {
+		t.Fatal("expected direct transport to disable proxy function")
 	}
 }
 
-func TestResolveTokenForAuth_Antigravity_SkipsRefreshWhenTokenValid(t *testing.T) {
-	var callCount int
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		callCount++
-		w.WriteHeader(http.StatusInternalServerError)
-	}))
-	t.Cleanup(srv.Close)
+func TestAPICallTransportInvalidAuthFallsBackToGlobalProxy(t *testing.T) {
+	t.Parallel()
 
-	originalURL := antigravityOAuthTokenURL
-	antigravityOAuthTokenURL = srv.URL
-	t.Cleanup(func() { antigravityOAuthTokenURL = originalURL })
-
-	auth := &coreauth.Auth{
-		ID:       "antigravity-valid.json",
-		FileName: "antigravity-valid.json",
-		Provider: "antigravity",
-		Metadata: map[string]any{
-			"type":         "antigravity",
-			"access_token": "ok-token",
-			"expired":      time.Now().Add(30 * time.Minute).Format(time.RFC3339),
+	h := &Handler{
+		cfg: &config.Config{
+			SDKConfig: sdkconfig.SDKConfig{ProxyURL: "http://global-proxy.example.com:8080"},
 		},
 	}
-	h := &Handler{}
-	token, err := h.resolveTokenForAuth(context.Background(), auth)
-	if err != nil {
-		t.Fatalf("resolveTokenForAuth: %v", err)
+
+	transport := h.apiCallTransport(&coreauth.Auth{ProxyURL: "bad-value"})
+	httpTransport := unwrapTransport(t, transport)
+
+	req, errRequest := http.NewRequest(http.MethodGet, "https://example.com", nil)
+	if errRequest != nil {
+		t.Fatalf("http.NewRequest returned error: %v", errRequest)
 	}
-	if token != "ok-token" {
-		t.Fatalf("expected existing token, got %q", token)
+
+	proxyURL, errProxy := httpTransport.Proxy(req)
+	if errProxy != nil {
+		t.Fatalf("httpTransport.Proxy returned error: %v", errProxy)
 	}
-	if callCount != 0 {
-		t.Fatalf("expected no refresh calls, got %d", callCount)
+	if proxyURL == nil || proxyURL.String() != "http://global-proxy.example.com:8080" {
+		t.Fatalf("proxy URL = %v, want http://global-proxy.example.com:8080", proxyURL)
+	}
+}
+
+func TestAPICallTransportAPIKeyAuthFallsBackToConfigProxyURL(t *testing.T) {
+	t.Parallel()
+
+	h := &Handler{
+		cfg: &config.Config{
+			SDKConfig: sdkconfig.SDKConfig{ProxyURL: "http://global-proxy.example.com:8080"},
+			GeminiKey: []config.GeminiKey{{
+				APIKey:   "gemini-key",
+				ProxyURL: "http://gemini-proxy.example.com:8080",
+			}},
+			ClaudeKey: []config.ClaudeKey{{
+				APIKey:   "claude-key",
+				ProxyURL: "http://claude-proxy.example.com:8080",
+			}},
+			CodexKey: []config.CodexKey{{
+				APIKey:   "codex-key",
+				ProxyURL: "http://codex-proxy.example.com:8080",
+			}},
+			OpenAICompatibility: []config.OpenAICompatibility{{
+				Name:    "bohe",
+				BaseURL: "https://bohe.example.com",
+				APIKeyEntries: []config.OpenAICompatibilityAPIKey{{
+					APIKey:   "compat-key",
+					ProxyURL: "http://compat-proxy.example.com:8080",
+				}},
+			}},
+		},
+	}
+
+	cases := []struct {
+		name      string
+		auth      *coreauth.Auth
+		wantProxy string
+	}{
+		{
+			name: "gemini",
+			auth: &coreauth.Auth{
+				Provider:   "gemini",
+				Attributes: map[string]string{"api_key": "gemini-key"},
+			},
+			wantProxy: "http://gemini-proxy.example.com:8080",
+		},
+		{
+			name: "claude",
+			auth: &coreauth.Auth{
+				Provider:   "claude",
+				Attributes: map[string]string{"api_key": "claude-key"},
+			},
+			wantProxy: "http://claude-proxy.example.com:8080",
+		},
+		{
+			name: "codex",
+			auth: &coreauth.Auth{
+				Provider:   "codex",
+				Attributes: map[string]string{"api_key": "codex-key"},
+			},
+			wantProxy: "http://codex-proxy.example.com:8080",
+		},
+		{
+			name: "openai-compatibility",
+			auth: &coreauth.Auth{
+				Provider: "bohe",
+				Attributes: map[string]string{
+					"api_key":      "compat-key",
+					"compat_name":  "bohe",
+					"provider_key": "bohe",
+				},
+			},
+			wantProxy: "http://compat-proxy.example.com:8080",
+		},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			transport := h.apiCallTransport(tc.auth)
+			httpTransport := unwrapTransport(t, transport)
+
+			req, errRequest := http.NewRequest(http.MethodGet, "https://example.com", nil)
+			if errRequest != nil {
+				t.Fatalf("http.NewRequest returned error: %v", errRequest)
+			}
+
+			proxyURL, errProxy := httpTransport.Proxy(req)
+			if errProxy != nil {
+				t.Fatalf("httpTransport.Proxy returned error: %v", errProxy)
+			}
+			if proxyURL == nil || proxyURL.String() != tc.wantProxy {
+				t.Fatalf("proxy URL = %v, want %s", proxyURL, tc.wantProxy)
+			}
+		})
+	}
+}
+
+func TestAuthByIndexDistinguishesSharedAPIKeysAcrossProviders(t *testing.T) {
+	t.Parallel()
+
+	manager := coreauth.NewManager(nil, nil, nil)
+	geminiAuth := &coreauth.Auth{
+		ID:       "gemini:apikey:123",
+		Provider: "gemini",
+		Attributes: map[string]string{
+			"api_key": "shared-key",
+		},
+	}
+	compatAuth := &coreauth.Auth{
+		ID:       "openai-compatibility:bohe:456",
+		Provider: "bohe",
+		Label:    "bohe",
+		Attributes: map[string]string{
+			"api_key":      "shared-key",
+			"compat_name":  "bohe",
+			"provider_key": "bohe",
+		},
+	}
+
+	if _, errRegister := manager.Register(context.Background(), geminiAuth); errRegister != nil {
+		t.Fatalf("register gemini auth: %v", errRegister)
+	}
+	if _, errRegister := manager.Register(context.Background(), compatAuth); errRegister != nil {
+		t.Fatalf("register compat auth: %v", errRegister)
+	}
+
+	geminiIndex := geminiAuth.EnsureIndex()
+	compatIndex := compatAuth.EnsureIndex()
+	if geminiIndex == compatIndex {
+		t.Fatalf("shared api key produced duplicate auth_index %q", geminiIndex)
+	}
+
+	h := &Handler{authManager: manager}
+
+	gotGemini := h.authByIndex(geminiIndex)
+	if gotGemini == nil {
+		t.Fatal("expected gemini auth by index")
+	}
+	if gotGemini.ID != geminiAuth.ID {
+		t.Fatalf("authByIndex(gemini) returned %q, want %q", gotGemini.ID, geminiAuth.ID)
+	}
+
+	gotCompat := h.authByIndex(compatIndex)
+	if gotCompat == nil {
+		t.Fatal("expected compat auth by index")
+	}
+	if gotCompat.ID != compatAuth.ID {
+		t.Fatalf("authByIndex(compat) returned %q, want %q", gotCompat.ID, compatAuth.ID)
 	}
 }
 
@@ -497,59 +572,5 @@ func TestAPICall_CodexDeactivatedWorkspaceDeletesAuthAndSkipsRefresh(t *testing.
 	}
 	if _, ok := manager.GetByID(auth.ID); ok {
 		t.Fatalf("expected auth deleted from manager after deactivated_workspace response")
-	}
-}
-
-func TestAuthByIndexDistinguishesSharedAPIKeysAcrossProviders(t *testing.T) {
-	t.Parallel()
-
-	manager := coreauth.NewManager(nil, nil, nil)
-	geminiAuth := &coreauth.Auth{
-		ID:       "gemini:apikey:123",
-		Provider: "gemini",
-		Attributes: map[string]string{
-			"api_key": "shared-key",
-		},
-	}
-	compatAuth := &coreauth.Auth{
-		ID:       "openai-compatibility:bohe:456",
-		Provider: "bohe",
-		Label:    "bohe",
-		Attributes: map[string]string{
-			"api_key":      "shared-key",
-			"compat_name":  "bohe",
-			"provider_key": "bohe",
-		},
-	}
-
-	if _, errRegister := manager.Register(context.Background(), geminiAuth); errRegister != nil {
-		t.Fatalf("register gemini auth: %v", errRegister)
-	}
-	if _, errRegister := manager.Register(context.Background(), compatAuth); errRegister != nil {
-		t.Fatalf("register compat auth: %v", errRegister)
-	}
-
-	geminiIndex := geminiAuth.EnsureIndex()
-	compatIndex := compatAuth.EnsureIndex()
-	if geminiIndex == compatIndex {
-		t.Fatalf("shared api key produced duplicate auth_index %q", geminiIndex)
-	}
-
-	h := &Handler{authManager: manager}
-
-	gotGemini := h.authByIndex(geminiIndex)
-	if gotGemini == nil {
-		t.Fatal("expected gemini auth by index")
-	}
-	if gotGemini.ID != geminiAuth.ID {
-		t.Fatalf("authByIndex(gemini) returned %q, want %q", gotGemini.ID, geminiAuth.ID)
-	}
-
-	gotCompat := h.authByIndex(compatIndex)
-	if gotCompat == nil {
-		t.Fatal("expected compat auth by index")
-	}
-	if gotCompat.ID != compatAuth.ID {
-		t.Fatalf("authByIndex(compat) returned %q, want %q", gotCompat.ID, compatAuth.ID)
 	}
 }

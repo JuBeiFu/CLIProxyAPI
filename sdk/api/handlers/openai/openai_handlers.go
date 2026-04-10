@@ -191,62 +191,62 @@ func convertCompletionsRequestToChatCompletions(rawJSON []byte) []byte {
 	}
 
 	// Create chat completions structure
-	out := `{"model":"","messages":[{"role":"user","content":""}]}`
+	out := []byte(`{"model":"","messages":[{"role":"user","content":""}]}`)
 
 	// Set model
 	if model := root.Get("model"); model.Exists() {
-		out, _ = sjson.Set(out, "model", model.String())
+		out, _ = sjson.SetBytes(out, "model", model.String())
 	}
 
 	// Set the prompt as user message content
-	out, _ = sjson.Set(out, "messages.0.content", prompt)
+	out, _ = sjson.SetBytes(out, "messages.0.content", prompt)
 
 	// Copy other parameters from completions to chat completions
 	if maxTokens := root.Get("max_tokens"); maxTokens.Exists() {
-		out, _ = sjson.Set(out, "max_tokens", maxTokens.Int())
+		out, _ = sjson.SetBytes(out, "max_tokens", maxTokens.Int())
 	}
 
 	if temperature := root.Get("temperature"); temperature.Exists() {
-		out, _ = sjson.Set(out, "temperature", temperature.Float())
+		out, _ = sjson.SetBytes(out, "temperature", temperature.Float())
 	}
 
 	if topP := root.Get("top_p"); topP.Exists() {
-		out, _ = sjson.Set(out, "top_p", topP.Float())
+		out, _ = sjson.SetBytes(out, "top_p", topP.Float())
 	}
 
 	if frequencyPenalty := root.Get("frequency_penalty"); frequencyPenalty.Exists() {
-		out, _ = sjson.Set(out, "frequency_penalty", frequencyPenalty.Float())
+		out, _ = sjson.SetBytes(out, "frequency_penalty", frequencyPenalty.Float())
 	}
 
 	if presencePenalty := root.Get("presence_penalty"); presencePenalty.Exists() {
-		out, _ = sjson.Set(out, "presence_penalty", presencePenalty.Float())
+		out, _ = sjson.SetBytes(out, "presence_penalty", presencePenalty.Float())
 	}
 
 	if stop := root.Get("stop"); stop.Exists() {
-		out, _ = sjson.SetRaw(out, "stop", stop.Raw)
+		out, _ = sjson.SetRawBytes(out, "stop", []byte(stop.Raw))
 	}
 
 	if stream := root.Get("stream"); stream.Exists() {
-		out, _ = sjson.Set(out, "stream", stream.Bool())
+		out, _ = sjson.SetBytes(out, "stream", stream.Bool())
 	}
 
 	if logprobs := root.Get("logprobs"); logprobs.Exists() {
-		out, _ = sjson.Set(out, "logprobs", logprobs.Bool())
+		out, _ = sjson.SetBytes(out, "logprobs", logprobs.Bool())
 	}
 
 	if topLogprobs := root.Get("top_logprobs"); topLogprobs.Exists() {
-		out, _ = sjson.Set(out, "top_logprobs", topLogprobs.Int())
+		out, _ = sjson.SetBytes(out, "top_logprobs", topLogprobs.Int())
 	}
 
 	if echo := root.Get("echo"); echo.Exists() {
-		out, _ = sjson.Set(out, "echo", echo.Bool())
+		out, _ = sjson.SetBytes(out, "echo", echo.Bool())
 	}
 
 	if serviceTier := root.Get("service_tier"); serviceTier.Exists() {
-		out, _ = sjson.Set(out, "service_tier", serviceTier.String())
+		out, _ = sjson.SetBytes(out, "service_tier", serviceTier.String())
 	}
 
-	return []byte(out)
+	return out
 }
 
 // convertChatCompletionsResponseToCompletions converts chat completions API response back to completions format.
@@ -262,30 +262,30 @@ func convertChatCompletionsResponseToCompletions(rawJSON, requestJSON []byte) []
 	requestRoot := gjson.ParseBytes(requestJSON)
 
 	// Base completions response structure
-	out := `{"id":"","object":"text_completion","created":0,"model":"","choices":[]}`
+	out := []byte(`{"id":"","object":"text_completion","created":0,"model":"","choices":[]}`)
 
 	// Copy basic fields
 	if id := root.Get("id"); id.Exists() {
-		out, _ = sjson.Set(out, "id", id.String())
+		out, _ = sjson.SetBytes(out, "id", id.String())
 	}
 
 	if created := root.Get("created"); created.Exists() {
-		out, _ = sjson.Set(out, "created", created.Int())
+		out, _ = sjson.SetBytes(out, "created", created.Int())
 	}
 
 	if model := root.Get("model"); model.Exists() {
-		out, _ = sjson.Set(out, "model", model.String())
+		out, _ = sjson.SetBytes(out, "model", model.String())
 	}
 
 	if usage := root.Get("usage"); usage.Exists() {
-		out, _ = sjson.SetRaw(out, "usage", usage.Raw)
+		out, _ = sjson.SetRawBytes(out, "usage", []byte(usage.Raw))
 	}
 
 	serviceTier := root.Get("service_tier")
 	if serviceTier.Exists() && serviceTier.String() != "" {
-		out, _ = sjson.Set(out, "service_tier", serviceTier.String())
+		out, _ = sjson.SetBytes(out, "service_tier", serviceTier.String())
 	} else if requestedServiceTier := requestRoot.Get("service_tier"); requestedServiceTier.Exists() && requestedServiceTier.String() != "" {
-		out, _ = sjson.Set(out, "service_tier", requestedServiceTier.String())
+		out, _ = sjson.SetBytes(out, "service_tier", requestedServiceTier.String())
 	}
 
 	// Convert choices from chat completions to completions format
@@ -325,10 +325,10 @@ func convertChatCompletionsResponseToCompletions(rawJSON, requestJSON []byte) []
 
 	if len(choices) > 0 {
 		choicesJSON, _ := json.Marshal(choices)
-		out, _ = sjson.SetRaw(out, "choices", string(choicesJSON))
+		out, _ = sjson.SetRawBytes(out, "choices", choicesJSON)
 	}
 
-	return []byte(out)
+	return out
 }
 
 // convertChatCompletionsStreamChunkToCompletions converts a streaming chat completions chunk to completions format.
@@ -370,26 +370,26 @@ func convertChatCompletionsStreamChunkToCompletions(chunkData, requestJSON []byt
 	}
 
 	// Base completions stream response structure
-	out := `{"id":"","object":"text_completion","created":0,"model":"","choices":[]}`
+	out := []byte(`{"id":"","object":"text_completion","created":0,"model":"","choices":[]}`)
 
 	// Copy basic fields
 	if id := root.Get("id"); id.Exists() {
-		out, _ = sjson.Set(out, "id", id.String())
+		out, _ = sjson.SetBytes(out, "id", id.String())
 	}
 
 	if created := root.Get("created"); created.Exists() {
-		out, _ = sjson.Set(out, "created", created.Int())
+		out, _ = sjson.SetBytes(out, "created", created.Int())
 	}
 
 	if model := root.Get("model"); model.Exists() {
-		out, _ = sjson.Set(out, "model", model.String())
+		out, _ = sjson.SetBytes(out, "model", model.String())
 	}
 
 	serviceTier := root.Get("service_tier")
 	if serviceTier.Exists() && serviceTier.String() != "" {
-		out, _ = sjson.Set(out, "service_tier", serviceTier.String())
+		out, _ = sjson.SetBytes(out, "service_tier", serviceTier.String())
 	} else if requestedServiceTier := requestRoot.Get("service_tier"); requestedServiceTier.Exists() && requestedServiceTier.String() != "" {
-		out, _ = sjson.Set(out, "service_tier", requestedServiceTier.String())
+		out, _ = sjson.SetBytes(out, "service_tier", requestedServiceTier.String())
 	}
 
 	// Convert choices from chat completions delta to completions format
@@ -428,15 +428,15 @@ func convertChatCompletionsStreamChunkToCompletions(chunkData, requestJSON []byt
 
 	if len(choices) > 0 {
 		choicesJSON, _ := json.Marshal(choices)
-		out, _ = sjson.SetRaw(out, "choices", string(choicesJSON))
+		out, _ = sjson.SetRawBytes(out, "choices", choicesJSON)
 	}
 
 	// Copy usage if present
 	if usage := root.Get("usage"); usage.Exists() {
-		out, _ = sjson.SetRaw(out, "usage", usage.Raw)
+		out, _ = sjson.SetRawBytes(out, "usage", []byte(usage.Raw))
 	}
 
-	return []byte(out)
+	return out
 }
 
 // handleNonStreamingResponse handles non-streaming chat completion responses

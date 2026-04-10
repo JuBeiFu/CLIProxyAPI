@@ -111,6 +111,8 @@ func ConvertGeminiRequestToGeminiCLI(_ string, inputRawJSON []byte, _ bool) []by
 		return true
 	})
 
+	// Filter out contents with empty parts to avoid Gemini API error:
+	// "required oneof field 'data' must have one initialized field"
 	filteredContents := []byte(`[]`)
 	hasFiltered := false
 	gjson.GetBytes(rawJSON, "request.contents").ForEach(func(_, content gjson.Result) bool {
@@ -132,9 +134,11 @@ func ConvertGeminiRequestToGeminiCLI(_ string, inputRawJSON []byte, _ bool) []by
 // FunctionCallGroup represents a group of function calls and their responses
 type FunctionCallGroup struct {
 	ResponsesNeeded int
-	CallNames       []string
+	CallNames       []string // ordered function call names for backfilling empty response names
 }
 
+// backfillFunctionResponseName ensures that a functionResponse JSON object has a non-empty name,
+// falling back to fallbackName if the original is empty.
 func backfillFunctionResponseName(raw string, fallbackName string) string {
 	name := gjson.Get(raw, "functionResponse.name").String()
 	if strings.TrimSpace(name) == "" && fallbackName != "" {
@@ -191,13 +195,16 @@ func fixCLIToolResponse(input string) (string, error) {
 		if len(responsePartsInThisContent) > 0 {
 			collectedResponses = append(collectedResponses, responsePartsInThisContent...)
 
+			// Check if pending groups can be satisfied (FIFO: oldest group first)
 			for len(pendingGroups) > 0 && len(collectedResponses) >= pendingGroups[0].ResponsesNeeded {
 				group := pendingGroups[0]
 				pendingGroups = pendingGroups[1:]
 
+				// Take the needed responses for this group
 				groupResponses := collectedResponses[:group.ResponsesNeeded]
 				collectedResponses = collectedResponses[group.ResponsesNeeded:]
 
+				// Create merged function response content
 				functionResponseContent := []byte(`{"parts":[],"role":"function"}`)
 				for ri, response := range groupResponses {
 					if !response.IsObject() {

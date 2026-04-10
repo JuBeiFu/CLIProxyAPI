@@ -139,11 +139,12 @@ func ConvertGeminiRequestToAntigravity(modelName string, inputRawJSON []byte, _ 
 // FunctionCallGroup represents a group of function calls and their responses
 type FunctionCallGroup struct {
 	ResponsesNeeded int
-	CallNames       []string
+	CallNames       []string // ordered function call names for backfilling empty response names
 }
 
 // parseFunctionResponseRaw attempts to normalize a function response part into a JSON object string.
 // Falls back to a minimal "functionResponse" object when parsing fails.
+// fallbackName is used when the response's own name is empty.
 func parseFunctionResponseRaw(response gjson.Result, fallbackName string) string {
 	if response.IsObject() && gjson.Valid(response.Raw) {
 		raw := response.Raw
@@ -228,13 +229,16 @@ func fixCLIToolResponse(input string) (string, error) {
 		if len(responsePartsInThisContent) > 0 {
 			collectedResponses = append(collectedResponses, responsePartsInThisContent...)
 
+			// Check if pending groups can be satisfied (FIFO: oldest group first)
 			for len(pendingGroups) > 0 && len(collectedResponses) >= pendingGroups[0].ResponsesNeeded {
 				group := pendingGroups[0]
 				pendingGroups = pendingGroups[1:]
 
+				// Take the needed responses for this group
 				groupResponses := collectedResponses[:group.ResponsesNeeded]
 				collectedResponses = collectedResponses[group.ResponsesNeeded:]
 
+				// Create merged function response content
 				functionResponseContent := []byte(`{"parts":[],"role":"function"}`)
 				for ri, response := range groupResponses {
 					partRaw := parseFunctionResponseRaw(response, group.CallNames[ri])

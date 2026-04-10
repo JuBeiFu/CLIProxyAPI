@@ -53,6 +53,7 @@ func ConvertOpenAIResponsesRequestToCodex(modelName string, inputRawJSON []byte,
 
 	// Convert role "system" to "developer" in input array to comply with Codex API requirements.
 	rawJSON = convertSystemRoleToDeveloper(rawJSON)
+	rawJSON = normalizeCodexBuiltinTools(rawJSON)
 
 	return rawJSON
 }
@@ -174,6 +175,8 @@ func convertSystemRoleToDeveloper(rawJSON []byte) []byte {
 	return result
 }
 
+// normalizeCodexBuiltinTools rewrites legacy/preview built-in tool variants to the
+// stable names expected by the current Codex upstream.
 func normalizeCodexBuiltinTools(rawJSON []byte) []byte {
 	result := rawJSON
 
@@ -260,6 +263,9 @@ func normalizeCodexBuiltinToolObject(rawJSON []byte, path string) []byte {
 	return result
 }
 
+// normalizeCodexBuiltinToolType centralizes the current known Codex Responses
+// built-in tool alias compatibility. If Codex introduces more legacy aliases,
+// extend this helper instead of adding path-specific rewrite logic elsewhere.
 func normalizeCodexBuiltinToolType(toolType string) string {
 	switch toolType {
 	case "web_search_preview", "web_search_preview_2025_03_11":

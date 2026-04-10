@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"strings"
 
+	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
@@ -74,17 +75,17 @@ func RenameKey(jsonStr, oldKeyPath, newKeyPath string) (string, error) {
 		return "", fmt.Errorf("old key '%s' does not exist", oldKeyPath)
 	}
 
-	interimJson, err := sjson.SetRaw(jsonStr, newKeyPath, value.Raw)
-	if err != nil {
-		return "", fmt.Errorf("failed to set new key '%s': %w", newKeyPath, err)
+	interimJSON, errSet := sjson.SetRawBytes([]byte(jsonStr), newKeyPath, []byte(value.Raw))
+	if errSet != nil {
+		return "", fmt.Errorf("failed to set new key '%s': %w", newKeyPath, errSet)
 	}
 
-	finalJson, err := sjson.Delete(interimJson, oldKeyPath)
-	if err != nil {
-		return "", fmt.Errorf("failed to delete old key '%s': %w", oldKeyPath, err)
+	finalJSON, errDelete := sjson.DeleteBytes(interimJSON, oldKeyPath)
+	if errDelete != nil {
+		return "", fmt.Errorf("failed to delete old key '%s': %w", oldKeyPath, errDelete)
 	}
 
-	return finalJson, nil
+	return string(finalJSON), nil
 }
 
 // FixJSON converts non-standard JSON that uses single quotes for strings into
@@ -277,6 +278,9 @@ func MapToolName(toolNameMap map[string]string, name string) string {
 
 // SanitizedToolNameMap builds a sanitized-name -> original-name map from request tools.
 // It supports both Claude-format tools[].name and OpenAI-format tools[].function.name.
+// It is used to restore exact tool names for clients (e.g. Claude Code) after the proxy
+// sanitizes tool names for Gemini/Vertex API compatibility via SanitizeFunctionName.
+// Only entries where sanitization actually changes the name are included.
 func SanitizedToolNameMap(rawJSON []byte) map[string]string {
 	if len(rawJSON) == 0 || !gjson.ValidBytes(rawJSON) {
 		return nil
@@ -302,6 +306,8 @@ func SanitizedToolNameMap(rawJSON []byte) map[string]string {
 		}
 		if _, exists := out[sanitized]; !exists {
 			out[sanitized] = name
+		} else {
+			log.Warnf("sanitized tool name collision: %q and %q both map to %q, keeping first", out[sanitized], name, sanitized)
 		}
 		return true
 	})
@@ -312,7 +318,9 @@ func SanitizedToolNameMap(rawJSON []byte) map[string]string {
 	return out
 }
 
-// RestoreSanitizedToolName restores an original client-facing tool name when available.
+// RestoreSanitizedToolName looks up a sanitized function name in the provided map
+// and returns the original client-facing name. If no mapping exists, it returns
+// the sanitized name unchanged.
 func RestoreSanitizedToolName(toolNameMap map[string]string, sanitizedName string) string {
 	if sanitizedName == "" || toolNameMap == nil {
 		return sanitizedName

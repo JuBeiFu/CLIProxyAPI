@@ -11,6 +11,8 @@ import (
 )
 
 func TestRoundTripperForDirectBypassesProxy(t *testing.T) {
+	t.Parallel()
+
 	provider := newDefaultRoundTripperProvider(func() *internalconfig.Config {
 		return &internalconfig.Config{SDKConfig: internalconfig.SDKConfig{ProxyURL: "http://global-proxy.example.com:8080"}}
 	})

@@ -10,6 +10,8 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/proxystats"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
+	"github.com/router-for-me/CLIProxyAPI/v6/sdk/proxyutil"
+	log "github.com/sirupsen/logrus"
 )
 
 // defaultRoundTripperProvider returns a per-auth HTTP RoundTripper based on
@@ -39,7 +41,16 @@ func (p *defaultRoundTripperProvider) RoundTripperFor(auth *coreauth.Auth) http.
 	base := p.cache[proxyStr]
 	p.mu.RUnlock()
 	if base == nil {
-		base = util.NewProxyPoolTransport(proxyStr)
+		transport, _, errBuild := proxyutil.BuildHTTPTransport(proxyStr)
+		if errBuild != nil {
+			log.Errorf("%v", errBuild)
+		}
+		if transport != nil {
+			base = transport
+		} else {
+			// Fallback to proxy pool transport for comma-separated proxy lists.
+			base = util.NewProxyPoolTransport(proxyStr)
+		}
 		if base == nil {
 			return nil
 		}

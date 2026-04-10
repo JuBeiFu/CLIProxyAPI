@@ -90,15 +90,15 @@ type modelStats struct {
 
 // RequestDetail stores the timestamp, latency, and token usage for a single request.
 type RequestDetail struct {
-	Timestamp    time.Time  `json:"timestamp"`
-	LatencyMs    int64      `json:"latency_ms"`
-	RequestID    string     `json:"request_id,omitempty"`
-	Source       string     `json:"source"`
-	AuthIndex    string     `json:"auth_index"`
-	Tokens       TokenStats `json:"tokens"`
-	Failed       bool       `json:"failed"`
-	StatusCode   int        `json:"status_code,omitempty"`
-	ErrorMessage string     `json:"error_message,omitempty"`
+	Timestamp      time.Time                       `json:"timestamp"`
+	LatencyMs      int64                           `json:"latency_ms"`
+	RequestID      string                          `json:"request_id,omitempty"`
+	Source         string                          `json:"source"`
+	AuthIndex      string                          `json:"auth_index"`
+	Tokens         TokenStats                      `json:"tokens"`
+	Failed         bool                            `json:"failed"`
+	StatusCode     int                             `json:"status_code,omitempty"`
+	ErrorMessage   string                          `json:"error_message,omitempty"`
 	CompactFailure *coreusage.CompactFailureSample `json:"compact_failure,omitempty"`
 }
 
@@ -208,15 +208,15 @@ func (s *RequestStatistics) Record(ctx context.Context, record coreusage.Record)
 		s.apis[statsKey] = stats
 	}
 	s.updateAPIStats(stats, modelName, RequestDetail{
-		Timestamp:    timestamp,
-		LatencyMs:    normaliseLatency(record.Latency),
-		RequestID:    resolveRequestID(ctx, record),
-		Source:       record.Source,
-		AuthIndex:    record.AuthIndex,
-		Tokens:       detail,
-		Failed:       failed,
-		StatusCode:   statusCode,
-		ErrorMessage: errorMessage,
+		Timestamp:      timestamp,
+		LatencyMs:      normaliseLatency(record.Latency),
+		RequestID:      resolveRequestID(ctx, record),
+		Source:         record.Source,
+		AuthIndex:      record.AuthIndex,
+		Tokens:         detail,
+		Failed:         failed,
+		StatusCode:     statusCode,
+		ErrorMessage:   errorMessage,
 		CompactFailure: cloneCompactFailureSample(record.Detail.CompactFailure),
 	})
 

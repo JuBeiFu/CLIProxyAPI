@@ -8,8 +8,8 @@ import (
 	"sync"
 
 	tls "github.com/refraction-networking/utls"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/config"
+	"github.com/router-for-me/CLIProxyAPI/v6/sdk/proxyutil"
 	log "github.com/sirupsen/logrus"
 	"golang.org/x/net/http2"
 	"golang.org/x/net/proxy"
@@ -31,14 +31,12 @@ type utlsRoundTripper struct {
 // newUtlsRoundTripper creates a new utls-based round tripper with optional proxy support
 func newUtlsRoundTripper(cfg *config.SDKConfig) *utlsRoundTripper {
 	var dialer proxy.Dialer = proxy.Direct
-	if cfg != nil && cfg.ProxyURL != "" {
-		pDialer := util.NewProxyDialer(cfg.ProxyURL, proxy.Direct)
-		if pDialer == proxy.Direct {
-			if !util.IsDirectProxyMode(cfg.ProxyURL) {
-				log.Debug("failed to create uTLS proxy dialer from configured proxy pool, falling back to direct dialer")
-			}
-		} else {
-			dialer = pDialer
+	if cfg != nil {
+		proxyDialer, mode, errBuild := proxyutil.BuildDialer(cfg.ProxyURL)
+		if errBuild != nil {
+			log.Errorf("failed to configure proxy dialer for %q: %v", cfg.ProxyURL, errBuild)
+		} else if mode != proxyutil.ModeInherit && proxyDialer != nil {
+			dialer = proxyDialer
 		}
 	}
 

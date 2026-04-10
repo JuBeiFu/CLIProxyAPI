@@ -170,7 +170,8 @@ func ConvertOpenAIRequestToCodex(modelName string, inputRawJSON []byte, stream b
 							part, _ = sjson.SetBytes(part, "text", it.Get("text").String())
 							msg, _ = sjson.SetRawBytes(msg, "content.-1", part)
 						case "image_url":
-							// Map image inputs to input_image for Responses API
+							// Map image inputs to input_image for Responses API.
+							// Only data: URIs are supported; remote URLs are stripped.
 							if role == "user" {
 								if u := it.Get("image_url.url"); u.Exists() {
 									imageURL := strings.TrimSpace(u.String())
@@ -200,8 +201,9 @@ func ConvertOpenAIRequestToCodex(modelName string, inputRawJSON []byte, stream b
 					}
 				}
 
-				// Tool-call-only assistant messages must not emit an empty message item,
-				// otherwise Responses API call_id matching breaks.
+				// Don't emit empty assistant messages when only tool_calls
+				// are present — Responses API needs function_call items
+				// directly, otherwise call_id matching fails (#2132).
 				if role != "assistant" || len(gjson.GetBytes(msg, "content").Array()) > 0 {
 					out, _ = sjson.SetRawBytes(out, "input.-1", msg)
 				}

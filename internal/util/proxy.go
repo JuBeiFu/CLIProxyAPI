@@ -7,6 +7,8 @@ import (
 	"net/http"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/config"
+	"github.com/router-for-me/CLIProxyAPI/v6/sdk/proxyutil"
+	log "github.com/sirupsen/logrus"
 )
 
 // SetProxy configures the provided HTTP client with proxy settings from the configuration.
@@ -20,8 +22,18 @@ func SetProxy(cfg *config.SDKConfig, httpClient *http.Client) *http.Client {
 		return httpClient
 	}
 	proxyURL := cfg.ProxyURL
-	if transport := NewProxyPoolTransport(proxyURL); transport != nil {
+
+	transport, _, errBuild := proxyutil.BuildHTTPTransport(proxyURL)
+	if errBuild != nil {
+		log.Errorf("%v", errBuild)
+	}
+	if transport != nil {
 		httpClient.Transport = transport
+		return httpClient
+	}
+	// Fallback to proxy pool transport for comma-separated proxy lists.
+	if poolTransport := NewProxyPoolTransport(proxyURL); poolTransport != nil {
+		httpClient.Transport = poolTransport
 		return httpClient
 	}
 	if !HasUsableProxyConfig(proxyURL) {

@@ -27,7 +27,11 @@ func TestSetProxy_ExplicitProxyConfigUsesConfiguredTransport(t *testing.T) {
 	if client.Transport == nil {
 		t.Fatal("expected explicit proxy config to install transport")
 	}
-	if _, ok := client.Transport.(*http.Transport); ok {
+	transport, ok := client.Transport.(*http.Transport)
+	if !ok || transport == nil {
+		t.Fatalf("expected *http.Transport, got %T", client.Transport)
+	}
+	if transport.Proxy == nil {
 		t.Fatal("expected explicit proxy config to use proxy-aware transport rather than direct transport")
 	}
 }

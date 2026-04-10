@@ -293,5 +293,8 @@ func (a *CodexAuthenticator) buildAuthRecord(authSvc *codex.CodexAuth, authBundl
 		FileName: fileName,
 		Storage:  tokenStorage,
 		Metadata: metadata,
+		Attributes: map[string]string{
+			"plan_type": planType,
+		},
 	}, nil
 }

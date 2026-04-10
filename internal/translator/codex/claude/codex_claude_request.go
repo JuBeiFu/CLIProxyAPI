@@ -51,6 +51,7 @@ func ConvertClaudeRequestToCodex(modelName string, inputRawJSON []byte, _ bool) 
 			if text == "" || strings.HasPrefix(text, "x-anthropic-billing-header: ") {
 				return
 			}
+
 			message, _ = sjson.SetBytes(message, fmt.Sprintf("content.%d.type", contentIndex), "input_text")
 			message, _ = sjson.SetBytes(message, fmt.Sprintf("content.%d.text", contentIndex), text)
 			contentIndex++
@@ -275,6 +276,8 @@ func ConvertClaudeRequestToCodex(modelName string, inputRawJSON []byte, _ bool) 
 	if disableParallelToolUse := rootResult.Get("tool_choice.disable_parallel_tool_use"); disableParallelToolUse.Exists() {
 		parallelToolCalls = !disableParallelToolUse.Bool()
 	}
+
+	// Add additional configuration parameters for the Codex API.
 	template, _ = sjson.SetBytes(template, "parallel_tool_calls", parallelToolCalls)
 
 	// Convert thinking.budget_tokens to reasoning.effort.

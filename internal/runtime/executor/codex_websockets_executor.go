@@ -9,7 +9,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"math"
 	"net"
 	"net/http"
 	"net/url"
@@ -18,16 +17,19 @@ import (
 	"sync"
 	"time"
 
+	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/misc"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/proxyrouting"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/executor/helps"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	apihandlers "github.com/router-for-me/CLIProxyAPI/v6/sdk/api/handlers"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
+	"github.com/router-for-me/CLIProxyAPI/v6/sdk/proxyutil"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v6/sdk/translator"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
@@ -48,16 +50,23 @@ const (
 type CodexWebsocketsExecutor struct {
 	*CodexExecutor
 
-	sessMu   sync.Mutex
+	store *codexWebsocketSessionStore
+}
+
+type codexWebsocketSessionStore struct {
+	mu       sync.Mutex
 	sessions map[string]*codexWebsocketSession
 }
 
+var globalCodexWebsocketSessionStore = &codexWebsocketSessionStore{
+	sessions: make(map[string]*codexWebsocketSession),
+}
+
 type codexWebsocketSession struct {
-	sessionID string
+	sessionID   string
+	lastRequest []byte
 
 	reqMu sync.Mutex
-
-	lastRequest []byte
 
 	connMu sync.Mutex
 	conn   *websocket.Conn
@@ -74,10 +83,18 @@ type codexWebsocketSession struct {
 	readerConn *websocket.Conn
 }
 
+type codexNonStreamAggregator struct {
+	messageText   strings.Builder
+	reasoningText strings.Builder
+	itemsByID     map[string]map[string]any
+	order         []string
+	itemIDByCall  map[string]string
+}
+
 func NewCodexWebsocketsExecutor(cfg *config.Config) *CodexWebsocketsExecutor {
 	return &CodexWebsocketsExecutor{
 		CodexExecutor: NewCodexExecutor(cfg),
-		sessions:      make(map[string]*codexWebsocketSession),
+		store:         globalCodexWebsocketSessionStore,
 	}
 }
 
@@ -86,14 +103,6 @@ type codexWebsocketRead struct {
 	msgType int
 	payload []byte
 	err     error
-}
-
-type codexNonStreamAggregator struct {
-	messageText   strings.Builder
-	reasoningText strings.Builder
-	itemsByID     map[string]map[string]any
-	order         []string
-	itemIDByCall  map[string]string
 }
 
 func (s *codexWebsocketSession) setActive(ch chan codexWebsocketRead) {
@@ -180,7 +189,6 @@ func (a *codexNonStreamAggregator) ensureItem(id string, itemType string) map[st
 		}
 		return item
 	}
-
 	item := map[string]any{}
 	if itemType != "" {
 		item["type"] = itemType
@@ -261,22 +269,18 @@ func (a *codexNonStreamAggregator) applyCompleted(payload []byte) []byte {
 	if a == nil || len(bytes.TrimSpace(payload)) == 0 {
 		return payload
 	}
-
 	responseNode := gjson.GetBytes(payload, "response")
 	if !responseNode.Exists() || !responseNode.IsObject() {
 		return payload
 	}
-
 	outputNode := responseNode.Get("output")
 	if outputNode.Exists() && outputNode.IsArray() && len(outputNode.Array()) > 0 {
 		return payload
 	}
-
 	output := a.materializeOutput()
 	if len(output) == 0 {
 		return payload
 	}
-
 	raw, err := json.Marshal(output)
 	if err != nil {
 		return payload
@@ -292,12 +296,9 @@ func (a *codexNonStreamAggregator) materializeOutput() []map[string]any {
 	if a == nil {
 		return nil
 	}
-
 	output := make([]map[string]any, 0, len(a.order)+2)
-
 	message := strings.TrimSpace(a.messageText.String())
 	reasoning := strings.TrimSpace(a.reasoningText.String())
-
 	for _, id := range a.order {
 		item := a.itemsByID[id]
 		if item == nil {
@@ -311,24 +312,14 @@ func (a *codexNonStreamAggregator) materializeOutput() []map[string]any {
 		case "message":
 			if message != "" && !messageItemHasContent(cloned) {
 				cloned["role"] = "assistant"
-				cloned["content"] = []map[string]any{
-					{
-						"type": "output_text",
-						"text": message,
-					},
-				}
+				cloned["content"] = []map[string]any{{"type": "output_text", "text": message}}
 			}
 			if message != "" {
 				message = ""
 			}
 		case "reasoning":
 			if reasoning != "" && !reasoningItemHasSummary(cloned) {
-				cloned["summary"] = []map[string]any{
-					{
-						"type": "summary_text",
-						"text": reasoning,
-					},
-				}
+				cloned["summary"] = []map[string]any{{"type": "summary_text", "text": reasoning}}
 			}
 			if reasoning != "" {
 				reasoning = ""
@@ -336,33 +327,18 @@ func (a *codexNonStreamAggregator) materializeOutput() []map[string]any {
 		}
 		output = append(output, cloned)
 	}
-
 	if message != "" {
 		output = append(output, map[string]any{
-			"type":   "message",
-			"role":   "assistant",
-			"status": "completed",
-			"content": []map[string]any{
-				{
-					"type": "output_text",
-					"text": message,
-				},
-			},
+			"type": "message", "role": "assistant", "status": "completed",
+			"content": []map[string]any{{"type": "output_text", "text": message}},
 		})
 	}
-
 	if reasoning != "" {
 		output = append(output, map[string]any{
 			"type": "reasoning",
-			"summary": []map[string]any{
-				{
-					"type": "summary_text",
-					"text": reasoning,
-				},
-			},
+			"summary": []map[string]any{{"type": "summary_text", "text": reasoning}},
 		})
 	}
-
 	return output
 }
 
@@ -514,8 +490,8 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 		baseURL = "https://chatgpt.com/backend-api/codex"
 	}
 
-	reporter := newUsageReporter(ctx, e.Identifier(), baseModel, e.cfg, auth)
-	defer reporter.trackFailure(ctx, &err)
+	reporter := helps.NewUsageReporter(ctx, e.Identifier(), baseModel, e.cfg, auth)
+	defer reporter.TrackFailure(ctx, &err)
 
 	from := opts.SourceFormat
 	to := sdktranslator.FromString("codex")
@@ -532,14 +508,12 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 		return resp, err
 	}
 
-	requestedModel := payloadRequestedModel(opts, req.Model)
-	body = applyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", body, originalTranslated, requestedModel)
+	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
+	body = helps.ApplyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", body, originalTranslated, requestedModel)
 	body, _ = sjson.SetBytes(body, "model", baseModel)
 	body, _ = sjson.SetBytes(body, "stream", true)
 	body = stripCodexUnsupportedResponseFields(body, shouldPreserveCodexPreviousResponseID(ctx, auth, from, body))
-	if !gjson.GetBytes(body, "instructions").Exists() {
-		body, _ = sjson.SetBytes(body, "instructions", "")
-	}
+	body = normalizeCodexInstructions(body)
 
 	httpURL := strings.TrimSuffix(baseURL, "/") + "/responses"
 	wsURL, err := buildCodexResponsesWebsocketURL(httpURL)
@@ -573,7 +547,7 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 	if sess != nil {
 		sess.lastRequest = bytes.Clone(body)
 	}
-	recordAPIRequest(ctx, e.cfg, upstreamRequestLog{
+	wsReqLog := helps.UpstreamRequestLog{
 		URL:       wsURL,
 		Method:    "WEBSOCKET",
 		Headers:   wsHeaders.Clone(),
@@ -583,27 +557,25 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 		AuthLabel: authLabel,
 		AuthType:  authType,
 		AuthValue: authValue,
-	})
+	}
+	helps.RecordAPIWebsocketRequest(ctx, e.cfg, wsReqLog)
 
 	conn, respHS, errDial := e.ensureUpstreamConn(ctx, auth, sess, authID, wsURL, wsHeaders)
-	if respHS != nil {
-		recordAPIResponseMetadata(ctx, e.cfg, respHS.StatusCode, respHS.Header.Clone())
-	}
 	if errDial != nil {
 		bodyErr := websocketHandshakeBody(respHS)
-		if len(bodyErr) > 0 {
-			appendAPIResponseChunk(ctx, e.cfg, bodyErr)
+		if respHS != nil {
+			helps.RecordAPIWebsocketUpgradeRejection(ctx, e.cfg, websocketUpgradeRequestLog(wsReqLog), respHS.StatusCode, respHS.Header.Clone(), bodyErr)
 		}
 		if respHS != nil && respHS.StatusCode == http.StatusUpgradeRequired {
 			return e.CodexExecutor.Execute(ctx, auth, req, opts)
 		}
 		if respHS != nil && respHS.StatusCode > 0 {
-			return resp, newCodexStatusErr(respHS.StatusCode, bodyErr)
+			return resp, statusErr{code: respHS.StatusCode, msg: string(bodyErr)}
 		}
-		recordAPIResponseError(ctx, e.cfg, errDial)
+		helps.RecordAPIWebsocketError(ctx, e.cfg, "dial", errDial)
 		return resp, errDial
 	}
-	closeHTTPResponseBody(respHS, "codex websockets executor: close handshake response body error")
+	recordAPIWebsocketHandshake(ctx, e.cfg, respHS)
 	if sess == nil {
 		logCodexWebsocketConnected(executionSessionID, authID, wsURL)
 		defer func() {
@@ -632,10 +604,10 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 			// Retry once with a fresh websocket connection. This is mainly to handle
 			// upstream closing the socket between sequential requests within the same
 			// execution session.
-			connRetry, _, errDialRetry := e.ensureUpstreamConn(ctx, auth, sess, authID, wsURL, wsHeaders)
+			connRetry, respHSRetry, errDialRetry := e.ensureUpstreamConn(ctx, auth, sess, authID, wsURL, wsHeaders)
 			if errDialRetry == nil && connRetry != nil {
 				wsReqBodyRetry := buildCodexWebsocketRequestBody(body)
-				recordAPIRequest(ctx, e.cfg, upstreamRequestLog{
+				helps.RecordAPIWebsocketRequest(ctx, e.cfg, helps.UpstreamRequestLog{
 					URL:       wsURL,
 					Method:    "WEBSOCKET",
 					Headers:   wsHeaders.Clone(),
@@ -646,23 +618,26 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 					AuthType:  authType,
 					AuthValue: authValue,
 				})
+				recordAPIWebsocketHandshake(ctx, e.cfg, respHSRetry)
 				if errSendRetry := writeCodexWebsocketMessage(sess, connRetry, wsReqBodyRetry); errSendRetry == nil {
 					conn = connRetry
 					wsReqBody = wsReqBodyRetry
 				} else {
 					e.invalidateUpstreamConn(sess, connRetry, "send_error", errSendRetry)
-					recordAPIResponseError(ctx, e.cfg, errSendRetry)
+					helps.RecordAPIWebsocketError(ctx, e.cfg, "send_retry", errSendRetry)
 					return resp, errSendRetry
 				}
 			} else {
-				recordAPIResponseError(ctx, e.cfg, errDialRetry)
+				closeHTTPResponseBody(respHSRetry, "codex websockets executor: close handshake response body error")
+				helps.RecordAPIWebsocketError(ctx, e.cfg, "dial_retry", errDialRetry)
 				return resp, errDialRetry
 			}
 		} else {
-			recordAPIResponseError(ctx, e.cfg, errSend)
+			helps.RecordAPIWebsocketError(ctx, e.cfg, "send", errSend)
 			return resp, errSend
 		}
 	}
+
 	aggregator := newCodexNonStreamAggregator()
 	for {
 		if ctx != nil && ctx.Err() != nil {
@@ -670,7 +645,7 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 		}
 		msgType, payload, errRead := readCodexWebsocketMessage(ctx, sess, conn, readCh)
 		if errRead != nil {
-			recordAPIResponseError(ctx, e.cfg, errRead)
+			helps.RecordAPIWebsocketError(ctx, e.cfg, "read", errRead)
 			return resp, errRead
 		}
 		if msgType != websocket.TextMessage {
@@ -679,7 +654,7 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 				if sess != nil {
 					e.invalidateUpstreamConn(sess, conn, "unexpected_binary", err)
 				}
-				recordAPIResponseError(ctx, e.cfg, err)
+				helps.RecordAPIWebsocketError(ctx, e.cfg, "unexpected_binary", err)
 				return resp, err
 			}
 			continue
@@ -689,13 +664,13 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 		if len(payload) == 0 {
 			continue
 		}
-		appendAPIResponseChunk(ctx, e.cfg, payload)
+		helps.AppendAPIWebsocketResponse(ctx, e.cfg, payload)
 
 		if wsErr, ok := parseCodexWebsocketError(payload); ok {
 			if sess != nil {
 				e.invalidateUpstreamConn(sess, conn, "upstream_error", wsErr)
 			}
-			recordAPIResponseError(ctx, e.cfg, wsErr)
+			helps.RecordAPIWebsocketError(ctx, e.cfg, "upstream_error", wsErr)
 			return resp, wsErr
 		}
 
@@ -704,12 +679,12 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 		eventType := gjson.GetBytes(payload, "type").String()
 		if eventType == "response.completed" {
 			payload = aggregator.applyCompleted(payload)
-			if detail, ok := parseCodexUsage(payload); ok {
-				reporter.publish(ctx, detail)
+			if detail, ok := helps.ParseCodexUsage(payload); ok {
+				reporter.Publish(ctx, detail)
 			}
 			var param any
 			out := sdktranslator.TranslateNonStream(ctx, to, from, req.Model, originalPayload, body, payload, &param)
-			resp = cliproxyexecutor.Response{Payload: []byte(out)}
+			resp = cliproxyexecutor.Response{Payload: out}
 			return resp, nil
 		}
 	}
@@ -730,8 +705,8 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 		baseURL = "https://chatgpt.com/backend-api/codex"
 	}
 
-	reporter := newUsageReporter(ctx, e.Identifier(), baseModel, e.cfg, auth)
-	defer reporter.trackFailure(ctx, &err)
+	reporter := helps.NewUsageReporter(ctx, e.Identifier(), baseModel, e.cfg, auth)
+	defer reporter.TrackFailure(ctx, &err)
 
 	from := opts.SourceFormat
 	to := sdktranslator.FromString("codex")
@@ -739,8 +714,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 	if len(opts.OriginalRequest) > 0 {
 		originalPayloadSource = opts.OriginalRequest
 	}
-	originalPayload := originalPayloadSource
-	originalTranslated := sdktranslator.TranslateRequest(from, to, baseModel, originalPayload, true)
+	originalTranslated := sdktranslator.TranslateRequest(from, to, baseModel, originalPayloadSource, true)
 	body := sdktranslator.TranslateRequest(from, to, baseModel, req.Payload, true)
 
 	body, err = thinking.ApplyThinking(body, req.Model, from.String(), to.String(), e.Identifier())
@@ -748,14 +722,12 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 		return nil, err
 	}
 
-	requestedModel := payloadRequestedModel(opts, req.Model)
-	body = applyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", body, originalTranslated, requestedModel)
+	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
+	body = helps.ApplyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", body, originalTranslated, requestedModel)
 	body = stripCodexUnsupportedResponseFields(body, shouldPreserveCodexPreviousResponseID(ctx, auth, from, body))
 	body, _ = sjson.SetBytes(body, "model", baseModel)
 	body, _ = sjson.SetBytes(body, "stream", true)
-	if !gjson.GetBytes(body, "instructions").Exists() {
-		body, _ = sjson.SetBytes(body, "instructions", "")
-	}
+	body = normalizeCodexInstructions(body)
 
 	httpURL := strings.TrimSuffix(baseURL, "/") + "/responses"
 	wsURL, err := buildCodexResponsesWebsocketURL(httpURL)
@@ -788,7 +760,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 	if sess != nil {
 		sess.lastRequest = bytes.Clone(body)
 	}
-	recordAPIRequest(ctx, e.cfg, upstreamRequestLog{
+	wsReqLog := helps.UpstreamRequestLog{
 		URL:       wsURL,
 		Method:    "WEBSOCKET",
 		Headers:   wsHeaders.Clone(),
@@ -798,32 +770,32 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 		AuthLabel: authLabel,
 		AuthType:  authType,
 		AuthValue: authValue,
-	})
+	}
+	helps.RecordAPIWebsocketRequest(ctx, e.cfg, wsReqLog)
 
 	conn, respHS, errDial := e.ensureUpstreamConn(ctx, auth, sess, authID, wsURL, wsHeaders)
 	var upstreamHeaders http.Header
 	if respHS != nil {
 		upstreamHeaders = respHS.Header.Clone()
-		recordAPIResponseMetadata(ctx, e.cfg, respHS.StatusCode, respHS.Header.Clone())
 	}
 	if errDial != nil {
 		bodyErr := websocketHandshakeBody(respHS)
-		if len(bodyErr) > 0 {
-			appendAPIResponseChunk(ctx, e.cfg, bodyErr)
+		if respHS != nil {
+			helps.RecordAPIWebsocketUpgradeRejection(ctx, e.cfg, websocketUpgradeRequestLog(wsReqLog), respHS.StatusCode, respHS.Header.Clone(), bodyErr)
 		}
 		if respHS != nil && respHS.StatusCode == http.StatusUpgradeRequired {
 			return e.CodexExecutor.ExecuteStream(ctx, auth, req, opts)
 		}
 		if respHS != nil && respHS.StatusCode > 0 {
-			return nil, newCodexStatusErr(respHS.StatusCode, bodyErr)
+			return nil, statusErr{code: respHS.StatusCode, msg: string(bodyErr)}
 		}
-		recordAPIResponseError(ctx, e.cfg, errDial)
+		helps.RecordAPIWebsocketError(ctx, e.cfg, "dial", errDial)
 		if sess != nil {
 			sess.reqMu.Unlock()
 		}
 		return nil, errDial
 	}
-	closeHTTPResponseBody(respHS, "codex websockets executor: close handshake response body error")
+	recordAPIWebsocketHandshake(ctx, e.cfg, respHS)
 
 	if sess == nil {
 		logCodexWebsocketConnected(executionSessionID, authID, wsURL)
@@ -836,20 +808,21 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 	}
 
 	if errSend := writeCodexWebsocketMessage(sess, conn, wsReqBody); errSend != nil {
-		recordAPIResponseError(ctx, e.cfg, errSend)
+		helps.RecordAPIWebsocketError(ctx, e.cfg, "send", errSend)
 		if sess != nil {
 			e.invalidateUpstreamConn(sess, conn, "send_error", errSend)
 
 			// Retry once with a new websocket connection for the same execution session.
-			connRetry, _, errDialRetry := e.ensureUpstreamConn(ctx, auth, sess, authID, wsURL, wsHeaders)
+			connRetry, respHSRetry, errDialRetry := e.ensureUpstreamConn(ctx, auth, sess, authID, wsURL, wsHeaders)
 			if errDialRetry != nil || connRetry == nil {
-				recordAPIResponseError(ctx, e.cfg, errDialRetry)
+				closeHTTPResponseBody(respHSRetry, "codex websockets executor: close handshake response body error")
+				helps.RecordAPIWebsocketError(ctx, e.cfg, "dial_retry", errDialRetry)
 				sess.clearActive(readCh)
 				sess.reqMu.Unlock()
 				return nil, errDialRetry
 			}
 			wsReqBodyRetry := buildCodexWebsocketRequestBody(body)
-			recordAPIRequest(ctx, e.cfg, upstreamRequestLog{
+			helps.RecordAPIWebsocketRequest(ctx, e.cfg, helps.UpstreamRequestLog{
 				URL:       wsURL,
 				Method:    "WEBSOCKET",
 				Headers:   wsHeaders.Clone(),
@@ -860,8 +833,9 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 				AuthType:  authType,
 				AuthValue: authValue,
 			})
+			recordAPIWebsocketHandshake(ctx, e.cfg, respHSRetry)
 			if errSendRetry := writeCodexWebsocketMessage(sess, connRetry, wsReqBodyRetry); errSendRetry != nil {
-				recordAPIResponseError(ctx, e.cfg, errSendRetry)
+				helps.RecordAPIWebsocketError(ctx, e.cfg, "send_retry", errSendRetry)
 				e.invalidateUpstreamConn(sess, connRetry, "send_error", errSendRetry)
 				sess.clearActive(readCh)
 				sess.reqMu.Unlock()
@@ -877,6 +851,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 			return nil, errSend
 		}
 	}
+
 	out := make(chan cliproxyexecutor.StreamChunk)
 	go func() {
 		terminateReason := "completed"
@@ -926,8 +901,8 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 				}
 				terminateReason = "read_error"
 				terminateErr = errRead
-				recordAPIResponseError(ctx, e.cfg, errRead)
-				reporter.publishFailure(ctx)
+				helps.RecordAPIWebsocketError(ctx, e.cfg, "read", errRead)
+				reporter.PublishFailure(ctx)
 				_ = send(cliproxyexecutor.StreamChunk{Err: errRead})
 				return
 			}
@@ -936,8 +911,8 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 					err = fmt.Errorf("codex websockets executor: unexpected binary message")
 					terminateReason = "unexpected_binary"
 					terminateErr = err
-					recordAPIResponseError(ctx, e.cfg, err)
-					reporter.publishFailure(ctx)
+					helps.RecordAPIWebsocketError(ctx, e.cfg, "unexpected_binary", err)
+					reporter.PublishFailure(ctx)
 					if sess != nil {
 						e.invalidateUpstreamConn(sess, conn, "unexpected_binary", err)
 					}
@@ -951,13 +926,13 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 			if len(payload) == 0 {
 				continue
 			}
-			appendAPIResponseChunk(ctx, e.cfg, payload)
+			helps.AppendAPIWebsocketResponse(ctx, e.cfg, payload)
 
 			if wsErr, ok := parseCodexWebsocketError(payload); ok {
 				terminateReason = "upstream_error"
 				terminateErr = wsErr
-				recordAPIResponseError(ctx, e.cfg, wsErr)
-				reporter.publishFailure(ctx)
+				helps.RecordAPIWebsocketError(ctx, e.cfg, "upstream_error", wsErr)
+				reporter.PublishFailure(ctx)
 				if sess != nil {
 					e.invalidateUpstreamConn(sess, conn, "upstream_error", wsErr)
 				}
@@ -968,15 +943,15 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 			payload = normalizeCodexWebsocketCompletion(payload)
 			eventType := gjson.GetBytes(payload, "type").String()
 			if eventType == "response.completed" || eventType == "response.done" {
-				if detail, ok := parseCodexUsage(payload); ok {
-					reporter.publish(ctx, detail)
+				if detail, ok := helps.ParseCodexUsage(payload); ok {
+					reporter.Publish(ctx, detail)
 				}
 			}
 
 			line := encodeCodexWebsocketAsSSE(payload)
-			chunks := sdktranslator.TranslateStream(ctx, to, from, req.Model, originalPayload, body, line, &param)
+			chunks := sdktranslator.TranslateStream(ctx, to, from, req.Model, body, body, line, &param)
 			for i := range chunks {
-				if !send(cliproxyexecutor.StreamChunk{Payload: []byte(chunks[i])}) {
+				if !send(cliproxyexecutor.StreamChunk{Payload: chunks[i]}) {
 					terminateReason = "context_done"
 					terminateErr = ctx.Err()
 					return
@@ -992,43 +967,19 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 }
 
 func (e *CodexWebsocketsExecutor) dialCodexWebsocket(ctx context.Context, auth *cliproxyauth.Auth, wsURL string, headers http.Header) (*websocket.Conn, *http.Response, error) {
+	dialer := newProxyAwareWebsocketDialer(e.cfg, auth)
+	dialer.HandshakeTimeout = codexResponsesWebsocketHandshakeTO
+	dialer.EnableCompression = true
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	proxyURLs := resolveProxyPoolURLs(e.cfg, auth)
-	if len(proxyURLs) == 0 {
-		proxyURLs = []string{""}
+	conn, resp, err := dialer.DialContext(ctx, wsURL, headers)
+	if conn != nil {
+		// Avoid gorilla/websocket flate tail validation issues on some upstreams/Go versions.
+		// Negotiating permessage-deflate is fine; we just don't compress outbound messages.
+		conn.EnableWriteCompression(false)
 	}
-
-	var lastResp *http.Response
-	var lastErr error
-	for idx := range proxyURLs {
-		dialer, ok := newProxyAwareWebsocketDialer(proxyURLs[idx])
-		if !ok {
-			// All proxies invalid would otherwise fall through with lastErr still nil.
-			lastErr = fmt.Errorf("codex websockets executor: invalid proxy URL: %q", proxyURLs[idx])
-			continue
-		}
-		conn, resp, err := dialer.DialContext(ctx, wsURL, headers)
-		if conn != nil {
-			// Avoid gorilla/websocket flate tail validation issues on some upstreams/Go versions.
-			// Negotiating permessage-deflate is fine; we just don't compress outbound messages.
-			conn.EnableWriteCompression(false)
-		}
-		if err == nil {
-			return conn, resp, nil
-		}
-		lastResp = resp
-		lastErr = err
-		if idx+1 >= len(proxyURLs) || !shouldRetryNextWebsocketProxy(err, resp) {
-			return conn, resp, err
-		}
-		if resp != nil && resp.Body != nil {
-			_ = resp.Body.Close()
-		}
-		log.WithError(err).Debug("codex websockets executor: websocket proxy failed, retrying next proxy")
-	}
-	return nil, lastResp, lastErr
+	return conn, resp, err
 }
 
 func writeCodexWebsocketMessage(sess *codexWebsocketSession, conn *websocket.Conn, payload []byte) error {
@@ -1056,44 +1007,6 @@ func buildCodexWebsocketRequestBody(body []byte) []byte {
 	fallback := bytes.Clone(body)
 	fallback, _ = sjson.SetBytes(fallback, "type", "response.create")
 	return fallback
-}
-
-func shouldEnrichCodexWebsocketBridgeFollowupRequest(ctx context.Context, executionSessionID string) bool {
-	if strings.TrimSpace(executionSessionID) == "" {
-		return false
-	}
-	return apihandlers.DownstreamWebsocketBridge(ctx)
-}
-
-func enrichCodexWebsocketBridgeFollowupRequest(body []byte, lastRequest []byte) []byte {
-	if len(body) == 0 || len(lastRequest) == 0 {
-		return body
-	}
-	if strings.TrimSpace(gjson.GetBytes(body, "previous_response_id").String()) == "" {
-		return body
-	}
-
-	enriched := bytes.Clone(body)
-	instructionsResult := gjson.GetBytes(enriched, "instructions")
-	if !instructionsResult.Exists() || strings.TrimSpace(instructionsResult.String()) == "" {
-		instructions := gjson.GetBytes(lastRequest, "instructions")
-		if instructions.Exists() && strings.TrimSpace(instructions.String()) != "" {
-			enriched, _ = sjson.SetRawBytes(enriched, "instructions", []byte(instructions.Raw))
-		}
-	}
-	if !gjson.GetBytes(enriched, "tools").Exists() {
-		tools := gjson.GetBytes(lastRequest, "tools")
-		if tools.Exists() {
-			enriched, _ = sjson.SetRawBytes(enriched, "tools", []byte(tools.Raw))
-		}
-	}
-	if !gjson.GetBytes(enriched, "tool_choice").Exists() {
-		toolChoice := gjson.GetBytes(lastRequest, "tool_choice")
-		if toolChoice.Exists() {
-			enriched, _ = sjson.SetRawBytes(enriched, "tool_choice", []byte(toolChoice.Raw))
-		}
-	}
-	return enriched
 }
 
 func readCodexWebsocketMessage(ctx context.Context, sess *codexWebsocketSession, conn *websocket.Conn, readCh chan codexWebsocketRead) (int, []byte, error) {
@@ -1130,9 +1043,9 @@ func readCodexWebsocketMessage(ctx context.Context, sess *codexWebsocketSession,
 	}
 }
 
-func newProxyAwareWebsocketDialer(proxyURL string) (*websocket.Dialer, bool) {
+func newProxyAwareWebsocketDialer(cfg *config.Config, auth *cliproxyauth.Auth) *websocket.Dialer {
 	dialer := &websocket.Dialer{
-		Proxy:             nil,
+		Proxy:             http.ProxyFromEnvironment,
 		HandshakeTimeout:  codexResponsesWebsocketHandshakeTO,
 		EnableCompression: true,
 		NetDialContext: (&net.Dialer{
@@ -1141,64 +1054,59 @@ func newProxyAwareWebsocketDialer(proxyURL string) (*websocket.Dialer, bool) {
 		}).DialContext,
 	}
 
-	proxyURL = strings.TrimSpace(proxyURL)
+	proxyURL := ""
+	if auth != nil {
+		proxyURL = strings.TrimSpace(auth.ProxyURL)
+	}
+	if proxyURL == "" && cfg != nil {
+		proxyURL = strings.TrimSpace(cfg.ProxyURL)
+	}
 	if proxyURL == "" {
-		return dialer, true
-	}
-	if util.IsDirectProxyMode(proxyURL) {
+		// When no explicit proxy is selected, prefer direct connections over
+		// inheriting process-wide HTTP(S)_PROXY settings such as warp-lb.
 		dialer.Proxy = nil
-		return dialer, true
+		return dialer
 	}
 
-	parsedURL, errParse := url.Parse(proxyURL)
+	setting, errParse := proxyutil.Parse(proxyURL)
 	if errParse != nil {
-		log.Errorf("codex websockets executor: parse proxy URL failed: %v", errParse)
-		return nil, false
+		log.Errorf("codex websockets executor: %v", errParse)
+		return dialer
 	}
 
-	switch parsedURL.Scheme {
+	switch setting.Mode {
+	case proxyutil.ModeDirect:
+		dialer.Proxy = nil
+		return dialer
+	case proxyutil.ModeProxy:
+	default:
+		return dialer
+	}
+
+	switch setting.URL.Scheme {
 	case "socks5", "socks5h":
 		var proxyAuth *proxy.Auth
-		if parsedURL.User != nil {
-			username := parsedURL.User.Username()
-			password, _ := parsedURL.User.Password()
+		if setting.URL.User != nil {
+			username := setting.URL.User.Username()
+			password, _ := setting.URL.User.Password()
 			proxyAuth = &proxy.Auth{User: username, Password: password}
 		}
-		socksDialer, errSOCKS5 := proxy.SOCKS5("tcp", parsedURL.Host, proxyAuth, proxy.Direct)
+		socksDialer, errSOCKS5 := proxy.SOCKS5("tcp", setting.URL.Host, proxyAuth, proxy.Direct)
 		if errSOCKS5 != nil {
 			log.Errorf("codex websockets executor: create SOCKS5 dialer failed: %v", errSOCKS5)
-			return nil, false
+			return dialer
 		}
 		dialer.Proxy = nil
 		dialer.NetDialContext = func(_ context.Context, network, addr string) (net.Conn, error) {
 			return socksDialer.Dial(network, addr)
 		}
 	case "http", "https":
-		dialer.Proxy = http.ProxyURL(parsedURL)
+		dialer.Proxy = http.ProxyURL(setting.URL)
 	default:
-		log.Errorf("codex websockets executor: unsupported proxy scheme: %s", parsedURL.Scheme)
-		return nil, false
+		log.Errorf("codex websockets executor: unsupported proxy scheme: %s", setting.URL.Scheme)
 	}
 
-	return dialer, true
-}
-
-func resolveProxyPoolURLs(cfg *config.Config, auth *cliproxyauth.Auth) []string {
-	selection := proxyrouting.Resolve(cfg, auth)
-	if proxyURL := strings.TrimSpace(selection.ProxyURL); proxyURL != "" {
-		return util.OrderedProxyURLs(proxyURL)
-	}
-	return nil
-}
-
-func shouldRetryNextWebsocketProxy(err error, resp *http.Response) bool {
-	if err == nil {
-		return false
-	}
-	if resp != nil {
-		return false
-	}
-	return !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded)
+	return dialer
 }
 
 func buildCodexResponsesWebsocketURL(httpURL string) (string, error) {
@@ -1221,19 +1129,19 @@ func applyCodexPromptCacheHeaders(from sdktranslator.Format, req cliproxyexecuto
 		return rawJSON, headers
 	}
 
-	var cache codexCache
+	var cache helps.CodexCache
 	if from == "claude" {
 		userIDResult := gjson.GetBytes(req.Payload, "metadata.user_id")
 		if userIDResult.Exists() {
 			key := fmt.Sprintf("%s-%s", req.Model, userIDResult.String())
-			if cached, ok := getCodexCache(key); ok {
+			if cached, ok := helps.GetCodexCache(key); ok {
 				cache = cached
 			} else {
-				cache = codexCache{
+				cache = helps.CodexCache{
 					ID:     uuid.New().String(),
 					Expire: time.Now().Add(1 * time.Hour),
 				}
-				setCodexCache(key, cache)
+				helps.SetCodexCache(key, cache)
 			}
 		}
 	} else if from == "openai-response" {
@@ -1245,7 +1153,6 @@ func applyCodexPromptCacheHeaders(from sdktranslator.Format, req cliproxyexecuto
 	if cache.ID != "" {
 		rawJSON, _ = sjson.SetBytes(rawJSON, "prompt_cache_key", cache.ID)
 		headers.Set("Conversation_id", cache.ID)
-		headers.Set("Session_id", cache.ID)
 	}
 
 	return rawJSON, headers
@@ -1260,17 +1167,18 @@ func applyCodexWebsocketHeaders(ctx context.Context, headers http.Header, auth *
 	}
 
 	var ginHeaders http.Header
-	if ginCtx := ginContextFrom(ctx); ginCtx != nil && ginCtx.Request != nil {
-		ginHeaders = ginCtx.Request.Header
+	if ginCtx, ok := ctx.Value("gin").(*gin.Context); ok && ginCtx != nil && ginCtx.Request != nil {
+		ginHeaders = ginCtx.Request.Header.Clone()
 	}
 
-	cfgUserAgent, cfgBetaFeatures := codexHeaderDefaults(cfg, auth)
+	_, cfgBetaFeatures := codexHeaderDefaults(cfg, auth)
 	ensureHeaderWithPriority(headers, ginHeaders, "x-codex-beta-features", cfgBetaFeatures, "")
 	misc.EnsureHeader(headers, ginHeaders, "x-codex-turn-state", "")
 	misc.EnsureHeader(headers, ginHeaders, "x-codex-turn-metadata", "")
+	misc.EnsureHeader(headers, ginHeaders, "x-client-request-id", "")
 	misc.EnsureHeader(headers, ginHeaders, "x-responsesapi-include-timing-metrics", "")
-
 	misc.EnsureHeader(headers, ginHeaders, "Version", "")
+
 	betaHeader := strings.TrimSpace(headers.Get("OpenAI-Beta"))
 	if betaHeader == "" && ginHeaders != nil {
 		betaHeader = strings.TrimSpace(ginHeaders.Get("OpenAI-Beta"))
@@ -1279,8 +1187,10 @@ func applyCodexWebsocketHeaders(ctx context.Context, headers http.Header, auth *
 		betaHeader = codexResponsesWebsocketBetaHeaderValue
 	}
 	headers.Set("OpenAI-Beta", betaHeader)
-	misc.EnsureHeader(headers, ginHeaders, "Session_id", uuid.NewString())
-	ensureHeaderWithConfigPrecedence(headers, ginHeaders, "User-Agent", cfgUserAgent, codexUserAgent)
+	if strings.Contains(headers.Get("User-Agent"), "Mac OS") {
+		misc.EnsureHeader(headers, ginHeaders, "Session_id", uuid.NewString())
+	}
+	headers.Del("User-Agent")
 
 	isAPIKey := false
 	if auth != nil && auth.Attributes != nil {
@@ -1391,6 +1301,17 @@ func parseCodexWebsocketError(payload []byte) (error, bool) {
 	if status == 0 {
 		status = int(gjson.GetBytes(payload, "status_code").Int())
 	}
+
+	errType := gjson.GetBytes(payload, "error.type").String()
+
+	// Recognize usage_limit_reached even when status is missing.
+	if status <= 0 && errType == "usage_limit_reached" {
+		status = http.StatusTooManyRequests
+	}
+	if status <= 0 {
+		return nil, false
+	}
+
 	out := []byte(`{}`)
 	if errNode := gjson.GetBytes(payload, "error"); errNode.Exists() {
 		raw := errNode.Raw
@@ -1400,38 +1321,45 @@ func parseCodexWebsocketError(payload []byte) (error, bool) {
 		out, _ = sjson.SetRawBytes(out, "error", []byte(raw))
 	} else {
 		out, _ = sjson.SetBytes(out, "error.type", "server_error")
-		message := "Unknown websocket error"
-		if status > 0 {
-			message = http.StatusText(status)
-		}
-		out, _ = sjson.SetBytes(out, "error.message", message)
-	}
-	if status <= 0 && isCodexUsageLimitError(out) {
-		// Some websocket error events omit status fields; treat usage limit exhaustion
-		// as a quota restriction so the auth manager can cool down the credential.
-		status = http.StatusTooManyRequests
-	}
-	if status <= 0 {
-		return nil, false
+		out, _ = sjson.SetBytes(out, "error.message", http.StatusText(status))
 	}
 
-	baseErr := newCodexStatusErr(status, out)
-	headers := parseCodexWebsocketErrorHeaders(payload)
-	if baseErr.retryAfter != nil {
-		if headers == nil {
-			headers = make(http.Header)
-		}
-		// Expose cooldown hints to downstream clients when available.
-		if headers.Get("Retry-After") == "" {
-			secs := int(math.Ceil(baseErr.retryAfter.Seconds()))
-			if secs < 0 {
-				secs = 0
-			}
-			headers.Set("Retry-After", strconv.Itoa(secs))
+	// Normalize usage_limit_reached and capacity errors to 429.
+	if errType == "usage_limit_reached" {
+		status = http.StatusTooManyRequests
+	}
+	if isCodexModelCapacityError(out) {
+		status = http.StatusTooManyRequests
+	}
+
+	se := statusErr{code: status, msg: string(out)}
+
+	// Parse retry-after from resets_in_seconds for usage limit errors.
+	if errType == "usage_limit_reached" {
+		if resetsIn := gjson.GetBytes(payload, "error.resets_in_seconds"); resetsIn.Exists() {
+			d := time.Duration(resetsIn.Int()) * time.Second
+			se.retryAfter = &d
 		}
 	}
+	// Capacity errors get a short default retry.
+	if isCodexModelCapacityError(out) && se.retryAfter == nil {
+		d := 5 * time.Second
+		se.retryAfter = &d
+	}
+
+	headers := parseCodexWebsocketErrorHeaders(payload)
+	// Inject Retry-After header from resets_in_seconds when present.
+	if se.retryAfter != nil && errType == "usage_limit_reached" {
+		if resetsIn := gjson.GetBytes(payload, "error.resets_in_seconds"); resetsIn.Exists() {
+			if headers == nil {
+				headers = make(http.Header)
+			}
+			headers.Set("Retry-After", strconv.FormatInt(resetsIn.Int(), 10))
+		}
+	}
+
 	return statusErrWithHeaders{
-		statusErr: baseErr,
+		statusErr: se,
 		headers:   headers,
 	}, true
 }
@@ -1486,6 +1414,32 @@ func encodeCodexWebsocketAsSSE(payload []byte) []byte {
 	return line
 }
 
+func websocketUpgradeRequestLog(info helps.UpstreamRequestLog) helps.UpstreamRequestLog {
+	upgradeInfo := info
+	upgradeInfo.URL = helps.WebsocketUpgradeRequestURL(info.URL)
+	upgradeInfo.Method = http.MethodGet
+	upgradeInfo.Body = nil
+	upgradeInfo.Headers = info.Headers.Clone()
+	if upgradeInfo.Headers == nil {
+		upgradeInfo.Headers = make(http.Header)
+	}
+	if strings.TrimSpace(upgradeInfo.Headers.Get("Connection")) == "" {
+		upgradeInfo.Headers.Set("Connection", "Upgrade")
+	}
+	if strings.TrimSpace(upgradeInfo.Headers.Get("Upgrade")) == "" {
+		upgradeInfo.Headers.Set("Upgrade", "websocket")
+	}
+	return upgradeInfo
+}
+
+func recordAPIWebsocketHandshake(ctx context.Context, cfg *config.Config, resp *http.Response) {
+	if resp == nil {
+		return
+	}
+	helps.RecordAPIWebsocketHandshake(ctx, cfg, resp.StatusCode, resp.Header.Clone())
+	closeHTTPResponseBody(resp, "codex websockets executor: close handshake response body error")
+}
+
 func websocketHandshakeBody(resp *http.Response) []byte {
 	if resp == nil || resp.Body == nil {
 		return nil
@@ -1530,16 +1484,23 @@ func (e *CodexWebsocketsExecutor) getOrCreateSession(sessionID string) *codexWeb
 	if sessionID == "" {
 		return nil
 	}
-	e.sessMu.Lock()
-	defer e.sessMu.Unlock()
-	if e.sessions == nil {
-		e.sessions = make(map[string]*codexWebsocketSession)
+	if e == nil {
+		return nil
 	}
-	if sess, ok := e.sessions[sessionID]; ok && sess != nil {
+	store := e.store
+	if store == nil {
+		store = globalCodexWebsocketSessionStore
+	}
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if store.sessions == nil {
+		store.sessions = make(map[string]*codexWebsocketSession)
+	}
+	if sess, ok := store.sessions[sessionID]; ok && sess != nil {
 		return sess
 	}
 	sess := &codexWebsocketSession{sessionID: sessionID}
-	e.sessions[sessionID] = sess
+	store.sessions[sessionID] = sess
 	return sess
 }
 
@@ -1685,14 +1646,20 @@ func (e *CodexWebsocketsExecutor) CloseExecutionSession(sessionID string) {
 		return
 	}
 	if sessionID == cliproxyauth.CloseAllExecutionSessionsID {
-		e.closeAllExecutionSessions("executor_replaced")
+		// Executor replacement can happen during hot reload (config/credential changes).
+		// Do not force-close upstream websocket sessions here, otherwise in-flight
+		// downstream websocket requests get interrupted.
 		return
 	}
 
-	e.sessMu.Lock()
-	sess := e.sessions[sessionID]
-	delete(e.sessions, sessionID)
-	e.sessMu.Unlock()
+	store := e.store
+	if store == nil {
+		store = globalCodexWebsocketSessionStore
+	}
+	store.mu.Lock()
+	sess := store.sessions[sessionID]
+	delete(store.sessions, sessionID)
+	store.mu.Unlock()
 
 	e.closeExecutionSession(sess, "session_closed")
 }
@@ -1702,15 +1669,19 @@ func (e *CodexWebsocketsExecutor) closeAllExecutionSessions(reason string) {
 		return
 	}
 
-	e.sessMu.Lock()
-	sessions := make([]*codexWebsocketSession, 0, len(e.sessions))
-	for sessionID, sess := range e.sessions {
-		delete(e.sessions, sessionID)
+	store := e.store
+	if store == nil {
+		store = globalCodexWebsocketSessionStore
+	}
+	store.mu.Lock()
+	sessions := make([]*codexWebsocketSession, 0, len(store.sessions))
+	for sessionID, sess := range store.sessions {
+		delete(store.sessions, sessionID)
 		if sess != nil {
 			sessions = append(sessions, sess)
 		}
 	}
-	e.sessMu.Unlock()
+	store.mu.Unlock()
 
 	for i := range sessions {
 		e.closeExecutionSession(sessions[i], reason)
@@ -1718,6 +1689,10 @@ func (e *CodexWebsocketsExecutor) closeAllExecutionSessions(reason string) {
 }
 
 func (e *CodexWebsocketsExecutor) closeExecutionSession(sess *codexWebsocketSession, reason string) {
+	closeCodexWebsocketSession(sess, reason)
+}
+
+func closeCodexWebsocketSession(sess *codexWebsocketSession, reason string) {
 	if sess == nil {
 		return
 	}
@@ -1758,6 +1733,69 @@ func logCodexWebsocketDisconnected(sessionID string, authID string, wsURL string
 	log.Infof("codex websockets: upstream disconnected session=%s auth=%s url=%s reason=%s", strings.TrimSpace(sessionID), strings.TrimSpace(authID), strings.TrimSpace(wsURL), strings.TrimSpace(reason))
 }
 
+// CloseCodexWebsocketSessionsForAuthID closes all active Codex upstream websocket sessions
+// associated with the supplied auth ID.
+func CloseCodexWebsocketSessionsForAuthID(authID string, reason string) {
+	authID = strings.TrimSpace(authID)
+	if authID == "" {
+		return
+	}
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		reason = "auth_removed"
+	}
+
+	store := globalCodexWebsocketSessionStore
+	if store == nil {
+		return
+	}
+
+	type sessionItem struct {
+		sessionID string
+		sess      *codexWebsocketSession
+	}
+
+	store.mu.Lock()
+	items := make([]sessionItem, 0, len(store.sessions))
+	for sessionID, sess := range store.sessions {
+		items = append(items, sessionItem{sessionID: sessionID, sess: sess})
+	}
+	store.mu.Unlock()
+
+	matches := make([]sessionItem, 0)
+	for i := range items {
+		sess := items[i].sess
+		if sess == nil {
+			continue
+		}
+		sess.connMu.Lock()
+		sessAuthID := strings.TrimSpace(sess.authID)
+		sess.connMu.Unlock()
+		if sessAuthID == authID {
+			matches = append(matches, items[i])
+		}
+	}
+	if len(matches) == 0 {
+		return
+	}
+
+	toClose := make([]*codexWebsocketSession, 0, len(matches))
+	store.mu.Lock()
+	for i := range matches {
+		current, ok := store.sessions[matches[i].sessionID]
+		if !ok || current == nil || current != matches[i].sess {
+			continue
+		}
+		delete(store.sessions, matches[i].sessionID)
+		toClose = append(toClose, current)
+	}
+	store.mu.Unlock()
+
+	for i := range toClose {
+		closeCodexWebsocketSession(toClose[i], reason)
+	}
+}
+
 // CodexAutoExecutor routes Codex requests to the websocket transport only when:
 //  1. The downstream transport is websocket, and
 //  2. The selected auth enables websockets.
@@ -1766,10 +1804,6 @@ func logCodexWebsocketDisconnected(sessionID string, authID string, wsURL string
 type CodexAutoExecutor struct {
 	httpExec *CodexExecutor
 	wsExec   *CodexWebsocketsExecutor
-}
-
-func shouldUseCodexWebsocketExecutor(ctx context.Context, auth *cliproxyauth.Auth) bool {
-	return apihandlers.DownstreamWebsocketBridge(ctx) && codexWebsocketsEnabled(auth)
 }
 
 func NewCodexAutoExecutor(cfg *config.Config) *CodexAutoExecutor {
@@ -1837,5 +1871,94 @@ func (e *CodexAutoExecutor) CloseExecutionSession(sessionID string) {
 }
 
 func codexWebsocketsEnabled(auth *cliproxyauth.Auth) bool {
-	return auth != nil && auth.WebsocketsEnabled()
+	if auth == nil {
+		return false
+	}
+	if len(auth.Attributes) > 0 {
+		if raw := strings.TrimSpace(auth.Attributes["websockets"]); raw != "" {
+			parsed, errParse := strconv.ParseBool(raw)
+			if errParse == nil {
+				return parsed
+			}
+		}
+	}
+	if len(auth.Metadata) > 0 {
+		raw, ok := auth.Metadata["websockets"]
+		if ok && raw != nil {
+			switch v := raw.(type) {
+			case bool:
+				return v
+			case string:
+				parsed, errParse := strconv.ParseBool(strings.TrimSpace(v))
+				if errParse == nil {
+					return parsed
+				}
+			}
+		}
+		// OAuth codex credentials (those with an email in metadata) are
+		// websocket-capable by default.
+		if email, _ := auth.Metadata["email"].(string); strings.TrimSpace(email) != "" {
+			return true
+		}
+	}
+	return false
+}
+
+func shouldUseCodexWebsocketExecutor(ctx context.Context, auth *cliproxyauth.Auth) bool {
+	return apihandlers.DownstreamWebsocketBridge(ctx) && codexWebsocketsEnabled(auth)
+}
+
+func shouldEnrichCodexWebsocketBridgeFollowupRequest(ctx context.Context, executionSessionID string) bool {
+	if strings.TrimSpace(executionSessionID) == "" {
+		return false
+	}
+	return apihandlers.DownstreamWebsocketBridge(ctx)
+}
+
+func enrichCodexWebsocketBridgeFollowupRequest(body []byte, lastRequest []byte) []byte {
+	if len(body) == 0 || len(lastRequest) == 0 {
+		return body
+	}
+	if strings.TrimSpace(gjson.GetBytes(body, "previous_response_id").String()) == "" {
+		return body
+	}
+	enriched := bytes.Clone(body)
+	instructionsResult := gjson.GetBytes(enriched, "instructions")
+	if !instructionsResult.Exists() || strings.TrimSpace(instructionsResult.String()) == "" {
+		instructions := gjson.GetBytes(lastRequest, "instructions")
+		if instructions.Exists() && strings.TrimSpace(instructions.String()) != "" {
+			enriched, _ = sjson.SetRawBytes(enriched, "instructions", []byte(instructions.Raw))
+		}
+	}
+	if !gjson.GetBytes(enriched, "tools").Exists() {
+		tools := gjson.GetBytes(lastRequest, "tools")
+		if tools.Exists() {
+			enriched, _ = sjson.SetRawBytes(enriched, "tools", []byte(tools.Raw))
+		}
+	}
+	if !gjson.GetBytes(enriched, "tool_choice").Exists() {
+		toolChoice := gjson.GetBytes(lastRequest, "tool_choice")
+		if toolChoice.Exists() {
+			enriched, _ = sjson.SetRawBytes(enriched, "tool_choice", []byte(toolChoice.Raw))
+		}
+	}
+	return enriched
+}
+
+func resolveProxyPoolURLs(cfg *config.Config, auth *cliproxyauth.Auth) []string {
+	selection := proxyrouting.Resolve(cfg, auth)
+	if proxyURL := strings.TrimSpace(selection.ProxyURL); proxyURL != "" {
+		return util.OrderedProxyURLs(proxyURL)
+	}
+	return nil
+}
+
+func shouldRetryNextWebsocketProxy(err error, resp *http.Response) bool {
+	if err == nil {
+		return false
+	}
+	if resp != nil {
+		return false
+	}
+	return !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded)
 }

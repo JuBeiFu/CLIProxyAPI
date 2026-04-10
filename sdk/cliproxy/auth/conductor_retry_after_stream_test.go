@@ -20,9 +20,8 @@ func (e *testRetryAfterStatusErr) StatusCode() int            { return e.status 
 func (e *testRetryAfterStatusErr) RetryAfter() *time.Duration { return &e.retryAfter }
 
 func TestWrapStreamResult_PropagatesRetryAfterFromStreamError(t *testing.T) {
-	// Simulate "disable-cooling: true" where quota backoff would otherwise not
-	// schedule any cooldown without an explicit Retry-After hint.
-	SetQuotaCooldownDisabled(true)
+	// Ensure quota cooldown is enabled so that Retry-After propagates into NextRetryAfter.
+	SetQuotaCooldownDisabled(false)
 	defer SetQuotaCooldownDisabled(false)
 
 	ctx := context.Background()

@@ -18,6 +18,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/misc"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
+	"github.com/router-for-me/CLIProxyAPI/v6/sdk/proxyutil"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 
@@ -77,8 +78,11 @@ func (g *GeminiAuth) GetAuthenticatedClient(ctx context.Context, ts *GeminiToken
 	}
 	callbackURL := fmt.Sprintf("http://localhost:%d/oauth2callback", callbackPort)
 
-	// Configure proxy settings for the HTTP client if a proxy URL is provided.
-	if proxyClient := util.SetProxy(&cfg.SDKConfig, &http.Client{}); proxyClient != nil && proxyClient.Transport != nil {
+	transport, _, errBuild := proxyutil.BuildHTTPTransport(cfg.ProxyURL)
+	if errBuild != nil {
+		log.Errorf("%v", errBuild)
+	} else if transport != nil {
+		proxyClient := &http.Client{Transport: transport}
 		ctx = context.WithValue(ctx, oauth2.HTTPClient, proxyClient)
 	}
 

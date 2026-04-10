@@ -23,7 +23,7 @@ func TestConvertCodexResponseToOpenAI_StreamSetsModelFromResponseCreated(t *test
 		t.Fatalf("expected 1 chunk, got %d", len(out))
 	}
 
-	gotModel := gjson.Get(out[0], "model").String()
+	gotModel := gjson.GetBytes(out[0], "model").String()
 	if gotModel != modelName {
 		t.Fatalf("expected model %q, got %q", modelName, gotModel)
 	}
@@ -40,7 +40,7 @@ func TestConvertCodexResponseToOpenAI_FirstChunkUsesRequestModelName(t *testing.
 		t.Fatalf("expected 1 chunk, got %d", len(out))
 	}
 
-	gotModel := gjson.Get(out[0], "model").String()
+	gotModel := gjson.GetBytes(out[0], "model").String()
 	if gotModel != modelName {
 		t.Fatalf("expected model %q, got %q", modelName, gotModel)
 	}
@@ -64,17 +64,62 @@ func TestConvertCodexResponseToOpenAINonStreamFallsBackToAccumulatedStreamText(t
 
 	completed := []byte(`{"type":"response.completed","response":{"id":"resp_123","created_at":1700000000,"model":"gpt-5.4","status":"completed","output":[],"usage":{"input_tokens":7,"output_tokens":13,"total_tokens":20}}}`)
 	result := ConvertCodexResponseToOpenAINonStream(ctx, modelName, nil, nil, completed, &param)
-	if result == "" {
+	if len(result) == 0 {
 		t.Fatal("expected non-stream conversion output")
 	}
 
-	if got := gjson.Get(result, "choices.0.message.role").String(); got != "assistant" {
-		t.Fatalf("message.role = %q, want assistant; result=%s", got, result)
+	if got := gjson.GetBytes(result, "choices.0.message.role").String(); got != "assistant" {
+		t.Fatalf("message.role = %q, want assistant; result=%s", got, string(result))
 	}
-	if got := gjson.Get(result, "choices.0.message.content").String(); got != "hello world" {
-		t.Fatalf("message.content = %q, want hello world; result=%s", got, result)
+	if got := gjson.GetBytes(result, "choices.0.message.content").String(); got != "hello world" {
+		t.Fatalf("message.content = %q, want hello world; result=%s", got, string(result))
 	}
-	if got := gjson.Get(result, "choices.0.finish_reason").String(); got != "stop" {
-		t.Fatalf("finish_reason = %q, want stop; result=%s", got, result)
+	if got := gjson.GetBytes(result, "choices.0.finish_reason").String(); got != "stop" {
+		t.Fatalf("finish_reason = %q, want stop; result=%s", got, string(result))
+	}
+}
+
+func TestConvertCodexResponseToOpenAI_ToolCallChunkOmitsNullContentFields(t *testing.T) {
+	ctx := context.Background()
+	var param any
+
+	out := ConvertCodexResponseToOpenAI(ctx, "gpt-5.4", nil, nil, []byte(`data: {"type":"response.output_item.added","item":{"type":"function_call","call_id":"call_123","name":"websearch"}}`), &param)
+	if len(out) != 1 {
+		t.Fatalf("expected 1 chunk, got %d", len(out))
+	}
+
+	if gjson.GetBytes(out[0], "choices.0.delta.content").Exists() {
+		t.Fatalf("expected content to be omitted, got %s", string(out[0]))
+	}
+	if gjson.GetBytes(out[0], "choices.0.delta.reasoning_content").Exists() {
+		t.Fatalf("expected reasoning_content to be omitted, got %s", string(out[0]))
+	}
+	if !gjson.GetBytes(out[0], "choices.0.delta.tool_calls").Exists() {
+		t.Fatalf("expected tool_calls to exist, got %s", string(out[0]))
+	}
+}
+
+func TestConvertCodexResponseToOpenAI_ToolCallArgumentsDeltaOmitsNullContentFields(t *testing.T) {
+	ctx := context.Background()
+	var param any
+
+	out := ConvertCodexResponseToOpenAI(ctx, "gpt-5.4", nil, nil, []byte(`data: {"type":"response.output_item.added","item":{"type":"function_call","call_id":"call_123","name":"websearch"}}`), &param)
+	if len(out) != 1 {
+		t.Fatalf("expected tool call announcement chunk, got %d", len(out))
+	}
+
+	out = ConvertCodexResponseToOpenAI(ctx, "gpt-5.4", nil, nil, []byte(`data: {"type":"response.function_call_arguments.delta","delta":"{\"query\":\"OpenAI\"}"}`), &param)
+	if len(out) != 1 {
+		t.Fatalf("expected 1 chunk, got %d", len(out))
+	}
+
+	if gjson.GetBytes(out[0], "choices.0.delta.content").Exists() {
+		t.Fatalf("expected content to be omitted, got %s", string(out[0]))
+	}
+	if gjson.GetBytes(out[0], "choices.0.delta.reasoning_content").Exists() {
+		t.Fatalf("expected reasoning_content to be omitted, got %s", string(out[0]))
+	}
+	if !gjson.GetBytes(out[0], "choices.0.delta.tool_calls.0.function.arguments").Exists() {
+		t.Fatalf("expected tool call arguments delta to exist, got %s", string(out[0]))
 	}
 }
