@@ -55,10 +55,16 @@ func ValidateConfig(config ThinkingConfig, modelInfo *registry.ModelInfo, fromFo
 
 	// allowClampUnsupported determines whether to clamp unsupported levels instead of returning an error.
 	// This applies when crossing provider families (e.g., openai→gemini, claude→gemini) and the target
-	// model supports discrete levels. Same-family conversions require strict validation.
+	// model supports discrete levels. Same-family conversions remain strict except for xhigh, which is
+	// downgraded to high for OpenAI-family requests when the target model does not advertise xhigh support.
 	toCapability := detectModelCapability(modelInfo)
 	toHasLevelSupport := toCapability == CapabilityLevelOnly || toCapability == CapabilityHybrid
 	allowClampUnsupported := toHasLevelSupport && !isSameProviderFamily(fromFormat, toFormat)
+	allowClampXHighSameFamily := toHasLevelSupport &&
+		isSameProviderFamily(fromFormat, toFormat) &&
+		isOpenAIFamily(fromFormat) &&
+		config.Mode == ModeLevel &&
+		config.Level == LevelXHigh
 
 	// strictBudget determines whether to enforce strict budget range validation.
 	// This applies when: (1) config comes from request body (not suffix), (2) source format is known,
@@ -116,6 +122,8 @@ func ValidateConfig(config ThinkingConfig, modelInfo *registry.ModelInfo, fromFo
 	if len(support.Levels) > 0 && config.Mode == ModeLevel {
 		if !isLevelSupported(string(config.Level), support.Levels) {
 			if allowClampUnsupported {
+				config.Level = clampLevel(config.Level, modelInfo, toFormat)
+			} else if allowClampXHighSameFamily {
 				config.Level = clampLevel(config.Level, modelInfo, toFormat)
 			}
 			if !isLevelSupported(string(config.Level), support.Levels) {
