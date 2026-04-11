@@ -76,11 +76,11 @@ func TestShouldRetryAcrossAuths_DoesNotRetryTimeouts(t *testing.T) {
 	if shouldRetryAcrossAuths(&Error{HTTPStatus: http.StatusRequestTimeout, Message: "stream bootstrap timeout"}) {
 		t.Fatal("expected request timeout to stop cross-auth rotation")
 	}
-	if !shouldRetryAcrossAuths(&Error{HTTPStatus: http.StatusTooManyRequests, Message: "rate limited"}) {
-		t.Fatal("expected 429 to remain cross-auth retryable")
+	if shouldRetryAcrossAuths(&Error{HTTPStatus: http.StatusTooManyRequests, Message: "rate limited"}) {
+		t.Fatal("expected generic 429 to stop cross-auth rotation")
 	}
-	if !shouldRetryAcrossAuths(&Error{HTTPStatus: http.StatusBadGateway, Message: "bad gateway"}) {
-		t.Fatal("expected 502 to remain cross-auth retryable")
+	if shouldRetryAcrossAuths(&Error{HTTPStatus: http.StatusBadGateway, Message: "bad gateway"}) {
+		t.Fatal("expected generic 502 to stop cross-auth rotation")
 	}
 	if !shouldRetryAcrossAuths(&Error{HTTPStatus: http.StatusRequestTimeout, Message: "stream disconnected before completion"}) {
 		t.Fatal("expected stream disconnect to be cross-auth retryable")
@@ -1653,93 +1653,6 @@ func TestManager_ExecuteStream_DoesNotRetryAfterFirstPayloadOnDisconnect(t *test
 	}
 }
 
-func TestResolveGPT54FallbackModelName(t *testing.T) {
-	testCases := []struct {
-		model string
-		want  string
-	}{
-		{model: "gpt-5.4", want: "gpt-5.3-codex"},
-		{model: "gpt-5.4-high", want: "gpt-5.3-codex-high"},
-		{model: "gpt-5.4-low", want: "gpt-5.3-codex-low"},
-		{model: "gpt-5.4-xhigh", want: "gpt-5.3-codex-xhigh"},
-		{model: "gpt-5.4-openai-compact", want: "gpt-5.3-codex-openai-compact"},
-		{model: "GPT-5.4-OPENAI-COMPACT", want: "gpt-5.3-codex-openai-compact"},
-		{model: "gpt-5.3-codex", want: ""},
-	}
-
-	for _, tc := range testCases {
-		if got := resolveGPT54FallbackModelName(tc.model); got != tc.want {
-			t.Fatalf("resolveGPT54FallbackModelName(%q) = %q, want %q", tc.model, got, tc.want)
-		}
-	}
-}
-
-func TestShouldFallbackGPT54ByError(t *testing.T) {
-	testCases := []struct {
-		name string
-		err  error
-		want bool
-	}{
-		{
-			name: "stream_disconnected_help_center",
-			err:  errors.New("stream disconnected before completion: An error occurred while processing your request. You can retry your request, or contact us through our help center at help.openai.com if the error persists."),
-			want: false,
-		},
-		{
-			name: "model_at_capacity",
-			err:  errors.New("Selected model is at capacity."),
-			want: true,
-		},
-		{
-			name: "bootstrap_timeout_message",
-			err:  &Error{HTTPStatus: http.StatusRequestTimeout, Message: "stream_bootstrap_timeout: upstream stream timed out waiting for first payload after 30s"},
-			want: false,
-		},
-		{
-			name: "stream_connect_timeout_message",
-			err:  &Error{HTTPStatus: http.StatusRequestTimeout, Code: "stream_connect_timeout", Message: "upstream stream setup timed out after 30s"},
-			want: false,
-		},
-		{
-			name: "goaway_protocol_error",
-			err:  errors.New(`Post "https://chatgpt.com/backend-api/codex/responses": http2: server sent GOAWAY and closed the connection; LastStreamID=3623, ErrCode=PROTOCOL_ERROR, debug=""`),
-			want: false,
-		},
-		{
-			name: "error_sending_request_for_url",
-			err:  errors.New("stream disconnected before completion: error sending request for url (https://api.openai.com/v1/responses)"),
-			want: false,
-		},
-		{
-			name: "stream_closed_before_completed",
-			err:  errors.New("stream disconnected before completion: stream closed before response.completed"),
-			want: false,
-		},
-		{
-			name: "server_error_message",
-			err:  errors.New("HTTP 500 server_error: The server had an error processing your request."),
-			want: false,
-		},
-		{
-			name: "generic_disconnect_without_signature",
-			err:  errors.New("stream disconnected before completion"),
-			want: false,
-		},
-		{
-			name: "irrelevant_error",
-			err:  errors.New("dial tcp timeout"),
-			want: false,
-		},
-	}
-
-	for _, tc := range testCases {
-		got := shouldFallbackGPT54ByError(tc.err)
-		if got != tc.want {
-			t.Fatalf("%s: shouldFallbackGPT54ByError() = %v, want %v", tc.name, got, tc.want)
-		}
-	}
-}
-
 func TestShouldRetryAcrossAuthPool_DoesNotRotateOnStreamSetupTimeout(t *testing.T) {
 	testCases := []struct {
 		name string
@@ -1759,45 +1672,6 @@ func TestShouldRetryAcrossAuthPool_DoesNotRotateOnStreamSetupTimeout(t *testing.
 		if got := shouldRetryAcrossAuthPool(tc.err); got {
 			t.Fatalf("%s: shouldRetryAcrossAuthPool() = true, want false", tc.name)
 		}
-	}
-}
-
-func TestManager_Execute_GPT54FallbackToGPT53Codex(t *testing.T) {
-	prevDelay := sameAuthRetryDelayFunc
-	sameAuthRetryDelayFunc = func() time.Duration { return 0 }
-	t.Cleanup(func() { sameAuthRetryDelayFunc = prevDelay })
-
-	m := NewManager(nil, nil, nil)
-	m.SetRetryConfig(0, 30*time.Second, 0)
-	executor := &sameAuthRetryExecutor{
-		id:  "codex",
-		err: &Error{HTTPStatus: http.StatusTooManyRequests, Message: "Selected model is at capacity."},
-	}
-	m.RegisterExecutor(executor)
-
-	authID := uuid.NewString() + "-auth"
-	if _, err := m.Register(context.Background(), &Auth{ID: authID, Provider: "codex", Status: StatusActive}); err != nil {
-		t.Fatalf("register auth: %v", err)
-	}
-
-	reg := registry.GetGlobalRegistry()
-	reg.RegisterClient(authID, "codex", []*registry.ModelInfo{{ID: "gpt-5.4-high"}, {ID: "gpt-5.3-codex-high"}, {ID: "gpt-5.3-codex"}})
-	t.Cleanup(func() { reg.UnregisterClient(authID) })
-
-	_, err := m.Execute(context.Background(), []string{"codex"}, cliproxyexecutor.Request{Model: "gpt-5.4-high"}, cliproxyexecutor.Options{})
-	if err == nil {
-		t.Fatal("expected fallback error")
-	}
-
-	models := executor.Models()
-	if len(models) < 2 {
-		t.Fatalf("expected at least 2 attempts, got %d", len(models))
-	}
-	if models[0] != "gpt-5.4-high" {
-		t.Fatalf("first model = %q, want %q", models[0], "gpt-5.4-high")
-	}
-	if models[1] != "gpt-5.3-codex-high" {
-		t.Fatalf("second model = %q, want %q", models[1], "gpt-5.3-codex-high")
 	}
 }
 
@@ -1839,87 +1713,6 @@ func TestManager_Execute_GPT54DoesNotFallbackToGPT53Codex_OnLongStreamDisconnect
 	}
 }
 
-func TestManager_Execute_GPT54FallbackToGPT53Codex_OnWrappedCapacityError(t *testing.T) {
-	prevDelay := sameAuthRetryDelayFunc
-	sameAuthRetryDelayFunc = func() time.Duration { return 0 }
-	t.Cleanup(func() { sameAuthRetryDelayFunc = prevDelay })
-
-	m := NewManager(nil, nil, nil)
-	m.SetRetryConfig(0, 30*time.Second, 0)
-	executor := &sameAuthRetryExecutor{
-		id:  "codex",
-		err: errors.New("do request failed: upstream error: do request failed: Selected model is at capacity."),
-	}
-	m.RegisterExecutor(executor)
-
-	authID := uuid.NewString() + "-auth"
-	if _, err := m.Register(context.Background(), &Auth{ID: authID, Provider: "codex", Status: StatusActive}); err != nil {
-		t.Fatalf("register auth: %v", err)
-	}
-
-	reg := registry.GetGlobalRegistry()
-	reg.RegisterClient(authID, "codex", []*registry.ModelInfo{{ID: "gpt-5.4"}, {ID: "gpt-5.3-codex"}})
-	t.Cleanup(func() { reg.UnregisterClient(authID) })
-
-	_, err := m.Execute(context.Background(), []string{"codex"}, cliproxyexecutor.Request{Model: "gpt-5.4"}, cliproxyexecutor.Options{})
-	if err == nil {
-		t.Fatal("expected fallback error")
-	}
-
-	models := executor.Models()
-	if len(models) < 2 {
-		t.Fatalf("expected at least 2 attempts, got %d", len(models))
-	}
-	if models[0] != "gpt-5.4" {
-		t.Fatalf("first model = %q, want %q", models[0], "gpt-5.4")
-	}
-	if models[1] != "gpt-5.3-codex" {
-		t.Fatalf("second model = %q, want %q", models[1], "gpt-5.3-codex")
-	}
-}
-
-func TestManager_Execute_GPT54FallbackVariantDowngradeToBaseOnNoModel(t *testing.T) {
-	prevDelay := sameAuthRetryDelayFunc
-	sameAuthRetryDelayFunc = func() time.Duration { return 0 }
-	t.Cleanup(func() { sameAuthRetryDelayFunc = prevDelay })
-
-	m := NewManager(nil, nil, nil)
-	m.SetRetryConfig(0, 30*time.Second, 0)
-	executor := &sameAuthRetryExecutor{
-		id:  "codex",
-		err: &Error{HTTPStatus: http.StatusTooManyRequests, Message: "Selected model is at capacity."},
-	}
-	m.RegisterExecutor(executor)
-
-	authID := uuid.NewString() + "-auth"
-	if _, err := m.Register(context.Background(), &Auth{ID: authID, Provider: "codex", Status: StatusActive}); err != nil {
-		t.Fatalf("register auth: %v", err)
-	}
-
-	reg := registry.GetGlobalRegistry()
-	reg.RegisterClient(authID, "codex", []*registry.ModelInfo{{ID: "gpt-5.4-xhigh"}, {ID: "gpt-5.3-codex"}})
-	t.Cleanup(func() { reg.UnregisterClient(authID) })
-
-	_, err := m.Execute(context.Background(), []string{"codex"}, cliproxyexecutor.Request{Model: "gpt-5.4-xhigh"}, cliproxyexecutor.Options{})
-	if err == nil {
-		t.Fatal("expected fallback error")
-	}
-
-	models := executor.Models()
-	if len(models) < 2 {
-		t.Fatalf("expected at least 2 attempts (primary -> base/variant fallback), got %d", len(models))
-	}
-	if models[0] != "gpt-5.4-xhigh" {
-		t.Fatalf("first model = %q, want %q", models[0], "gpt-5.4-xhigh")
-	}
-	if models[len(models)-1] != "gpt-5.3-codex" {
-		t.Fatalf("last model = %q, want %q", models[len(models)-1], "gpt-5.3-codex")
-	}
-	if len(models) >= 3 && models[1] != "gpt-5.3-codex-xhigh" {
-		t.Fatalf("second model = %q, want %q when variant attempt exists", models[1], "gpt-5.3-codex-xhigh")
-	}
-}
-
 func newGPT54FallbackMockManager(t *testing.T, execErr error, models []string) (*Manager, *sameAuthRetryExecutor) {
 	t.Helper()
 
@@ -1947,19 +1740,6 @@ func newGPT54FallbackMockManager(t *testing.T, execErr error, models []string) (
 	return m, executor
 }
 
-func assertFallbackFirstSecondModel(t *testing.T, models []string, first string, second string) {
-	t.Helper()
-	if len(models) < 2 {
-		t.Fatalf("expected at least 2 attempts, got %d", len(models))
-	}
-	if models[0] != first {
-		t.Fatalf("first model = %q, want %q", models[0], first)
-	}
-	if models[1] != second {
-		t.Fatalf("second model = %q, want %q", models[1], second)
-	}
-}
-
 func TestManager_Execute_GPT54DoesNotFallbackToGPT53Codex_OnBootstrapTimeoutError(t *testing.T) {
 	prevDelay := sameAuthRetryDelayFunc
 	sameAuthRetryDelayFunc = func() time.Duration { return 0 }
@@ -1984,47 +1764,40 @@ func TestManager_Execute_GPT54DoesNotFallbackToGPT53Codex_OnBootstrapTimeoutErro
 	}
 }
 
-func TestManager_ExecuteCount_GPT54FallbackToGPT53Codex_OnlyOnCapacityError(t *testing.T) {
+func TestManager_ExecuteCount_GPT54DoesNotFallbackToGPT53Codex(t *testing.T) {
 	prevDelay := sameAuthRetryDelayFunc
 	sameAuthRetryDelayFunc = func() time.Duration { return 0 }
 	t.Cleanup(func() { sameAuthRetryDelayFunc = prevDelay })
 
 	testCases := []struct {
-		name         string
-		err          error
-		wantFallback bool
+		name string
+		err  error
 	}{
 		{
 			name: "long_stream_disconnect",
 			err: errors.New("do request failed: upstream error: do request failed: stream disconnected before completion: " +
 				"An error occurred while processing your request. You can retry your request, or contact us through our help center at help.openai.com if the error persists. " +
 				"Please include the request ID 4730fdb2-d1a8-4496-b1f9-a271b42b9a3e in your message."),
-			wantFallback: false,
 		},
 		{
-			name:         "selected_model_capacity",
-			err:          errors.New("do request failed: upstream error: do request failed: Selected model is at capacity."),
-			wantFallback: true,
+			name: "selected_model_capacity",
+			err:  errors.New("do request failed: upstream error: do request failed: Selected model is at capacity."),
 		},
 		{
-			name:         "goaway_protocol_error",
-			err:          errors.New(`do request failed: upstream error: do request failed: Post "https://chatgpt.com/backend-api/codex/responses": http2: server sent GOAWAY and closed the connection; LastStreamID=3623, ErrCode=PROTOCOL_ERROR, debug=""`),
-			wantFallback: false,
+			name: "goaway_protocol_error",
+			err:  errors.New(`do request failed: upstream error: do request failed: Post "https://chatgpt.com/backend-api/codex/responses": http2: server sent GOAWAY and closed the connection; LastStreamID=3623, ErrCode=PROTOCOL_ERROR, debug=""`),
 		},
 		{
-			name:         "error_sending_request_for_url",
-			err:          errors.New("do request failed: upstream error: do request failed: stream disconnected before completion: error sending request for url (https://api.openai.com/v1/responses)"),
-			wantFallback: false,
+			name: "error_sending_request_for_url",
+			err:  errors.New("do request failed: upstream error: do request failed: stream disconnected before completion: error sending request for url (https://api.openai.com/v1/responses)"),
 		},
 		{
-			name:         "stream_closed_before_completed",
-			err:          errors.New("do request failed: upstream error: do request failed: stream disconnected before completion: stream closed before response.completed"),
-			wantFallback: false,
+			name: "stream_closed_before_completed",
+			err:  errors.New("do request failed: upstream error: do request failed: stream disconnected before completion: stream closed before response.completed"),
 		},
 		{
-			name:         "server_error_message",
-			err:          errors.New("HTTP 500 server_error: The server had an error processing your request."),
-			wantFallback: false,
+			name: "server_error_message",
+			err:  errors.New("HTTP 500 server_error: The server had an error processing your request."),
 		},
 	}
 
@@ -2038,10 +1811,6 @@ func TestManager_ExecuteCount_GPT54FallbackToGPT53Codex_OnlyOnCapacityError(t *t
 				t.Fatal("expected error")
 			}
 			models := executor.Models()
-			if tc.wantFallback {
-				assertFallbackFirstSecondModel(t, models, "gpt-5.4", "gpt-5.3-codex")
-				return
-			}
 			if len(models) != 1 {
 				t.Fatalf("expected no fallback attempt, got models %v", models)
 			}
@@ -2052,47 +1821,40 @@ func TestManager_ExecuteCount_GPT54FallbackToGPT53Codex_OnlyOnCapacityError(t *t
 	}
 }
 
-func TestManager_ExecuteStream_GPT54FallbackToGPT53Codex_OnlyOnCapacityError(t *testing.T) {
+func TestManager_ExecuteStream_GPT54DoesNotFallbackToGPT53Codex(t *testing.T) {
 	prevDelay := sameAuthRetryDelayFunc
 	sameAuthRetryDelayFunc = func() time.Duration { return 0 }
 	t.Cleanup(func() { sameAuthRetryDelayFunc = prevDelay })
 
 	testCases := []struct {
-		name         string
-		err          error
-		wantFallback bool
+		name string
+		err  error
 	}{
 		{
 			name: "long_stream_disconnect",
 			err: errors.New("do request failed: upstream error: do request failed: stream disconnected before completion: " +
 				"An error occurred while processing your request. You can retry your request, or contact us through our help center at help.openai.com if the error persists. " +
 				"Please include the request ID 4730fdb2-d1a8-4496-b1f9-a271b42b9a3e in your message."),
-			wantFallback: false,
 		},
 		{
-			name:         "selected_model_capacity",
-			err:          errors.New("do request failed: upstream error: do request failed: Selected model is at capacity."),
-			wantFallback: true,
+			name: "selected_model_capacity",
+			err:  errors.New("do request failed: upstream error: do request failed: Selected model is at capacity."),
 		},
 		{
-			name:         "goaway_protocol_error",
-			err:          errors.New(`do request failed: upstream error: do request failed: Post "https://chatgpt.com/backend-api/codex/responses": http2: server sent GOAWAY and closed the connection; LastStreamID=3623, ErrCode=PROTOCOL_ERROR, debug=""`),
-			wantFallback: false,
+			name: "goaway_protocol_error",
+			err:  errors.New(`do request failed: upstream error: do request failed: Post "https://chatgpt.com/backend-api/codex/responses": http2: server sent GOAWAY and closed the connection; LastStreamID=3623, ErrCode=PROTOCOL_ERROR, debug=""`),
 		},
 		{
-			name:         "error_sending_request_for_url",
-			err:          errors.New("do request failed: upstream error: do request failed: stream disconnected before completion: error sending request for url (https://api.openai.com/v1/responses)"),
-			wantFallback: false,
+			name: "error_sending_request_for_url",
+			err:  errors.New("do request failed: upstream error: do request failed: stream disconnected before completion: error sending request for url (https://api.openai.com/v1/responses)"),
 		},
 		{
-			name:         "stream_closed_before_completed",
-			err:          errors.New("do request failed: upstream error: do request failed: stream disconnected before completion: stream closed before response.completed"),
-			wantFallback: false,
+			name: "stream_closed_before_completed",
+			err:  errors.New("do request failed: upstream error: do request failed: stream disconnected before completion: stream closed before response.completed"),
 		},
 		{
-			name:         "server_error_message",
-			err:          errors.New("HTTP 500 server_error: The server had an error processing your request."),
-			wantFallback: false,
+			name: "server_error_message",
+			err:  errors.New("HTTP 500 server_error: The server had an error processing your request."),
 		},
 	}
 
@@ -2106,10 +1868,6 @@ func TestManager_ExecuteStream_GPT54FallbackToGPT53Codex_OnlyOnCapacityError(t *
 				t.Fatal("expected error")
 			}
 			models := executor.Models()
-			if tc.wantFallback {
-				assertFallbackFirstSecondModel(t, models, "gpt-5.4", "gpt-5.3-codex")
-				return
-			}
 			if len(models) != 1 {
 				t.Fatalf("expected no fallback attempt, got models %v", models)
 			}

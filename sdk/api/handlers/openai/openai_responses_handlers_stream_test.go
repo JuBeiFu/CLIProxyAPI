@@ -97,6 +97,26 @@ func TestForwardResponsesStreamPreservesValidFullSSEEventChunks(t *testing.T) {
 	}
 }
 
+func TestForwardResponsesStreamCompletedDoesNotAppendDoneMarker(t *testing.T) {
+	h, recorder, c, flusher := newResponsesStreamTestHandler(t)
+
+	data := make(chan []byte, 1)
+	errs := make(chan *interfaces.ErrorMessage)
+	data <- []byte("event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-1\",\"output\":[]}}\n\n")
+	close(data)
+	close(errs)
+
+	h.forwardResponsesStream(c, flusher, func(error) {}, data, errs, nil)
+
+	body := recorder.Body.String()
+	if strings.Contains(body, "data: [DONE]") {
+		t.Fatalf("responses stream must terminate on response.completed without [DONE]: %q", body)
+	}
+	if !strings.Contains(body, "\"type\":\"response.completed\"") {
+		t.Fatalf("expected completed event in body: %q", body)
+	}
+}
+
 func TestForwardResponsesStreamBuffersSplitDataPayloadChunks(t *testing.T) {
 	h, recorder, c, flusher := newResponsesStreamTestHandler(t)
 

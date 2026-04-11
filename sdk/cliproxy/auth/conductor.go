@@ -107,23 +107,20 @@ const (
 	freeAuthExpiryDrainDelay      = 100 * time.Millisecond
 	slowRequestWindowDefault      = 5 * time.Minute
 	slowRequestCooldownDefault    = 5 * time.Minute
-	gpt54ModelPrefix              = "gpt-5.4"
-	gpt53CodexModelPrefix         = "gpt-5.3-codex"
-	fallbackRetryableErrorCode    = "fallback_retryable"
 )
 
 const (
-	metadataQuotaProbeLastKey        = "cliproxy_quota_probe_last"
-	metadataQuotaProbeAfterKey       = "cliproxy_quota_probe_after"
-	metadataAutoDisabledReasonKey    = "cliproxy_auto_disabled_reason"
-	autoDisabledReasonQuotaExhausted = "quota_exhausted"
+	metadataQuotaProbeLastKey         = "cliproxy_quota_probe_last"
+	metadataQuotaProbeAfterKey        = "cliproxy_quota_probe_after"
+	metadataAutoDisabledReasonKey     = "cliproxy_auto_disabled_reason"
+	autoDisabledReasonQuotaExhausted  = "quota_exhausted"
 	autoDisabledReasonQuotaLowBalance = "quota_low_balance"
-	metadataFreeFirstUsedAtKey       = "cliproxy_free_first_used_at"
-	metadataLastUsedAtKey            = "cliproxy_last_used_at"
-	metadataCodexUsageLastKey        = "cliproxy_codex_usage_last"
-	metadataCodexUsageAfterKey       = "cliproxy_codex_usage_after"
-	metadataCodexUsagePayloadKey     = "cliproxy_codex_usage_payload"
-	metadataCodexUsageRemainingKey   = "cliproxy_codex_usage_remaining_percent"
+	metadataFreeFirstUsedAtKey        = "cliproxy_free_first_used_at"
+	metadataLastUsedAtKey             = "cliproxy_last_used_at"
+	metadataCodexUsageLastKey         = "cliproxy_codex_usage_last"
+	metadataCodexUsageAfterKey        = "cliproxy_codex_usage_after"
+	metadataCodexUsagePayloadKey      = "cliproxy_codex_usage_payload"
+	metadataCodexUsageRemainingKey    = "cliproxy_codex_usage_remaining_percent"
 )
 
 var quotaCooldownDisabled atomic.Bool
@@ -860,38 +857,6 @@ func setRequestedModelMetadata(opts cliproxyexecutor.Options, model string) clip
 	return cloned
 }
 
-func resolveGPT54FallbackModelName(model string) string {
-	normalized := strings.ToLower(strings.TrimSpace(canonicalModelKey(model)))
-	if normalized == "" || !strings.HasPrefix(normalized, gpt54ModelPrefix) {
-		return ""
-	}
-	return gpt53CodexModelPrefix + strings.TrimPrefix(normalized, gpt54ModelPrefix)
-}
-
-func shouldFallbackGPT54ByError(err error) bool {
-	if err == nil {
-		return false
-	}
-	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-		return false
-	}
-	message := strings.ToLower(strings.TrimSpace(err.Error()))
-	if message == "" {
-		return false
-	}
-	return strings.Contains(message, "selected model is at capacity")
-}
-
-func shouldFallbackToGPT53Codex(model string, provider string, err error) bool {
-	if strings.ToLower(strings.TrimSpace(provider)) != "codex" {
-		return false
-	}
-	if resolveGPT54FallbackModelName(model) == "" {
-		return false
-	}
-	return shouldFallbackGPT54ByError(err)
-}
-
 func shouldAbortRetryLoop(ctx context.Context, err error) error {
 	if ctx != nil {
 		if errCtx := ctx.Err(); errCtx != nil {
@@ -912,93 +877,6 @@ func shouldAbortRetryLoop(ctx context.Context, err error) error {
 		return err
 	}
 	return nil
-}
-
-func shouldTreatAsNoAvailableModel(err error) bool {
-	if err == nil {
-		return false
-	}
-	if _, ok := errors.AsType[*modelCooldownError](err); ok {
-		return true
-	}
-	if authErr, ok := errors.AsType[*Error](err); ok && authErr != nil {
-		code := strings.ToLower(strings.TrimSpace(authErr.Code))
-		if code == "auth_not_found" || code == "provider_not_found" {
-			return true
-		}
-	}
-	message := strings.ToLower(strings.TrimSpace(err.Error()))
-	if message == "" {
-		return false
-	}
-	return strings.Contains(message, "no upstream model available") ||
-		strings.Contains(message, "no auth available")
-}
-
-func withGPT53CodexFallbackSkipRegistry(opts cliproxyexecutor.Options) cliproxyexecutor.Options {
-	cloned := cloneExecutionOptions(opts)
-	if len(cloned.Metadata) == 0 {
-		cloned.Metadata = map[string]any{}
-	}
-	cloned.Metadata[cliproxyexecutor.SkipModelRegistryCheckMetadataKey] = true
-	return cloned
-}
-
-func downgradeGPT53CodexVariantToBase(model string) string {
-	normalized := strings.ToLower(strings.TrimSpace(canonicalModelKey(model)))
-	if strings.HasPrefix(normalized, gpt53CodexModelPrefix+"-") {
-		return gpt53CodexModelPrefix
-	}
-	return normalized
-}
-
-func shouldFallbackGPT53VariantToBase(currentModel string, err error) bool {
-	current := strings.ToLower(strings.TrimSpace(canonicalModelKey(currentModel)))
-	if !strings.HasPrefix(current, gpt53CodexModelPrefix+"-") {
-		return false
-	}
-	return shouldTreatAsNoAvailableModel(err)
-}
-
-func registryIndicatesModelUnavailable(authID string, model string) bool {
-	authID = strings.TrimSpace(authID)
-	model = strings.TrimSpace(canonicalModelKey(model))
-	if authID == "" || model == "" {
-		return false
-	}
-	reg := registry.GetGlobalRegistry()
-	if reg == nil {
-		return false
-	}
-	knownModels := reg.GetModelsForClient(authID)
-	if len(knownModels) == 0 {
-		return false
-	}
-	return !reg.ClientSupportsModel(authID, model)
-}
-
-func sanitizeResultForFallbackRetry(result Result) Result {
-	sanitized := result
-	sanitized.RetryAfter = nil
-	if sanitized.Error == nil {
-		sanitized.Error = &Error{Code: fallbackRetryableErrorCode, Retryable: true}
-		return sanitized
-	}
-	if sanitized.Error.Code == "" {
-		sanitized.Error.Code = fallbackRetryableErrorCode
-	} else {
-		sanitized.Error.Code = fallbackRetryableErrorCode + "_" + sanitized.Error.Code
-	}
-	sanitized.Error.HTTPStatus = 0
-	sanitized.Error.Retryable = true
-	return sanitized
-}
-
-func adjustResultForPotentialGPT54Fallback(provider, model string, execErr error, result Result) Result {
-	if !shouldFallbackToGPT53Codex(model, provider, execErr) {
-		return result
-	}
-	return sanitizeResultForFallbackRetry(result)
 }
 
 func (m *Manager) executionModelCandidates(auth *Auth, routeModel string) []string {
@@ -1899,23 +1777,11 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 	tried := make(map[string]struct{})
 	countedTried := make(map[string]struct{})
 	var lastErr error
-	fallbackActive := false
-	fallbackRouteModel := ""
-	fallbackVariantNoModel := false
-	fallbackVariantAuthAttempts := 0
-	fallbackVariantTried := make(map[string]struct{})
-	fallbackVariantCountedTried := make(map[string]struct{})
 	for {
 		currentRouteModel := routeModel
 		currentOpts := opts
 		currentTried := tried
 		currentCountedTried := countedTried
-		if fallbackActive {
-			currentRouteModel = fallbackRouteModel
-			currentOpts = setRequestedModelMetadata(opts, fallbackRouteModel)
-			currentTried = fallbackVariantTried
-			currentCountedTried = fallbackVariantCountedTried
-		}
 		if maxRetryCredentials > 0 && len(currentCountedTried) >= maxRetryCredentials {
 			if lastErr != nil {
 				return cliproxyexecutor.Response{}, lastErr
@@ -1928,35 +1794,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 				if cooldownErr := m.triedModelCooldownError(currentTried, providers, currentRouteModel); cooldownErr != nil {
 					return cliproxyexecutor.Response{}, cooldownErr
 				}
-				if fallbackActive && shouldFallbackGPT53VariantToBase(currentRouteModel, lastErr) {
-					baseModel := downgradeGPT53CodexVariantToBase(currentRouteModel)
-					if baseModel != "" && !strings.EqualFold(baseModel, currentRouteModel) {
-						entry := logEntryWithRequestID(ctx)
-						entry.Infof("fallback model %s has no available channel, retrying with base model %s", currentRouteModel, baseModel)
-						fallbackRouteModel = baseModel
-						opts = withGPT53CodexFallbackSkipRegistry(setRequestedModelMetadata(opts, baseModel))
-						fallbackVariantNoModel = false
-						fallbackVariantAuthAttempts = 0
-						fallbackVariantTried = make(map[string]struct{})
-						fallbackVariantCountedTried = make(map[string]struct{})
-						continue
-					}
-				}
 				return cliproxyexecutor.Response{}, lastErr
-			}
-			if fallbackActive && shouldFallbackGPT53VariantToBase(currentRouteModel, errPick) {
-				baseModel := downgradeGPT53CodexVariantToBase(currentRouteModel)
-				if baseModel != "" && !strings.EqualFold(baseModel, currentRouteModel) {
-					entry := logEntryWithRequestID(ctx)
-					entry.Infof("fallback model %s has no available channel, retrying with base model %s", currentRouteModel, baseModel)
-					fallbackRouteModel = baseModel
-					opts = withGPT53CodexFallbackSkipRegistry(setRequestedModelMetadata(opts, baseModel))
-					fallbackVariantNoModel = false
-					fallbackVariantAuthAttempts = 0
-					fallbackVariantTried = make(map[string]struct{})
-					fallbackVariantCountedTried = make(map[string]struct{})
-					continue
-				}
 			}
 			if lastErr != nil {
 				return cliproxyexecutor.Response{}, lastErr
@@ -1983,22 +1821,6 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 
 		entry := logEntryWithRequestID(ctx)
 		debugLogAuthSelection(entry, auth, provider, currentRouteModel)
-		if fallbackActive && strings.HasPrefix(strings.ToLower(strings.TrimSpace(canonicalModelKey(currentRouteModel))), gpt53CodexModelPrefix+"-") {
-			if registryIndicatesModelUnavailable(auth.ID, currentRouteModel) {
-				baseModel := downgradeGPT53CodexVariantToBase(currentRouteModel)
-				if baseModel != "" && !strings.EqualFold(baseModel, currentRouteModel) {
-					entry.Infof("fallback model %s not registered for auth, retrying with base model %s", currentRouteModel, baseModel)
-					fallbackRouteModel = baseModel
-					opts = withGPT53CodexFallbackSkipRegistry(setRequestedModelMetadata(opts, baseModel))
-					fallbackVariantNoModel = false
-					fallbackVariantAuthAttempts = 0
-					fallbackVariantTried = make(map[string]struct{})
-					fallbackVariantCountedTried = make(map[string]struct{})
-					releaseSlot()
-					continue
-				}
-			}
-		}
 		publishSelectedAuthMetadata(currentOpts.Metadata, auth.ID)
 		m.bindExecutionSessionAuth(executionSessionIDFromMetadata(currentOpts.Metadata), auth.ID)
 
@@ -2088,7 +1910,6 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 						}
 					}
 
-					result = adjustResultForPotentialGPT54Fallback(provider, currentRouteModel, errExec, result)
 					m.recordResult(execCtx, result)
 					if isRequestInvalidError(errExec) {
 						releaseSlot()
@@ -2101,22 +1922,6 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 						return cliproxyexecutor.Response{}, abortErr
 					}
 					sameAuthRetries = transientSameAuthRetryBudget(auth, errExec)
-					if shouldFallbackToGPT53Codex(currentRouteModel, provider, errExec) {
-						fallbackModel := resolveGPT54FallbackModelName(currentRouteModel)
-						if fallbackModel != "" && !strings.EqualFold(fallbackModel, currentRouteModel) {
-							entry := logEntryWithRequestID(execCtx)
-							entry.Infof("stream disconnected detected on gpt-5.4, retrying with fallback model %s", fallbackModel)
-							fallbackActive = true
-							fallbackRouteModel = fallbackModel
-							opts = withGPT53CodexFallbackSkipRegistry(setRequestedModelMetadata(opts, fallbackModel))
-							fallbackVariantNoModel = false
-							fallbackVariantAuthAttempts = 0
-							fallbackVariantTried = make(map[string]struct{})
-							fallbackVariantCountedTried = make(map[string]struct{})
-							releaseSlot()
-							goto nextExecuteAttempt
-						}
-					}
 					if restrictionErr == nil && shouldRetryAcrossAuths(errExec) {
 						restrictionErr = errExec
 					}
@@ -2135,27 +1940,6 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			}
 			if restrictionErr != nil {
 				lastErr = restrictionErr
-				if fallbackActive {
-					if shouldTreatAsNoAvailableModel(restrictionErr) {
-						fallbackVariantNoModel = true
-					}
-					fallbackVariantAuthAttempts++
-					if shouldFallbackGPT53VariantToBase(currentRouteModel, restrictionErr) || (fallbackVariantNoModel && fallbackVariantAuthAttempts > 0) {
-						baseModel := downgradeGPT53CodexVariantToBase(currentRouteModel)
-						if baseModel != "" && !strings.EqualFold(baseModel, currentRouteModel) {
-							entry := logEntryWithRequestID(execCtx)
-							entry.Infof("fallback model %s has no available channel, retrying with base model %s", currentRouteModel, baseModel)
-							fallbackRouteModel = baseModel
-							opts = withGPT53CodexFallbackSkipRegistry(setRequestedModelMetadata(opts, baseModel))
-							fallbackVariantNoModel = false
-							fallbackVariantAuthAttempts = 0
-							fallbackVariantTried = make(map[string]struct{})
-							fallbackVariantCountedTried = make(map[string]struct{})
-							releaseSlot()
-							goto nextExecuteAttempt
-						}
-					}
-				}
 				break
 			}
 			lastErr = authErr
@@ -2192,23 +1976,11 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 	tried := make(map[string]struct{})
 	countedTried := make(map[string]struct{})
 	var lastErr error
-	fallbackActive := false
-	fallbackRouteModel := ""
-	fallbackVariantNoModel := false
-	fallbackVariantAuthAttempts := 0
-	fallbackVariantTried := make(map[string]struct{})
-	fallbackVariantCountedTried := make(map[string]struct{})
 	for {
 		currentRouteModel := routeModel
 		currentOpts := opts
 		currentTried := tried
 		currentCountedTried := countedTried
-		if fallbackActive {
-			currentRouteModel = fallbackRouteModel
-			currentOpts = setRequestedModelMetadata(opts, fallbackRouteModel)
-			currentTried = fallbackVariantTried
-			currentCountedTried = fallbackVariantCountedTried
-		}
 		if maxRetryCredentials > 0 && len(currentCountedTried) >= maxRetryCredentials {
 			if lastErr != nil {
 				return cliproxyexecutor.Response{}, lastErr
@@ -2221,35 +1993,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 				if cooldownErr := m.triedModelCooldownError(currentTried, providers, currentRouteModel); cooldownErr != nil {
 					return cliproxyexecutor.Response{}, cooldownErr
 				}
-				if fallbackActive && shouldFallbackGPT53VariantToBase(currentRouteModel, lastErr) {
-					baseModel := downgradeGPT53CodexVariantToBase(currentRouteModel)
-					if baseModel != "" && !strings.EqualFold(baseModel, currentRouteModel) {
-						entry := logEntryWithRequestID(ctx)
-						entry.Infof("fallback model %s has no available channel, retrying with base model %s", currentRouteModel, baseModel)
-						fallbackRouteModel = baseModel
-						opts = withGPT53CodexFallbackSkipRegistry(setRequestedModelMetadata(opts, baseModel))
-						fallbackVariantNoModel = false
-						fallbackVariantAuthAttempts = 0
-						fallbackVariantTried = make(map[string]struct{})
-						fallbackVariantCountedTried = make(map[string]struct{})
-						continue
-					}
-				}
 				return cliproxyexecutor.Response{}, lastErr
-			}
-			if fallbackActive && shouldFallbackGPT53VariantToBase(currentRouteModel, errPick) {
-				baseModel := downgradeGPT53CodexVariantToBase(currentRouteModel)
-				if baseModel != "" && !strings.EqualFold(baseModel, currentRouteModel) {
-					entry := logEntryWithRequestID(ctx)
-					entry.Infof("fallback model %s has no available channel, retrying with base model %s", currentRouteModel, baseModel)
-					fallbackRouteModel = baseModel
-					opts = withGPT53CodexFallbackSkipRegistry(setRequestedModelMetadata(opts, baseModel))
-					fallbackVariantNoModel = false
-					fallbackVariantAuthAttempts = 0
-					fallbackVariantTried = make(map[string]struct{})
-					fallbackVariantCountedTried = make(map[string]struct{})
-					continue
-				}
 			}
 			if lastErr != nil {
 				return cliproxyexecutor.Response{}, lastErr
@@ -2276,22 +2020,6 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 
 		entry := logEntryWithRequestID(ctx)
 		debugLogAuthSelection(entry, auth, provider, currentRouteModel)
-		if fallbackActive && strings.HasPrefix(strings.ToLower(strings.TrimSpace(canonicalModelKey(currentRouteModel))), gpt53CodexModelPrefix+"-") {
-			if registryIndicatesModelUnavailable(auth.ID, currentRouteModel) {
-				baseModel := downgradeGPT53CodexVariantToBase(currentRouteModel)
-				if baseModel != "" && !strings.EqualFold(baseModel, currentRouteModel) {
-					entry.Infof("fallback model %s not registered for auth, retrying with base model %s", currentRouteModel, baseModel)
-					fallbackRouteModel = baseModel
-					opts = withGPT53CodexFallbackSkipRegistry(setRequestedModelMetadata(opts, baseModel))
-					fallbackVariantNoModel = false
-					fallbackVariantAuthAttempts = 0
-					fallbackVariantTried = make(map[string]struct{})
-					fallbackVariantCountedTried = make(map[string]struct{})
-					releaseSlot()
-					continue
-				}
-			}
-		}
 		publishSelectedAuthMetadata(currentOpts.Metadata, auth.ID)
 		m.bindExecutionSessionAuth(executionSessionIDFromMetadata(currentOpts.Metadata), auth.ID)
 
@@ -2345,7 +2073,6 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 					if ra := retryAfterFromError(errExec); ra != nil {
 						result.RetryAfter = ra
 					}
-					result = adjustResultForPotentialGPT54Fallback(provider, currentRouteModel, errExec, result)
 					m.recordResult(execCtx, result)
 					if isRequestInvalidError(errExec) {
 						releaseSlot()
@@ -2358,22 +2085,6 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 						return cliproxyexecutor.Response{}, abortErr
 					}
 					sameAuthRetries = transientSameAuthRetryBudget(auth, errExec)
-					if shouldFallbackToGPT53Codex(currentRouteModel, provider, errExec) {
-						fallbackModel := resolveGPT54FallbackModelName(currentRouteModel)
-						if fallbackModel != "" && !strings.EqualFold(fallbackModel, currentRouteModel) {
-							entry := logEntryWithRequestID(execCtx)
-							entry.Infof("stream disconnected detected on gpt-5.4, retrying with fallback model %s", fallbackModel)
-							fallbackActive = true
-							fallbackRouteModel = fallbackModel
-							opts = withGPT53CodexFallbackSkipRegistry(setRequestedModelMetadata(opts, fallbackModel))
-							fallbackVariantNoModel = false
-							fallbackVariantAuthAttempts = 0
-							fallbackVariantTried = make(map[string]struct{})
-							fallbackVariantCountedTried = make(map[string]struct{})
-							releaseSlot()
-							goto nextCountAttempt
-						}
-					}
 					if restrictionErr == nil && shouldRetryAcrossAuths(errExec) {
 						restrictionErr = errExec
 					}
@@ -2392,27 +2103,6 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 			}
 			if restrictionErr != nil {
 				lastErr = restrictionErr
-				if fallbackActive {
-					if shouldTreatAsNoAvailableModel(restrictionErr) {
-						fallbackVariantNoModel = true
-					}
-					fallbackVariantAuthAttempts++
-					if shouldFallbackGPT53VariantToBase(currentRouteModel, restrictionErr) || (fallbackVariantNoModel && fallbackVariantAuthAttempts > 0) {
-						baseModel := downgradeGPT53CodexVariantToBase(currentRouteModel)
-						if baseModel != "" && !strings.EqualFold(baseModel, currentRouteModel) {
-							entry := logEntryWithRequestID(execCtx)
-							entry.Infof("fallback model %s has no available channel, retrying with base model %s", currentRouteModel, baseModel)
-							fallbackRouteModel = baseModel
-							opts = withGPT53CodexFallbackSkipRegistry(setRequestedModelMetadata(opts, baseModel))
-							fallbackVariantNoModel = false
-							fallbackVariantAuthAttempts = 0
-							fallbackVariantTried = make(map[string]struct{})
-							fallbackVariantCountedTried = make(map[string]struct{})
-							releaseSlot()
-							goto nextCountAttempt
-						}
-					}
-				}
 				break
 			}
 			lastErr = authErr
@@ -2449,23 +2139,11 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 	tried := make(map[string]struct{})
 	countedTried := make(map[string]struct{})
 	var lastErr error
-	fallbackActive := false
-	fallbackRouteModel := ""
-	fallbackVariantNoModel := false
-	fallbackVariantAuthAttempts := 0
-	fallbackVariantTried := make(map[string]struct{})
-	fallbackVariantCountedTried := make(map[string]struct{})
 	for {
 		currentRouteModel := routeModel
 		currentOpts := opts
 		currentTried := tried
 		currentCountedTried := countedTried
-		if fallbackActive {
-			currentRouteModel = fallbackRouteModel
-			currentOpts = setRequestedModelMetadata(opts, fallbackRouteModel)
-			currentTried = fallbackVariantTried
-			currentCountedTried = fallbackVariantCountedTried
-		}
 		if maxRetryCredentials > 0 && len(currentCountedTried) >= maxRetryCredentials {
 			if lastErr != nil {
 				var bootstrapErr *streamBootstrapError
@@ -2482,35 +2160,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 				if cooldownErr := m.triedModelCooldownError(currentTried, providers, currentRouteModel); cooldownErr != nil {
 					return nil, cooldownErr
 				}
-				if fallbackActive && shouldFallbackGPT53VariantToBase(currentRouteModel, lastErr) {
-					baseModel := downgradeGPT53CodexVariantToBase(currentRouteModel)
-					if baseModel != "" && !strings.EqualFold(baseModel, currentRouteModel) {
-						entry := logEntryWithRequestID(ctx)
-						entry.Infof("fallback model %s has no available channel, retrying with base model %s", currentRouteModel, baseModel)
-						fallbackRouteModel = baseModel
-						opts = withGPT53CodexFallbackSkipRegistry(setRequestedModelMetadata(opts, baseModel))
-						fallbackVariantNoModel = false
-						fallbackVariantAuthAttempts = 0
-						fallbackVariantTried = make(map[string]struct{})
-						fallbackVariantCountedTried = make(map[string]struct{})
-						continue
-					}
-				}
 				return nil, lastErr
-			}
-			if fallbackActive && shouldFallbackGPT53VariantToBase(currentRouteModel, errPick) {
-				baseModel := downgradeGPT53CodexVariantToBase(currentRouteModel)
-				if baseModel != "" && !strings.EqualFold(baseModel, currentRouteModel) {
-					entry := logEntryWithRequestID(ctx)
-					entry.Infof("fallback model %s has no available channel, retrying with base model %s", currentRouteModel, baseModel)
-					fallbackRouteModel = baseModel
-					opts = withGPT53CodexFallbackSkipRegistry(setRequestedModelMetadata(opts, baseModel))
-					fallbackVariantNoModel = false
-					fallbackVariantAuthAttempts = 0
-					fallbackVariantTried = make(map[string]struct{})
-					fallbackVariantCountedTried = make(map[string]struct{})
-					continue
-				}
 			}
 			if lastErr != nil {
 				var bootstrapErr *streamBootstrapError
@@ -2541,22 +2191,6 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 
 		entry := logEntryWithRequestID(ctx)
 		debugLogAuthSelection(entry, auth, provider, currentRouteModel)
-		if fallbackActive && strings.HasPrefix(strings.ToLower(strings.TrimSpace(canonicalModelKey(currentRouteModel))), gpt53CodexModelPrefix+"-") {
-			if registryIndicatesModelUnavailable(auth.ID, currentRouteModel) {
-				baseModel := downgradeGPT53CodexVariantToBase(currentRouteModel)
-				if baseModel != "" && !strings.EqualFold(baseModel, currentRouteModel) {
-					entry.Infof("fallback model %s not registered for auth, retrying with base model %s", currentRouteModel, baseModel)
-					fallbackRouteModel = baseModel
-					opts = withGPT53CodexFallbackSkipRegistry(setRequestedModelMetadata(opts, baseModel))
-					fallbackVariantNoModel = false
-					fallbackVariantAuthAttempts = 0
-					fallbackVariantTried = make(map[string]struct{})
-					fallbackVariantCountedTried = make(map[string]struct{})
-					releaseSlot()
-					continue
-				}
-			}
-		}
 		publishSelectedAuthMetadata(currentOpts.Metadata, auth.ID)
 		m.bindExecutionSessionAuth(executionSessionIDFromMetadata(currentOpts.Metadata), auth.ID)
 
@@ -2596,22 +2230,6 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 					return nil, errStream
 				}
 				sameAuthRetries = transientSameAuthRetryBudget(auth, errStream)
-				if shouldFallbackToGPT53Codex(currentRouteModel, provider, errStream) {
-					fallbackModel := resolveGPT54FallbackModelName(currentRouteModel)
-					if fallbackModel != "" && !strings.EqualFold(fallbackModel, currentRouteModel) {
-						entry := logEntryWithRequestID(execCtx)
-						entry.Infof("stream disconnected detected on gpt-5.4, retrying with fallback model %s", fallbackModel)
-						fallbackActive = true
-						fallbackRouteModel = fallbackModel
-						opts = withGPT53CodexFallbackSkipRegistry(setRequestedModelMetadata(opts, fallbackModel))
-						fallbackVariantNoModel = false
-						fallbackVariantAuthAttempts = 0
-						fallbackVariantTried = make(map[string]struct{})
-						fallbackVariantCountedTried = make(map[string]struct{})
-						releaseSlot()
-						goto nextStreamAttempt
-					}
-				}
 				if isStreamDisconnectedBeforeCompletionError(errStream) && authAttempt < streamDisconnectRetryLimit {
 					if errWait := waitForCooldown(execCtx, streamDisconnectRetryDelayFunc()); errWait != nil {
 						releaseSlot()
@@ -2622,27 +2240,6 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 				}
 				if shouldRetryAcrossAuthPool(errStream) {
 					lastErr = errStream
-					if fallbackActive {
-						if shouldTreatAsNoAvailableModel(errStream) {
-							fallbackVariantNoModel = true
-						}
-						fallbackVariantAuthAttempts++
-						if shouldFallbackGPT53VariantToBase(currentRouteModel, errStream) || (fallbackVariantNoModel && fallbackVariantAuthAttempts > 0) {
-							baseModel := downgradeGPT53CodexVariantToBase(currentRouteModel)
-							if baseModel != "" && !strings.EqualFold(baseModel, currentRouteModel) {
-								entry := logEntryWithRequestID(execCtx)
-								entry.Infof("fallback model %s has no available channel, retrying with base model %s", currentRouteModel, baseModel)
-								fallbackRouteModel = baseModel
-								opts = withGPT53CodexFallbackSkipRegistry(setRequestedModelMetadata(opts, baseModel))
-								fallbackVariantNoModel = false
-								fallbackVariantAuthAttempts = 0
-								fallbackVariantTried = make(map[string]struct{})
-								fallbackVariantCountedTried = make(map[string]struct{})
-								releaseSlot()
-								goto nextStreamAttempt
-							}
-						}
-					}
 					break
 				}
 				if authAttempt < sameAuthRetries {
@@ -4449,7 +4046,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 						suspendReason = "model_not_supported"
 						shouldSuspendModel = true
 					} else {
-					switch statusCode {
+						switch statusCode {
 						case 401:
 							if disableCooling {
 								state.NextRetryAfter = time.Time{}
@@ -4527,7 +4124,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 							state.NextRetryAfter = time.Time{}
 						}
 					} // end else (non-model-support errors)
-					}
+				}
 
 				auth.Status = StatusError
 				auth.UpdatedAt = now
@@ -5218,8 +4815,7 @@ func shouldRetryAcrossAuths(err error) bool {
 		return false
 	}
 	switch statusCodeFromError(err) {
-	case http.StatusUnauthorized, http.StatusPaymentRequired, http.StatusForbidden, http.StatusNotFound, http.StatusTooManyRequests,
-		http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+	case http.StatusUnauthorized, http.StatusPaymentRequired, http.StatusForbidden, http.StatusNotFound:
 		return !isStreamSetupTimeoutError(err)
 	default:
 		return isStreamDisconnectedBeforeCompletionError(err)
