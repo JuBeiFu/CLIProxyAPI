@@ -3917,10 +3917,26 @@ func (m *Manager) shouldRetryAfterError(err error, attempt int, providers []stri
 	if isCompactExecuteTimeoutError(err) {
 		return 0, false
 	}
-	if !shouldRetryAcrossAuths(err) {
+	if !m.retryAllowed(attempt, providers) {
 		return 0, false
 	}
-	if !m.retryAllowed(attempt, providers) {
+	// For 429 rate-limit errors, attempt same-auth retry via cooldown state or
+	// Retry-After header before checking cross-auth eligibility.
+	if status == http.StatusTooManyRequests {
+		wait, found := m.closestRetryWaitForError(err, providers, model, attempt)
+		if found {
+			if wait > maxWait {
+				return 0, false
+			}
+			return wait, true
+		}
+		retryAfter := retryAfterFromError(err)
+		if retryAfter != nil && *retryAfter > 0 && *retryAfter <= maxWait {
+			return *retryAfter, true
+		}
+		return 0, false
+	}
+	if !shouldRetryAcrossAuths(err) {
 		return 0, false
 	}
 	wait, found := m.closestRetryWaitForError(err, providers, model, attempt)
@@ -3930,15 +3946,7 @@ func (m *Manager) shouldRetryAfterError(err error, attempt int, providers []stri
 		}
 		return wait, true
 	}
-	// No cooldown state found; for 429 errors, fall back to the Retry-After header.
-	if status != http.StatusTooManyRequests {
-		return 0, false
-	}
-	retryAfter := retryAfterFromError(err)
-	if retryAfter == nil || *retryAfter <= 0 || *retryAfter > maxWait {
-		return 0, false
-	}
-	return *retryAfter, true
+	return 0, false
 }
 
 func waitForCooldown(ctx context.Context, wait time.Duration) error {
