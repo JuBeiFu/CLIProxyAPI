@@ -493,6 +493,16 @@ func fixSchemaNode(node map[string]any) {
 		fixSchemaNode(items)
 	}
 
+	for _, defsKey := range []string{"$defs", "definitions"} {
+		if defs, ok := node[defsKey].(map[string]any); ok {
+			for _, v := range defs {
+				if child, ok := v.(map[string]any); ok {
+					fixSchemaNode(child)
+				}
+			}
+		}
+	}
+
 	// Handle anyOf/oneOf/allOf
 	for _, keyword := range []string{"anyOf", "oneOf", "allOf"} {
 		if arr, ok := node[keyword].([]any); ok {
