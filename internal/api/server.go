@@ -28,6 +28,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/managementasset"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/proxypool"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/usage"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	sdkaccess "github.com/router-for-me/CLIProxyAPI/v6/sdk/access"
@@ -171,6 +172,7 @@ type Server struct {
 	envManagementSecret bool
 
 	localPassword string
+	proxyHealthStop context.CancelFunc
 
 	keepAliveEnabled   bool
 	keepAliveTimeout   time.Duration
@@ -274,6 +276,9 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 		s.mgmt.SetPostAuthHook(optionState.postAuthHook)
 	}
 	s.localPassword = optionState.localPassword
+	proxyHealthCtx, proxyHealthCancel := context.WithCancel(context.Background())
+	s.proxyHealthStop = proxyHealthCancel
+	proxypool.StartBackgroundRefresh(proxyHealthCtx, func() *config.Config { return s.cfg }, 5*time.Second)
 
 	// Setup routes
 	s.setupRoutes()
@@ -524,6 +529,15 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.PUT("/proxy-url", s.mgmt.PutProxyURL)
 		mgmt.PATCH("/proxy-url", s.mgmt.PutProxyURL)
 		mgmt.DELETE("/proxy-url", s.mgmt.DeleteProxyURL)
+		mgmt.GET("/default-proxy-pool", s.mgmt.GetDefaultProxyPool)
+		mgmt.PUT("/default-proxy-pool", s.mgmt.PutDefaultProxyPool)
+		mgmt.PATCH("/default-proxy-pool", s.mgmt.PutDefaultProxyPool)
+		mgmt.DELETE("/default-proxy-pool", s.mgmt.DeleteDefaultProxyPool)
+		mgmt.GET("/proxy-pools", s.mgmt.GetProxyPools)
+		mgmt.PUT("/proxy-pools", s.mgmt.PutProxyPools)
+		mgmt.PATCH("/proxy-pools", s.mgmt.PatchProxyPools)
+		mgmt.DELETE("/proxy-pools", s.mgmt.DeleteProxyPools)
+		mgmt.POST("/proxy-pools/check", s.mgmt.CheckProxyPools)
 
 		mgmt.POST("/api-call", s.mgmt.APICall)
 
@@ -829,6 +843,10 @@ func (s *Server) Start() error {
 //   - error: An error if the server fails to stop
 func (s *Server) Stop(ctx context.Context) error {
 	log.Debug("Stopping API server...")
+
+	if s.proxyHealthStop != nil {
+		s.proxyHealthStop()
+	}
 
 	if s.keepAliveEnabled {
 		select {
