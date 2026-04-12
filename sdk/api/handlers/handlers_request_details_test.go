@@ -100,7 +100,7 @@ func TestGetRequestDetails_PreservesSuffix(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			providers, model, _, errMsg := handler.getRequestDetails(tt.inputModel)
+			providers, model, errMsg := handler.getRequestDetails(tt.inputModel)
 			if (errMsg != nil) != tt.wantErr {
 				t.Fatalf("getRequestDetails() error = %v, wantErr %v", errMsg, tt.wantErr)
 			}
@@ -114,23 +114,5 @@ func TestGetRequestDetails_PreservesSuffix(t *testing.T) {
 				t.Fatalf("getRequestDetails() model = %v, want %v", model, tt.wantModel)
 			}
 		})
-	}
-}
-
-func TestGetRequestDetails_FallbackGPTModelsRouteToCodex(t *testing.T) {
-	handler := NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, coreauth.NewManager(nil, nil, nil))
-
-	providers, model, skip, errMsg := handler.getRequestDetails("gpt-new-model(8192)")
-	if errMsg != nil {
-		t.Fatalf("expected no error, got %v", errMsg)
-	}
-	if model != "gpt-new-model(8192)" {
-		t.Fatalf("model = %q, want %q", model, "gpt-new-model(8192)")
-	}
-	if !skip {
-		t.Fatalf("expected skipModelRegistryCheck=true for fallback routing")
-	}
-	if len(providers) != 1 || providers[0] != "codex" {
-		t.Fatalf("providers = %v, want [codex]", providers)
 	}
 }

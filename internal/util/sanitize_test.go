@@ -67,10 +67,10 @@ func TestSanitizedToolNameMap(t *testing.T) {
 			t.Fatal("expected non-nil map")
 		}
 		if m["mcp_server_read"] != "mcp/server/read" {
-			t.Errorf("expected mcp_server_read -> mcp/server/read, got %q", m["mcp_server_read"])
+			t.Errorf("expected mcp_server_read → mcp/server/read, got %q", m["mcp_server_read"])
 		}
 		if m["tool_v2"] != "tool@v2" {
-			t.Errorf("expected tool_v2 -> tool@v2, got %q", m["tool_v2"])
+			t.Errorf("expected tool_v2 → tool@v2, got %q", m["tool_v2"])
 		}
 		if _, exists := m["valid_tool"]; exists {
 			t.Error("valid_tool should not be in the map (no sanitization needed)")

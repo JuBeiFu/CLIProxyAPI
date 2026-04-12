@@ -233,33 +233,3 @@ func TestDefaultRequestLoggerFactory_UsesResolvedLogDirectory(t *testing.T) {
 		}
 	}
 }
-
-func TestNewServer_CommercialModeStillInstallsRequestLoggerWhenEnabled(t *testing.T) {
-	gin.SetMode(gin.TestMode)
-
-	tmpDir := t.TempDir()
-	authDir := filepath.Join(tmpDir, "auth")
-	if err := os.MkdirAll(authDir, 0o700); err != nil {
-		t.Fatalf("failed to create auth dir: %v", err)
-	}
-
-	cfg := &proxyconfig.Config{
-		SDKConfig: proxyconfig.SDKConfig{
-			APIKeys:    []string{"test-key"},
-			RequestLog: true,
-		},
-		Port:           0,
-		AuthDir:        authDir,
-		Debug:          true,
-		CommercialMode: true,
-	}
-
-	authManager := auth.NewManager(nil, nil, nil)
-	accessManager := sdkaccess.NewManager()
-	configPath := filepath.Join(tmpDir, "config.yaml")
-
-	server := NewServer(cfg, authManager, accessManager, configPath)
-	if server.requestLogger == nil {
-		t.Fatal("expected request logger to be installed when request-log is enabled in commercial mode")
-	}
-}

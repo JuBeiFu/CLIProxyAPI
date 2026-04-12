@@ -86,6 +86,8 @@ func (g *GeminiAuth) GetAuthenticatedClient(ctx context.Context, ts *GeminiToken
 		ctx = context.WithValue(ctx, oauth2.HTTPClient, proxyClient)
 	}
 
+	var err error
+
 	// Configure the OAuth2 client.
 	conf := &oauth2.Config{
 		ClientID:     ClientID,
@@ -95,10 +97,7 @@ func (g *GeminiAuth) GetAuthenticatedClient(ctx context.Context, ts *GeminiToken
 		Endpoint:     google.Endpoint,
 	}
 
-	var (
-		token *oauth2.Token
-		err   error
-	)
+	var token *oauth2.Token
 
 	// If no token is found in storage, initiate the web-based OAuth flow.
 	if ts.Token == nil {
@@ -300,13 +299,14 @@ func (g *GeminiAuth) getTokenFromWeb(ctx context.Context, config *oauth2.Config,
 
 	var manualPromptTimer *time.Timer
 	var manualPromptC <-chan time.Time
-	var manualInputCh <-chan string
-	var manualInputErrCh <-chan error
 	if opts != nil && opts.Prompt != nil {
 		manualPromptTimer = time.NewTimer(15 * time.Second)
 		manualPromptC = manualPromptTimer.C
 		defer manualPromptTimer.Stop()
 	}
+
+	var manualInputCh <-chan string
+	var manualInputErrCh <-chan error
 
 waitForCallback:
 	for {

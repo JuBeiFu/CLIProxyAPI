@@ -373,12 +373,12 @@ func (s *GitTokenStore) List(_ context.Context) ([]*cliproxyauth.Auth, error) {
 }
 
 // Delete removes the auth file.
-func (s *GitTokenStore) Delete(ctx context.Context, id string) error {
+func (s *GitTokenStore) Delete(_ context.Context, id string) error {
 	id = strings.TrimSpace(id)
 	if id == "" {
 		return fmt.Errorf("auth filestore: id is empty")
 	}
-	path, err := s.resolveDeletePath(ctx, id)
+	path, err := s.resolveDeletePath(id)
 	if err != nil {
 		return err
 	}
@@ -440,7 +440,7 @@ func (s *GitTokenStore) PersistAuthFiles(_ context.Context, message string, path
 	return s.commitAndPushLocked(message, filtered...)
 }
 
-func (s *GitTokenStore) resolveDeletePath(ctx context.Context, id string) (string, error) {
+func (s *GitTokenStore) resolveDeletePath(id string) (string, error) {
 	if strings.ContainsRune(id, os.PathSeparator) || filepath.IsAbs(id) {
 		return id, nil
 	}
@@ -448,34 +448,7 @@ func (s *GitTokenStore) resolveDeletePath(ctx context.Context, id string) (strin
 	if dir == "" {
 		return "", fmt.Errorf("auth filestore: directory not configured")
 	}
-	if resolved, ok := s.lookupPathByAuthID(ctx, dir, id); ok {
-		return resolved, nil
-	}
 	return filepath.Join(dir, id), nil
-}
-
-func (s *GitTokenStore) lookupPathByAuthID(ctx context.Context, baseDir string, id string) (string, bool) {
-	entries, err := s.List(ctx)
-	if err != nil {
-		return "", false
-	}
-	for _, auth := range entries {
-		if auth == nil || strings.TrimSpace(auth.ID) != id {
-			continue
-		}
-		if auth.Attributes != nil {
-			if path := strings.TrimSpace(auth.Attributes["path"]); path != "" {
-				return path, true
-			}
-		}
-		if fileName := strings.TrimSpace(auth.FileName); fileName != "" {
-			if filepath.IsAbs(fileName) {
-				return fileName, true
-			}
-			return filepath.Join(baseDir, fileName), true
-		}
-	}
-	return "", false
 }
 
 func (s *GitTokenStore) readAuthFile(path, baseDir string) (*cliproxyauth.Auth, error) {

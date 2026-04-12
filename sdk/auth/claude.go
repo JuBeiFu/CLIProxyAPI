@@ -118,13 +118,14 @@ func (a *ClaudeAuthenticator) Login(ctx context.Context, cfg *config.Config, opt
 	var result *claude.OAuthResult
 	var manualPromptTimer *time.Timer
 	var manualPromptC <-chan time.Time
-	var manualInputCh <-chan string
-	var manualInputErrCh <-chan error
 	if opts.Prompt != nil {
 		manualPromptTimer = time.NewTimer(15 * time.Second)
 		manualPromptC = manualPromptTimer.C
 		defer manualPromptTimer.Stop()
 	}
+
+	var manualInputCh <-chan string
+	var manualInputErrCh <-chan error
 
 waitForCallback:
 	for {

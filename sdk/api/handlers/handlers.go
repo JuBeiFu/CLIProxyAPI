@@ -9,8 +9,6 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"path"
-	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -48,10 +46,7 @@ type ErrorDetail struct {
 	Code string `json:"code,omitempty"`
 }
 
-const normalizedCapacityMessage = "The requested model is temporarily at capacity. Please retry shortly."
-
 const idempotencyKeyMetadataKey = "idempotency_key"
-const newAPIDownstreamTransportHeader = "X-NewAPI-Downstream-Transport"
 
 const (
 	defaultStreamingKeepAliveSeconds = 0
@@ -61,23 +56,6 @@ const (
 type pinnedAuthContextKey struct{}
 type selectedAuthCallbackContextKey struct{}
 type executionSessionContextKey struct{}
-
-// DownstreamWebsocketBridge reports whether this request should be treated as a
-// logical downstream websocket bridge, even if the immediate transport into
-// CLIProxyAPI is HTTP.
-func DownstreamWebsocketBridge(ctx context.Context) bool {
-	if ctx == nil {
-		return false
-	}
-	if coreexecutor.DownstreamWebsocket(ctx) {
-		return true
-	}
-	ginCtx, ok := ctx.Value("gin").(*gin.Context)
-	if !ok || ginCtx == nil || ginCtx.Request == nil {
-		return false
-	}
-	return strings.EqualFold(strings.TrimSpace(ginCtx.Request.Header.Get(newAPIDownstreamTransportHeader)), "websocket")
-}
 
 // WithPinnedAuthID returns a child context that requests execution on a specific auth ID.
 func WithPinnedAuthID(ctx context.Context, authID string) context.Context {
@@ -125,10 +103,7 @@ func BuildErrorResponseBody(status int, errText string) []byte {
 	}
 
 	trimmed := strings.TrimSpace(errText)
-	if status == http.StatusTooManyRequests && isCapacityErrorText(trimmed) {
-		trimmed = normalizedCapacityMessage
-		errText = normalizedCapacityMessage
-	} else if trimmed != "" && json.Valid([]byte(trimmed)) {
+	if trimmed != "" && json.Valid([]byte(trimmed)) {
 		return []byte(trimmed)
 	}
 
@@ -165,37 +140,6 @@ func BuildErrorResponseBody(status int, errText string) []byte {
 		return []byte(fmt.Sprintf(`{"error":{"message":%q,"type":"server_error","code":"internal_server_error"}}`, errText))
 	}
 	return payload
-}
-
-func isCapacityErrorText(errText string) bool {
-	msg := strings.ToLower(strings.TrimSpace(errText))
-	if msg == "" {
-		return false
-	}
-	if strings.Contains(msg, "selected model is at capacity") {
-		return true
-	}
-	if !json.Valid([]byte(strings.TrimSpace(errText))) {
-		return false
-	}
-	message := strings.ToLower(strings.TrimSpace(extractEmbeddedErrorMessage([]byte(errText))))
-	return strings.Contains(message, "selected model is at capacity")
-}
-
-func extractEmbeddedErrorMessage(body []byte) string {
-	if len(bytes.TrimSpace(body)) == 0 || !json.Valid(body) {
-		return ""
-	}
-	var payload map[string]any
-	if err := json.Unmarshal(body, &payload); err != nil {
-		return ""
-	}
-	errNode, _ := payload["error"].(map[string]any)
-	if errNode == nil {
-		return ""
-	}
-	message, _ := errNode["message"].(string)
-	return strings.TrimSpace(message)
 }
 
 // StreamingKeepAliveInterval returns the SSE keep-alive interval for this server.
@@ -246,13 +190,9 @@ func requestExecutionMetadata(ctx context.Context) map[string]any {
 	// Idempotency-Key is an optional client-supplied header used to correlate retries.
 	// It is forwarded as execution metadata; when absent we generate a UUID.
 	key := ""
-	executionSessionID := executionSessionIDFromContext(ctx)
 	if ctx != nil {
 		if ginCtx, ok := ctx.Value("gin").(*gin.Context); ok && ginCtx != nil && ginCtx.Request != nil {
 			key = strings.TrimSpace(ginCtx.GetHeader("Idempotency-Key"))
-			if executionSessionID == "" {
-				executionSessionID = bridgeExecutionSessionIDFromHeaders(ginCtx.Request.Header)
-			}
 		}
 	}
 	if key == "" {
@@ -266,20 +206,10 @@ func requestExecutionMetadata(ctx context.Context) map[string]any {
 	if selectedCallback := selectedAuthIDCallbackFromContext(ctx); selectedCallback != nil {
 		meta[coreexecutor.SelectedAuthCallbackMetadataKey] = selectedCallback
 	}
-	if executionSessionID != "" {
+	if executionSessionID := executionSessionIDFromContext(ctx); executionSessionID != "" {
 		meta[coreexecutor.ExecutionSessionMetadataKey] = executionSessionID
 	}
 	return meta
-}
-
-func bridgeExecutionSessionIDFromHeaders(headers http.Header) string {
-	if headers == nil {
-		return ""
-	}
-	if !strings.EqualFold(strings.TrimSpace(headers.Get(newAPIDownstreamTransportHeader)), "websocket") {
-		return ""
-	}
-	return strings.TrimSpace(headers.Get("Session_id"))
 }
 
 func pinnedAuthIDFromContext(ctx context.Context) string {
@@ -422,9 +352,6 @@ func (h *BaseAPIHandler) GetContextWithCancel(handler interfaces.APIHandler, c *
 	}
 	newCtx = context.WithValue(newCtx, "gin", c)
 	newCtx = context.WithValue(newCtx, "handler", handler)
-	if DownstreamWebsocketBridge(newCtx) {
-		newCtx = coreexecutor.WithDownstreamWebsocket(newCtx)
-	}
 	return newCtx, func(params ...interface{}) {
 		if h.Cfg.RequestLog && len(params) == 1 {
 			if existing, exists := c.Get("API_RESPONSE"); exists {
@@ -543,15 +470,12 @@ func appendAPIResponse(c *gin.Context, data []byte) {
 // ExecuteWithAuthManager executes a non-streaming request via the core auth manager.
 // This path is the only supported execution route.
 func (h *BaseAPIHandler) ExecuteWithAuthManager(ctx context.Context, handlerType, modelName string, rawJSON []byte, alt string) ([]byte, http.Header, *interfaces.ErrorMessage) {
-	providers, normalizedModel, skipModelRegistryCheck, errMsg := h.getRequestDetails(modelName)
+	providers, normalizedModel, errMsg := h.getRequestDetails(modelName)
 	if errMsg != nil {
 		return nil, nil, errMsg
 	}
 	reqMeta := requestExecutionMetadata(ctx)
 	reqMeta[coreexecutor.RequestedModelMetadataKey] = normalizedModel
-	if skipModelRegistryCheck {
-		reqMeta[coreexecutor.SkipModelRegistryCheckMetadataKey] = true
-	}
 	payload := rawJSON
 	if len(payload) == 0 {
 		payload = nil
@@ -593,15 +517,12 @@ func (h *BaseAPIHandler) ExecuteWithAuthManager(ctx context.Context, handlerType
 // ExecuteCountWithAuthManager executes a non-streaming request via the core auth manager.
 // This path is the only supported execution route.
 func (h *BaseAPIHandler) ExecuteCountWithAuthManager(ctx context.Context, handlerType, modelName string, rawJSON []byte, alt string) ([]byte, http.Header, *interfaces.ErrorMessage) {
-	providers, normalizedModel, skipModelRegistryCheck, errMsg := h.getRequestDetails(modelName)
+	providers, normalizedModel, errMsg := h.getRequestDetails(modelName)
 	if errMsg != nil {
 		return nil, nil, errMsg
 	}
 	reqMeta := requestExecutionMetadata(ctx)
 	reqMeta[coreexecutor.RequestedModelMetadataKey] = normalizedModel
-	if skipModelRegistryCheck {
-		reqMeta[coreexecutor.SkipModelRegistryCheckMetadataKey] = true
-	}
 	payload := rawJSON
 	if len(payload) == 0 {
 		payload = nil
@@ -644,7 +565,7 @@ func (h *BaseAPIHandler) ExecuteCountWithAuthManager(ctx context.Context, handle
 // This path is the only supported execution route.
 // The returned http.Header carries upstream response headers captured before streaming begins.
 func (h *BaseAPIHandler) ExecuteStreamWithAuthManager(ctx context.Context, handlerType, modelName string, rawJSON []byte, alt string) (<-chan []byte, http.Header, <-chan *interfaces.ErrorMessage) {
-	providers, normalizedModel, skipModelRegistryCheck, errMsg := h.getRequestDetails(modelName)
+	providers, normalizedModel, errMsg := h.getRequestDetails(modelName)
 	if errMsg != nil {
 		errChan := make(chan *interfaces.ErrorMessage, 1)
 		errChan <- errMsg
@@ -653,9 +574,6 @@ func (h *BaseAPIHandler) ExecuteStreamWithAuthManager(ctx context.Context, handl
 	}
 	reqMeta := requestExecutionMetadata(ctx)
 	reqMeta[coreexecutor.RequestedModelMetadataKey] = normalizedModel
-	if skipModelRegistryCheck {
-		reqMeta[coreexecutor.SkipModelRegistryCheckMetadataKey] = true
-	}
 	payload := rawJSON
 	if len(payload) == 0 {
 		payload = nil
@@ -739,12 +657,15 @@ func (h *BaseAPIHandler) ExecuteStreamWithAuthManager(ctx context.Context, handl
 
 		bootstrapEligible := func(err error) bool {
 			status := statusFromError(err)
+			if status == 0 {
+				return true
+			}
 			switch status {
 			case http.StatusUnauthorized, http.StatusForbidden, http.StatusPaymentRequired,
-				http.StatusTooManyRequests:
+				http.StatusRequestTimeout, http.StatusTooManyRequests:
 				return true
 			default:
-				return false
+				return status >= http.StatusInternalServerError
 			}
 		}
 
@@ -858,7 +779,7 @@ func statusFromError(err error) int {
 	return 0
 }
 
-func (h *BaseAPIHandler) getRequestDetails(modelName string) (providers []string, normalizedModel string, skipModelRegistryCheck bool, err *interfaces.ErrorMessage) {
+func (h *BaseAPIHandler) getRequestDetails(modelName string) (providers []string, normalizedModel string, err *interfaces.ErrorMessage) {
 	resolvedModelName := modelName
 	initialSuffix := thinking.ParseSuffix(modelName)
 	if initialSuffix.ModelName == "auto" {
@@ -886,99 +807,12 @@ func (h *BaseAPIHandler) getRequestDetails(modelName string) (providers []string
 	}
 
 	if len(providers) == 0 {
-		// Configurable fallback mapping for unregistered models.
-		if mapped, ok := matchModelProviderMappings(h, baseModel); ok {
-			providers = mapped
-			skipModelRegistryCheck = true
-		} else if baseModel != resolvedModelName {
-			if mapped, ok := matchModelProviderMappings(h, resolvedModelName); ok {
-				providers = mapped
-				skipModelRegistryCheck = true
-			}
-		}
-	}
-
-	if len(providers) == 0 {
-		// Built-in fallback: route unknown GPT-family models through the Codex executor.
-		// This keeps routing resilient when new "gpt-*" model IDs land before static model lists are updated.
-		if strings.HasPrefix(strings.ToLower(baseModel), "gpt-") {
-			providers = []string{"codex"}
-			skipModelRegistryCheck = true
-		}
-	}
-
-	if len(providers) == 0 {
-		return nil, "", false, &interfaces.ErrorMessage{StatusCode: http.StatusBadGateway, Error: fmt.Errorf("unknown provider for model %s", modelName)}
+		return nil, "", &interfaces.ErrorMessage{StatusCode: http.StatusBadGateway, Error: fmt.Errorf("unknown provider for model %s", modelName)}
 	}
 
 	// The thinking suffix is preserved in the model name itself, so no
 	// metadata-based configuration passing is needed.
-	return providers, resolvedModelName, skipModelRegistryCheck, nil
-}
-
-func matchModelProviderMappings(h *BaseAPIHandler, modelName string) ([]string, bool) {
-	if h == nil || h.Cfg == nil {
-		return nil, false
-	}
-	modelName = strings.TrimSpace(modelName)
-	if modelName == "" {
-		return nil, false
-	}
-	rules := h.Cfg.ModelProviderMappings
-	if len(rules) == 0 {
-		return nil, false
-	}
-	for i := range rules {
-		pattern := strings.TrimSpace(rules[i].Pattern)
-		if pattern == "" || len(rules[i].Providers) == 0 {
-			continue
-		}
-		matched := false
-		if rules[i].Regex {
-			re, errCompile := regexp.Compile(pattern)
-			if errCompile != nil {
-				continue
-			}
-			matched = re.MatchString(modelName)
-		} else if strings.ContainsAny(pattern, "*?") {
-			ok, errMatch := path.Match(pattern, modelName)
-			matched = errMatch == nil && ok
-		} else {
-			matched = strings.EqualFold(pattern, modelName)
-		}
-		if !matched {
-			continue
-		}
-		providers := normalizeProviderList(rules[i].Providers)
-		if len(providers) == 0 {
-			continue
-		}
-		return providers, true
-	}
-	return nil, false
-}
-
-func normalizeProviderList(providers []string) []string {
-	if len(providers) == 0 {
-		return nil
-	}
-	out := make([]string, 0, len(providers))
-	seen := make(map[string]struct{}, len(providers))
-	for _, raw := range providers {
-		p := strings.ToLower(strings.TrimSpace(raw))
-		if p == "" {
-			continue
-		}
-		if _, ok := seen[p]; ok {
-			continue
-		}
-		seen[p] = struct{}{}
-		out = append(out, p)
-	}
-	if len(out) == 0 {
-		return nil
-	}
-	return out
+	return providers, resolvedModelName, nil
 }
 
 func cloneBytes(src []byte) []byte {

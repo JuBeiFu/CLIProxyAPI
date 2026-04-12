@@ -87,34 +87,6 @@ func TestRoundRobinSelectorPick_PriorityBuckets(t *testing.T) {
 	}
 }
 
-func TestRoundRobinSelectorPick_PriorityFromMetadata(t *testing.T) {
-	t.Parallel()
-
-	selector := &RoundRobinSelector{}
-	auths := []*Auth{
-		{ID: "low", Metadata: map[string]any{"priority": 0}},
-		{ID: "high-a", Metadata: map[string]any{"priority": 10}},
-		{ID: "high-b", Metadata: map[string]any{"priority": 10}},
-	}
-
-	want := []string{"high-a", "high-b", "high-a"}
-	for i, id := range want {
-		got, err := selector.Pick(context.Background(), "mixed", "", cliproxyexecutor.Options{}, auths)
-		if err != nil {
-			t.Fatalf("Pick() #%d error = %v", i, err)
-		}
-		if got == nil {
-			t.Fatalf("Pick() #%d auth = nil", i)
-		}
-		if got.ID != id {
-			t.Fatalf("Pick() #%d auth.ID = %q, want %q", i, got.ID, id)
-		}
-		if got.ID == "low" {
-			t.Fatalf("Pick() #%d unexpectedly selected lower priority auth", i)
-		}
-	}
-}
-
 func TestFillFirstSelectorPick_PriorityFallbackCooldown(t *testing.T) {
 	t.Parallel()
 
@@ -276,12 +248,6 @@ func TestSelectorPick_AllCooldownReturnsModelCooldownError(t *testing.T) {
 		if got, _ := rawErr["code"].(string); got != "model_cooldown" {
 			t.Fatalf("Error().error.code = %q, want %q", got, "model_cooldown")
 		}
-		if _, ok := rawErr["reset_time"]; ok {
-			t.Fatalf("Error().error.reset_time should be omitted, got %v", rawErr["reset_time"])
-		}
-		if _, ok := rawErr["reset_seconds"]; !ok {
-			t.Fatalf("Error().error.reset_seconds missing")
-		}
 		if _, ok := rawErr["provider"]; ok {
 			t.Fatalf("Error().error.provider exists for mixed provider: %v", rawErr["provider"])
 		}
@@ -309,45 +275,10 @@ func TestSelectorPick_AllCooldownReturnsModelCooldownError(t *testing.T) {
 		if !ok {
 			t.Fatalf("Error() payload missing error object: %v", payload)
 		}
-		if _, ok := rawErr["reset_time"]; ok {
-			t.Fatalf("Error().error.reset_time should be omitted, got %v", rawErr["reset_time"])
-		}
 		if got, _ := rawErr["provider"].(string); got != "gemini" {
 			t.Fatalf("Error().error.provider = %q, want %q", got, "gemini")
 		}
 	})
-}
-
-func TestSelectorPick_ExpiredQuotaCooldownBecomesAvailable(t *testing.T) {
-	t.Parallel()
-
-	model := "test-model"
-	past := time.Now().Add(-time.Minute)
-	auths := []*Auth{
-		{
-			ID: "a",
-			ModelStates: map[string]*ModelState{
-				model: {
-					Status:         StatusActive,
-					Unavailable:    true,
-					NextRetryAfter: past,
-					Quota: QuotaState{
-						Exceeded:      true,
-						NextRecoverAt: past,
-					},
-				},
-			},
-		},
-	}
-
-	selector := &FillFirstSelector{}
-	got, err := selector.Pick(context.Background(), "gemini", model, cliproxyexecutor.Options{}, auths)
-	if err != nil {
-		t.Fatalf("Pick() error = %v", err)
-	}
-	if got == nil || got.ID != "a" {
-		t.Fatalf("Pick() auth = %#v, want auth a", got)
-	}
 }
 
 func TestIsAuthBlockedForModel_UnavailableWithoutNextRetryIsNotBlocked(t *testing.T) {

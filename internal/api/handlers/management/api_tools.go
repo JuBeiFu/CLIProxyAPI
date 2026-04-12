@@ -11,12 +11,8 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-	codexauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/codex"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/proxyrouting"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/proxystats"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/geminicli"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/proxyutil"
 	log "github.com/sirupsen/logrus"
@@ -44,13 +40,6 @@ const (
 
 var antigravityOAuthTokenURL = "https://oauth2.googleapis.com/token"
 
-var refreshCodexTokensWithRetry = func(ctx context.Context, h *Handler, refreshToken string, maxRetries int) (*codexauth.CodexTokenData, error) {
-	if h == nil {
-		return nil, fmt.Errorf("codex handler is nil")
-	}
-	return codexauth.NewCodexAuth(h.cfg).RefreshTokensWithRetry(ctx, refreshToken, maxRetries)
-}
-
 type apiCallRequest struct {
 	AuthIndexSnake  *string           `json:"auth_index"`
 	AuthIndexCamel  *string           `json:"authIndex"`
@@ -62,13 +51,9 @@ type apiCallRequest struct {
 }
 
 type apiCallResponse struct {
-	StatusCode           int                 `json:"status_code"`
-	Header               map[string][]string `json:"header"`
-	Body                 string              `json:"body"`
-	AuthRefreshAttempted bool                `json:"auth_refresh_attempted,omitempty"`
-	AuthRefreshSucceeded bool                `json:"auth_refresh_succeeded,omitempty"`
-	AuthRefreshError     string              `json:"auth_refresh_error,omitempty"`
-	AuthRevokedDeleted   bool                `json:"auth_revoked_deleted,omitempty"`
+	StatusCode int                 `json:"status_code"`
+	Header     map[string][]string `json:"header"`
+	Body       string              `json:"body"`
 }
 
 // APICall makes a generic HTTP request on behalf of the management API caller.
@@ -152,14 +137,53 @@ func (h *Handler) APICall(c *gin.Context) {
 	if reqHeaders == nil {
 		reqHeaders = map[string]string{}
 	}
-	var authRefreshAttempted bool
-	var authRefreshSucceeded bool
-	var authRefreshError string
-	headerTemplate := cloneStringMap(reqHeaders)
-	req, errNewRequest := h.buildAPICallRequest(c.Request.Context(), method, urlStr, body.Data, auth, headerTemplate, nil)
+
+	var hostOverride string
+	var token string
+	var tokenResolved bool
+	var tokenErr error
+	for key, value := range reqHeaders {
+		if !strings.Contains(value, "$TOKEN$") {
+			continue
+		}
+		if !tokenResolved {
+			token, tokenErr = h.resolveTokenForAuth(c.Request.Context(), auth)
+			tokenResolved = true
+		}
+		if auth != nil && token == "" {
+			if tokenErr != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "auth token refresh failed"})
+				return
+			}
+			c.JSON(http.StatusBadRequest, gin.H{"error": "auth token not found"})
+			return
+		}
+		if token == "" {
+			continue
+		}
+		reqHeaders[key] = strings.ReplaceAll(value, "$TOKEN$", token)
+	}
+
+	var requestBody io.Reader
+	if body.Data != "" {
+		requestBody = strings.NewReader(body.Data)
+	}
+
+	req, errNewRequest := http.NewRequestWithContext(c.Request.Context(), method, urlStr, requestBody)
 	if errNewRequest != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": errNewRequest.Error()})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "failed to build request"})
 		return
+	}
+
+	for key, value := range reqHeaders {
+		if strings.EqualFold(key, "host") {
+			hostOverride = strings.TrimSpace(value)
+			continue
+		}
+		req.Header.Set(key, value)
+	}
+	if hostOverride != "" {
+		req.Host = hostOverride
 	}
 
 	httpClient := &http.Client{
@@ -173,72 +197,6 @@ func (h *Handler) APICall(c *gin.Context) {
 		c.JSON(http.StatusBadGateway, gin.H{"error": "request failed"})
 		return
 	}
-
-	if shouldRetryCodex401Probe(auth, resp.StatusCode) {
-		originalStatusCode := resp.StatusCode
-		originalHeader := resp.Header.Clone()
-		originalBody, errReadOriginal := io.ReadAll(resp.Body)
-		if errReadOriginal != nil {
-			_ = resp.Body.Close()
-			c.JSON(http.StatusBadGateway, gin.H{"error": "failed to read response"})
-			return
-		}
-		if errClose := resp.Body.Close(); errClose != nil {
-			log.Errorf("response body close error: %v", errClose)
-		}
-
-		// Deactivated/revoked accounts should be removed immediately instead of attempting
-		// token refresh (which is guaranteed to fail and only adds load).
-		if auth != nil && isAuthRevokedResponse(originalStatusCode, originalBody) {
-			authRevokedDeleted := h.deleteRevokedAuthFromAPICall(c.Request.Context(), auth, originalStatusCode, originalBody)
-			c.JSON(http.StatusOK, apiCallResponse{
-				StatusCode:         originalStatusCode,
-				Header:             originalHeader,
-				Body:               string(originalBody),
-				AuthRevokedDeleted: authRevokedDeleted,
-			})
-			return
-		}
-
-		authRefreshAttempted = true
-		refreshedToken, errRefresh := h.refreshCodexOAuthAccessToken(c.Request.Context(), auth)
-		if errRefresh != nil {
-			authRefreshError = strings.TrimSpace(errRefresh.Error())
-			log.WithError(errRefresh).Debug("management APICall codex refresh after 401 failed")
-			c.JSON(http.StatusOK, apiCallResponse{
-				StatusCode:           originalStatusCode,
-				Header:               originalHeader,
-				Body:                 string(originalBody),
-				AuthRefreshAttempted: authRefreshAttempted,
-				AuthRefreshSucceeded: authRefreshSucceeded,
-				AuthRefreshError:     authRefreshError,
-			})
-			return
-		}
-		authRefreshSucceeded = true
-
-		retryReq, errRetryRequest := h.buildAPICallRequest(c.Request.Context(), method, urlStr, body.Data, auth, headerTemplate, &refreshedToken)
-		if errRetryRequest != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": errRetryRequest.Error()})
-			return
-		}
-
-		retryResp, errRetryDo := httpClient.Do(retryReq)
-		if errRetryDo != nil {
-			authRefreshError = strings.TrimSpace(errRetryDo.Error())
-			log.WithError(errRetryDo).Debug("management APICall retry request failed after codex refresh")
-			c.JSON(http.StatusOK, apiCallResponse{
-				StatusCode:           originalStatusCode,
-				Header:               originalHeader,
-				Body:                 string(originalBody),
-				AuthRefreshAttempted: authRefreshAttempted,
-				AuthRefreshSucceeded: authRefreshSucceeded,
-				AuthRefreshError:     authRefreshError,
-			})
-			return
-		}
-		resp = retryResp
-	}
 	defer func() {
 		if errClose := resp.Body.Close(); errClose != nil {
 			log.Errorf("response body close error: %v", errClose)
@@ -251,74 +209,11 @@ func (h *Handler) APICall(c *gin.Context) {
 		return
 	}
 
-	authRevokedDeleted := false
-	if auth != nil && isAuthRevokedResponse(resp.StatusCode, respBody) {
-		authRevokedDeleted = h.deleteRevokedAuthFromAPICall(c.Request.Context(), auth, resp.StatusCode, respBody)
-	}
-
 	c.JSON(http.StatusOK, apiCallResponse{
-		StatusCode:           resp.StatusCode,
-		Header:               resp.Header,
-		Body:                 string(respBody),
-		AuthRefreshAttempted: authRefreshAttempted,
-		AuthRefreshSucceeded: authRefreshSucceeded,
-		AuthRefreshError:     authRefreshError,
-		AuthRevokedDeleted:   authRevokedDeleted,
+		StatusCode: resp.StatusCode,
+		Header:     resp.Header,
+		Body:       string(respBody),
 	})
-}
-
-func isAuthRevokedResponse(statusCode int, body []byte) bool {
-	if len(body) == 0 {
-		return false
-	}
-	message := strings.ToLower(strings.TrimSpace(string(body)))
-	if message == "" {
-		return false
-	}
-	if strings.Contains(message, "deactivated_workspace") && statusCode >= 400 && statusCode < 500 {
-		return true
-	}
-	if statusCode != http.StatusUnauthorized {
-		return false
-	}
-	for _, needle := range []string{
-		"token_revoked",
-		"token_invalidated",
-		"account_deactivated",
-		"encountered invalidated oauth token for user",
-		"your authentication token has been invalidated. please try signing in again.",
-		"your openai account has been deactivated",
-		"account has been deactivated",
-	} {
-		if strings.Contains(message, needle) {
-			return true
-		}
-	}
-	return false
-}
-
-func (h *Handler) deleteRevokedAuthFromAPICall(ctx context.Context, auth *coreauth.Auth, statusCode int, body []byte) bool {
-	if h == nil || h.authManager == nil || auth == nil {
-		return false
-	}
-	message := strings.TrimSpace(string(body))
-	if message == "" {
-		return false
-	}
-	h.authManager.MarkResult(ctx, coreauth.Result{
-		AuthID:   auth.ID,
-		Provider: auth.Provider,
-		Model:    "",
-		Success:  false,
-		Error: &coreauth.Error{
-			Code:       "account_deactivated",
-			Message:    message,
-			Retryable:  false,
-			HTTPStatus: statusCode,
-		},
-	})
-	_, ok := h.authManager.GetByID(auth.ID)
-	return !ok
 }
 
 func firstNonEmptyString(values ...*string) string {
@@ -367,153 +262,8 @@ func (h *Handler) resolveTokenForAuth(ctx context.Context, auth *coreauth.Auth) 
 		token, errToken := h.refreshAntigravityOAuthAccessToken(ctx, auth)
 		return token, errToken
 	}
-	if provider == "codex" && strings.TrimSpace(tokenValueForAuth(auth)) == "" {
-		token, errToken := h.refreshCodexOAuthAccessToken(ctx, auth)
-		return token, errToken
-	}
 
 	return tokenValueForAuth(auth), nil
-}
-
-func shouldRetryCodex401Probe(auth *coreauth.Auth, statusCode int) bool {
-	if statusCode != http.StatusUnauthorized || auth == nil {
-		return false
-	}
-	provider := strings.ToLower(strings.TrimSpace(auth.Provider))
-	if provider != "codex" {
-		return false
-	}
-	return strings.TrimSpace(stringValue(auth.Metadata, "refresh_token")) != ""
-}
-
-func cloneStringMap(in map[string]string) map[string]string {
-	if len(in) == 0 {
-		return map[string]string{}
-	}
-	out := make(map[string]string, len(in))
-	for k, v := range in {
-		out[k] = v
-	}
-	return out
-}
-
-func (h *Handler) buildAPICallRequest(ctx context.Context, method, urlStr, data string, auth *coreauth.Auth, headerTemplate map[string]string, tokenOverride *string) (*http.Request, error) {
-	reqHeaders, hostOverride, errHeaders := h.resolveAPICallHeaders(ctx, auth, headerTemplate, tokenOverride)
-	if errHeaders != nil {
-		return nil, errHeaders
-	}
-
-	var requestBody io.Reader
-	if data != "" {
-		requestBody = strings.NewReader(data)
-	}
-
-	req, errNewRequest := http.NewRequestWithContext(ctx, method, urlStr, requestBody)
-	if errNewRequest != nil {
-		return nil, fmt.Errorf("failed to build request")
-	}
-	for key, value := range reqHeaders {
-		req.Header.Set(key, value)
-	}
-	if hostOverride != "" {
-		req.Host = hostOverride
-	}
-	return req, nil
-}
-
-func (h *Handler) resolveAPICallHeaders(ctx context.Context, auth *coreauth.Auth, headerTemplate map[string]string, tokenOverride *string) (map[string]string, string, error) {
-	reqHeaders := cloneStringMap(headerTemplate)
-	var hostOverride string
-	var token string
-	var tokenResolved bool
-	var tokenErr error
-	if tokenOverride != nil {
-		token = strings.TrimSpace(*tokenOverride)
-		tokenResolved = true
-	}
-	for key, value := range reqHeaders {
-		if strings.EqualFold(key, "host") {
-			hostOverride = strings.TrimSpace(value)
-			delete(reqHeaders, key)
-			continue
-		}
-		if !strings.Contains(value, "$TOKEN$") {
-			continue
-		}
-		if !tokenResolved {
-			token, tokenErr = h.resolveTokenForAuth(ctx, auth)
-			tokenResolved = true
-		}
-		if auth != nil && token == "" {
-			if tokenErr != nil {
-				return nil, "", fmt.Errorf("auth token refresh failed")
-			}
-			return nil, "", fmt.Errorf("auth token not found")
-		}
-		if token == "" {
-			continue
-		}
-		reqHeaders[key] = strings.ReplaceAll(value, "$TOKEN$", token)
-	}
-	return reqHeaders, hostOverride, nil
-}
-
-func (h *Handler) refreshCodexOAuthAccessToken(ctx context.Context, auth *coreauth.Auth) (string, error) {
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	if auth == nil {
-		return "", nil
-	}
-	metadata := auth.Metadata
-	if len(metadata) == 0 {
-		return "", fmt.Errorf("codex oauth metadata missing")
-	}
-	refreshToken := stringValue(metadata, "refresh_token")
-	if refreshToken == "" {
-		current := strings.TrimSpace(tokenValueFromMetadata(metadata))
-		if current != "" {
-			return current, nil
-		}
-		return "", fmt.Errorf("codex refresh token missing")
-	}
-	tokenData, errRefresh := refreshCodexTokensWithRetry(ctx, h, refreshToken, 3)
-	if errRefresh != nil {
-		return "", errRefresh
-	}
-	if tokenData == nil || strings.TrimSpace(tokenData.AccessToken) == "" {
-		return "", fmt.Errorf("codex oauth token refresh returned empty access_token")
-	}
-	if auth.Metadata == nil {
-		auth.Metadata = make(map[string]any)
-	}
-	now := time.Now()
-	if strings.TrimSpace(tokenData.IDToken) != "" {
-		auth.Metadata["id_token"] = strings.TrimSpace(tokenData.IDToken)
-	}
-	auth.Metadata["access_token"] = strings.TrimSpace(tokenData.AccessToken)
-	if strings.TrimSpace(tokenData.RefreshToken) != "" {
-		auth.Metadata["refresh_token"] = strings.TrimSpace(tokenData.RefreshToken)
-	}
-	if strings.TrimSpace(tokenData.AccountID) != "" {
-		auth.Metadata["account_id"] = strings.TrimSpace(tokenData.AccountID)
-	}
-	if strings.TrimSpace(tokenData.Email) != "" {
-		auth.Metadata["email"] = strings.TrimSpace(tokenData.Email)
-	}
-	if strings.TrimSpace(tokenData.Expire) != "" {
-		auth.Metadata["expired"] = strings.TrimSpace(tokenData.Expire)
-	}
-	auth.Metadata["type"] = "codex"
-	auth.Metadata["last_refresh"] = now.Format(time.RFC3339)
-
-	if h != nil && h.authManager != nil {
-		auth.LastRefreshedAt = now
-		auth.UpdatedAt = now
-		_, _ = h.authManager.Update(ctx, auth)
-	}
-
-	return strings.TrimSpace(tokenData.AccessToken), nil
 }
 
 func (h *Handler) refreshGeminiOAuthAccessToken(ctx context.Context, auth *coreauth.Auth) (string, error) {
@@ -893,17 +643,15 @@ func (h *Handler) apiCallTransport(auth *coreauth.Auth) http.RoundTripper {
 			}
 		}
 	}
-	for _, proxyStr := range proxyCandidates {
-		if transport := util.NewProxyPoolTransport(proxyStr); transport != nil {
-			return transport
+	if h != nil && h.cfg != nil {
+		if proxyStr := strings.TrimSpace(h.cfg.ProxyURL); proxyStr != "" {
+			proxyCandidates = append(proxyCandidates, proxyStr)
 		}
 	}
-	if h != nil && h.cfg != nil {
-		selection := proxyrouting.Resolve(h.cfg, auth)
-		if selection.HasProxy() {
-			if transport := util.NewProxyPoolTransport(selection.ProxyURL); transport != nil {
-				return proxystats.AttachRoundTripperMetadata(transport, selection.StatsMetadata())
-			}
+
+	for _, proxyStr := range proxyCandidates {
+		if transport := buildProxyTransport(proxyStr); transport != nil {
+			return transport
 		}
 	}
 

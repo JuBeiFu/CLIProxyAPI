@@ -28,12 +28,6 @@ type VertexCompatKey struct {
 	// ProxyURL optionally overrides the global proxy for this API key.
 	ProxyURL string `yaml:"proxy-url,omitempty" json:"proxy-url,omitempty"`
 
-	// ProxyProfile selects a named proxy profile for this credential.
-	ProxyProfile string `yaml:"proxy-profile,omitempty" json:"proxy-profile,omitempty"`
-
-	// PlanType annotates the subscription tier for auth-aware proxy routing.
-	PlanType string `yaml:"plan-type,omitempty" json:"plan-type,omitempty"`
-
 	// Headers optionally adds extra HTTP headers for requests sent with this key.
 	// Commonly used for cookies, user-agent, and other authentication headers.
 	Headers map[string]string `yaml:"headers,omitempty" json:"headers,omitempty"`
@@ -78,8 +72,6 @@ func (cfg *Config) SanitizeVertexCompatKeys() {
 		entry.Prefix = normalizeModelPrefix(entry.Prefix)
 		entry.BaseURL = strings.TrimSpace(entry.BaseURL)
 		entry.ProxyURL = strings.TrimSpace(entry.ProxyURL)
-		entry.ProxyProfile = strings.TrimSpace(entry.ProxyProfile)
-		entry.PlanType = strings.TrimSpace(entry.PlanType)
 		entry.Headers = NormalizeHeaders(entry.Headers)
 		entry.ExcludedModels = NormalizeExcludedModels(entry.ExcludedModels)
 

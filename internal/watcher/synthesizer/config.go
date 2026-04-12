@@ -70,7 +70,6 @@ func (s *ConfigSynthesizer) synthesizeGeminiKeys(ctx *SynthesisContext) []*corea
 			attrs["models_hash"] = hash
 		}
 		addConfigHeadersToAttrs(entry.Headers, attrs)
-		addRoutingMetadataToAttrs(attrs, entry.PlanType, entry.ProxyProfile)
 		a := &coreauth.Auth{
 			ID:         id,
 			Provider:   "gemini",
@@ -118,7 +117,6 @@ func (s *ConfigSynthesizer) synthesizeClaudeKeys(ctx *SynthesisContext) []*corea
 			attrs["models_hash"] = hash
 		}
 		addConfigHeadersToAttrs(ck.Headers, attrs)
-		addRoutingMetadataToAttrs(attrs, ck.PlanType, ck.ProxyProfile)
 		proxyURL := strings.TrimSpace(ck.ProxyURL)
 		a := &coreauth.Auth{
 			ID:         id,
@@ -169,7 +167,6 @@ func (s *ConfigSynthesizer) synthesizeCodexKeys(ctx *SynthesisContext) []*coreau
 			attrs["models_hash"] = hash
 		}
 		addConfigHeadersToAttrs(ck.Headers, attrs)
-		addRoutingMetadataToAttrs(attrs, ck.PlanType, ck.ProxyProfile)
 		proxyURL := strings.TrimSpace(ck.ProxyURL)
 		a := &coreauth.Auth{
 			ID:         id,
@@ -228,7 +225,6 @@ func (s *ConfigSynthesizer) synthesizeOpenAICompat(ctx *SynthesisContext) []*cor
 				attrs["models_hash"] = hash
 			}
 			addConfigHeadersToAttrs(compat.Headers, attrs)
-			addRoutingMetadataToAttrs(attrs, entry.PlanType, entry.ProxyProfile)
 			a := &coreauth.Auth{
 				ID:         id,
 				Provider:   providerName,
@@ -308,7 +304,6 @@ func (s *ConfigSynthesizer) synthesizeVertexCompat(ctx *SynthesisContext) []*cor
 			attrs["models_hash"] = hash
 		}
 		addConfigHeadersToAttrs(compat.Headers, attrs)
-		addRoutingMetadataToAttrs(attrs, compat.PlanType, compat.ProxyProfile)
 		a := &coreauth.Auth{
 			ID:         id,
 			Provider:   providerName,

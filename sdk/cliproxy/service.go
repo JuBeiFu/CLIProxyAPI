@@ -348,7 +348,6 @@ func (s *Service) applyRetryConfig(cfg *config.Config) {
 	}
 	maxInterval := time.Duration(cfg.MaxRetryInterval) * time.Second
 	s.coreManager.SetRetryConfig(cfg.RequestRetry, maxInterval, cfg.MaxRetryCredentials)
-	s.coreManager.SetConfig(cfg)
 }
 
 func openAICompatInfoFromAuth(a *coreauth.Auth) (providerKey string, compatName string, ok bool) {
@@ -690,9 +689,7 @@ func (s *Service) Run(ctx context.Context) error {
 	if s.coreManager != nil {
 		interval := 15 * time.Minute
 		s.coreManager.StartAutoRefresh(context.Background(), interval)
-		s.coreManager.StartAutoQuotaRefresh(context.Background())
 		log.Infof("core auth auto-refresh started (interval=%s)", interval)
-		log.Infof("core auth quota refresh started (batch=%d interval=%s cooldown=%s retry=%d)", 20, 15*time.Second, 15*time.Minute, 2)
 	}
 
 	select {
@@ -730,7 +727,6 @@ func (s *Service) Shutdown(ctx context.Context) error {
 		}
 		if s.coreManager != nil {
 			s.coreManager.StopAutoRefresh()
-			s.coreManager.StopAutoQuotaRefresh()
 		}
 		if s.watcher != nil {
 			if err := s.watcher.Stop(); err != nil {

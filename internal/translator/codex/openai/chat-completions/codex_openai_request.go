@@ -7,7 +7,6 @@
 package chat_completions
 
 import (
-	"encoding/json"
 	"strconv"
 	"strings"
 
@@ -171,18 +170,14 @@ func ConvertOpenAIRequestToCodex(modelName string, inputRawJSON []byte, stream b
 							part, _ = sjson.SetBytes(part, "text", it.Get("text").String())
 							msg, _ = sjson.SetRawBytes(msg, "content.-1", part)
 						case "image_url":
-							// Map image inputs to input_image for Responses API.
-							// Only data: URIs are supported; remote URLs are stripped.
+							// Map image inputs to input_image for Responses API
 							if role == "user" {
+								part := []byte(`{}`)
+								part, _ = sjson.SetBytes(part, "type", "input_image")
 								if u := it.Get("image_url.url"); u.Exists() {
-									imageURL := strings.TrimSpace(u.String())
-									if strings.HasPrefix(strings.ToLower(imageURL), "data:image/") {
-										part := []byte(`{}`)
-										part, _ = sjson.SetBytes(part, "type", "input_image")
-										part, _ = sjson.SetBytes(part, "image_url", imageURL)
-										msg, _ = sjson.SetRawBytes(msg, "content.-1", part)
-									}
+									part, _ = sjson.SetBytes(part, "image_url", u.String())
 								}
+								msg, _ = sjson.SetRawBytes(msg, "content.-1", part)
 							}
 						case "file":
 							if role == "user" {
@@ -264,7 +259,7 @@ func ConvertOpenAIRequestToCodex(modelName string, inputRawJSON []byte, stream b
 					out, _ = sjson.SetBytes(out, "text.format.strict", v.Value())
 				}
 				if v := js.Get("schema"); v.Exists() {
-					out, _ = sjson.SetRawBytes(out, "text.format.schema", ensureSchemaRequired([]byte(v.Raw)))
+					out, _ = sjson.SetRawBytes(out, "text.format.schema", []byte(v.Raw))
 				}
 			}
 		}
@@ -440,77 +435,4 @@ func buildShortNameMap(names []string) map[string]string {
 		m[n] = uniq
 	}
 	return m
-}
-
-// ensureSchemaRequired recursively walks a JSON Schema and ensures that every
-// object with "properties" has a "required" array listing all property keys.
-// OpenAI strict structured output rejects schemas where required is missing
-// or incomplete.
-func ensureSchemaRequired(schema []byte) []byte {
-	var node map[string]any
-	if err := json.Unmarshal(schema, &node); err != nil {
-		return schema
-	}
-	fixSchemaNode(node)
-	out, err := json.Marshal(node)
-	if err != nil {
-		return schema
-	}
-	return out
-}
-
-func fixSchemaNode(node map[string]any) {
-	props, ok := node["properties"].(map[string]any)
-	if ok && len(props) > 0 {
-		existing := make(map[string]struct{})
-		if req, ok := node["required"].([]any); ok {
-			for _, v := range req {
-				if s, ok := v.(string); ok {
-					existing[s] = struct{}{}
-				}
-			}
-		}
-		var required []any
-		for key := range props {
-			if _, ok := existing[key]; !ok {
-				existing[key] = struct{}{}
-			}
-		}
-		for key := range existing {
-			required = append(required, key)
-		}
-		node["required"] = required
-
-		for _, v := range props {
-			if child, ok := v.(map[string]any); ok {
-				fixSchemaNode(child)
-			}
-		}
-	}
-
-	// Handle items for array types
-	if items, ok := node["items"].(map[string]any); ok {
-		fixSchemaNode(items)
-	}
-
-	for _, defsKey := range []string{"$defs", "definitions"} {
-		if defs, ok := node[defsKey].(map[string]any); ok {
-			for _, v := range defs {
-				if child, ok := v.(map[string]any); ok {
-					fixSchemaNode(child)
-				}
-			}
-		}
-	}
-
-	// Handle anyOf/oneOf/allOf
-	for _, keyword := range []string{"anyOf", "oneOf", "allOf"} {
-		if arr, ok := node[keyword].([]any); ok {
-			for _, item := range arr {
-				if child, ok := item.(map[string]any); ok {
-					fixSchemaNode(child)
-				}
-			}
-		}
-	}
 }

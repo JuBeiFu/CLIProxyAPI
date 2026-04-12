@@ -325,7 +325,7 @@ func (s *PostgresStore) Delete(ctx context.Context, id string) error {
 	if id == "" {
 		return fmt.Errorf("postgres store: id is empty")
 	}
-	path, err := s.resolveDeletePath(ctx, id)
+	path, err := s.resolveDeletePath(id)
 	if err != nil {
 		return err
 	}
@@ -569,38 +569,11 @@ func (s *PostgresStore) resolveAuthPath(auth *cliproxyauth.Auth) (string, error)
 	return filepath.Join(s.authDir, filepath.FromSlash(auth.ID)), nil
 }
 
-func (s *PostgresStore) resolveDeletePath(ctx context.Context, id string) (string, error) {
+func (s *PostgresStore) resolveDeletePath(id string) (string, error) {
 	if strings.ContainsRune(id, os.PathSeparator) || filepath.IsAbs(id) {
 		return id, nil
 	}
-	if resolved, ok := s.lookupPathByAuthID(ctx, id); ok {
-		return resolved, nil
-	}
 	return filepath.Join(s.authDir, filepath.FromSlash(id)), nil
-}
-
-func (s *PostgresStore) lookupPathByAuthID(ctx context.Context, id string) (string, bool) {
-	entries, err := s.List(ctx)
-	if err != nil {
-		return "", false
-	}
-	for _, auth := range entries {
-		if auth == nil || strings.TrimSpace(auth.ID) != id {
-			continue
-		}
-		if auth.Attributes != nil {
-			if path := strings.TrimSpace(auth.Attributes["path"]); path != "" {
-				return path, true
-			}
-		}
-		if fileName := strings.TrimSpace(auth.FileName); fileName != "" {
-			if filepath.IsAbs(fileName) {
-				return fileName, true
-			}
-			return filepath.Join(s.authDir, filepath.FromSlash(fileName)), true
-		}
-	}
-	return "", false
 }
 
 func (s *PostgresStore) relativeAuthID(path string) (string, error) {

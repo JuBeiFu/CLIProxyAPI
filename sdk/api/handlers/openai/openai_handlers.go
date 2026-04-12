@@ -242,10 +242,6 @@ func convertCompletionsRequestToChatCompletions(rawJSON []byte) []byte {
 		out, _ = sjson.SetBytes(out, "echo", echo.Bool())
 	}
 
-	if serviceTier := root.Get("service_tier"); serviceTier.Exists() {
-		out, _ = sjson.SetBytes(out, "service_tier", serviceTier.String())
-	}
-
 	return out
 }
 
@@ -257,9 +253,8 @@ func convertCompletionsRequestToChatCompletions(rawJSON []byte) []byte {
 //
 // Returns:
 //   - []byte: The converted completions response
-func convertChatCompletionsResponseToCompletions(rawJSON, requestJSON []byte) []byte {
+func convertChatCompletionsResponseToCompletions(rawJSON []byte) []byte {
 	root := gjson.ParseBytes(rawJSON)
-	requestRoot := gjson.ParseBytes(requestJSON)
 
 	// Base completions response structure
 	out := []byte(`{"id":"","object":"text_completion","created":0,"model":"","choices":[]}`)
@@ -279,13 +274,6 @@ func convertChatCompletionsResponseToCompletions(rawJSON, requestJSON []byte) []
 
 	if usage := root.Get("usage"); usage.Exists() {
 		out, _ = sjson.SetRawBytes(out, "usage", []byte(usage.Raw))
-	}
-
-	serviceTier := root.Get("service_tier")
-	if serviceTier.Exists() && serviceTier.String() != "" {
-		out, _ = sjson.SetBytes(out, "service_tier", serviceTier.String())
-	} else if requestedServiceTier := requestRoot.Get("service_tier"); requestedServiceTier.Exists() && requestedServiceTier.String() != "" {
-		out, _ = sjson.SetBytes(out, "service_tier", requestedServiceTier.String())
 	}
 
 	// Convert choices from chat completions to completions format
@@ -339,9 +327,8 @@ func convertChatCompletionsResponseToCompletions(rawJSON, requestJSON []byte) []
 //
 // Returns:
 //   - []byte: The converted completions stream chunk, or nil if should be filtered out
-func convertChatCompletionsStreamChunkToCompletions(chunkData, requestJSON []byte) []byte {
+func convertChatCompletionsStreamChunkToCompletions(chunkData []byte) []byte {
 	root := gjson.ParseBytes(chunkData)
-	requestRoot := gjson.ParseBytes(requestJSON)
 
 	// Check if this chunk has any meaningful content
 	hasContent := false
@@ -383,13 +370,6 @@ func convertChatCompletionsStreamChunkToCompletions(chunkData, requestJSON []byt
 
 	if model := root.Get("model"); model.Exists() {
 		out, _ = sjson.SetBytes(out, "model", model.String())
-	}
-
-	serviceTier := root.Get("service_tier")
-	if serviceTier.Exists() && serviceTier.String() != "" {
-		out, _ = sjson.SetBytes(out, "service_tier", serviceTier.String())
-	} else if requestedServiceTier := requestRoot.Get("service_tier"); requestedServiceTier.Exists() && requestedServiceTier.String() != "" {
-		out, _ = sjson.SetBytes(out, "service_tier", requestedServiceTier.String())
 	}
 
 	// Convert choices from chat completions delta to completions format
@@ -562,7 +542,7 @@ func (h *OpenAIAPIHandler) handleCompletionsNonStreamingResponse(c *gin.Context,
 		return
 	}
 	handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
-	completionsResp := convertChatCompletionsResponseToCompletions(resp, rawJSON)
+	completionsResp := convertChatCompletionsResponseToCompletions(resp)
 	_, _ = c.Writer.Write(completionsResp)
 	cliCancel()
 }
@@ -635,7 +615,7 @@ func (h *OpenAIAPIHandler) handleCompletionsStreamingResponse(c *gin.Context, ra
 			handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
 
 			// Write the first chunk
-			converted := convertChatCompletionsStreamChunkToCompletions(chunk, rawJSON)
+			converted := convertChatCompletionsStreamChunkToCompletions(chunk)
 			if converted != nil {
 				_, _ = fmt.Fprintf(c.Writer, "data: %s\n\n", string(converted))
 				flusher.Flush()
@@ -656,7 +636,7 @@ func (h *OpenAIAPIHandler) handleCompletionsStreamingResponse(c *gin.Context, ra
 						if !ok {
 							return
 						}
-						converted := convertChatCompletionsStreamChunkToCompletions(chunk, rawJSON)
+						converted := convertChatCompletionsStreamChunkToCompletions(chunk)
 						if converted == nil {
 							continue
 						}

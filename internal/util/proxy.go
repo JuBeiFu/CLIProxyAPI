@@ -15,29 +15,16 @@ import (
 // It supports SOCKS5, HTTP, and HTTPS proxies. The function modifies the client's transport
 // to route requests through the configured proxy server.
 func SetProxy(cfg *config.SDKConfig, httpClient *http.Client) *http.Client {
-	if httpClient == nil {
-		httpClient = &http.Client{}
-	}
-	if cfg == nil {
+	if cfg == nil || httpClient == nil {
 		return httpClient
 	}
-	proxyURL := cfg.ProxyURL
 
-	transport, _, errBuild := proxyutil.BuildHTTPTransport(proxyURL)
+	transport, _, errBuild := proxyutil.BuildHTTPTransport(cfg.ProxyURL)
 	if errBuild != nil {
 		log.Errorf("%v", errBuild)
 	}
 	if transport != nil {
 		httpClient.Transport = transport
-		return httpClient
-	}
-	// Fallback to proxy pool transport for comma-separated proxy lists.
-	if poolTransport := NewProxyPoolTransport(proxyURL); poolTransport != nil {
-		httpClient.Transport = poolTransport
-		return httpClient
-	}
-	if !HasUsableProxyConfig(proxyURL) {
-		httpClient.Transport = NewProxyPoolTransport("direct")
 	}
 	return httpClient
 }

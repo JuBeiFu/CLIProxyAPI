@@ -1,7 +1,6 @@
 package handlers
 
 import (
-	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -67,35 +66,6 @@ func TestWriteErrorResponse_AddonHeadersEnabled(t *testing.T) {
 	}
 	if got := recorder.Header().Values("X-Request-Id"); !reflect.DeepEqual(got, []string{"new-1", "new-2"}) {
 		t.Fatalf("X-Request-Id = %#v, want %#v", got, []string{"new-1", "new-2"})
-	}
-}
-
-func TestBuildErrorResponseBody_NormalizesCapacityJSONFor429(t *testing.T) {
-	body := BuildErrorResponseBody(http.StatusTooManyRequests, `{"error":{"message":"Selected model is at capacity. Please try a different model.","type":"server_error"}}`)
-
-	var parsed ErrorResponse
-	if err := json.Unmarshal(body, &parsed); err != nil {
-		t.Fatalf("expected valid JSON body, got error: %v", err)
-	}
-	if parsed.Error.Message == "Selected model is at capacity. Please try a different model." {
-		t.Fatalf("expected capacity message to be normalized, got upstream raw message")
-	}
-	if parsed.Error.Message != "The requested model is temporarily at capacity. Please retry shortly." {
-		t.Fatalf("message = %q", parsed.Error.Message)
-	}
-	if parsed.Error.Type != "rate_limit_error" {
-		t.Fatalf("type = %q, want %q", parsed.Error.Type, "rate_limit_error")
-	}
-	if parsed.Error.Code != "rate_limit_exceeded" {
-		t.Fatalf("code = %q, want %q", parsed.Error.Code, "rate_limit_exceeded")
-	}
-}
-
-func TestBuildErrorResponseBody_PreservesOtherValidJSON(t *testing.T) {
-	raw := `{"error":{"message":"some upstream validation error","type":"invalid_request_error","code":"invalid_payload"}}`
-	body := BuildErrorResponseBody(http.StatusBadRequest, raw)
-	if string(body) != raw {
-		t.Fatalf("body = %q, want original JSON payload", string(body))
 	}
 }
 

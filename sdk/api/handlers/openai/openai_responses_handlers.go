@@ -13,15 +13,12 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"time"
 
 	"github.com/gin-gonic/gin"
 	. "github.com/router-for-me/CLIProxyAPI/v6/internal/constant"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/api/handlers"
-	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
-	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
@@ -299,41 +296,17 @@ func (h *OpenAIResponsesAPIHandler) Compact(c *gin.Context) {
 	c.Header("Content-Type", "application/json")
 	modelName := gjson.GetBytes(rawJSON, "model").String()
 	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
-	compactCtx := context.WithoutCancel(cliCtx)
-	compactCtx = coreauth.WithExecuteAttemptTimeout(compactCtx, compactExecuteTimeout(h))
-	compactCtx, compactCancel := context.WithCancel(compactCtx)
-	if c != nil && c.Request != nil {
-		requestCtx := c.Request.Context()
-		if requestCtx != nil {
-			go func() {
-				select {
-				case <-requestCtx.Done():
-					compactCancel()
-				case <-compactCtx.Done():
-				}
-			}()
-		}
-	}
-	stopKeepAlive := h.StartNonStreamingKeepAlive(c, compactCtx)
-	resp, upstreamHeaders, errMsg := h.ExecuteWithAuthManager(compactCtx, h.HandlerType(), modelName, rawJSON, "responses/compact")
+	stopKeepAlive := h.StartNonStreamingKeepAlive(c, cliCtx)
+	resp, upstreamHeaders, errMsg := h.ExecuteWithAuthManager(cliCtx, h.HandlerType(), modelName, rawJSON, "responses/compact")
 	stopKeepAlive()
 	if errMsg != nil {
-		compactCancel()
 		h.WriteErrorResponse(c, errMsg)
 		cliCancel(errMsg.Error)
 		return
 	}
 	handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
 	_, _ = c.Writer.Write(resp)
-	compactCancel()
 	cliCancel()
-}
-
-func compactExecuteTimeout(h *OpenAIResponsesAPIHandler) time.Duration {
-	if h != nil && h.AuthManager != nil {
-		return coreauth.CompactExecuteAttemptTimeout(h.AuthManager.CurrentConfig())
-	}
-	return 0
 }
 
 // handleNonStreamingResponse handles non-streaming chat completion responses
@@ -441,60 +414,12 @@ func (h *OpenAIResponsesAPIHandler) handleStreamingResponse(c *gin.Context, rawJ
 	}
 }
 
-func responsesChunkHasCompleted(chunk []byte) bool {
-	for _, payload := range websocketJSONPayloadsFromChunk(chunk) {
-		if gjson.GetBytes(payload, "type").String() == wsEventTypeCompleted {
-			return true
-		}
-	}
-	return false
-}
-
-func responsesIncompleteStreamError() *interfaces.ErrorMessage {
-	return &interfaces.ErrorMessage{
-		StatusCode: http.StatusRequestTimeout,
-		Error:      fmt.Errorf("stream disconnected before completion: stream closed before response.completed"),
-	}
-}
-
-func (h *OpenAIResponsesAPIHandler) logResponsesStreamError(c *gin.Context, errMsg *interfaces.ErrorMessage) {
-	if errMsg == nil {
-		return
-	}
-	status := errMsg.StatusCode
-	if status <= 0 {
-		status = http.StatusInternalServerError
-	}
-	if errMsg.Error != nil {
-		log.Warnf("responses stream error: status=%d error=%v", status, errMsg.Error)
-	} else {
-		log.Warnf("responses stream error: status=%d", status)
-	}
-	h.LoggingAPIResponseError(context.WithValue(context.Background(), "gin", c), errMsg)
-	markAPIResponseTimestamp(c)
-}
-
 func (h *OpenAIResponsesAPIHandler) forwardResponsesStream(c *gin.Context, flusher http.Flusher, cancel func(error), data <-chan []byte, errs <-chan *interfaces.ErrorMessage, framer *responsesSSEFramer) {
 	if framer == nil {
 		framer = &responsesSSEFramer{}
 	}
-	completed := false
-	receivedOutputEvent := false
 	h.ForwardStream(c, flusher, cancel, data, errs, handlers.StreamForwardOptions{
 		WriteChunk: func(chunk []byte) {
-			if responsesChunkHasCompleted(chunk) {
-				completed = true
-				markAPIResponseTimestamp(c)
-			}
-			if !receivedOutputEvent {
-				for _, payload := range websocketJSONPayloadsFromChunk(chunk) {
-					evtType := gjson.GetBytes(payload, "type").String()
-					if evtType != "" && evtType != "response.created" {
-						receivedOutputEvent = true
-						break
-					}
-				}
-			}
 			framer.WriteChunk(c.Writer, chunk)
 		},
 		WriteTerminalError: func(errMsg *interfaces.ErrorMessage) {
@@ -502,7 +427,6 @@ func (h *OpenAIResponsesAPIHandler) forwardResponsesStream(c *gin.Context, flush
 			if errMsg == nil {
 				return
 			}
-			h.logResponsesStreamError(c, errMsg)
 			status := http.StatusInternalServerError
 			if errMsg.StatusCode > 0 {
 				status = errMsg.StatusCode
@@ -516,13 +440,6 @@ func (h *OpenAIResponsesAPIHandler) forwardResponsesStream(c *gin.Context, flush
 		},
 		WriteDone: func() {
 			framer.Flush(c.Writer)
-			if receivedOutputEvent && !completed {
-				errMsg := responsesIncompleteStreamError()
-				h.logResponsesStreamError(c, errMsg)
-				chunk := handlers.BuildOpenAIResponsesStreamErrorChunk(errMsg.StatusCode, errMsg.Error.Error(), 0)
-				_, _ = fmt.Fprintf(c.Writer, "\nevent: error\ndata: %s\n\n", string(chunk))
-				return
-			}
 			_, _ = c.Writer.Write([]byte("\n"))
 		},
 	})

@@ -20,7 +20,7 @@ import (
 )
 
 const (
-	DefaultPanelGitHubRepository = "https://github.com/JuBeiFu/Cli-Proxy-API-Management-Center"
+	DefaultPanelGitHubRepository = "https://github.com/router-for-me/Cli-Proxy-API-Management-Center"
 	DefaultPprofAddr             = "127.0.0.1:8316"
 )
 
@@ -75,16 +75,6 @@ type Config struct {
 	MaxRetryCredentials int `yaml:"max-retry-credentials" json:"max-retry-credentials"`
 	// MaxRetryInterval defines the maximum wait time in seconds before retrying a cooled-down credential.
 	MaxRetryInterval int `yaml:"max-retry-interval" json:"max-retry-interval"`
-	// ExecuteTimeoutSeconds defines the maximum time budget for a single non-streaming upstream execution attempt.
-	// <= 0 disables the manager-level execution timeout.
-	ExecuteTimeoutSeconds int `yaml:"execute-timeout-seconds" json:"execute-timeout-seconds"`
-	// CountTimeoutSeconds defines the maximum time budget for a single token-count upstream execution attempt.
-	// <= 0 disables the manager-level token-count timeout.
-	CountTimeoutSeconds int `yaml:"count-timeout-seconds" json:"count-timeout-seconds"`
-	// StreamConnectTimeoutSeconds defines the maximum time budget for establishing a streaming upstream request,
-	// including receiving response headers and the initial stream handle.
-	// <= 0 disables the manager-level stream-connect timeout.
-	StreamConnectTimeoutSeconds int `yaml:"stream-connect-timeout-seconds" json:"stream-connect-timeout-seconds"`
 
 	// QuotaExceeded defines the behavior when a quota is exceeded.
 	QuotaExceeded QuotaExceeded `yaml:"quota-exceeded" json:"quota-exceeded"`
@@ -143,29 +133,7 @@ type Config struct {
 	// Payload defines default and override rules for provider payload parameters.
 	Payload PayloadConfig `yaml:"payload" json:"payload"`
 
-	// UsagePricing stores model token pricing for management-side USD analytics.
-	UsagePricing UsagePricingConfig `yaml:"usage-pricing" json:"usage-pricing"`
-
 	legacyMigrationPending bool `yaml:"-" json:"-"`
-}
-
-// UsagePricingConfig stores persisted model pricing metadata used by the
-// management center to compute USD usage from recorded token consumption.
-type UsagePricingConfig struct {
-	NewAPIPricingURL      string                     `yaml:"new-api-pricing-url,omitempty" json:"new-api-pricing-url,omitempty"`
-	NewAPIPricingToken    string                     `yaml:"new-api-pricing-token,omitempty" json:"-"`
-	LastSyncedAt          string                     `yaml:"last-synced-at,omitempty" json:"last-synced-at,omitempty"`
-	LastSyncSource        string                     `yaml:"last-sync-source,omitempty" json:"last-sync-source,omitempty"`
-	LastSyncModelCount    int                        `yaml:"last-sync-model-count,omitempty" json:"last-sync-model-count,omitempty"`
-	LastSyncRequestModels int                        `yaml:"last-sync-request-models,omitempty" json:"last-sync-request-models,omitempty"`
-	ModelPrices           map[string]UsageModelPrice `yaml:"model-prices,omitempty" json:"model-prices,omitempty"`
-}
-
-// UsageModelPrice stores token pricing in USD per 1M tokens.
-type UsageModelPrice struct {
-	Prompt     float64 `yaml:"prompt" json:"prompt"`
-	Completion float64 `yaml:"completion" json:"completion"`
-	Cache      float64 `yaml:"cache" json:"cache"`
 }
 
 // ClaudeHeaderDefaults configures default header values injected into Claude API requests.
@@ -244,56 +212,6 @@ type RoutingConfig struct {
 	// Strategy selects the credential selection strategy.
 	// Supported values: "round-robin" (default), "fill-first".
 	Strategy string `yaml:"strategy,omitempty" json:"strategy,omitempty"`
-	// MaxInflightPerAuth limits concurrent live requests that may execute against
-	// the same auth entry at the same time. <= 0 disables the limiter.
-	MaxInflightPerAuth int `yaml:"max-inflight-per-auth,omitempty" json:"max-inflight-per-auth,omitempty"`
-	// AllowInflightOverflowWhenExhausted permits temporary overflow above
-	// MaxInflightPerAuth only when every otherwise-eligible auth for the request
-	// is already blocked by the in-flight limit.
-	AllowInflightOverflowWhenExhausted bool `yaml:"allow-inflight-overflow-when-exhausted,omitempty" json:"allow-inflight-overflow-when-exhausted,omitempty"`
-	// NewAuthFirst controls tie-breaking order within the same priority bucket.
-	// When omitted or true, newer auths are preferred before older ones.
-	// Set it to false to restore older-first ordering.
-	NewAuthFirst *bool `yaml:"new-auth-first,omitempty" json:"new-auth-first,omitempty"`
-	// IdleProbeAfterHours defines how long an auth may remain unused before it is
-	// eligible for background health probing. <= 0 disables idle-age-triggered probing.
-	IdleProbeAfterHours int `yaml:"idle-probe-after-hours,omitempty" json:"idle-probe-after-hours,omitempty"`
-	// SlowRequestPenaltyEnabled enables runtime demotion for repeatedly slow auths.
-	SlowRequestPenaltyEnabled *bool `yaml:"slow-request-penalty-enabled,omitempty" json:"slow-request-penalty-enabled,omitempty"`
-	// SlowRequestThresholdMs is the latency threshold above which a request counts as slow.
-	SlowRequestThresholdMs int `yaml:"slow-request-threshold-ms,omitempty" json:"slow-request-threshold-ms,omitempty"`
-	// SlowRequestWindowSeconds is the accumulation window for slow requests.
-	SlowRequestWindowSeconds int `yaml:"slow-request-window-seconds,omitempty" json:"slow-request-window-seconds,omitempty"`
-	// SlowRequestTriggerCount is how many slow requests in the window trigger a penalty.
-	SlowRequestTriggerCount int `yaml:"slow-request-trigger-count,omitempty" json:"slow-request-trigger-count,omitempty"`
-	// SlowRequestPenaltyStep is the per-trigger priority penalty increment.
-	SlowRequestPenaltyStep int `yaml:"slow-request-penalty-step,omitempty" json:"slow-request-penalty-step,omitempty"`
-	// SlowRequestPenaltyMax caps the accumulated slow-request priority penalty.
-	SlowRequestPenaltyMax int `yaml:"slow-request-penalty-max,omitempty" json:"slow-request-penalty-max,omitempty"`
-	// SlowRequestPenaltyRecover is how many penalty points are recovered on success.
-	SlowRequestPenaltyRecover int `yaml:"slow-request-penalty-recover,omitempty" json:"slow-request-penalty-recover,omitempty"`
-	// SlowRequestCooldownSeconds temporarily cools an auth after repeated slow requests.
-	SlowRequestCooldownSeconds int `yaml:"slow-request-cooldown-seconds,omitempty" json:"slow-request-cooldown-seconds,omitempty"`
-	// DisableFreeCodexAutoDelete disables automatic deletion of persisted free Codex auths.
-	// When enabled, the manager will not remove free Codex auths on the legacy 1-hour expiry
-	// path or on terminal upstream errors such as unauthorized / usage-limit / capacity.
-	DisableFreeCodexAutoDelete bool `yaml:"disable-free-codex-auto-delete,omitempty" json:"disable-free-codex-auto-delete,omitempty"`
-}
-
-// PreferNewAuthFirst returns whether same-priority auth ordering should favor newer auths.
-func (cfg RoutingConfig) PreferNewAuthFirst() bool {
-	if cfg.NewAuthFirst == nil {
-		return true
-	}
-	return *cfg.NewAuthFirst
-}
-
-// SlowPenaltyEnabled returns whether slow-request runtime penalties are enabled.
-func (cfg RoutingConfig) SlowPenaltyEnabled() bool {
-	if cfg.SlowRequestPenaltyEnabled == nil {
-		return true
-	}
-	return *cfg.SlowRequestPenaltyEnabled
 }
 
 // OAuthModelAlias defines a model ID alias for a specific channel.
@@ -445,12 +363,6 @@ type ClaudeKey struct {
 	// ProxyURL overrides the global proxy setting for this API key if provided.
 	ProxyURL string `yaml:"proxy-url" json:"proxy-url"`
 
-	// ProxyProfile selects a named proxy profile for this credential.
-	ProxyProfile string `yaml:"proxy-profile,omitempty" json:"proxy-profile,omitempty"`
-
-	// PlanType annotates the subscription tier for auth-aware proxy routing.
-	PlanType string `yaml:"plan-type,omitempty" json:"plan-type,omitempty"`
-
 	// Models defines upstream model names and aliases for request routing.
 	Models []ClaudeModel `yaml:"models" json:"models"`
 
@@ -507,12 +419,6 @@ type CodexKey struct {
 	// ProxyURL overrides the global proxy setting for this API key if provided.
 	ProxyURL string `yaml:"proxy-url" json:"proxy-url"`
 
-	// ProxyProfile selects a named proxy profile for this credential.
-	ProxyProfile string `yaml:"proxy-profile,omitempty" json:"proxy-profile,omitempty"`
-
-	// PlanType annotates the subscription tier for auth-aware proxy routing.
-	PlanType string `yaml:"plan-type,omitempty" json:"plan-type,omitempty"`
-
 	// Models defines upstream model names and aliases for request routing.
 	Models []CodexModel `yaml:"models" json:"models"`
 
@@ -556,12 +462,6 @@ type GeminiKey struct {
 
 	// ProxyURL optionally overrides the global proxy for this API key.
 	ProxyURL string `yaml:"proxy-url,omitempty" json:"proxy-url,omitempty"`
-
-	// ProxyProfile selects a named proxy profile for this credential.
-	ProxyProfile string `yaml:"proxy-profile,omitempty" json:"proxy-profile,omitempty"`
-
-	// PlanType annotates the subscription tier for auth-aware proxy routing.
-	PlanType string `yaml:"plan-type,omitempty" json:"plan-type,omitempty"`
 
 	// Models defines upstream model names and aliases for request routing.
 	Models []GeminiModel `yaml:"models,omitempty" json:"models,omitempty"`
@@ -621,12 +521,6 @@ type OpenAICompatibilityAPIKey struct {
 
 	// ProxyURL overrides the global proxy setting for this API key if provided.
 	ProxyURL string `yaml:"proxy-url,omitempty" json:"proxy-url,omitempty"`
-
-	// ProxyProfile selects a named proxy profile for this credential.
-	ProxyProfile string `yaml:"proxy-profile,omitempty" json:"proxy-profile,omitempty"`
-
-	// PlanType annotates the subscription tier for auth-aware proxy routing.
-	PlanType string `yaml:"plan-type,omitempty" json:"plan-type,omitempty"`
 }
 
 // OpenAICompatibilityModel represents a model configuration for OpenAI compatibility,
@@ -775,9 +669,6 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	// Sanitize OpenAI compatibility providers: drop entries without base-url
 	cfg.SanitizeOpenAICompatibility()
 
-	// Normalize named proxy profiles and routing rules.
-	cfg.SanitizeProxyRouting()
-
 	// Normalize OAuth provider model exclusion map.
 	cfg.OAuthExcludedModels = NormalizeOAuthExcludedModels(cfg.OAuthExcludedModels)
 
@@ -786,9 +677,6 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 
 	// Validate raw payload rules and drop invalid entries.
 	cfg.SanitizePayloadRules()
-
-	// Normalize persisted usage pricing records.
-	cfg.SanitizeUsagePricing()
 
 	// NOTE: Legacy migration persistence is intentionally disabled together with
 	// startup legacy migration to keep startup read-only for config.yaml.
@@ -807,57 +695,6 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 
 	// Return the populated configuration struct.
 	return &cfg, nil
-}
-
-// SanitizeUsagePricing normalizes persisted model pricing and metadata.
-func (cfg *Config) SanitizeUsagePricing() {
-	if cfg == nil {
-		return
-	}
-	cfg.UsagePricing.NewAPIPricingURL = strings.TrimSpace(cfg.UsagePricing.NewAPIPricingURL)
-	cfg.UsagePricing.NewAPIPricingToken = strings.TrimSpace(cfg.UsagePricing.NewAPIPricingToken)
-	cfg.UsagePricing.LastSyncedAt = strings.TrimSpace(cfg.UsagePricing.LastSyncedAt)
-	cfg.UsagePricing.LastSyncSource = strings.TrimSpace(cfg.UsagePricing.LastSyncSource)
-	if cfg.UsagePricing.LastSyncModelCount < 0 {
-		cfg.UsagePricing.LastSyncModelCount = 0
-	}
-	if cfg.UsagePricing.LastSyncRequestModels < 0 {
-		cfg.UsagePricing.LastSyncRequestModels = 0
-	}
-	if len(cfg.UsagePricing.ModelPrices) == 0 {
-		cfg.UsagePricing.ModelPrices = nil
-		return
-	}
-
-	normalized := make(map[string]UsageModelPrice, len(cfg.UsagePricing.ModelPrices))
-	for model, price := range cfg.UsagePricing.ModelPrices {
-		name := strings.TrimSpace(model)
-		if name == "" {
-			continue
-		}
-		prompt := price.Prompt
-		completion := price.Completion
-		cache := price.Cache
-		if prompt < 0 {
-			prompt = 0
-		}
-		if completion < 0 {
-			completion = 0
-		}
-		if cache < 0 {
-			cache = prompt
-		}
-		normalized[name] = UsageModelPrice{
-			Prompt:     prompt,
-			Completion: completion,
-			Cache:      cache,
-		}
-	}
-	if len(normalized) == 0 {
-		cfg.UsagePricing.ModelPrices = nil
-		return
-	}
-	cfg.UsagePricing.ModelPrices = normalized
 }
 
 // SanitizePayloadRules validates raw JSON payload rule params and drops invalid rules.
@@ -991,12 +828,6 @@ func (cfg *Config) SanitizeOpenAICompatibility() {
 		e.Prefix = normalizeModelPrefix(e.Prefix)
 		e.BaseURL = strings.TrimSpace(e.BaseURL)
 		e.Headers = NormalizeHeaders(e.Headers)
-		for j := range e.APIKeyEntries {
-			e.APIKeyEntries[j].APIKey = strings.TrimSpace(e.APIKeyEntries[j].APIKey)
-			e.APIKeyEntries[j].ProxyURL = strings.TrimSpace(e.APIKeyEntries[j].ProxyURL)
-			e.APIKeyEntries[j].ProxyProfile = strings.TrimSpace(e.APIKeyEntries[j].ProxyProfile)
-			e.APIKeyEntries[j].PlanType = strings.TrimSpace(e.APIKeyEntries[j].PlanType)
-		}
 		if e.BaseURL == "" {
 			// Skip providers with no base-url; treated as removed
 			continue
@@ -1017,9 +848,6 @@ func (cfg *Config) SanitizeCodexKeys() {
 		e := cfg.CodexKey[i]
 		e.Prefix = normalizeModelPrefix(e.Prefix)
 		e.BaseURL = strings.TrimSpace(e.BaseURL)
-		e.ProxyURL = strings.TrimSpace(e.ProxyURL)
-		e.ProxyProfile = strings.TrimSpace(e.ProxyProfile)
-		e.PlanType = strings.TrimSpace(e.PlanType)
 		e.Headers = NormalizeHeaders(e.Headers)
 		e.ExcludedModels = NormalizeExcludedModels(e.ExcludedModels)
 		if e.BaseURL == "" {
@@ -1038,9 +866,6 @@ func (cfg *Config) SanitizeClaudeKeys() {
 	for i := range cfg.ClaudeKey {
 		entry := &cfg.ClaudeKey[i]
 		entry.Prefix = normalizeModelPrefix(entry.Prefix)
-		entry.ProxyURL = strings.TrimSpace(entry.ProxyURL)
-		entry.ProxyProfile = strings.TrimSpace(entry.ProxyProfile)
-		entry.PlanType = strings.TrimSpace(entry.PlanType)
 		entry.Headers = NormalizeHeaders(entry.Headers)
 		entry.ExcludedModels = NormalizeExcludedModels(entry.ExcludedModels)
 	}
@@ -1064,8 +889,6 @@ func (cfg *Config) SanitizeGeminiKeys() {
 		entry.Prefix = normalizeModelPrefix(entry.Prefix)
 		entry.BaseURL = strings.TrimSpace(entry.BaseURL)
 		entry.ProxyURL = strings.TrimSpace(entry.ProxyURL)
-		entry.ProxyProfile = strings.TrimSpace(entry.ProxyProfile)
-		entry.PlanType = strings.TrimSpace(entry.PlanType)
 		entry.Headers = NormalizeHeaders(entry.Headers)
 		entry.ExcludedModels = NormalizeExcludedModels(entry.ExcludedModels)
 		uniqueKey := entry.APIKey + "|" + entry.BaseURL
@@ -1076,69 +899,6 @@ func (cfg *Config) SanitizeGeminiKeys() {
 		out = append(out, entry)
 	}
 	cfg.GeminiKey = out
-}
-
-func (cfg *Config) SanitizeProxyRouting() {
-	if cfg == nil {
-		return
-	}
-	if len(cfg.ProxyProfiles) > 0 {
-		seenProfiles := make(map[string]struct{}, len(cfg.ProxyProfiles))
-		profiles := make([]ProxyProfile, 0, len(cfg.ProxyProfiles))
-		for _, item := range cfg.ProxyProfiles {
-			item.Name = strings.TrimSpace(item.Name)
-			item.ProxyURL = strings.TrimSpace(item.ProxyURL)
-			item.Description = strings.TrimSpace(item.Description)
-			key := strings.ToLower(item.Name)
-			if item.Name == "" || item.ProxyURL == "" {
-				continue
-			}
-			if _, exists := seenProfiles[key]; exists {
-				continue
-			}
-			seenProfiles[key] = struct{}{}
-			profiles = append(profiles, item)
-		}
-		cfg.ProxyProfiles = profiles
-	}
-	if len(cfg.ProxyRouting.Rules) > 0 {
-		rules := make([]ProxyRoutingRule, 0, len(cfg.ProxyRouting.Rules))
-		for _, rule := range cfg.ProxyRouting.Rules {
-			rule.Name = strings.TrimSpace(rule.Name)
-			rule.ProxyProfile = strings.TrimSpace(rule.ProxyProfile)
-			rule.ProxyURL = strings.TrimSpace(rule.ProxyURL)
-			rule.Providers = normalizeProxyRuleValues(rule.Providers)
-			rule.PlanTypes = normalizeProxyRuleValues(rule.PlanTypes)
-			rule.AuthKinds = normalizeProxyRuleValues(rule.AuthKinds)
-			if rule.ProxyProfile == "" && rule.ProxyURL == "" {
-				continue
-			}
-			rules = append(rules, rule)
-		}
-		cfg.ProxyRouting.Rules = rules
-	}
-}
-
-func normalizeProxyRuleValues(values []string) []string {
-	if len(values) == 0 {
-		return nil
-	}
-	seen := make(map[string]struct{}, len(values))
-	result := make([]string, 0, len(values))
-	for _, value := range values {
-		normalized := strings.ToLower(strings.TrimSpace(value))
-		normalized = strings.ReplaceAll(normalized, "_", "-")
-		normalized = strings.ReplaceAll(normalized, " ", "-")
-		if normalized == "" {
-			continue
-		}
-		if _, exists := seen[normalized]; exists {
-			continue
-		}
-		seen[normalized] = struct{}{}
-		result = append(result, normalized)
-	}
-	return result
 }
 
 func normalizeModelPrefix(prefix string) string {
@@ -1282,7 +1042,6 @@ func SaveConfigPreserveComments(configFile string, cfg *Config) error {
 
 	pruneMappingToGeneratedKeys(original.Content[0], generated.Content[0], "oauth-excluded-models")
 	pruneMappingToGeneratedKeys(original.Content[0], generated.Content[0], "oauth-model-alias")
-	pruneMappingToGeneratedKeys(original.Content[0], generated.Content[0], "usage-pricing")
 
 	// Merge generated into original in-place, preserving comments/order of existing nodes.
 	mergeMappingPreserve(original.Content[0], generated.Content[0])

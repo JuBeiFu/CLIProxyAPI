@@ -11,12 +11,10 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
-	"sort"
 	"strings"
 	"sync"
 	"time"
 
-	internalcodex "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/codex"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 )
 
@@ -130,8 +128,7 @@ func (s *FileTokenStore) List(ctx context.Context) ([]*cliproxyauth.Auth, error)
 	if dir == "" {
 		return nil, fmt.Errorf("auth filestore: directory not configured")
 	}
-	_ = ctx
-	entriesByID := make(map[string]*cliproxyauth.Auth)
+	entries := make([]*cliproxyauth.Auth, 0)
 	err := filepath.WalkDir(dir, func(path string, d fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
@@ -143,25 +140,16 @@ func (s *FileTokenStore) List(ctx context.Context) ([]*cliproxyauth.Auth, error)
 			return nil
 		}
 		auth, err := s.readAuthFile(path, dir)
-		if err != nil || auth == nil {
+		if err != nil {
 			return nil
 		}
-		if existing, ok := entriesByID[auth.ID]; !ok || preferLoadedAuthRecord(auth, existing) {
-			entriesByID[auth.ID] = auth
+		if auth != nil {
+			entries = append(entries, auth)
 		}
 		return nil
 	})
 	if err != nil {
 		return nil, err
-	}
-	ids := make([]string, 0, len(entriesByID))
-	for id := range entriesByID {
-		ids = append(ids, id)
-	}
-	sort.Strings(ids)
-	entries := make([]*cliproxyauth.Auth, 0, len(ids))
-	for _, id := range ids {
-		entries = append(entries, entriesByID[id])
 	}
 	return entries, nil
 }
@@ -172,7 +160,7 @@ func (s *FileTokenStore) Delete(ctx context.Context, id string) error {
 	if id == "" {
 		return fmt.Errorf("auth filestore: id is empty")
 	}
-	path, err := s.resolveDeletePath(ctx, id)
+	path, err := s.resolveDeletePath(id)
 	if err != nil {
 		return err
 	}
@@ -182,7 +170,7 @@ func (s *FileTokenStore) Delete(ctx context.Context, id string) error {
 	return nil
 }
 
-func (s *FileTokenStore) resolveDeletePath(ctx context.Context, id string) (string, error) {
+func (s *FileTokenStore) resolveDeletePath(id string) (string, error) {
 	if strings.ContainsRune(id, os.PathSeparator) || filepath.IsAbs(id) {
 		return id, nil
 	}
@@ -190,34 +178,7 @@ func (s *FileTokenStore) resolveDeletePath(ctx context.Context, id string) (stri
 	if dir == "" {
 		return "", fmt.Errorf("auth filestore: directory not configured")
 	}
-	if resolved, ok := s.lookupPathByAuthID(ctx, dir, id); ok {
-		return resolved, nil
-	}
 	return filepath.Join(dir, id), nil
-}
-
-func (s *FileTokenStore) lookupPathByAuthID(ctx context.Context, baseDir string, id string) (string, bool) {
-	entries, err := s.List(ctx)
-	if err != nil {
-		return "", false
-	}
-	for _, auth := range entries {
-		if auth == nil || strings.TrimSpace(auth.ID) != id {
-			continue
-		}
-		if auth.Attributes != nil {
-			if path := strings.TrimSpace(auth.Attributes["path"]); path != "" {
-				return path, true
-			}
-		}
-		if fileName := strings.TrimSpace(auth.FileName); fileName != "" {
-			if filepath.IsAbs(fileName) {
-				return fileName, true
-			}
-			return filepath.Join(baseDir, fileName), true
-		}
-	}
-	return "", false
 }
 
 func (s *FileTokenStore) readAuthFile(path, baseDir string) (*cliproxyauth.Auth, error) {
@@ -270,14 +231,7 @@ func (s *FileTokenStore) readAuthFile(path, baseDir string) (*cliproxyauth.Auth,
 	if err != nil {
 		return nil, fmt.Errorf("stat file: %w", err)
 	}
-	id := ""
-	if strings.EqualFold(provider, "codex") {
-		id = internalcodex.CredentialID(metadata)
-	}
-	if id == "" {
-		id = s.idFor(path, baseDir)
-	}
-	fileName := filepath.Base(path)
+	id := s.idFor(path, baseDir)
 	disabled, _ := metadata["disabled"].(bool)
 	status := cliproxyauth.StatusActive
 	if disabled {
@@ -286,7 +240,7 @@ func (s *FileTokenStore) readAuthFile(path, baseDir string) (*cliproxyauth.Auth,
 	auth := &cliproxyauth.Auth{
 		ID:               id,
 		Provider:         provider,
-		FileName:         fileName,
+		FileName:         id,
 		Label:            s.labelFor(metadata),
 		Status:           status,
 		Disabled:         disabled,
@@ -316,30 +270,6 @@ func (s *FileTokenStore) idFor(path, baseDir string) string {
 		id = strings.ToLower(id)
 	}
 	return id
-}
-
-func preferLoadedAuthRecord(candidate, existing *cliproxyauth.Auth) bool {
-	if candidate == nil {
-		return false
-	}
-	if existing == nil {
-		return true
-	}
-	if candidate.UpdatedAt.After(existing.UpdatedAt) {
-		return true
-	}
-	if candidate.UpdatedAt.Before(existing.UpdatedAt) {
-		return false
-	}
-	candidatePath := ""
-	if candidate.Attributes != nil {
-		candidatePath = strings.TrimSpace(candidate.Attributes["path"])
-	}
-	existingPath := ""
-	if existing.Attributes != nil {
-		existingPath = strings.TrimSpace(existing.Attributes["path"])
-	}
-	return strings.Compare(candidatePath, existingPath) > 0
 }
 
 func (s *FileTokenStore) resolveAuthPath(auth *cliproxyauth.Auth) (string, error) {

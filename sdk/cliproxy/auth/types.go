@@ -88,20 +88,6 @@ type Auth struct {
 	NextRetryAfter time.Time `json:"next_retry_after"`
 	// ModelStates tracks per-model runtime availability data.
 	ModelStates map[string]*ModelState `json:"model_states,omitempty"`
-	// TransientCooldownUntil blocks fresh selections immediately after runtime quota signals.
-	TransientCooldownUntil time.Time `json:"-"`
-	// QuotaPriorityPenalty lowers scheduler priority while the auth is under quota pressure.
-	QuotaPriorityPenalty int `json:"-"`
-	// SlowRequestPriorityPenalty lowers scheduler priority for auths that repeatedly respond slowly.
-	SlowRequestPriorityPenalty int `json:"-"`
-	// SlowRequestWindowStartedAt tracks the current slow-request accumulation window.
-	SlowRequestWindowStartedAt time.Time `json:"-"`
-	// SlowRequestWindowCount is the number of slow requests observed in the current window.
-	SlowRequestWindowCount int `json:"-"`
-	// SlowRequestCooldownUntil blocks fresh picks after repeated slow responses.
-	SlowRequestCooldownUntil time.Time `json:"-"`
-	// LastObservedLatency stores the last observed request latency.
-	LastObservedLatency time.Duration `json:"-"`
 
 	// Runtime carries non-serialisable data used during execution (in-memory only).
 	Runtime any `json:"-"`
@@ -369,52 +355,6 @@ func (a *Auth) RequestRetryOverride() (int, bool) {
 	return 0, false
 }
 
-// SameAuthRetryOverride returns the auth-file scoped same_auth_retry override when present.
-// The value is read from metadata key "same_auth_retry" (or legacy "same-auth-retry").
-// Unlike request_retry, this only controls immediate retries against the same credential.
-func (a *Auth) SameAuthRetryOverride() (int, bool) {
-	if a == nil || a.Metadata == nil {
-		return 0, false
-	}
-	if val, ok := a.Metadata["same_auth_retry"]; ok {
-		if parsed, okParse := parseIntAny(val); okParse {
-			if parsed < 0 {
-				parsed = 0
-			}
-			return parsed, true
-		}
-	}
-	if val, ok := a.Metadata["same-auth-retry"]; ok {
-		if parsed, okParse := parseIntAny(val); okParse {
-			if parsed < 0 {
-				parsed = 0
-			}
-			return parsed, true
-		}
-	}
-	return 0, false
-}
-
-// MaxInflightOverride returns the auth-file scoped max_inflight override when present.
-// The value is read from metadata key "max_inflight" (or legacy "max-inflight").
-// <= 0 disables per-auth in-flight limiting for this credential.
-func (a *Auth) MaxInflightOverride() (int, bool) {
-	if a == nil || a.Metadata == nil {
-		return 0, false
-	}
-	for _, key := range []string{"max_inflight", "max-inflight"} {
-		if val, ok := a.Metadata[key]; ok {
-			if parsed, okParse := parseIntAny(val); okParse {
-				if parsed < 0 {
-					parsed = 0
-				}
-				return parsed, true
-			}
-		}
-	}
-	return 0, false
-}
-
 func parseBoolAny(val any) (bool, bool) {
 	switch typed := val.(type) {
 	case bool:
@@ -476,14 +416,6 @@ func parseIntAny(val any) (int, bool) {
 func (a *Auth) AccountInfo() (string, string) {
 	if a == nil {
 		return "", ""
-	}
-	if a.Metadata != nil {
-		if v, ok := a.Metadata["account"].(string); ok {
-			account := strings.TrimSpace(v)
-			if account != "" {
-				return "oauth", account
-			}
-		}
 	}
 	// For Gemini CLI, include project ID in the OAuth account info if present.
 	if strings.ToLower(a.Provider) == "gemini-cli" {

@@ -6,7 +6,6 @@ import (
 	"strings"
 	"sync"
 	"testing"
-	"time"
 
 	internalconfig "github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
@@ -479,46 +478,6 @@ func TestManagerExecuteStream_OpenAICompatAliasPoolFallsBackBeforeFirstByte(t *t
 	}
 	if gotHeader := streamResult.Headers.Get("X-Model"); gotHeader != "glm-5" {
 		t.Fatalf("header X-Model = %q, want %q", gotHeader, "glm-5")
-	}
-}
-
-func TestManagerExecuteStream_OpenAICompatAliasPoolFallsBackOnBootstrapTimeout(t *testing.T) {
-	alias := "claude-opus-4.66"
-	deadline := time.NewTimer(50 * time.Millisecond)
-	defer deadline.Stop()
-	timeoutCtx := context.WithValue(context.Background(), streamBootstrapTimeoutContextKey{}, 50*time.Millisecond)
-	executor := &openAICompatPoolExecutor{
-		id: "pool",
-		streamPayloads: map[string][]cliproxyexecutor.StreamChunk{
-			"qwen3.5-plus": {},
-			"glm-5":       {{Payload: []byte("glm-5")}},
-		},
-	}
-	m := newOpenAICompatPoolTestManager(t, alias, []internalconfig.OpenAICompatibilityModel{
-		{Name: "qwen3.5-plus", Alias: alias},
-		{Name: "glm-5", Alias: alias},
-	}, executor)
-
-	streamResult, err := m.ExecuteStream(timeoutCtx, []string{"pool"}, cliproxyexecutor.Request{Model: alias}, cliproxyexecutor.Options{})
-	if err != nil {
-		t.Fatalf("execute stream: %v", err)
-	}
-	var payload []byte
-	for chunk := range streamResult.Chunks {
-		if chunk.Err != nil {
-			t.Fatalf("unexpected stream error: %v", chunk.Err)
-		}
-		payload = append(payload, chunk.Payload...)
-	}
-	if string(payload) != "glm-5" {
-		t.Fatalf("payload = %q, want %q", string(payload), "glm-5")
-	}
-	got := executor.StreamModels()
-	want := []string{"qwen3.5-plus", "glm-5"}
-	for i := range want {
-		if got[i] != want[i] {
-			t.Fatalf("stream call %d model = %q, want %q", i, got[i], want[i])
-		}
 	}
 }
 

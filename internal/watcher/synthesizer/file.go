@@ -10,7 +10,7 @@ import (
 	"strings"
 	"time"
 
-	codexauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/codex"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/auth/codex"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/geminicli"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 )
@@ -37,8 +37,6 @@ func (s *FileSynthesizer) Synthesize(ctx *SynthesisContext) ([]*coreauth.Auth, e
 		return out, nil
 	}
 
-	seenByID := make(map[string]*coreauth.Auth, 16)
-	orderedIDs := make([]string, 0, 16)
 	for _, e := range entries {
 		if e.IsDir() {
 			continue
@@ -52,32 +50,11 @@ func (s *FileSynthesizer) Synthesize(ctx *SynthesisContext) ([]*coreauth.Auth, e
 		if errRead != nil || len(data) == 0 {
 			continue
 		}
-		modTime := ctx.Now
-		if info, errInfo := e.Info(); errInfo == nil {
-			modTime = info.ModTime()
-		}
 		auths := synthesizeFileAuths(ctx, full, data)
 		if len(auths) == 0 {
 			continue
 		}
-		for _, auth := range auths {
-			if auth == nil || auth.ID == "" {
-				continue
-			}
-			auth.CreatedAt = modTime
-			auth.UpdatedAt = modTime
-			if existing, ok := seenByID[auth.ID]; !ok {
-				seenByID[auth.ID] = auth
-				orderedIDs = append(orderedIDs, auth.ID)
-			} else if preferSynthesizedAuth(auth, existing) {
-				seenByID[auth.ID] = auth
-			}
-		}
-	}
-	for _, id := range orderedIDs {
-		if auth := seenByID[id]; auth != nil {
-			out = append(out, auth)
-		}
+		out = append(out, auths...)
 	}
 	return out, nil
 }
@@ -86,30 +63,6 @@ func (s *FileSynthesizer) Synthesize(ctx *SynthesisContext) ([]*coreauth.Auth, e
 // It shares exactly the same mapping behavior as FileSynthesizer.Synthesize.
 func SynthesizeAuthFile(ctx *SynthesisContext, fullPath string, data []byte) []*coreauth.Auth {
 	return synthesizeFileAuths(ctx, fullPath, data)
-}
-
-func preferSynthesizedAuth(candidate, existing *coreauth.Auth) bool {
-	if candidate == nil {
-		return false
-	}
-	if existing == nil {
-		return true
-	}
-	if candidate.UpdatedAt.After(existing.UpdatedAt) {
-		return true
-	}
-	if candidate.UpdatedAt.Before(existing.UpdatedAt) {
-		return false
-	}
-	candidatePath := ""
-	if candidate.Attributes != nil {
-		candidatePath = strings.TrimSpace(candidate.Attributes["path"])
-	}
-	existingPath := ""
-	if existing.Attributes != nil {
-		existingPath = strings.TrimSpace(existing.Attributes["path"])
-	}
-	return strings.Compare(candidatePath, existingPath) > 0
 }
 
 func synthesizeFileAuths(ctx *SynthesisContext, fullPath string, data []byte) []*coreauth.Auth {
@@ -134,21 +87,15 @@ func synthesizeFileAuths(ctx *SynthesisContext, fullPath string, data []byte) []
 	if email, _ := metadata["email"].(string); email != "" {
 		label = email
 	}
-	// Prefer stable account-based IDs for selected providers; otherwise fall back to the relative file path.
-	id := ""
-	if provider == "codex" {
-		id = codexauth.CredentialID(metadata)
+	// Use relative path under authDir as ID to stay consistent with the file-based token store.
+	id := fullPath
+	if strings.TrimSpace(ctx.AuthDir) != "" {
+		if rel, errRel := filepath.Rel(ctx.AuthDir, fullPath); errRel == nil && rel != "" {
+			id = rel
+		}
 	}
-	if id == "" {
-		id = fullPath
-		if strings.TrimSpace(ctx.AuthDir) != "" {
-			if rel, errRel := filepath.Rel(ctx.AuthDir, fullPath); errRel == nil && rel != "" {
-				id = rel
-			}
-		}
-		if runtime.GOOS == "windows" {
-			id = strings.ToLower(id)
-		}
+	if runtime.GOOS == "windows" {
+		id = strings.ToLower(id)
 	}
 
 	proxyURL := ""
@@ -215,7 +162,7 @@ func synthesizeFileAuths(ctx *SynthesisContext, fullPath string, data []byte) []
 	// For codex auth files, extract plan_type from the JWT id_token.
 	if provider == "codex" {
 		if idTokenRaw, ok := metadata["id_token"].(string); ok && strings.TrimSpace(idTokenRaw) != "" {
-			if claims, errParse := codexauth.ParseJWTToken(idTokenRaw); errParse == nil && claims != nil {
+			if claims, errParse := codex.ParseJWTToken(idTokenRaw); errParse == nil && claims != nil {
 				if pt := strings.TrimSpace(claims.CodexAuthInfo.ChatgptPlanType); pt != "" {
 					a.Attributes["plan_type"] = pt
 				}

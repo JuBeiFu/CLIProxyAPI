@@ -59,34 +59,3 @@ func TestUpdateAggregatedAvailability_FutureNextRetryBlocksAuth(t *testing.T) {
 		t.Fatalf("auth.NextRetryAfter = %v, want %v", auth.NextRetryAfter, next)
 	}
 }
-
-func TestModelNotFoundFromError_ExtractsRequestedModel(t *testing.T) {
-	t.Parallel()
-
-	err := &Error{HTTPStatus: 404, Message: "HTTP 404 invalid_request_error: Model not found gpt-5.2"}
-	got, ok := modelNotFoundFromError(err, "")
-	if !ok {
-		t.Fatalf("modelNotFoundFromError() ok = false, want true")
-	}
-	if got != "gpt-5.2" {
-		t.Fatalf("modelNotFoundFromError() = %q, want %q", got, "gpt-5.2")
-	}
-}
-
-func TestMergeExcludedModels_AddsModelWithoutDuplicates(t *testing.T) {
-	t.Parallel()
-
-	auth := &Auth{
-		Attributes: map[string]string{"excluded_models": "gpt-4.1,gpt-5.2"},
-		Metadata:   map[string]any{"excluded_models": []string{"gpt-4.1", "gpt-5.2"}},
-	}
-	if changed := mergeExcludedModels(auth, "gpt-5.2"); changed {
-		t.Fatalf("mergeExcludedModels() changed = true, want false")
-	}
-	if changed := mergeExcludedModels(auth, "gpt-5.2-codex"); !changed {
-		t.Fatalf("mergeExcludedModels() changed = false, want true")
-	}
-	if got := auth.Attributes["excluded_models"]; got != "gpt-4.1,gpt-5.2,gpt-5.2-codex" {
-		t.Fatalf("excluded_models = %q", got)
-	}
-}

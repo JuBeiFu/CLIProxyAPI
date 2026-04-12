@@ -35,7 +35,6 @@ const (
 	blockReasonNone blockReason = iota
 	blockReasonCooldown
 	blockReasonDisabled
-	blockReasonPlanIneligible
 	blockReasonOther
 )
 
@@ -69,10 +68,17 @@ func (e *modelCooldownError) Error() string {
 	if resetSeconds < 0 {
 		resetSeconds = 0
 	}
+	displayDuration := e.resetIn
+	if displayDuration > 0 && displayDuration < time.Second {
+		displayDuration = time.Second
+	} else {
+		displayDuration = displayDuration.Round(time.Second)
+	}
 	errorBody := map[string]any{
 		"code":          "model_cooldown",
 		"message":       message,
 		"model":         e.model,
+		"reset_time":    displayDuration.String(),
 		"reset_seconds": resetSeconds,
 	}
 	if e.provider != "" {
@@ -102,62 +108,18 @@ func (e *modelCooldownError) Headers() http.Header {
 }
 
 func authPriority(auth *Auth) int {
-	base := priorityFromMetadata(auth)
-	if auth != nil && auth.Attributes != nil {
-		raw := strings.TrimSpace(auth.Attributes["priority"])
-		if raw != "" {
-			if parsed, err := strconv.Atoi(raw); err == nil {
-				base = parsed
-			}
-		}
-	}
-	return base - quotaPriorityPenalty(auth) - slowRequestPriorityPenalty(auth)
-}
-
-func quotaPriorityPenalty(auth *Auth) int {
-	if auth == nil || auth.QuotaPriorityPenalty <= 0 {
+	if auth == nil || auth.Attributes == nil {
 		return 0
 	}
-	return auth.QuotaPriorityPenalty
-}
-
-func slowRequestPriorityPenalty(auth *Auth) int {
-	if auth == nil || auth.SlowRequestPriorityPenalty <= 0 {
+	raw := strings.TrimSpace(auth.Attributes["priority"])
+	if raw == "" {
 		return 0
 	}
-	return auth.SlowRequestPriorityPenalty
-}
-
-func priorityFromMetadata(auth *Auth) int {
-	if auth == nil || len(auth.Metadata) == 0 {
+	parsed, err := strconv.Atoi(raw)
+	if err != nil {
 		return 0
 	}
-	raw, ok := auth.Metadata["priority"]
-	if !ok || raw == nil {
-		return 0
-	}
-	switch v := raw.(type) {
-	case int:
-		return v
-	case int64:
-		return int(v)
-	case float64:
-		return int(v)
-	case json.Number:
-		parsed, err := v.Int64()
-		if err != nil {
-			return 0
-		}
-		return int(parsed)
-	case string:
-		parsed, err := strconv.Atoi(strings.TrimSpace(v))
-		if err != nil {
-			return 0
-		}
-		return parsed
-	default:
-		return 0
-	}
+	return parsed
 }
 
 func canonicalModelKey(model string) string {
@@ -173,35 +135,11 @@ func canonicalModelKey(model string) string {
 	return modelName
 }
 
-func codexModelRequiresPaidPlan(model string) bool {
-	return codexModelPrefersPaidPlan(model)
-}
-
-func codexModelPrefersPaidPlan(model string) bool {
-	switch strings.ToLower(canonicalModelKey(model)) {
-	case "gpt-5.3-codex", "gpt-5.4":
-		return true
-	default:
-		return false
-	}
-}
-
-func codexModelPrefersFreePlan(model string) bool {
-	base := strings.ToLower(canonicalModelKey(model))
-	if base == "" {
-		return false
-	}
-	if !strings.HasPrefix(base, "gpt-") {
-		return false
-	}
-	return !codexModelPrefersPaidPlan(base)
-}
-
 func authWebsocketsEnabled(auth *Auth) bool {
 	return auth != nil && auth.WebsocketsEnabled()
 }
 
-func preferCodexWebsocketAuths(ctx context.Context, provider, model string, available []*Auth) []*Auth {
+func preferCodexWebsocketAuths(ctx context.Context, provider string, available []*Auth) []*Auth {
 	if len(available) == 0 {
 		return available
 	}
@@ -212,18 +150,12 @@ func preferCodexWebsocketAuths(ctx context.Context, provider, model string, avai
 		return available
 	}
 
-	preferPaid := codexModelPrefersPaidPlan(model)
-
 	wsEnabled := make([]*Auth, 0, len(available))
 	for i := 0; i < len(available); i++ {
 		candidate := available[i]
-		if candidate == nil || !authWebsocketsEnabled(candidate) {
-			continue
+		if authWebsocketsEnabled(candidate) {
+			wsEnabled = append(wsEnabled, candidate)
 		}
-		if preferPaid && !codexPlanIsPaid(codexPlanType(candidate)) {
-			continue
-		}
-		wsEnabled = append(wsEnabled, candidate)
 	}
 	if len(wsEnabled) > 0 {
 		return wsEnabled
@@ -231,7 +163,7 @@ func preferCodexWebsocketAuths(ctx context.Context, provider, model string, avai
 	return available
 }
 
-func collectAvailableByPriority(auths []*Auth, model string, now time.Time) (available map[int][]*Auth, cooldownCount int, ineligibleCount int, earliest time.Time) {
+func collectAvailableByPriority(auths []*Auth, model string, now time.Time) (available map[int][]*Auth, cooldownCount int, earliest time.Time) {
 	available = make(map[int][]*Auth)
 	for i := 0; i < len(auths); i++ {
 		candidate := auths[i]
@@ -246,13 +178,9 @@ func collectAvailableByPriority(auths []*Auth, model string, now time.Time) (ava
 			if !next.IsZero() && (earliest.IsZero() || next.Before(earliest)) {
 				earliest = next
 			}
-			continue
-		}
-		if reason == blockReasonPlanIneligible {
-			ineligibleCount++
 		}
 	}
-	return available, cooldownCount, ineligibleCount, earliest
+	return available, cooldownCount, earliest
 }
 
 func getAvailableAuths(auths []*Auth, provider, model string, now time.Time) ([]*Auth, error) {
@@ -260,7 +188,7 @@ func getAvailableAuths(auths []*Auth, provider, model string, now time.Time) ([]
 		return nil, &Error{Code: "auth_not_found", Message: "no auth candidates"}
 	}
 
-	availableByPriority, cooldownCount, _, earliest := collectAvailableByPriority(auths, model, now)
+	availableByPriority, cooldownCount, earliest := collectAvailableByPriority(auths, model, now)
 	if len(availableByPriority) == 0 {
 		if cooldownCount == len(auths) && !earliest.IsZero() {
 			providerForError := provider
@@ -274,41 +202,6 @@ func getAvailableAuths(auths []*Auth, provider, model string, now time.Time) ([]
 			return nil, newModelCooldownError(model, providerForError, resetIn)
 		}
 		return nil, &Error{Code: "auth_unavailable", Message: "no auth available"}
-	}
-
-	// For Codex, admission is already driven by each account's registered model list.
-	// The remaining plan metadata only influences preference order:
-	// - gpt-5.3-codex / gpt-5.4: prefer paid/team first, then fall back to free
-	// - other GPT-family Codex models: prefer free first to preserve paid capacity
-	if strings.EqualFold(strings.TrimSpace(provider), "codex") && model != "" {
-		switch {
-		case codexModelPrefersPaidPlan(model):
-			paidByPriority := make(map[int][]*Auth)
-			for priority, entries := range availableByPriority {
-				for _, candidate := range entries {
-					if candidate == nil || !codexPlanIsPaid(codexPlanType(candidate)) {
-						continue
-					}
-					paidByPriority[priority] = append(paidByPriority[priority], candidate)
-				}
-			}
-			if len(paidByPriority) > 0 {
-				availableByPriority = paidByPriority
-			}
-		case codexModelPrefersFreePlan(model):
-			freeByPriority := make(map[int][]*Auth)
-			for priority, entries := range availableByPriority {
-				for _, candidate := range entries {
-					if candidate == nil || codexPlanIsPaid(codexPlanType(candidate)) {
-						continue
-					}
-					freeByPriority[priority] = append(freeByPriority[priority], candidate)
-				}
-			}
-			if len(freeByPriority) > 0 {
-				availableByPriority = freeByPriority
-			}
-		}
 	}
 
 	bestPriority := 0
@@ -338,7 +231,7 @@ func (s *RoundRobinSelector) Pick(ctx context.Context, provider, model string, o
 	if err != nil {
 		return nil, err
 	}
-	available = preferCodexWebsocketAuths(ctx, provider, model, available)
+	available = preferCodexWebsocketAuths(ctx, provider, available)
 	key := provider + ":" + canonicalModelKey(model)
 	s.mu.Lock()
 	if s.cursors == nil {
@@ -437,7 +330,7 @@ func (s *FillFirstSelector) Pick(ctx context.Context, provider, model string, op
 	if err != nil {
 		return nil, err
 	}
-	available = preferCodexWebsocketAuths(ctx, provider, model, available)
+	available = preferCodexWebsocketAuths(ctx, provider, available)
 	return available[0], nil
 }
 
@@ -445,33 +338,8 @@ func isAuthBlockedForModel(auth *Auth, model string, now time.Time) (bool, block
 	if auth == nil {
 		return true, blockReasonOther, time.Time{}
 	}
-	if expireAt, expired := freeCodexAuthExpired(auth, now); expired {
-		return true, blockReasonDisabled, expireAt
-	}
 	if auth.Disabled || auth.Status == StatusDisabled {
 		return true, blockReasonDisabled, time.Time{}
-	}
-	disableCooling := quotaCooldownDisabledForAuth(auth)
-	if !disableCooling {
-		if !auth.TransientCooldownUntil.IsZero() && auth.TransientCooldownUntil.After(now) {
-			return true, blockReasonCooldown, auth.TransientCooldownUntil
-		}
-		if !auth.SlowRequestCooldownUntil.IsZero() && auth.SlowRequestCooldownUntil.After(now) {
-			return true, blockReasonCooldown, auth.SlowRequestCooldownUntil
-		}
-		if until, ok := cooldownUntilFromAuthMetadata(auth.Metadata); ok && until.After(now) {
-			return true, blockReasonCooldown, until
-		}
-		// Treat quota cooldown as global for the auth: Codex "usage_limit_reached" and
-		// similar 429 quota signals are account-level, so we must avoid reusing the
-		// same credential across other models until it recovers.
-		if auth.Quota.Exceeded && !auth.Quota.NextRecoverAt.IsZero() && auth.Quota.NextRecoverAt.After(now) {
-			next := auth.Quota.NextRecoverAt
-			if next.Before(now) {
-				next = now
-			}
-			return true, blockReasonCooldown, next
-		}
 	}
 	if model != "" {
 		if len(auth.ModelStates) > 0 {
@@ -491,9 +359,6 @@ func isAuthBlockedForModel(auth *Auth, model string, now time.Time) (bool, block
 						return false, blockReasonNone, time.Time{}
 					}
 					if state.NextRetryAfter.After(now) {
-						if disableCooling {
-							return false, blockReasonNone, time.Time{}
-						}
 						next := state.NextRetryAfter
 						if !state.Quota.NextRecoverAt.IsZero() && state.Quota.NextRecoverAt.After(now) {
 							next = state.Quota.NextRecoverAt
@@ -513,9 +378,6 @@ func isAuthBlockedForModel(auth *Auth, model string, now time.Time) (bool, block
 		return false, blockReasonNone, time.Time{}
 	}
 	if auth.Unavailable && auth.NextRetryAfter.After(now) {
-		if disableCooling {
-			return false, blockReasonNone, time.Time{}
-		}
 		next := auth.NextRetryAfter
 		if !auth.Quota.NextRecoverAt.IsZero() && auth.Quota.NextRecoverAt.After(now) {
 			next = auth.Quota.NextRecoverAt
@@ -529,50 +391,4 @@ func isAuthBlockedForModel(auth *Auth, model string, now time.Time) (bool, block
 		return true, blockReasonOther, next
 	}
 	return false, blockReasonNone, time.Time{}
-}
-
-func cooldownUntilFromAuthMetadata(meta map[string]any) (time.Time, bool) {
-	if len(meta) == 0 {
-		return time.Time{}, false
-	}
-	raw, ok := meta[metadataCooldownUntilKey]
-	if !ok || raw == nil {
-		return time.Time{}, false
-	}
-	switch v := raw.(type) {
-	case int64:
-		if v <= 0 {
-			return time.Time{}, false
-		}
-		return time.Unix(v, 0), true
-	case int:
-		if v <= 0 {
-			return time.Time{}, false
-		}
-		return time.Unix(int64(v), 0), true
-	case float64:
-		if v <= 0 {
-			return time.Time{}, false
-		}
-		return time.Unix(int64(v), 0), true
-	case json.Number:
-		parsed, err := v.Int64()
-		if err != nil || parsed <= 0 {
-			return time.Time{}, false
-		}
-		return time.Unix(parsed, 0), true
-	case string:
-		s := strings.TrimSpace(v)
-		if s == "" {
-			return time.Time{}, false
-		}
-		if parsed, err := strconv.ParseInt(s, 10, 64); err == nil && parsed > 0 {
-			return time.Unix(parsed, 0), true
-		}
-		if parsed, err := time.Parse(time.RFC3339, s); err == nil && !parsed.IsZero() {
-			return parsed, true
-		}
-	default:
-	}
-	return time.Time{}, false
 }

@@ -95,15 +95,6 @@ func runAutoUpdater(ctx context.Context) {
 		}
 
 		configPath, _ := schedulerConfigPath.Load().(string)
-		if strings.TrimSpace(os.Getenv("MANAGEMENT_STATIC_PATH")) != "" {
-			localPath := FilePath(configPath)
-			if strings.TrimSpace(localPath) != "" {
-				if _, err := os.Stat(localPath); err == nil {
-					log.Debug("management asset auto-updater skipped: MANAGEMENT_STATIC_PATH override in use")
-					return
-				}
-			}
-		}
 		staticDir := StaticDir(configPath)
 		EnsureLatestManagementHTML(ctx, staticDir, cfg.ProxyURL, cfg.RemoteManagement.PanelGitHubRepository)
 	}

@@ -1714,8 +1714,7 @@ func TestClaudeExecutor_ExecuteStream_AcceptEncodingOverrideCannotBypassIdentity
 	}
 }
 
-// Test case 1: String system prompt is preserved — injected as 3 system blocks
-// with the user system text prepended to the first user message.
+// Test case 1: String system prompt is preserved and converted to a content block
 func TestCheckSystemInstructionsWithMode_StringSystemPreserved(t *testing.T) {
 	payload := []byte(`{"system":"You are a helpful assistant.","messages":[{"role":"user","content":"hi"}]}`)
 
@@ -1734,25 +1733,26 @@ func TestCheckSystemInstructionsWithMode_StringSystemPreserved(t *testing.T) {
 	if !strings.HasPrefix(blocks[0].Get("text").String(), "x-anthropic-billing-header:") {
 		t.Fatalf("blocks[0] should be billing header, got %q", blocks[0].Get("text").String())
 	}
-	if blocks[1].Get("text").String() != "You are Claude Code, Anthropic's official CLI for Claude." {
+	if blocks[1].Get("text").String() != "You are a Claude agent, built on Anthropic's Claude Agent SDK." {
 		t.Fatalf("blocks[1] should be agent block, got %q", blocks[1].Get("text").String())
 	}
-	// User system prompt is moved to the first user message, not kept in system array.
-	firstUserContent := gjson.GetBytes(out, "messages.0.content").String()
-	if !strings.Contains(firstUserContent, "You are a helpful assistant.") {
-		t.Fatalf("first user message should contain original system prompt, got %q", firstUserContent)
+	if blocks[2].Get("text").String() != "You are a helpful assistant." {
+		t.Fatalf("blocks[2] should be user system prompt, got %q", blocks[2].Get("text").String())
+	}
+	if blocks[2].Get("cache_control.type").String() != "ephemeral" {
+		t.Fatalf("blocks[2] should have cache_control.type=ephemeral")
 	}
 }
 
-// Test case 2: Strict mode drops the string system prompt — only 3 injected blocks remain.
+// Test case 2: Strict mode drops the string system prompt
 func TestCheckSystemInstructionsWithMode_StringSystemStrict(t *testing.T) {
 	payload := []byte(`{"system":"You are a helpful assistant.","messages":[{"role":"user","content":"hi"}]}`)
 
 	out := checkSystemInstructionsWithMode(payload, true)
 
 	blocks := gjson.GetBytes(out, "system").Array()
-	if len(blocks) != 3 {
-		t.Fatalf("strict mode should produce 3 blocks (billing+agent+static), got %d", len(blocks))
+	if len(blocks) != 2 {
+		t.Fatalf("strict mode should produce 2 blocks, got %d", len(blocks))
 	}
 }
 
@@ -1763,12 +1763,12 @@ func TestCheckSystemInstructionsWithMode_EmptyStringSystemIgnored(t *testing.T) 
 	out := checkSystemInstructionsWithMode(payload, false)
 
 	blocks := gjson.GetBytes(out, "system").Array()
-	if len(blocks) != 3 {
-		t.Fatalf("empty string system should produce 3 blocks (billing+agent+static), got %d", len(blocks))
+	if len(blocks) != 2 {
+		t.Fatalf("empty string system should produce 2 blocks, got %d", len(blocks))
 	}
 }
 
-// Test case 4: Array system prompt — user system text is prepended to first user message
+// Test case 4: Array system prompt is unaffected by the string handling
 func TestCheckSystemInstructionsWithMode_ArraySystemStillWorks(t *testing.T) {
 	payload := []byte(`{"system":[{"type":"text","text":"Be concise."}],"messages":[{"role":"user","content":"hi"}]}`)
 
@@ -1776,12 +1776,10 @@ func TestCheckSystemInstructionsWithMode_ArraySystemStillWorks(t *testing.T) {
 
 	blocks := gjson.GetBytes(out, "system").Array()
 	if len(blocks) != 3 {
-		t.Fatalf("expected 3 system blocks (billing+agent+static), got %d", len(blocks))
+		t.Fatalf("expected 3 system blocks, got %d", len(blocks))
 	}
-	// User system text is moved to the first user message.
-	firstUserContent := gjson.GetBytes(out, "messages.0.content").String()
-	if !strings.Contains(firstUserContent, "Be concise.") {
-		t.Fatalf("first user message should contain original system prompt, got %q", firstUserContent)
+	if blocks[2].Get("text").String() != "Be concise." {
+		t.Fatalf("blocks[2] should be user system prompt, got %q", blocks[2].Get("text").String())
 	}
 }
 
@@ -1793,12 +1791,10 @@ func TestCheckSystemInstructionsWithMode_StringWithSpecialChars(t *testing.T) {
 
 	blocks := gjson.GetBytes(out, "system").Array()
 	if len(blocks) != 3 {
-		t.Fatalf("expected 3 system blocks (billing+agent+static), got %d", len(blocks))
+		t.Fatalf("expected 3 system blocks, got %d", len(blocks))
 	}
-	// User system text is prepended to first user message with special chars preserved.
-	firstUserContent := gjson.GetBytes(out, "messages.0.content").String()
-	if !strings.Contains(firstUserContent, `Use <xml> tags & "quotes" in output.`) {
-		t.Fatalf("first user message should contain original system prompt with special chars, got %q", firstUserContent)
+	if blocks[2].Get("text").String() != `Use <xml> tags & "quotes" in output.` {
+		t.Fatalf("blocks[2] text mangled, got %q", blocks[2].Get("text").String())
 	}
 }
 
@@ -1906,8 +1902,8 @@ func TestApplyCloaking_PreservesConfiguredStrictModeAndSensitiveWordsWhenModeOmi
 	out := applyCloaking(context.Background(), cfg, auth, payload, "claude-3-5-sonnet-20241022", "key-123")
 
 	blocks := gjson.GetBytes(out, "system").Array()
-	if len(blocks) != 3 {
-		t.Fatalf("expected strict mode to keep only injected system blocks (billing+agent+static), got %d", len(blocks))
+	if len(blocks) != 2 {
+		t.Fatalf("expected strict mode to keep only injected system blocks, got %d", len(blocks))
 	}
 	if got := gjson.GetBytes(out, "messages.0.content.0.text").String(); !strings.Contains(got, "\u200B") {
 		t.Fatalf("expected configured sensitive word obfuscation to apply, got %q", got)
