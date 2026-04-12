@@ -70,6 +70,26 @@ usage-statistics-enabled: false
 # Per-entry proxy-url also supports "direct" or "none" to bypass both the global proxy-url and environment proxies explicitly.
 proxy-url: ""
 
+# Default proxy pool for credentials that do not set proxy-url / proxy-pool explicitly.
+# default-proxy-pool: "shared-egress"
+#
+# Named proxy pools. Account selection is stable per auth, so accounts are spread across entries
+# without changing proxy on every request. When fallback-to-direct is true, failed pool proxy
+# requests retry once without a proxy.
+# proxy-pools:
+#   - name: "shared-egress"
+#     fallback-to-direct: true
+#     health-check-url: "https://www.gstatic.com/generate_204"
+#     health-check-method: "GET"
+#     health-check-timeout-seconds: 8
+#     entries:
+#       - name: "proxy-a"
+#         url: "socks5://proxy-a.example.com:1080"
+#         weight: 1
+#       - name: "proxy-b"
+#         url: "http://proxy-b.example.com:8080"
+#         weight: 2
+
 # When true, unprefixed model requests only use credentials without a prefix (except when prefix == model name).
 force-model-prefix: false
 
@@ -132,6 +152,7 @@ nonstream-keepalive-interval: 0
 #     headers:
 #       X-Custom-Header: "custom-value"
 #     proxy-url: "socks5://proxy.example.com:1080"
+#     proxy-pool: "shared-egress" # optional: named proxy pool when proxy-url is unset
 #     # proxy-url: "direct" # optional: explicit direct connect for this credential
 #     models:
 #       - name: "gemini-2.5-flash" # upstream model name
@@ -151,6 +172,7 @@ nonstream-keepalive-interval: 0
 #     headers:
 #       X-Custom-Header: "custom-value"
 #     proxy-url: "socks5://proxy.example.com:1080" # optional: per-key proxy override
+#     proxy-pool: "shared-egress"                  # optional: named proxy pool when proxy-url is unset
 #     # proxy-url: "direct" # optional: explicit direct connect for this credential
 #     models:
 #       - name: "gpt-5-codex"   # upstream model name
@@ -170,6 +192,7 @@ nonstream-keepalive-interval: 0
 #     headers:
 #       X-Custom-Header: "custom-value"
 #     proxy-url: "socks5://proxy.example.com:1080" # optional: per-key proxy override
+#     proxy-pool: "shared-egress"                  # optional: named proxy pool when proxy-url is unset
 #     # proxy-url: "direct" # optional: explicit direct connect for this credential
 #     models:
 #       - name: "claude-3-5-sonnet-20241022" # upstream model name
@@ -225,6 +248,7 @@ nonstream-keepalive-interval: 0
 #     api-key-entries:
 #       - api-key: "sk-or-v1-...b780"
 #         proxy-url: "socks5://proxy.example.com:1080" # optional: per-key proxy override
+#         proxy-pool: "shared-egress"                  # optional: named proxy pool when proxy-url is unset
 #         # proxy-url: "direct" # optional: explicit direct connect for this credential
 #       - api-key: "sk-or-v1-...b781" # without proxy-url
 #     models: # The models supported by the provider.
@@ -250,6 +274,7 @@ nonstream-keepalive-interval: 0
 #     prefix: "test"                              # optional: require calls like "test/vertex-pro" to target this credential
 #     base-url: "https://example.com/api"         # optional, e.g. https://zenmux.ai/api; falls back to Google Vertex when omitted
 #     proxy-url: "socks5://proxy.example.com:1080" # optional per-key proxy override
+#     proxy-pool: "shared-egress"                  # optional: named proxy pool when proxy-url is unset
 #     # proxy-url: "direct" # optional: explicit direct connect for this credential
 #     headers:
 #       X-Custom-Header: "custom-value"

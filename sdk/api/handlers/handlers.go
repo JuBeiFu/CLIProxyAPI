@@ -47,6 +47,7 @@ type ErrorDetail struct {
 }
 
 const idempotencyKeyMetadataKey = "idempotency_key"
+const newAPIDownstreamTransportHeader = "X-NewAPI-Downstream-Transport"
 
 const (
 	defaultStreamingKeepAliveSeconds = 0
@@ -56,6 +57,23 @@ const (
 type pinnedAuthContextKey struct{}
 type selectedAuthCallbackContextKey struct{}
 type executionSessionContextKey struct{}
+
+// DownstreamWebsocketBridge reports whether this request should be treated as a
+// logical downstream websocket bridge, even if the immediate transport into
+// CLIProxyAPI is HTTP.
+func DownstreamWebsocketBridge(ctx context.Context) bool {
+	if ctx == nil {
+		return false
+	}
+	if coreexecutor.DownstreamWebsocket(ctx) {
+		return true
+	}
+	ginCtx, ok := ctx.Value("gin").(*gin.Context)
+	if !ok || ginCtx == nil || ginCtx.Request == nil {
+		return false
+	}
+	return strings.EqualFold(strings.TrimSpace(ginCtx.Request.Header.Get(newAPIDownstreamTransportHeader)), "websocket")
+}
 
 // WithPinnedAuthID returns a child context that requests execution on a specific auth ID.
 func WithPinnedAuthID(ctx context.Context, authID string) context.Context {
@@ -190,9 +208,13 @@ func requestExecutionMetadata(ctx context.Context) map[string]any {
 	// Idempotency-Key is an optional client-supplied header used to correlate retries.
 	// It is forwarded as execution metadata; when absent we generate a UUID.
 	key := ""
+	executionSessionID := executionSessionIDFromContext(ctx)
 	if ctx != nil {
 		if ginCtx, ok := ctx.Value("gin").(*gin.Context); ok && ginCtx != nil && ginCtx.Request != nil {
 			key = strings.TrimSpace(ginCtx.GetHeader("Idempotency-Key"))
+			if executionSessionID == "" {
+				executionSessionID = bridgeExecutionSessionIDFromHeaders(ginCtx.Request.Header)
+			}
 		}
 	}
 	if key == "" {
@@ -206,10 +228,20 @@ func requestExecutionMetadata(ctx context.Context) map[string]any {
 	if selectedCallback := selectedAuthIDCallbackFromContext(ctx); selectedCallback != nil {
 		meta[coreexecutor.SelectedAuthCallbackMetadataKey] = selectedCallback
 	}
-	if executionSessionID := executionSessionIDFromContext(ctx); executionSessionID != "" {
+	if executionSessionID != "" {
 		meta[coreexecutor.ExecutionSessionMetadataKey] = executionSessionID
 	}
 	return meta
+}
+
+func bridgeExecutionSessionIDFromHeaders(headers http.Header) string {
+	if headers == nil {
+		return ""
+	}
+	if !strings.EqualFold(strings.TrimSpace(headers.Get(newAPIDownstreamTransportHeader)), "websocket") {
+		return ""
+	}
+	return strings.TrimSpace(headers.Get("Session_id"))
 }
 
 func pinnedAuthIDFromContext(ctx context.Context) string {
@@ -352,6 +384,9 @@ func (h *BaseAPIHandler) GetContextWithCancel(handler interfaces.APIHandler, c *
 	}
 	newCtx = context.WithValue(newCtx, "gin", c)
 	newCtx = context.WithValue(newCtx, "handler", handler)
+	if DownstreamWebsocketBridge(newCtx) {
+		newCtx = coreexecutor.WithDownstreamWebsocket(newCtx)
+	}
 	return newCtx, func(params ...interface{}) {
 		if h.Cfg.RequestLog && len(params) == 1 {
 			if existing, exists := c.Get("API_RESPONSE"); exists {
@@ -885,7 +920,7 @@ func enrichAuthSelectionError(err error, providers []string, model string) error
 	}
 
 	return &coreauth.Error{
-		Code:       authErr.Code,
+		Code:       "auth_unavailable",
 		Message:    detail,
 		Retryable:  authErr.Retryable,
 		HTTPStatus: status,

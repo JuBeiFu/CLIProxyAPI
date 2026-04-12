@@ -77,10 +77,11 @@ func TestConfigSynthesizer_GeminiKeys(t *testing.T) {
 			name: "gemini key with base url and proxy",
 			geminiKeys: []config.GeminiKey{
 				{
-					APIKey:   "api-key",
-					BaseURL:  "https://custom.api.com",
-					ProxyURL: "http://proxy.local:8080",
-					Prefix:   "custom",
+					APIKey:    "api-key",
+					BaseURL:   "https://custom.api.com",
+					ProxyURL:  "http://proxy.local:8080",
+					ProxyPool: "shared-pool",
+					Prefix:    "custom",
 				},
 			},
 			wantLen: 1,
@@ -90,6 +91,9 @@ func TestConfigSynthesizer_GeminiKeys(t *testing.T) {
 				}
 				if auths[0].ProxyURL != "http://proxy.local:8080" {
 					t.Errorf("expected proxy_url http://proxy.local:8080, got %s", auths[0].ProxyURL)
+				}
+				if auths[0].ProxyPool != "shared-pool" {
+					t.Errorf("expected proxy_pool shared-pool, got %s", auths[0].ProxyPool)
 				}
 			},
 		},
@@ -235,6 +239,7 @@ func TestConfigSynthesizer_CodexKeys(t *testing.T) {
 					Prefix:     "dev",
 					BaseURL:    "https://api.openai.com",
 					ProxyURL:   "http://proxy.local",
+					ProxyPool:  "codex-egress",
 					Websockets: true,
 				},
 			},
@@ -259,6 +264,9 @@ func TestConfigSynthesizer_CodexKeys(t *testing.T) {
 	}
 	if auths[0].ProxyURL != "http://proxy.local" {
 		t.Errorf("expected proxy_url http://proxy.local, got %s", auths[0].ProxyURL)
+	}
+	if auths[0].ProxyPool != "codex-egress" {
+		t.Errorf("expected proxy_pool codex-egress, got %s", auths[0].ProxyPool)
 	}
 	if auths[0].Attributes["websockets"] != "true" {
 		t.Errorf("expected websockets=true, got %s", auths[0].Attributes["websockets"])

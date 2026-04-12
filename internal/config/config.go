@@ -363,6 +363,9 @@ type ClaudeKey struct {
 	// ProxyURL overrides the global proxy setting for this API key if provided.
 	ProxyURL string `yaml:"proxy-url" json:"proxy-url"`
 
+	// ProxyPool selects a named proxy pool when ProxyURL is not explicitly set.
+	ProxyPool string `yaml:"proxy-pool,omitempty" json:"proxy-pool,omitempty"`
+
 	// Models defines upstream model names and aliases for request routing.
 	Models []ClaudeModel `yaml:"models" json:"models"`
 
@@ -419,6 +422,9 @@ type CodexKey struct {
 	// ProxyURL overrides the global proxy setting for this API key if provided.
 	ProxyURL string `yaml:"proxy-url" json:"proxy-url"`
 
+	// ProxyPool selects a named proxy pool when ProxyURL is not explicitly set.
+	ProxyPool string `yaml:"proxy-pool,omitempty" json:"proxy-pool,omitempty"`
+
 	// Models defines upstream model names and aliases for request routing.
 	Models []CodexModel `yaml:"models" json:"models"`
 
@@ -462,6 +468,9 @@ type GeminiKey struct {
 
 	// ProxyURL optionally overrides the global proxy for this API key.
 	ProxyURL string `yaml:"proxy-url,omitempty" json:"proxy-url,omitempty"`
+
+	// ProxyPool selects a named proxy pool when ProxyURL is not explicitly set.
+	ProxyPool string `yaml:"proxy-pool,omitempty" json:"proxy-pool,omitempty"`
 
 	// Models defines upstream model names and aliases for request routing.
 	Models []GeminiModel `yaml:"models,omitempty" json:"models,omitempty"`
@@ -521,6 +530,9 @@ type OpenAICompatibilityAPIKey struct {
 
 	// ProxyURL overrides the global proxy setting for this API key if provided.
 	ProxyURL string `yaml:"proxy-url,omitempty" json:"proxy-url,omitempty"`
+
+	// ProxyPool selects a named proxy pool when ProxyURL is not explicitly set.
+	ProxyPool string `yaml:"proxy-pool,omitempty" json:"proxy-pool,omitempty"`
 }
 
 // OpenAICompatibilityModel represents a model configuration for OpenAI compatibility,
@@ -647,6 +659,9 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	if cfg.MaxRetryCredentials < 0 {
 		cfg.MaxRetryCredentials = 0
 	}
+
+	cfg.DefaultProxyPool = strings.TrimSpace(cfg.DefaultProxyPool)
+	cfg.ProxyPools = NormalizeProxyPools(cfg.ProxyPools)
 
 	// Sanitize Gemini API key configuration and migrate legacy entries.
 	cfg.SanitizeGeminiKeys()
@@ -828,6 +843,19 @@ func (cfg *Config) SanitizeOpenAICompatibility() {
 		e.Prefix = normalizeModelPrefix(e.Prefix)
 		e.BaseURL = strings.TrimSpace(e.BaseURL)
 		e.Headers = NormalizeHeaders(e.Headers)
+		if len(e.APIKeyEntries) > 0 {
+			entries := make([]OpenAICompatibilityAPIKey, 0, len(e.APIKeyEntries))
+			for _, entry := range e.APIKeyEntries {
+				entry.APIKey = strings.TrimSpace(entry.APIKey)
+				entry.ProxyURL = strings.TrimSpace(entry.ProxyURL)
+				entry.ProxyPool = strings.TrimSpace(entry.ProxyPool)
+				if entry.APIKey == "" && entry.ProxyURL == "" && entry.ProxyPool == "" {
+					continue
+				}
+				entries = append(entries, entry)
+			}
+			e.APIKeyEntries = entries
+		}
 		if e.BaseURL == "" {
 			// Skip providers with no base-url; treated as removed
 			continue
@@ -848,6 +876,8 @@ func (cfg *Config) SanitizeCodexKeys() {
 		e := cfg.CodexKey[i]
 		e.Prefix = normalizeModelPrefix(e.Prefix)
 		e.BaseURL = strings.TrimSpace(e.BaseURL)
+		e.ProxyURL = strings.TrimSpace(e.ProxyURL)
+		e.ProxyPool = strings.TrimSpace(e.ProxyPool)
 		e.Headers = NormalizeHeaders(e.Headers)
 		e.ExcludedModels = NormalizeExcludedModels(e.ExcludedModels)
 		if e.BaseURL == "" {
@@ -866,6 +896,8 @@ func (cfg *Config) SanitizeClaudeKeys() {
 	for i := range cfg.ClaudeKey {
 		entry := &cfg.ClaudeKey[i]
 		entry.Prefix = normalizeModelPrefix(entry.Prefix)
+		entry.ProxyURL = strings.TrimSpace(entry.ProxyURL)
+		entry.ProxyPool = strings.TrimSpace(entry.ProxyPool)
 		entry.Headers = NormalizeHeaders(entry.Headers)
 		entry.ExcludedModels = NormalizeExcludedModels(entry.ExcludedModels)
 	}
@@ -889,6 +921,7 @@ func (cfg *Config) SanitizeGeminiKeys() {
 		entry.Prefix = normalizeModelPrefix(entry.Prefix)
 		entry.BaseURL = strings.TrimSpace(entry.BaseURL)
 		entry.ProxyURL = strings.TrimSpace(entry.ProxyURL)
+		entry.ProxyPool = strings.TrimSpace(entry.ProxyPool)
 		entry.Headers = NormalizeHeaders(entry.Headers)
 		entry.ExcludedModels = NormalizeExcludedModels(entry.ExcludedModels)
 		uniqueKey := entry.APIKey + "|" + entry.BaseURL
@@ -911,6 +944,87 @@ func normalizeModelPrefix(prefix string) string {
 		return ""
 	}
 	return trimmed
+}
+
+// NormalizeProxyPools trims, de-duplicates, and drops empty proxy pool entries.
+func NormalizeProxyPools(pools []ProxyPool) []ProxyPool {
+	if len(pools) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(pools))
+	out := make([]ProxyPool, 0, len(pools))
+	for _, pool := range pools {
+		pool.Name = strings.TrimSpace(pool.Name)
+		if pool.Name == "" {
+			continue
+		}
+		key := strings.ToLower(pool.Name)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		pool.HealthCheckURL = strings.TrimSpace(pool.HealthCheckURL)
+		pool.HealthCheckMethod = strings.ToUpper(strings.TrimSpace(pool.HealthCheckMethod))
+		if pool.HealthCheckMethod == "" {
+			pool.HealthCheckMethod = "GET"
+		}
+		if pool.HealthCheckIntervalSeconds < 0 {
+			pool.HealthCheckIntervalSeconds = 0
+		}
+		if pool.HealthCheckTimeoutSeconds < 0 {
+			pool.HealthCheckTimeoutSeconds = 0
+		}
+		pool.Entries = normalizeProxyPoolEntries(pool.Entries)
+		if len(pool.Entries) == 0 {
+			continue
+		}
+		out = append(out, pool)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func normalizeProxyPoolEntries(entries []ProxyPoolEntry) []ProxyPoolEntry {
+	if len(entries) == 0 {
+		return nil
+	}
+	out := make([]ProxyPoolEntry, 0, len(entries))
+	for idx, entry := range entries {
+		entry.Name = strings.TrimSpace(entry.Name)
+		entry.URL = strings.TrimSpace(entry.URL)
+		if entry.URL == "" {
+			continue
+		}
+		if entry.Weight <= 0 {
+			entry.Weight = 1
+		}
+		if entry.Name == "" {
+			entry.Name = fmt.Sprintf("proxy-%d", idx+1)
+		}
+		out = append(out, entry)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func (cfg *Config) ProxyPoolByName(name string) *ProxyPool {
+	if cfg == nil {
+		return nil
+	}
+	target := strings.TrimSpace(name)
+	if target == "" {
+		return nil
+	}
+	for i := range cfg.ProxyPools {
+		if strings.EqualFold(strings.TrimSpace(cfg.ProxyPools[i].Name), target) {
+			return &cfg.ProxyPools[i]
+		}
+	}
+	return nil
 }
 
 // looksLikeBcrypt returns true if the provided string appears to be a bcrypt hash.

@@ -102,6 +102,10 @@ func synthesizeFileAuths(ctx *SynthesisContext, fullPath string, data []byte) []
 	if p, ok := metadata["proxy_url"].(string); ok {
 		proxyURL = p
 	}
+	proxyPool := ""
+	if p, ok := metadata["proxy_pool"].(string); ok {
+		proxyPool = strings.TrimSpace(p)
+	}
 
 	prefix := ""
 	if rawPrefix, ok := metadata["prefix"].(string); ok {
@@ -123,6 +127,7 @@ func synthesizeFileAuths(ctx *SynthesisContext, fullPath string, data []byte) []
 
 	a := &coreauth.Auth{
 		ID:       id,
+		FileName: id,
 		Provider: provider,
 		Label:    label,
 		Prefix:   prefix,
@@ -133,6 +138,7 @@ func synthesizeFileAuths(ctx *SynthesisContext, fullPath string, data []byte) []
 			"path":   fullPath,
 		},
 		ProxyURL:  proxyURL,
+		ProxyPool: proxyPool,
 		Metadata:  metadata,
 		CreatedAt: now,
 		UpdatedAt: now,
@@ -260,6 +266,9 @@ func SynthesizeGeminiVirtualAuths(primary *coreauth.Auth, metadata map[string]an
 		if proxy != "" {
 			metadataCopy["proxy_url"] = proxy
 		}
+		if pool := strings.TrimSpace(primary.ProxyPool); pool != "" {
+			metadataCopy["proxy_pool"] = pool
+		}
 		virtual := &coreauth.Auth{
 			ID:         buildGeminiVirtualID(primary.ID, projectID),
 			Provider:   originalProvider,
@@ -268,6 +277,7 @@ func SynthesizeGeminiVirtualAuths(primary *coreauth.Auth, metadata map[string]an
 			Attributes: attrs,
 			Metadata:   metadataCopy,
 			ProxyURL:   primary.ProxyURL,
+			ProxyPool:  primary.ProxyPool,
 			Prefix:     primary.Prefix,
 			CreatedAt:  primary.CreatedAt,
 			UpdatedAt:  primary.UpdatedAt,

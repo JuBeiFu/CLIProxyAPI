@@ -1120,7 +1120,7 @@ func (h *Handler) PatchAuthFileStatus(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"status": "ok", "disabled": *req.Disabled})
 }
 
-// PatchAuthFileFields updates editable fields (prefix, proxy_url, headers, priority, note) of an auth file.
+// PatchAuthFileFields updates editable fields (prefix, proxy_url, proxy_pool, headers, priority, note) of an auth file.
 func (h *Handler) PatchAuthFileFields(c *gin.Context) {
 	if h.authManager == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "core auth manager unavailable"})
@@ -1128,12 +1128,13 @@ func (h *Handler) PatchAuthFileFields(c *gin.Context) {
 	}
 
 	var req struct {
-		Name     string            `json:"name"`
-		Prefix   *string           `json:"prefix"`
-		ProxyURL *string           `json:"proxy_url"`
-		Headers  map[string]string `json:"headers"`
-		Priority *int              `json:"priority"`
-		Note     *string           `json:"note"`
+		Name      string            `json:"name"`
+		Prefix    *string           `json:"prefix"`
+		ProxyURL  *string           `json:"proxy_url"`
+		ProxyPool *string           `json:"proxy_pool"`
+		Headers   map[string]string `json:"headers"`
+		Priority  *int              `json:"priority"`
+		Note      *string           `json:"note"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
@@ -1191,6 +1192,19 @@ func (h *Handler) PatchAuthFileFields(c *gin.Context) {
 			delete(targetAuth.Metadata, "proxy_url")
 		} else {
 			targetAuth.Metadata["proxy_url"] = proxyURL
+		}
+		changed = true
+	}
+	if req.ProxyPool != nil {
+		proxyPool := strings.TrimSpace(*req.ProxyPool)
+		targetAuth.ProxyPool = proxyPool
+		if targetAuth.Metadata == nil {
+			targetAuth.Metadata = make(map[string]any)
+		}
+		if proxyPool == "" {
+			delete(targetAuth.Metadata, "proxy_pool")
+		} else {
+			targetAuth.Metadata["proxy_pool"] = proxyPool
 		}
 		changed = true
 	}

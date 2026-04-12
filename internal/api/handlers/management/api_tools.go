@@ -12,6 +12,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/proxypool"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/geminicli"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/proxyutil"
@@ -632,36 +633,27 @@ func (h *Handler) authByIndex(authIndex string) *coreauth.Auth {
 }
 
 func (h *Handler) apiCallTransport(auth *coreauth.Auth) http.RoundTripper {
-	var proxyCandidates []string
+	effectiveAuth := auth
 	if auth != nil {
-		if proxyStr := strings.TrimSpace(auth.ProxyURL); proxyStr != "" {
-			proxyCandidates = append(proxyCandidates, proxyStr)
-		}
+		effectiveAuth = auth.Clone()
 		if h != nil && h.cfg != nil {
-			if proxyStr := strings.TrimSpace(proxyURLFromAPIKeyConfig(h.cfg, auth)); proxyStr != "" {
-				proxyCandidates = append(proxyCandidates, proxyStr)
+			if strings.TrimSpace(effectiveAuth.ProxyURL) == "" {
+				effectiveAuth.ProxyURL = strings.TrimSpace(proxyURLFromAPIKeyConfig(h.cfg, auth))
+			}
+			if strings.TrimSpace(effectiveAuth.ProxyPool) == "" {
+				effectiveAuth.ProxyPool = strings.TrimSpace(proxyPoolFromAPIKeyConfig(h.cfg, auth))
 			}
 		}
 	}
-	if h != nil && h.cfg != nil {
-		if proxyStr := strings.TrimSpace(h.cfg.ProxyURL); proxyStr != "" {
-			proxyCandidates = append(proxyCandidates, proxyStr)
+	if h != nil {
+		if transport, _ := proxypool.BuildHTTPRoundTripper(h.cfg, effectiveAuth); transport != nil {
+			return transport
 		}
-	}
-
-	for _, proxyStr := range proxyCandidates {
-		if transport := buildProxyTransport(proxyStr); transport != nil {
+		if transport, _ := proxypool.BuildHTTPRoundTripper(h.cfg, nil); transport != nil {
 			return transport
 		}
 	}
-
-	transport, ok := http.DefaultTransport.(*http.Transport)
-	if !ok || transport == nil {
-		return &http.Transport{Proxy: nil}
-	}
-	clone := transport.Clone()
-	clone.Proxy = nil
-	return clone
+	return proxyutil.NewDirectTransport()
 }
 
 type apiKeyConfigEntry interface {
@@ -745,6 +737,47 @@ func proxyURLFromAPIKeyConfig(cfg *config.Config, auth *coreauth.Auth) string {
 	return ""
 }
 
+func proxyPoolFromAPIKeyConfig(cfg *config.Config, auth *coreauth.Auth) string {
+	if cfg == nil || auth == nil {
+		return ""
+	}
+	authKind, authAccount := auth.AccountInfo()
+	if !strings.EqualFold(strings.TrimSpace(authKind), "api_key") {
+		return ""
+	}
+
+	attrs := auth.Attributes
+	compatName := ""
+	providerKey := ""
+	if len(attrs) > 0 {
+		compatName = strings.TrimSpace(attrs["compat_name"])
+		providerKey = strings.TrimSpace(attrs["provider_key"])
+	}
+	if compatName != "" || strings.EqualFold(strings.TrimSpace(auth.Provider), "openai-compatibility") {
+		return resolveOpenAICompatAPIKeyProxyPool(cfg, auth, strings.TrimSpace(authAccount), providerKey, compatName)
+	}
+
+	switch strings.ToLower(strings.TrimSpace(auth.Provider)) {
+	case "gemini":
+		if entry := resolveAPIKeyConfig(cfg.GeminiKey, auth); entry != nil {
+			return strings.TrimSpace(entry.ProxyPool)
+		}
+	case "claude":
+		if entry := resolveAPIKeyConfig(cfg.ClaudeKey, auth); entry != nil {
+			return strings.TrimSpace(entry.ProxyPool)
+		}
+	case "codex":
+		if entry := resolveAPIKeyConfig(cfg.CodexKey, auth); entry != nil {
+			return strings.TrimSpace(entry.ProxyPool)
+		}
+	case "vertex":
+		if entry := resolveAPIKeyConfig(cfg.VertexCompatAPIKey, auth); entry != nil {
+			return strings.TrimSpace(entry.ProxyPool)
+		}
+	}
+	return ""
+}
+
 func resolveOpenAICompatAPIKeyProxyURL(cfg *config.Config, auth *coreauth.Auth, apiKey, providerKey, compatName string) string {
 	if cfg == nil || auth == nil {
 		return ""
@@ -772,6 +805,42 @@ func resolveOpenAICompatAPIKeyProxyURL(cfg *config.Config, auth *coreauth.Auth, 
 					entry := &compat.APIKeyEntries[j]
 					if strings.EqualFold(strings.TrimSpace(entry.APIKey), apiKey) {
 						return strings.TrimSpace(entry.ProxyURL)
+					}
+				}
+				return ""
+			}
+		}
+	}
+	return ""
+}
+
+func resolveOpenAICompatAPIKeyProxyPool(cfg *config.Config, auth *coreauth.Auth, apiKey, providerKey, compatName string) string {
+	if cfg == nil || auth == nil {
+		return ""
+	}
+	apiKey = strings.TrimSpace(apiKey)
+	if apiKey == "" {
+		return ""
+	}
+	candidates := make([]string, 0, 3)
+	if v := strings.TrimSpace(compatName); v != "" {
+		candidates = append(candidates, v)
+	}
+	if v := strings.TrimSpace(providerKey); v != "" {
+		candidates = append(candidates, v)
+	}
+	if v := strings.TrimSpace(auth.Provider); v != "" {
+		candidates = append(candidates, v)
+	}
+
+	for i := range cfg.OpenAICompatibility {
+		compat := &cfg.OpenAICompatibility[i]
+		for _, candidate := range candidates {
+			if candidate != "" && strings.EqualFold(strings.TrimSpace(candidate), compat.Name) {
+				for j := range compat.APIKeyEntries {
+					entry := &compat.APIKeyEntries[j]
+					if strings.EqualFold(strings.TrimSpace(entry.APIKey), apiKey) {
+						return strings.TrimSpace(entry.ProxyPool)
 					}
 				}
 				return ""

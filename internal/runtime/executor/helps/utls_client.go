@@ -9,6 +9,7 @@ import (
 
 	tls "github.com/refraction-networking/utls"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/proxypool"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/proxyutil"
 	log "github.com/sirupsen/logrus"
@@ -153,25 +154,20 @@ func (f *fallbackRoundTripper) RoundTrip(req *http.Request) (*http.Response, err
 // Use this for Claude API requests to match real Claude Code's TLS behavior.
 // Falls back to standard transport for non-HTTPS requests.
 func NewUtlsHTTPClient(cfg *config.Config, auth *cliproxyauth.Auth, timeout time.Duration) *http.Client {
-	var proxyURL string
-	if auth != nil {
-		proxyURL = strings.TrimSpace(auth.ProxyURL)
-	}
-	if proxyURL == "" && cfg != nil {
-		proxyURL = strings.TrimSpace(cfg.ProxyURL)
-	}
+	resolution := proxypool.Resolve(cfg, auth)
+	proxyURL := strings.TrimSpace(resolution.ProxyURL)
 
 	utlsRT := newUtlsRoundTripper(proxyURL)
 
-	var standardTransport http.RoundTripper = &http.Transport{
-		DialContext: (&net.Dialer{
-			Timeout:   30 * time.Second,
-			KeepAlive: 30 * time.Second,
-		}).DialContext,
-	}
-	if proxyURL != "" {
-		if transport := buildProxyTransport(proxyURL); transport != nil {
-			standardTransport = transport
+	var standardTransport http.RoundTripper
+	if transport := proxypool.BuildHTTPRoundTripperForResolution(resolution); transport != nil {
+		standardTransport = transport
+	} else {
+		standardTransport = &http.Transport{
+			DialContext: (&net.Dialer{
+				Timeout:   30 * time.Second,
+				KeepAlive: 30 * time.Second,
+			}).DialContext,
 		}
 	}
 

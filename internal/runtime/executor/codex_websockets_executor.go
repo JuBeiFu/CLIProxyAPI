@@ -5,6 +5,7 @@ package executor
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net"
@@ -20,9 +21,11 @@ import (
 	"github.com/gorilla/websocket"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/misc"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/proxypool"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/executor/helps"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
+	apihandlers "github.com/router-for-me/CLIProxyAPI/v6/sdk/api/handlers"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/proxyutil"
@@ -59,7 +62,8 @@ var globalCodexWebsocketSessionStore = &codexWebsocketSessionStore{
 }
 
 type codexWebsocketSession struct {
-	sessionID string
+	sessionID   string
+	lastRequest []byte
 
 	reqMu sync.Mutex
 
@@ -76,6 +80,14 @@ type codexWebsocketSession struct {
 	activeCancel context.CancelFunc
 
 	readerConn *websocket.Conn
+}
+
+type codexNonStreamAggregator struct {
+	messageText   strings.Builder
+	reasoningText strings.Builder
+	itemsByID     map[string]map[string]any
+	order         []string
+	itemIDByCall  map[string]string
 }
 
 func NewCodexWebsocketsExecutor(cfg *config.Config) *CodexWebsocketsExecutor {
@@ -151,6 +163,318 @@ func (s *codexWebsocketSession) configureConn(conn *websocket.Conn) {
 	})
 }
 
+func newCodexNonStreamAggregator() *codexNonStreamAggregator {
+	return &codexNonStreamAggregator{
+		itemsByID:    make(map[string]map[string]any),
+		order:        make([]string, 0, 4),
+		itemIDByCall: make(map[string]string),
+	}
+}
+
+func (a *codexNonStreamAggregator) ensureItem(id string, itemType string) map[string]any {
+	if a == nil {
+		return nil
+	}
+	id = strings.TrimSpace(id)
+	if id == "" {
+		id = fmt.Sprintf("__idx_%d", len(a.order))
+	}
+	if item, ok := a.itemsByID[id]; ok {
+		if itemType != "" && strings.TrimSpace(asString(item["type"])) == "" {
+			item["type"] = itemType
+		}
+		if rawID := strings.TrimSpace(asString(item["id"])); rawID == "" && !strings.HasPrefix(id, "__idx_") {
+			item["id"] = id
+		}
+		return item
+	}
+	item := map[string]any{}
+	if itemType != "" {
+		item["type"] = itemType
+	}
+	if !strings.HasPrefix(id, "__idx_") {
+		item["id"] = id
+	}
+	a.itemsByID[id] = item
+	a.order = append(a.order, id)
+	return item
+}
+
+func (a *codexNonStreamAggregator) ingest(payload []byte) {
+	if a == nil || len(bytes.TrimSpace(payload)) == 0 {
+		return
+	}
+	root := gjson.ParseBytes(payload)
+	switch root.Get("type").String() {
+	case "response.output_text.delta":
+		a.messageText.WriteString(root.Get("delta").String())
+	case "response.reasoning_summary_text.delta":
+		a.reasoningText.WriteString(root.Get("delta").String())
+	case "response.output_item.added", "response.output_item.done":
+		item := root.Get("item")
+		if !item.Exists() || !item.IsObject() {
+			return
+		}
+		itemID := strings.TrimSpace(item.Get("id").String())
+		if itemID == "" {
+			itemID = strings.TrimSpace(root.Get("item_id").String())
+		}
+		itemType := strings.TrimSpace(item.Get("type").String())
+		dst := a.ensureItem(itemID, itemType)
+		if dst == nil {
+			return
+		}
+		mergeJSONObject(dst, item)
+		if callID := strings.TrimSpace(item.Get("call_id").String()); callID != "" {
+			a.itemIDByCall[callID] = itemID
+		}
+	case "response.function_call_arguments.delta":
+		itemID := strings.TrimSpace(root.Get("item_id").String())
+		if itemID == "" {
+			if callID := strings.TrimSpace(root.Get("call_id").String()); callID != "" {
+				itemID = a.itemIDByCall[callID]
+			}
+		}
+		if itemID == "" {
+			return
+		}
+		dst := a.ensureItem(itemID, "function_call")
+		if dst == nil {
+			return
+		}
+		existingArgs := asString(dst["arguments"])
+		dst["arguments"] = existingArgs + root.Get("delta").String()
+	case "response.function_call_arguments.done":
+		itemID := strings.TrimSpace(root.Get("item_id").String())
+		if itemID == "" {
+			if callID := strings.TrimSpace(root.Get("call_id").String()); callID != "" {
+				itemID = a.itemIDByCall[callID]
+			}
+		}
+		if itemID == "" {
+			return
+		}
+		dst := a.ensureItem(itemID, "function_call")
+		if dst == nil {
+			return
+		}
+		if args := root.Get("arguments"); args.Exists() {
+			dst["arguments"] = args.String()
+		}
+	}
+}
+
+func (a *codexNonStreamAggregator) applyCompleted(payload []byte) []byte {
+	if a == nil || len(bytes.TrimSpace(payload)) == 0 {
+		return payload
+	}
+	responseNode := gjson.GetBytes(payload, "response")
+	if !responseNode.Exists() || !responseNode.IsObject() {
+		return payload
+	}
+	outputNode := responseNode.Get("output")
+	if outputNode.Exists() && outputNode.IsArray() && len(outputNode.Array()) > 0 {
+		return payload
+	}
+	output := a.materializeOutput()
+	if len(output) == 0 {
+		return payload
+	}
+	raw, err := json.Marshal(output)
+	if err != nil {
+		return payload
+	}
+	updated, err := sjson.SetRawBytes(payload, "response.output", raw)
+	if err != nil {
+		return payload
+	}
+	return updated
+}
+
+func (a *codexNonStreamAggregator) materializeOutput() []map[string]any {
+	if a == nil {
+		return nil
+	}
+	output := make([]map[string]any, 0, len(a.order)+2)
+	message := strings.TrimSpace(a.messageText.String())
+	reasoning := strings.TrimSpace(a.reasoningText.String())
+	for _, id := range a.order {
+		item := a.itemsByID[id]
+		if item == nil {
+			continue
+		}
+		cloned := cloneJSONObject(item)
+		if strings.TrimSpace(asString(cloned["status"])) == "" {
+			cloned["status"] = "completed"
+		}
+		switch strings.TrimSpace(asString(cloned["type"])) {
+		case "message":
+			if message != "" && !messageItemHasContent(cloned) {
+				cloned["role"] = "assistant"
+				cloned["content"] = []map[string]any{{"type": "output_text", "text": message}}
+			}
+			if message != "" {
+				message = ""
+			}
+		case "reasoning":
+			if reasoning != "" && !reasoningItemHasSummary(cloned) {
+				cloned["summary"] = []map[string]any{{"type": "summary_text", "text": reasoning}}
+			}
+			if reasoning != "" {
+				reasoning = ""
+			}
+		}
+		output = append(output, cloned)
+	}
+	if message != "" {
+		output = append(output, map[string]any{
+			"type": "message", "role": "assistant", "status": "completed",
+			"content": []map[string]any{{"type": "output_text", "text": message}},
+		})
+	}
+	if reasoning != "" {
+		output = append(output, map[string]any{
+			"type":    "reasoning",
+			"summary": []map[string]any{{"type": "summary_text", "text": reasoning}},
+		})
+	}
+	return output
+}
+
+func messageItemHasContent(item map[string]any) bool {
+	content, ok := item["content"]
+	if !ok || content == nil {
+		return false
+	}
+	raw, err := json.Marshal(content)
+	if err != nil {
+		return false
+	}
+	contentNode := gjson.ParseBytes(raw)
+	if !contentNode.IsArray() {
+		return false
+	}
+	for _, child := range contentNode.Array() {
+		if child.Get("type").String() == "output_text" && strings.TrimSpace(child.Get("text").String()) != "" {
+			return true
+		}
+	}
+	return false
+}
+
+func reasoningItemHasSummary(item map[string]any) bool {
+	summary, ok := item["summary"]
+	if !ok || summary == nil {
+		return false
+	}
+	raw, err := json.Marshal(summary)
+	if err != nil {
+		return false
+	}
+	summaryNode := gjson.ParseBytes(raw)
+	if !summaryNode.IsArray() {
+		return false
+	}
+	for _, child := range summaryNode.Array() {
+		if child.Get("type").String() == "summary_text" && strings.TrimSpace(child.Get("text").String()) != "" {
+			return true
+		}
+	}
+	return false
+}
+
+func mergeJSONObject(dst map[string]any, src gjson.Result) {
+	if dst == nil || !src.Exists() || !src.IsObject() {
+		return
+	}
+	src.ForEach(func(key, value gjson.Result) bool {
+		k := strings.TrimSpace(key.String())
+		if k == "" {
+			return true
+		}
+		switch {
+		case value.IsObject():
+			child, _ := dst[k].(map[string]any)
+			if child == nil {
+				child = map[string]any{}
+			}
+			mergeJSONObject(child, value)
+			dst[k] = child
+		case value.IsArray():
+			var arr any
+			if err := json.Unmarshal([]byte(value.Raw), &arr); err == nil {
+				dst[k] = arr
+			}
+		default:
+			dst[k] = scalarValue(value)
+		}
+		return true
+	})
+}
+
+func cloneJSONObject(src map[string]any) map[string]any {
+	if src == nil {
+		return nil
+	}
+	out := make(map[string]any, len(src))
+	for key, value := range src {
+		out[key] = cloneJSONValue(value)
+	}
+	return out
+}
+
+func cloneJSONValue(value any) any {
+	switch v := value.(type) {
+	case map[string]any:
+		return cloneJSONObject(v)
+	case []any:
+		out := make([]any, len(v))
+		for i := range v {
+			out[i] = cloneJSONValue(v[i])
+		}
+		return out
+	case []map[string]any:
+		out := make([]map[string]any, len(v))
+		for i := range v {
+			out[i] = cloneJSONObject(v[i])
+		}
+		return out
+	default:
+		return v
+	}
+}
+
+func scalarValue(value gjson.Result) any {
+	switch value.Type {
+	case gjson.String:
+		return value.String()
+	case gjson.Number:
+		return value.Value()
+	case gjson.True:
+		return true
+	case gjson.False:
+		return false
+	case gjson.Null:
+		return nil
+	default:
+		return value.Value()
+	}
+}
+
+func asString(value any) string {
+	switch v := value.(type) {
+	case string:
+		return v
+	case []byte:
+		return string(v)
+	default:
+		if v == nil {
+			return ""
+		}
+		return fmt.Sprint(v)
+	}
+}
+
 func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (resp cliproxyexecutor.Response, err error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -187,12 +511,8 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 	body = helps.ApplyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", body, originalTranslated, requestedModel)
 	body, _ = sjson.SetBytes(body, "model", baseModel)
 	body, _ = sjson.SetBytes(body, "stream", true)
-	body, _ = sjson.DeleteBytes(body, "previous_response_id")
-	body, _ = sjson.DeleteBytes(body, "prompt_cache_retention")
-	body, _ = sjson.DeleteBytes(body, "safety_identifier")
-	if !gjson.GetBytes(body, "instructions").Exists() {
-		body, _ = sjson.SetBytes(body, "instructions", "")
-	}
+	body = stripCodexUnsupportedResponseFields(body, shouldPreserveCodexPreviousResponseID(ctx, auth, from, body))
+	body = normalizeCodexInstructions(body)
 
 	httpURL := strings.TrimSuffix(baseURL, "/") + "/responses"
 	wsURL, err := buildCodexResponsesWebsocketURL(httpURL)
@@ -218,7 +538,14 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 		defer sess.reqMu.Unlock()
 	}
 
+	if sess != nil && shouldEnrichCodexWebsocketBridgeFollowupRequest(ctx, executionSessionID) {
+		body = enrichCodexWebsocketBridgeFollowupRequest(body, sess.lastRequest)
+	}
+
 	wsReqBody := buildCodexWebsocketRequestBody(body)
+	if sess != nil {
+		sess.lastRequest = bytes.Clone(body)
+	}
 	wsReqLog := helps.UpstreamRequestLog{
 		URL:       wsURL,
 		Method:    "WEBSOCKET",
@@ -310,6 +637,7 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 		}
 	}
 
+	aggregator := newCodexNonStreamAggregator()
 	for {
 		if ctx != nil && ctx.Err() != nil {
 			return resp, ctx.Err()
@@ -346,8 +674,10 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 		}
 
 		payload = normalizeCodexWebsocketCompletion(payload)
+		aggregator.ingest(payload)
 		eventType := gjson.GetBytes(payload, "type").String()
-		if eventType == "response.completed" {
+		if eventType == "response.completed" || eventType == "response.done" {
+			payload = aggregator.applyCompleted(payload)
 			if detail, ok := helps.ParseCodexUsage(payload); ok {
 				reporter.Publish(ctx, detail)
 			}
@@ -388,6 +718,10 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 
 	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
 	body = helps.ApplyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", body, body, requestedModel)
+	body = stripCodexUnsupportedResponseFields(body, shouldPreserveCodexPreviousResponseID(ctx, auth, from, body))
+	body, _ = sjson.SetBytes(body, "model", baseModel)
+	body, _ = sjson.SetBytes(body, "stream", true)
+	body = normalizeCodexInstructions(body)
 
 	httpURL := strings.TrimSuffix(baseURL, "/") + "/responses"
 	wsURL, err := buildCodexResponsesWebsocketURL(httpURL)
@@ -412,7 +746,14 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 		}
 	}
 
+	if sess != nil && shouldEnrichCodexWebsocketBridgeFollowupRequest(ctx, executionSessionID) {
+		body = enrichCodexWebsocketBridgeFollowupRequest(body, sess.lastRequest)
+	}
+
 	wsReqBody := buildCodexWebsocketRequestBody(body)
+	if sess != nil {
+		sess.lastRequest = bytes.Clone(body)
+	}
 	wsReqLog := helps.UpstreamRequestLog{
 		URL:       wsURL,
 		Method:    "WEBSOCKET",
@@ -620,13 +961,19 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 }
 
 func (e *CodexWebsocketsExecutor) dialCodexWebsocket(ctx context.Context, auth *cliproxyauth.Auth, wsURL string, headers http.Header) (*websocket.Conn, *http.Response, error) {
-	dialer := newProxyAwareWebsocketDialer(e.cfg, auth)
+	dialer, resolution := newProxyAwareWebsocketDialerWithResolution(e.cfg, auth)
 	dialer.HandshakeTimeout = codexResponsesWebsocketHandshakeTO
 	dialer.EnableCompression = true
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	conn, resp, err := dialer.DialContext(ctx, wsURL, headers)
+	if err != nil && resolution.FallbackToDirect && strings.TrimSpace(resolution.ProxyURL) != "" && !strings.EqualFold(strings.TrimSpace(resolution.ProxyURL), "direct") && !strings.EqualFold(strings.TrimSpace(resolution.ProxyURL), "none") {
+		directDialer, _ := newProxyAwareWebsocketDialerWithResolution(e.cfg, &cliproxyauth.Auth{ProxyURL: "direct"})
+		directDialer.HandshakeTimeout = codexResponsesWebsocketHandshakeTO
+		directDialer.EnableCompression = true
+		conn, resp, err = directDialer.DialContext(ctx, wsURL, headers)
+	}
 	if conn != nil {
 		// Avoid gorilla/websocket flate tail validation issues on some upstreams/Go versions.
 		// Negotiating permessage-deflate is fine; we just don't compress outbound messages.
@@ -697,6 +1044,11 @@ func readCodexWebsocketMessage(ctx context.Context, sess *codexWebsocketSession,
 }
 
 func newProxyAwareWebsocketDialer(cfg *config.Config, auth *cliproxyauth.Auth) *websocket.Dialer {
+	dialer, _ := newProxyAwareWebsocketDialerWithResolution(cfg, auth)
+	return dialer
+}
+
+func newProxyAwareWebsocketDialerWithResolution(cfg *config.Config, auth *cliproxyauth.Auth) (*websocket.Dialer, proxypool.Resolution) {
 	dialer := &websocket.Dialer{
 		Proxy:             http.ProxyFromEnvironment,
 		HandshakeTimeout:  codexResponsesWebsocketHandshakeTO,
@@ -707,30 +1059,25 @@ func newProxyAwareWebsocketDialer(cfg *config.Config, auth *cliproxyauth.Auth) *
 		}).DialContext,
 	}
 
-	proxyURL := ""
-	if auth != nil {
-		proxyURL = strings.TrimSpace(auth.ProxyURL)
-	}
-	if proxyURL == "" && cfg != nil {
-		proxyURL = strings.TrimSpace(cfg.ProxyURL)
-	}
+	resolution := proxypool.Resolve(cfg, auth)
+	proxyURL := strings.TrimSpace(resolution.ProxyURL)
 	if proxyURL == "" {
-		return dialer
+		return dialer, resolution
 	}
 
 	setting, errParse := proxyutil.Parse(proxyURL)
 	if errParse != nil {
 		log.Errorf("codex websockets executor: %v", errParse)
-		return dialer
+		return dialer, resolution
 	}
 
 	switch setting.Mode {
 	case proxyutil.ModeDirect:
 		dialer.Proxy = nil
-		return dialer
+		return dialer, resolution
 	case proxyutil.ModeProxy:
 	default:
-		return dialer
+		return dialer, resolution
 	}
 
 	switch setting.URL.Scheme {
@@ -744,7 +1091,7 @@ func newProxyAwareWebsocketDialer(cfg *config.Config, auth *cliproxyauth.Auth) *
 		socksDialer, errSOCKS5 := proxy.SOCKS5("tcp", setting.URL.Host, proxyAuth, proxy.Direct)
 		if errSOCKS5 != nil {
 			log.Errorf("codex websockets executor: create SOCKS5 dialer failed: %v", errSOCKS5)
-			return dialer
+			return dialer, resolution
 		}
 		dialer.Proxy = nil
 		dialer.NetDialContext = func(_ context.Context, network, addr string) (net.Conn, error) {
@@ -756,7 +1103,7 @@ func newProxyAwareWebsocketDialer(cfg *config.Config, auth *cliproxyauth.Auth) *
 		log.Errorf("codex websockets executor: unsupported proxy scheme: %s", setting.URL.Scheme)
 	}
 
-	return dialer
+	return dialer, resolution
 }
 
 func buildCodexResponsesWebsocketURL(httpURL string) (string, error) {
@@ -1443,7 +1790,7 @@ func (e *CodexAutoExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth
 	if e == nil || e.httpExec == nil || e.wsExec == nil {
 		return cliproxyexecutor.Response{}, fmt.Errorf("codex auto executor: executor is nil")
 	}
-	if cliproxyexecutor.DownstreamWebsocket(ctx) && codexWebsocketsEnabled(auth) {
+	if shouldUseCodexWebsocketExecutor(ctx, auth) {
 		return e.wsExec.Execute(ctx, auth, req, opts)
 	}
 	return e.httpExec.Execute(ctx, auth, req, opts)
@@ -1453,7 +1800,7 @@ func (e *CodexAutoExecutor) ExecuteStream(ctx context.Context, auth *cliproxyaut
 	if e == nil || e.httpExec == nil || e.wsExec == nil {
 		return nil, fmt.Errorf("codex auto executor: executor is nil")
 	}
-	if cliproxyexecutor.DownstreamWebsocket(ctx) && codexWebsocketsEnabled(auth) {
+	if shouldUseCodexWebsocketExecutor(ctx, auth) {
 		return e.wsExec.ExecuteStream(ctx, auth, req, opts)
 	}
 	return e.httpExec.ExecuteStream(ctx, auth, req, opts)
@@ -1496,18 +1843,60 @@ func codexWebsocketsEnabled(auth *cliproxyauth.Auth) bool {
 		return false
 	}
 	raw, ok := auth.Metadata["websockets"]
-	if !ok || raw == nil {
-		return false
-	}
-	switch v := raw.(type) {
-	case bool:
-		return v
-	case string:
-		parsed, errParse := strconv.ParseBool(strings.TrimSpace(v))
-		if errParse == nil {
-			return parsed
+	if ok && raw != nil {
+		switch v := raw.(type) {
+		case bool:
+			return v
+		case string:
+			parsed, errParse := strconv.ParseBool(strings.TrimSpace(v))
+			if errParse == nil {
+				return parsed
+			}
 		}
-	default:
+	}
+	if email, _ := auth.Metadata["email"].(string); strings.TrimSpace(email) != "" {
+		return true
 	}
 	return false
+}
+
+func shouldUseCodexWebsocketExecutor(ctx context.Context, auth *cliproxyauth.Auth) bool {
+	return apihandlers.DownstreamWebsocketBridge(ctx) && codexWebsocketsEnabled(auth)
+}
+
+func shouldEnrichCodexWebsocketBridgeFollowupRequest(ctx context.Context, executionSessionID string) bool {
+	if strings.TrimSpace(executionSessionID) == "" {
+		return false
+	}
+	return apihandlers.DownstreamWebsocketBridge(ctx)
+}
+
+func enrichCodexWebsocketBridgeFollowupRequest(body []byte, lastRequest []byte) []byte {
+	if len(body) == 0 || len(lastRequest) == 0 {
+		return body
+	}
+	if strings.TrimSpace(gjson.GetBytes(body, "previous_response_id").String()) == "" {
+		return body
+	}
+	enriched := bytes.Clone(body)
+	instructionsResult := gjson.GetBytes(enriched, "instructions")
+	if !instructionsResult.Exists() || strings.TrimSpace(instructionsResult.String()) == "" {
+		instructions := gjson.GetBytes(lastRequest, "instructions")
+		if instructions.Exists() && strings.TrimSpace(instructions.String()) != "" {
+			enriched, _ = sjson.SetRawBytes(enriched, "instructions", []byte(instructions.Raw))
+		}
+	}
+	if !gjson.GetBytes(enriched, "tools").Exists() {
+		tools := gjson.GetBytes(lastRequest, "tools")
+		if tools.Exists() {
+			enriched, _ = sjson.SetRawBytes(enriched, "tools", []byte(tools.Raw))
+		}
+	}
+	if !gjson.GetBytes(enriched, "tool_choice").Exists() {
+		toolChoice := gjson.GetBytes(lastRequest, "tool_choice")
+		if toolChoice.Exists() {
+			enriched, _ = sjson.SetRawBytes(enriched, "tool_choice", []byte(toolChoice.Raw))
+		}
+	}
+	return enriched
 }

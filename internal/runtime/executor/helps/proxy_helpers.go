@@ -3,13 +3,11 @@ package helps
 import (
 	"context"
 	"net/http"
-	"strings"
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/proxypool"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
-	"github.com/router-for-me/CLIProxyAPI/v6/sdk/proxyutil"
-	log "github.com/sirupsen/logrus"
 )
 
 // NewProxyAwareHTTPClient creates an HTTP client with proper proxy configuration priority:
@@ -31,26 +29,10 @@ func NewProxyAwareHTTPClient(ctx context.Context, cfg *config.Config, auth *clip
 		httpClient.Timeout = timeout
 	}
 
-	// Priority 1: Use auth.ProxyURL if configured
-	var proxyURL string
-	if auth != nil {
-		proxyURL = strings.TrimSpace(auth.ProxyURL)
-	}
-
-	// Priority 2: Use cfg.ProxyURL if auth proxy is not configured
-	if proxyURL == "" && cfg != nil {
-		proxyURL = strings.TrimSpace(cfg.ProxyURL)
-	}
-
-	// If we have a proxy URL configured, set up the transport
-	if proxyURL != "" {
-		transport := buildProxyTransport(proxyURL)
-		if transport != nil {
-			httpClient.Transport = transport
-			return httpClient
-		}
-		// If proxy setup failed, log and fall through to context RoundTripper
-		log.Debugf("failed to setup proxy from URL: %s, falling back to context transport", proxyURL)
+	// Priority 1/2: explicit auth/global proxy-url or proxy-pool selection.
+	if transport, _ := proxypool.BuildHTTPRoundTripper(cfg, auth); transport != nil {
+		httpClient.Transport = transport
+		return httpClient
 	}
 
 	// Priority 3: Use RoundTripper from context (typically from RoundTripperFor)
@@ -59,21 +41,4 @@ func NewProxyAwareHTTPClient(ctx context.Context, cfg *config.Config, auth *clip
 	}
 
 	return httpClient
-}
-
-// buildProxyTransport creates an HTTP transport configured for the given proxy URL.
-// It supports SOCKS5, HTTP, and HTTPS proxy protocols.
-//
-// Parameters:
-//   - proxyURL: The proxy URL string (e.g., "socks5://user:pass@host:port", "http://host:port")
-//
-// Returns:
-//   - *http.Transport: A configured transport, or nil if the proxy URL is invalid
-func buildProxyTransport(proxyURL string) *http.Transport {
-	transport, _, errBuild := proxyutil.BuildHTTPTransport(proxyURL)
-	if errBuild != nil {
-		log.Errorf("%v", errBuild)
-		return nil
-	}
-	return transport
 }

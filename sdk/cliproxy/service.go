@@ -663,6 +663,7 @@ func (s *Service) Run(ctx context.Context) error {
 		if s.coreManager != nil {
 			s.coreManager.SetConfig(newCfg)
 			s.coreManager.SetOAuthModelAlias(newCfg.OAuthModelAlias)
+			s.coreManager.SetRoundTripperProvider(newDefaultRoundTripperProvider(newCfg))
 		}
 		s.rebindExecutors()
 	}

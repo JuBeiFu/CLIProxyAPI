@@ -68,6 +68,8 @@ type Auth struct {
 	Unavailable bool `json:"unavailable"`
 	// ProxyURL overrides the global proxy setting for this auth if provided.
 	ProxyURL string `json:"proxy_url,omitempty"`
+	// ProxyPool selects a named proxy pool when ProxyURL is not explicitly set.
+	ProxyPool string `json:"proxy_pool,omitempty"`
 	// Attributes stores provider specific metadata needed by executors (immutable configuration).
 	Attributes map[string]string `json:"attributes,omitempty"`
 	// Metadata stores runtime mutable provider state (e.g. tokens, cookies).
@@ -187,7 +189,8 @@ func (a *Auth) indexSeed() string {
 	}
 
 	proxyURL := strings.TrimSpace(a.ProxyURL)
-	hasCredentialIdentity := compatName != "" || baseURL != "" || proxyURL != "" || apiKey != "" || source != ""
+	proxyPool := strings.TrimSpace(a.ProxyPool)
+	hasCredentialIdentity := compatName != "" || baseURL != "" || proxyURL != "" || proxyPool != "" || apiKey != "" || source != ""
 	if providerKey != "" && hasCredentialIdentity {
 		parts := []string{"provider=" + providerKey}
 		if compatName != "" {
@@ -198,6 +201,9 @@ func (a *Auth) indexSeed() string {
 		}
 		if proxyURL != "" {
 			parts = append(parts, "proxy="+proxyURL)
+		}
+		if proxyPool != "" {
+			parts = append(parts, "proxy_pool="+proxyPool)
 		}
 		if apiKey != "" {
 			parts = append(parts, "api_key="+apiKey)
@@ -258,6 +264,9 @@ func (a *Auth) ProxyInfo() string {
 	}
 	proxyStr := strings.TrimSpace(a.ProxyURL)
 	if proxyStr == "" {
+		if pool := strings.TrimSpace(a.ProxyPool); pool != "" {
+			return "via proxy pool " + pool
+		}
 		return ""
 	}
 	if idx := strings.Index(proxyStr, "://"); idx > 0 {

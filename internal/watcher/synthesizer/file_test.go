@@ -69,10 +69,11 @@ func TestFileSynthesizer_Synthesize_ValidAuthFile(t *testing.T) {
 
 	// Create a valid auth file
 	authData := map[string]any{
-		"type":      "claude",
-		"email":     "test@example.com",
-		"proxy_url": "http://proxy.local",
-		"prefix":    "test-prefix",
+		"type":       "claude",
+		"email":      "test@example.com",
+		"proxy_url":  "http://proxy.local",
+		"proxy_pool": "shared-auth-pool",
+		"prefix":     "test-prefix",
 		"headers": map[string]string{
 			" X-Test ": " value ",
 			"X-Empty":  "  ",
@@ -113,6 +114,9 @@ func TestFileSynthesizer_Synthesize_ValidAuthFile(t *testing.T) {
 	}
 	if auths[0].ProxyURL != "http://proxy.local" {
 		t.Errorf("expected proxy_url http://proxy.local, got %s", auths[0].ProxyURL)
+	}
+	if auths[0].ProxyPool != "shared-auth-pool" {
+		t.Errorf("expected proxy_pool shared-auth-pool, got %s", auths[0].ProxyPool)
 	}
 	if got := auths[0].Attributes["header:X-Test"]; got != "value" {
 		t.Errorf("expected header:X-Test value, got %q", got)
@@ -259,6 +263,56 @@ func TestFileSynthesizer_Synthesize_RelativeID(t *testing.T) {
 	// ID should be relative path
 	if auths[0].ID != "my-auth.json" {
 		t.Errorf("expected ID my-auth.json, got %s", auths[0].ID)
+	}
+}
+
+func TestFileSynthesizer_Synthesize_StableIndexMatchesFileBackedAuth(t *testing.T) {
+	tempDir := t.TempDir()
+
+	authData := map[string]any{
+		"type":       "claude",
+		"email":      "stable@example.com",
+		"proxy_pool": "shared-egress",
+	}
+	data, _ := json.Marshal(authData)
+	fullPath := filepath.Join(tempDir, "stable-auth.json")
+	if err := os.WriteFile(fullPath, data, 0644); err != nil {
+		t.Fatalf("failed to write auth file: %v", err)
+	}
+
+	synth := NewFileSynthesizer()
+	ctx := &SynthesisContext{
+		Config:      &config.Config{},
+		AuthDir:     tempDir,
+		Now:         time.Now(),
+		IDGenerator: NewStableIDGenerator(),
+	}
+
+	auths, err := synth.Synthesize(ctx)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(auths) != 1 {
+		t.Fatalf("expected 1 auth, got %d", len(auths))
+	}
+
+	got := auths[0]
+	want := &coreauth.Auth{
+		ID:       "stable-auth.json",
+		FileName: "stable-auth.json",
+		Provider: "claude",
+		ProxyPool: "shared-egress",
+		Attributes: map[string]string{
+			"source": fullPath,
+			"path":   fullPath,
+		},
+	}
+
+	if got.EnsureIndex() != want.EnsureIndex() {
+		t.Fatalf("expected synthesized auth index %q to match file-backed auth index %q", got.EnsureIndex(), want.EnsureIndex())
+	}
+	if got.FileName != "stable-auth.json" {
+		t.Fatalf("expected synthesized auth FileName to be stable-auth.json, got %q", got.FileName)
 	}
 }
 

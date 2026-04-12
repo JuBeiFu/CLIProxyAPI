@@ -364,3 +364,138 @@ func TestTruncationRemovedForCodexCompatibility(t *testing.T) {
 		t.Fatalf("truncation should be removed for Codex compatibility")
 	}
 }
+
+func TestConvertOpenAIResponsesRequestToCodex_StripsReasoningInputItems(t *testing.T) {
+	inputJSON := []byte(`{
+		"model":"gpt-5.2",
+		"input":[
+			{"type":"reasoning","id":"rs_abc","summary":[{"type":"summary_text","text":"internal"}]},
+			{"type":"item_reference","id":"rs_def"},
+			{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}
+		]
+	}`)
+
+	output := ConvertOpenAIResponsesRequestToCodex("gpt-5.2", inputJSON, false)
+	input := gjson.GetBytes(output, "input")
+	if !input.IsArray() {
+		t.Fatalf("expected input array, got %s", input.Type.String())
+	}
+	arr := input.Array()
+	if len(arr) != 1 {
+		t.Fatalf("expected 1 input item after stripping reasoning, got %d: %s", len(arr), input.Raw)
+	}
+	if got := arr[0].Get("type").String(); got != "message" {
+		t.Fatalf("expected remaining item type=message, got %q", got)
+	}
+}
+
+func TestConvertOpenAIResponsesRequestToCodex_StripsUnsupportedMessageIDs(t *testing.T) {
+	inputJSON := []byte(`{
+		"model":"gpt-5.3-codex",
+		"input":[
+			{"type":"message","id":"item_Ny3ONlYLeYYObL38","role":"assistant","content":[{"type":"output_text","text":"old"}]},
+			{"type":"message","id":"msg_valid","role":"user","content":[{"type":"input_text","text":"next"}]},
+			{"type":"function_call_output","id":"tool-out-1","call_id":"call-1","output":"ok"}
+		]
+	}`)
+
+	output := ConvertOpenAIResponsesRequestToCodex("gpt-5.3-codex", inputJSON, false)
+	input := gjson.GetBytes(output, "input")
+	if !input.IsArray() {
+		t.Fatalf("expected input array, got %s", input.Type.String())
+	}
+	arr := input.Array()
+	if got := arr[0].Get("id").String(); got != "" {
+		t.Fatalf("expected unsupported message id to be stripped, got %q", got)
+	}
+	if got := arr[1].Get("id").String(); got != "msg_valid" {
+		t.Fatalf("expected valid msg_* id to be preserved, got %q", got)
+	}
+	if got := arr[2].Get("id").String(); got != "tool-out-1" {
+		t.Fatalf("expected function_call_output id to be preserved, got %q", got)
+	}
+}
+
+func TestConvertOpenAIResponsesRequestToCodex_NormalizesToolSearchToFunctionTool(t *testing.T) {
+	inputJSON := []byte(`{
+		"model": "gpt-5.4",
+		"input": "find the right tool",
+		"tools": [
+			{
+				"type": "tool_search",
+				"execution": "sync",
+				"description": "Search installed tools",
+				"parameters": {
+					"type": "object",
+					"properties": {
+						"query": {"type": "string"}
+					},
+					"required": ["query"]
+				}
+			}
+		]
+	}`)
+
+	output := ConvertOpenAIResponsesRequestToCodex("gpt-5.4", inputJSON, false)
+
+	if got := gjson.GetBytes(output, "tools.0.type").String(); got != "function" {
+		t.Fatalf("tools.0.type = %q, want %q: %s", got, "function", string(output))
+	}
+	if got := gjson.GetBytes(output, "tools.0.name").String(); got != "tool_search" {
+		t.Fatalf("tools.0.name = %q, want %q: %s", got, "tool_search", string(output))
+	}
+	if got := gjson.GetBytes(output, "tools.0.description").String(); got != "Search installed tools" {
+		t.Fatalf("tools.0.description = %q, want %q: %s", got, "Search installed tools", string(output))
+	}
+	if !gjson.GetBytes(output, "tools.0.parameters").Exists() {
+		t.Fatalf("tools.0.parameters missing: %s", string(output))
+	}
+	if gjson.GetBytes(output, "tools.0.execution").Exists() {
+		t.Fatalf("tools.0.execution should be removed: %s", string(output))
+	}
+}
+
+func TestConvertOpenAIResponsesRequestToCodex_FlattensNestedFunctionToolSpec(t *testing.T) {
+	inputJSON := []byte(`{
+		"model": "gpt-5.4",
+		"input": "run a function tool",
+		"tools": [
+			{
+				"type": "function",
+				"function": {
+					"name": "lookup_order",
+					"description": "Look up an order by id",
+					"parameters": {
+						"type": "object",
+						"properties": {
+							"order_id": {"type": "string"}
+						},
+						"required": ["order_id"]
+					},
+					"strict": true
+				}
+			}
+		]
+	}`)
+
+	output := ConvertOpenAIResponsesRequestToCodex("gpt-5.4", inputJSON, false)
+
+	if got := gjson.GetBytes(output, "tools.0.type").String(); got != "function" {
+		t.Fatalf("tools.0.type = %q, want %q: %s", got, "function", string(output))
+	}
+	if got := gjson.GetBytes(output, "tools.0.name").String(); got != "lookup_order" {
+		t.Fatalf("tools.0.name = %q, want %q: %s", got, "lookup_order", string(output))
+	}
+	if got := gjson.GetBytes(output, "tools.0.description").String(); got != "Look up an order by id" {
+		t.Fatalf("tools.0.description = %q, want %q: %s", got, "Look up an order by id", string(output))
+	}
+	if !gjson.GetBytes(output, "tools.0.parameters").Exists() {
+		t.Fatalf("tools.0.parameters missing: %s", string(output))
+	}
+	if got := gjson.GetBytes(output, "tools.0.strict").Bool(); !got {
+		t.Fatalf("tools.0.strict = %v, want true: %s", got, string(output))
+	}
+	if gjson.GetBytes(output, "tools.0.function").Exists() {
+		t.Fatalf("tools.0.function should be flattened away: %s", string(output))
+	}
+}

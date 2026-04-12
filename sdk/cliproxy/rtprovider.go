@@ -1,13 +1,12 @@
 package cliproxy
 
 import (
+	internalconfig "github.com/router-for-me/CLIProxyAPI/v6/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/proxypool"
 	"net/http"
-	"strings"
 	"sync"
 
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
-	"github.com/router-for-me/CLIProxyAPI/v6/sdk/proxyutil"
-	log "github.com/sirupsen/logrus"
 )
 
 // defaultRoundTripperProvider returns a per-auth HTTP RoundTripper based on
@@ -15,10 +14,14 @@ import (
 type defaultRoundTripperProvider struct {
 	mu    sync.RWMutex
 	cache map[string]http.RoundTripper
+	cfg   *internalconfig.Config
 }
 
-func newDefaultRoundTripperProvider() *defaultRoundTripperProvider {
-	return &defaultRoundTripperProvider{cache: make(map[string]http.RoundTripper)}
+func newDefaultRoundTripperProvider(cfg *internalconfig.Config) *defaultRoundTripperProvider {
+	return &defaultRoundTripperProvider{
+		cache: make(map[string]http.RoundTripper),
+		cfg:   cfg,
+	}
 }
 
 // RoundTripperFor implements coreauth.RoundTripperProvider.
@@ -26,26 +29,26 @@ func (p *defaultRoundTripperProvider) RoundTripperFor(auth *coreauth.Auth) http.
 	if auth == nil {
 		return nil
 	}
-	proxyStr := strings.TrimSpace(auth.ProxyURL)
-	if proxyStr == "" {
+	resolution := proxypool.Resolve(p.cfg, auth)
+	cacheKey := resolution.ProxyURL
+	if resolution.FallbackToDirect {
+		cacheKey += "|fallback=direct"
+	}
+	if cacheKey == "" {
 		return nil
 	}
 	p.mu.RLock()
-	rt := p.cache[proxyStr]
+	rt := p.cache[cacheKey]
 	p.mu.RUnlock()
 	if rt != nil {
 		return rt
 	}
-	transport, _, errBuild := proxyutil.BuildHTTPTransport(proxyStr)
-	if errBuild != nil {
-		log.Errorf("%v", errBuild)
-		return nil
-	}
+	transport := proxypool.BuildHTTPRoundTripperForResolution(resolution)
 	if transport == nil {
 		return nil
 	}
 	p.mu.Lock()
-	p.cache[proxyStr] = transport
+	p.cache[cacheKey] = transport
 	p.mu.Unlock()
 	return transport
 }

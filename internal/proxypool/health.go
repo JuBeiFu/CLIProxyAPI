@@ -43,9 +43,17 @@ type PoolStatus struct {
 	Entries             []EntryStatus `json:"entries"`
 }
 
+type probeClientKey struct {
+	proxyURL string
+	timeout  time.Duration
+}
+
 type HealthManager struct {
-	mu      sync.RWMutex
-	entries map[string]map[string]ProbeResult
+	mu             sync.RWMutex
+	entries        map[string]map[string]ProbeResult
+	probeClientMu  sync.Mutex
+	probeClients   map[probeClientKey]*http.Client
+	probeEntryFunc func(context.Context, config.ProxyPool, config.ProxyPoolEntry) ProbeResult
 }
 
 var defaultHealthManager = NewHealthManager()
@@ -56,7 +64,8 @@ func DefaultHealthManager() *HealthManager {
 
 func NewHealthManager() *HealthManager {
 	return &HealthManager{
-		entries: make(map[string]map[string]ProbeResult),
+		entries:      make(map[string]map[string]ProbeResult),
+		probeClients: make(map[probeClientKey]*http.Client),
 	}
 }
 
@@ -174,30 +183,65 @@ func (m *HealthManager) CheckPools(ctx context.Context, pools []config.ProxyPool
 		return nil
 	}
 
-	results := make([]PoolStatus, 0, len(pools))
+	filtered := make([]config.ProxyPool, 0, len(pools))
 	for _, pool := range pools {
 		if targetName != "" && !strings.EqualFold(strings.TrimSpace(pool.Name), strings.TrimSpace(targetName)) {
 			continue
 		}
-		results = append(results, m.CheckPool(ctx, pool))
+		filtered = append(filtered, pool)
 	}
+	if len(filtered) == 0 {
+		return nil
+	}
+
+	results := make([]PoolStatus, len(filtered))
+	var wg sync.WaitGroup
+	for i, pool := range filtered {
+		wg.Add(1)
+		go func(index int, currentPool config.ProxyPool) {
+			defer wg.Done()
+			results[index] = m.CheckPool(ctx, currentPool)
+		}(i, pool)
+	}
+	wg.Wait()
 	return results
 }
 
 func (m *HealthManager) CheckPool(ctx context.Context, pool config.ProxyPool) PoolStatus {
 	status := m.poolStatus(pool)
 	lastCheckedAt := time.Time{}
+	type probeOutcome struct {
+		index  int
+		entry  config.ProxyPoolEntry
+		result ProbeResult
+	}
+
+	outcomes := make(chan probeOutcome, len(pool.Entries))
+	var wg sync.WaitGroup
+
 	for index, entry := range pool.Entries {
 		if entry.Disabled || strings.TrimSpace(entry.URL) == "" {
 			status.Entries[index].Disabled = entry.Disabled
 			continue
 		}
+		wg.Add(1)
+		go func(idx int, currentEntry config.ProxyPoolEntry) {
+			defer wg.Done()
+			outcomes <- probeOutcome{
+				index:  idx,
+				entry:  currentEntry,
+				result: m.probeEntry(ctx, pool, currentEntry),
+			}
+		}(index, entry)
+	}
+	wg.Wait()
+	close(outcomes)
 
-		result := probePoolEntry(ctx, pool, entry)
-		m.StoreResult(pool.Name, entry.Name, result)
-		status.Entries[index] = entryStatusFromProbe(entry, result)
-		if result.CheckedAt.After(lastCheckedAt) {
-			lastCheckedAt = result.CheckedAt
+	for outcome := range outcomes {
+		m.StoreResult(pool.Name, outcome.entry.Name, outcome.result)
+		status.Entries[outcome.index] = entryStatusFromProbe(outcome.entry, outcome.result)
+		if outcome.result.CheckedAt.After(lastCheckedAt) {
+			lastCheckedAt = outcome.result.CheckedAt
 		}
 	}
 	if !lastCheckedAt.IsZero() {
@@ -300,13 +344,53 @@ func entryStatusFromProbe(entry config.ProxyPoolEntry, result ProbeResult) Entry
 	return status
 }
 
-func probePoolEntry(ctx context.Context, pool config.ProxyPool, entry config.ProxyPoolEntry) ProbeResult {
-	url := healthCheckURLForPool(pool)
-	method := healthCheckMethodForPool(pool)
+func (m *HealthManager) probeEntry(ctx context.Context, pool config.ProxyPool, entry config.ProxyPoolEntry) ProbeResult {
+	if m != nil && m.probeEntryFunc != nil {
+		return m.probeEntryFunc(ctx, pool, entry)
+	}
+	return m.probePoolEntry(ctx, pool, entry)
+}
+
+func (m *HealthManager) probeClientForEntry(pool config.ProxyPool, entry config.ProxyPoolEntry) (*http.Client, error) {
+	if m == nil {
+		return nil, fmt.Errorf("health manager is nil")
+	}
+
 	timeout := time.Duration(healthCheckTimeoutSecondsForPool(pool)) * time.Second
 	if timeout <= 0 {
 		timeout = 8 * time.Second
 	}
+	key := probeClientKey{
+		proxyURL: strings.TrimSpace(entry.URL),
+		timeout:  timeout,
+	}
+
+	m.probeClientMu.Lock()
+	defer m.probeClientMu.Unlock()
+
+	if client, ok := m.probeClients[key]; ok && client != nil {
+		return client, nil
+	}
+
+	transport, _, errBuild := proxyutil.BuildHTTPTransport(entry.URL)
+	if errBuild != nil || transport == nil {
+		if errBuild != nil {
+			return nil, errBuild
+		}
+		return nil, fmt.Errorf("failed to build proxy transport")
+	}
+
+	client := &http.Client{
+		Timeout:   timeout,
+		Transport: transport,
+	}
+	m.probeClients[key] = client
+	return client, nil
+}
+
+func (m *HealthManager) probePoolEntry(ctx context.Context, pool config.ProxyPool, entry config.ProxyPoolEntry) ProbeResult {
+	url := healthCheckURLForPool(pool)
+	method := healthCheckMethodForPool(pool)
 
 	if ctx == nil {
 		ctx = context.Background()
@@ -316,18 +400,9 @@ func probePoolEntry(ctx context.Context, pool config.ProxyPool, entry config.Pro
 		return ProbeResult{Error: err.Error(), CheckedAt: time.Now()}
 	}
 
-	transport, _, errBuild := proxyutil.BuildHTTPTransport(entry.URL)
-	if errBuild != nil || transport == nil {
-		errText := "failed to build proxy transport"
-		if errBuild != nil {
-			errText = errBuild.Error()
-		}
-		return ProbeResult{Error: errText, CheckedAt: time.Now()}
-	}
-
-	client := &http.Client{
-		Timeout:   timeout,
-		Transport: transport,
+	client, err := m.probeClientForEntry(pool, entry)
+	if err != nil {
+		return ProbeResult{Error: err.Error(), CheckedAt: time.Now()}
 	}
 	started := time.Now()
 	resp, err := client.Do(req)

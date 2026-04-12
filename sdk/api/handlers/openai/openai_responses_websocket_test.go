@@ -70,11 +70,11 @@ type websocketAuthCaptureExecutor struct {
 }
 
 type websocketSessionCaptureExecutor struct {
-	mu         sync.Mutex
-	authIDs    []string
-	payloads   [][]byte
+	mu               sync.Mutex
+	authIDs          []string
+	payloads         [][]byte
 	responsePayloads [][]byte
-	sessionIDs []string
+	sessionIDs       []string
 }
 
 func (e *websocketAuthCaptureExecutor) Identifier() string { return "test-provider" }
@@ -1667,5 +1667,68 @@ func TestResponsesWebsocketCompactionResetsTurnStateOnTranscriptReplacement(t *t
 	}
 	if items[0].Get("call_id").String() != "call-1" {
 		t.Fatalf("post-compact function call id = %s, want call-1", items[0].Get("call_id").String())
+	}
+}
+
+func TestNormalizeSubsequentRequestCompactSkipsMerge(t *testing.T) {
+	lastRequest := []byte(`{"model":"gpt-5.4","stream":true,"input":[
+		{"type":"message","role":"user","id":"msg-1","content":"original long prompt"},
+		{"type":"message","role":"assistant","id":"msg-2","content":"original long response"},
+		{"type":"function_call","id":"fc-1","call_id":"call-old","name":"bash","arguments":"{}"},
+		{"type":"function_call_output","id":"fco-1","call_id":"call-old","output":"old result"}
+	]}`)
+	lastResponseOutput := []byte(`[
+		{"type":"message","role":"assistant","id":"msg-3","content":"another assistant reply"},
+		{"type":"function_call","id":"fc-2","call_id":"call-stale","name":"read","arguments":"{}"}
+	]`)
+
+	raw := []byte(`{"type":"response.create","input":[
+		{"type":"message","role":"user","id":"msg-1c","content":"compacted user msg"},
+		{"type":"compaction","encrypted_content":"conversation summary"}
+	]}`)
+
+	normalized, _, errMsg := normalizeResponsesWebsocketRequest(raw, lastRequest, lastResponseOutput)
+	if errMsg != nil {
+		t.Fatalf("unexpected error: %v", errMsg.Error)
+	}
+
+	input := gjson.GetBytes(normalized, "input").Array()
+	if len(input) != 2 {
+		t.Fatalf("input len = %d, want 2 (compacted only); stale state was not skipped", len(input))
+	}
+	if input[0].Get("id").String() != "msg-1c" {
+		t.Fatalf("input[0].id = %q, want %q", input[0].Get("id").String(), "msg-1c")
+	}
+	if input[1].Get("type").String() != "compaction" {
+		t.Fatalf("input[1].type = %q, want %q", input[1].Get("type").String(), "compaction")
+	}
+}
+
+func TestNormalizeSubsequentRequestIncrementalInputStillMerges(t *testing.T) {
+	lastRequest := []byte(`{"model":"gpt-5.4","stream":true,"input":[
+		{"type":"message","role":"user","id":"msg-1","content":"hello"}
+	]}`)
+	lastResponseOutput := []byte(`[
+		{"type":"message","role":"assistant","id":"msg-2","content":"let me check"},
+		{"type":"function_call","id":"fc-1","call_id":"call-1","name":"bash","arguments":"{}"}
+	]`)
+	raw := []byte(`{"type":"response.create","input":[
+		{"type":"function_call_output","call_id":"call-1","id":"fco-1","output":"done"}
+	]}`)
+
+	normalized, _, errMsg := normalizeResponsesWebsocketRequest(raw, lastRequest, lastResponseOutput)
+	if errMsg != nil {
+		t.Fatalf("unexpected error: %v", errMsg.Error)
+	}
+
+	input := gjson.GetBytes(normalized, "input").Array()
+	if len(input) != 4 {
+		t.Fatalf("input len = %d, want 4 (merged)", len(input))
+	}
+	wantIDs := []string{"msg-1", "msg-2", "fc-1", "fco-1"}
+	for i, want := range wantIDs {
+		if got := input[i].Get("id").String(); got != want {
+			t.Fatalf("input[%d].id = %q, want %q", i, got, want)
+		}
 	}
 }
