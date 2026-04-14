@@ -58,6 +58,28 @@ func TestParseCodexRetryAfter(t *testing.T) {
 			t.Fatalf("expected nil for non-usage_limit_reached, got %v", *got)
 		}
 	})
+
+	t.Run("plain rate limit exceeded detail defaults to 60 seconds", func(t *testing.T) {
+		body := []byte(`{"detail":"Rate limit exceeded"}`)
+		retryAfter := parseCodexRetryAfter(http.StatusTooManyRequests, body, now)
+		if retryAfter == nil {
+			t.Fatalf("expected retryAfter, got nil")
+		}
+		if *retryAfter != 60*time.Second {
+			t.Fatalf("retryAfter = %v, want %v", *retryAfter, 60*time.Second)
+		}
+	})
+
+	t.Run("plain too many requests message defaults to 60 seconds", func(t *testing.T) {
+		body := []byte(`{"error":{"message":"Too many requests, please slow down.","type":"rate_limit_exceeded"}}`)
+		retryAfter := parseCodexRetryAfter(http.StatusTooManyRequests, body, now)
+		if retryAfter == nil {
+			t.Fatalf("expected retryAfter, got nil")
+		}
+		if *retryAfter != 60*time.Second {
+			t.Fatalf("retryAfter = %v, want %v", *retryAfter, 60*time.Second)
+		}
+	})
 }
 
 func TestNewCodexStatusErrTreatsCapacityAsRetryableRateLimit(t *testing.T) {

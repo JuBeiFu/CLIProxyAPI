@@ -23,6 +23,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 	log "github.com/sirupsen/logrus"
+	"github.com/tidwall/gjson"
 )
 
 // ProviderExecutor defines the contract required by Manager to execute provider calls.
@@ -66,6 +67,7 @@ const (
 	refreshFailureBackoff = 5 * time.Minute
 	quotaBackoffBase      = time.Second
 	quotaBackoffMax       = 30 * time.Minute
+	plain429Cooldown      = 60 * time.Second
 	revokedDeleteTimeout  = 10 * time.Second
 )
 
@@ -2047,9 +2049,10 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 						case 429:
 							var next time.Time
 							backoffLevel := state.Quota.BackoffLevel
+							retryAfter := normalizedRetryAfter(statusCode, result.RetryAfter, state.StatusMessage)
 							if !disableCooling {
-								if result.RetryAfter != nil {
-									next = now.Add(*result.RetryAfter)
+								if retryAfter != nil {
+									next = now.Add(*retryAfter)
 								} else {
 									cooldown, nextLevel := nextQuotaCooldown(backoffLevel, disableCooling)
 									if cooldown > 0 {
@@ -2317,14 +2320,70 @@ func retryAfterFromError(err error) *time.Duration {
 		RetryAfter() *time.Duration
 	}
 	rap, ok := err.(retryAfterProvider)
-	if !ok || rap == nil {
+	if ok && rap != nil {
+		return normalizedRetryAfter(statusCodeFromError(err), rap.RetryAfter(), err.Error())
+	}
+	statusCode := statusCodeFromError(err)
+	if statusCode == 0 {
 		return nil
 	}
-	retryAfter := rap.RetryAfter()
-	if retryAfter == nil {
+	return normalizedRetryAfter(statusCode, nil, err.Error())
+}
+
+func normalizedRetryAfter(statusCode int, retryAfter *time.Duration, message string) *time.Duration {
+	if retryAfter != nil && *retryAfter > 0 {
+		return new(*retryAfter)
+	}
+	if statusCode != http.StatusTooManyRequests {
 		return nil
 	}
-	return new(*retryAfter)
+	if parsed := usageLimitRetryAfterFromMessage(message, time.Now()); parsed != nil {
+		return parsed
+	}
+	return fallbackRetryAfterFor429Message(message)
+}
+
+func usageLimitRetryAfterFromMessage(message string, now time.Time) *time.Duration {
+	body := strings.TrimSpace(message)
+	if body == "" || !gjson.Valid(body) {
+		return nil
+	}
+	if strings.TrimSpace(gjson.Get(body, "error.type").String()) != "usage_limit_reached" {
+		return nil
+	}
+	if resetsAt := gjson.Get(body, "error.resets_at").Int(); resetsAt > 0 {
+		resetAt := time.Unix(resetsAt, 0)
+		if resetAt.After(now) {
+			retryAfter := resetAt.Sub(now)
+			return &retryAfter
+		}
+	}
+	if resetsInSeconds := gjson.Get(body, "error.resets_in_seconds").Int(); resetsInSeconds > 0 {
+		retryAfter := time.Duration(resetsInSeconds) * time.Second
+		return &retryAfter
+	}
+	return nil
+}
+
+func fallbackRetryAfterFor429Message(message string) *time.Duration {
+	lower := strings.ToLower(strings.TrimSpace(message))
+	if lower == "" {
+		return nil
+	}
+	keywords := []string{
+		"rate limit exceeded",
+		"too many requests",
+		"requests rate limit",
+		"rate limited",
+		"rate_limit_exceeded",
+	}
+	for _, keyword := range keywords {
+		if strings.Contains(lower, keyword) {
+			retryAfter := plain429Cooldown
+			return &retryAfter
+		}
+	}
+	return nil
 }
 
 func statusCodeFromResult(err *Error) int {
@@ -2647,6 +2706,11 @@ func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Durati
 		auth.Quota.Exceeded = true
 		auth.Quota.Reason = "quota"
 		var next time.Time
+		message := auth.StatusMessage
+		if resultErr != nil && strings.TrimSpace(resultErr.Message) != "" {
+			message = resultErr.Message
+		}
+		retryAfter = normalizedRetryAfter(statusCode, retryAfter, message)
 		if !disableCooling {
 			if retryAfter != nil {
 				next = now.Add(*retryAfter)

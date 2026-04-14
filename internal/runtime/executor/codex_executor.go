@@ -805,6 +805,10 @@ func parseCodexRetryAfter(statusCode int, errorBody []byte, now time.Time) *time
 		return nil
 	}
 	if strings.TrimSpace(gjson.GetBytes(errorBody, "error.type").String()) != "usage_limit_reached" {
+		if isCodexPlainRateLimitError(errorBody) {
+			retryAfter := 60 * time.Second
+			return &retryAfter
+		}
 		return nil
 	}
 	if resetsAt := gjson.GetBytes(errorBody, "error.resets_at").Int(); resetsAt > 0 {
@@ -819,6 +823,31 @@ func parseCodexRetryAfter(statusCode int, errorBody []byte, now time.Time) *time
 		return &retryAfter
 	}
 	return nil
+}
+
+func isCodexPlainRateLimitError(errorBody []byte) bool {
+	if len(errorBody) == 0 {
+		return false
+	}
+	candidates := []string{
+		gjson.GetBytes(errorBody, "detail").String(),
+		gjson.GetBytes(errorBody, "error.message").String(),
+		gjson.GetBytes(errorBody, "message").String(),
+		string(errorBody),
+	}
+	for _, candidate := range candidates {
+		lower := strings.ToLower(strings.TrimSpace(candidate))
+		if lower == "" {
+			continue
+		}
+		if strings.Contains(lower, "rate limit exceeded") ||
+			strings.Contains(lower, "too many requests") ||
+			strings.Contains(lower, "requests rate limit") ||
+			strings.Contains(lower, "rate limited") {
+			return true
+		}
+	}
+	return false
 }
 
 func codexCreds(a *cliproxyauth.Auth) (apiKey, baseURL string) {

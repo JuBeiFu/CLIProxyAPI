@@ -3,6 +3,7 @@ package auth
 import (
 	"context"
 	"net/http"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -738,6 +739,143 @@ func TestManager_Execute_DisableCooling_RetriesAfter429RetryAfter(t *testing.T) 
 	calls := executor.ExecuteCalls()
 	if len(calls) != 4 {
 		t.Fatalf("execute calls = %d, want 4 (initial + 3 retries)", len(calls))
+	}
+}
+
+func TestManager_Execute_Plain429RateLimitSuspendsAuthFor60SecondsAndSwitchesAuth(t *testing.T) {
+	m := NewManager(nil, nil, nil)
+	m.SetRetryConfig(1, 100*time.Millisecond, 2)
+
+	executor := &authFallbackExecutor{
+		id: "codex",
+		executeErrors: map[string]error{
+			"auth-001-rate-limited": &retryAfterStatusError{
+				status:  http.StatusTooManyRequests,
+				message: `{"detail":"Rate limit exceeded"}`,
+			},
+		},
+	}
+	m.RegisterExecutor(executor)
+
+	rateLimited := &Auth{ID: "auth-001-rate-limited", Provider: "codex"}
+	healthy := &Auth{ID: "auth-999-healthy", Provider: "codex"}
+
+	if _, errRegister := m.Register(context.Background(), rateLimited); errRegister != nil {
+		t.Fatalf("register rate limited auth: %v", errRegister)
+	}
+	if _, errRegister := m.Register(context.Background(), healthy); errRegister != nil {
+		t.Fatalf("register healthy auth: %v", errRegister)
+	}
+
+	model := "gpt-5.4"
+	reg := registry.GetGlobalRegistry()
+	reg.RegisterClient(rateLimited.ID, "codex", []*registry.ModelInfo{{ID: model}})
+	reg.RegisterClient(healthy.ID, "codex", []*registry.ModelInfo{{ID: model}})
+	t.Cleanup(func() {
+		reg.UnregisterClient(rateLimited.ID)
+		reg.UnregisterClient(healthy.ID)
+	})
+
+	resp, errExecute := m.Execute(context.Background(), []string{"codex"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
+	if errExecute != nil {
+		t.Fatalf("execute error = %v, want nil", errExecute)
+	}
+	if string(resp.Payload) != healthy.ID {
+		t.Fatalf("response payload = %q, want %q", string(resp.Payload), healthy.ID)
+	}
+
+	calls := executor.ExecuteCalls()
+	wantCalls := []string{rateLimited.ID, healthy.ID}
+	if len(calls) != len(wantCalls) {
+		t.Fatalf("execute calls = %v, want %v", calls, wantCalls)
+	}
+	for i := range wantCalls {
+		if calls[i] != wantCalls[i] {
+			t.Fatalf("execute call %d auth = %q, want %q", i, calls[i], wantCalls[i])
+		}
+	}
+
+	updated, ok := m.GetByID(rateLimited.ID)
+	if !ok || updated == nil {
+		t.Fatalf("expected rate-limited auth to remain present")
+	}
+	state := updated.ModelStates[model]
+	if state == nil {
+		t.Fatalf("expected model state to exist")
+	}
+	if state.NextRetryAfter.IsZero() {
+		t.Fatalf("expected NextRetryAfter to be set")
+	}
+	remaining := time.Until(state.NextRetryAfter)
+	if remaining < 55*time.Second || remaining > 65*time.Second {
+		t.Fatalf("cooldown remaining = %v, want about 60s", remaining)
+	}
+	if !updated.NextRetryAfter.After(time.Now().Add(55 * time.Second)) {
+		t.Fatalf("auth NextRetryAfter = %v, want about 60s in future", updated.NextRetryAfter)
+	}
+}
+
+func TestManager_Execute_UsageLimitReachedSuspendsUntilResetAndSwitchesAuth(t *testing.T) {
+	m := NewManager(nil, nil, nil)
+	m.SetRetryConfig(1, 100*time.Millisecond, 2)
+
+	resetAt := time.Now().Add(90 * time.Second).Unix()
+	executor := &authFallbackExecutor{
+		id: "codex",
+		executeErrors: map[string]error{
+			"auth-001-usage-limit": &retryAfterStatusError{
+				status: http.StatusTooManyRequests,
+				message: `{"error":{"type":"usage_limit_reached","message":"The usage limit has been reached","plan_type":"plus","resets_at":` +
+					strconv.FormatInt(resetAt, 10) + `,"eligible_promo":null,"resets_in_seconds":10}}`,
+			},
+		},
+	}
+	m.RegisterExecutor(executor)
+
+	limited := &Auth{ID: "auth-001-usage-limit", Provider: "codex"}
+	healthy := &Auth{ID: "auth-999-healthy-usage", Provider: "codex"}
+
+	if _, errRegister := m.Register(context.Background(), limited); errRegister != nil {
+		t.Fatalf("register limited auth: %v", errRegister)
+	}
+	if _, errRegister := m.Register(context.Background(), healthy); errRegister != nil {
+		t.Fatalf("register healthy auth: %v", errRegister)
+	}
+
+	model := "gpt-5.4"
+	reg := registry.GetGlobalRegistry()
+	reg.RegisterClient(limited.ID, "codex", []*registry.ModelInfo{{ID: model}})
+	reg.RegisterClient(healthy.ID, "codex", []*registry.ModelInfo{{ID: model}})
+	t.Cleanup(func() {
+		reg.UnregisterClient(limited.ID)
+		reg.UnregisterClient(healthy.ID)
+	})
+
+	resp, errExecute := m.Execute(context.Background(), []string{"codex"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
+	if errExecute != nil {
+		t.Fatalf("execute error = %v, want nil", errExecute)
+	}
+	if string(resp.Payload) != healthy.ID {
+		t.Fatalf("response payload = %q, want %q", string(resp.Payload), healthy.ID)
+	}
+
+	updated, ok := m.GetByID(limited.ID)
+	if !ok || updated == nil {
+		t.Fatalf("expected limited auth to remain present")
+	}
+	state := updated.ModelStates[model]
+	if state == nil {
+		t.Fatalf("expected model state to exist")
+	}
+	if state.NextRetryAfter.IsZero() {
+		t.Fatalf("expected NextRetryAfter to be set")
+	}
+	remaining := time.Until(state.NextRetryAfter)
+	if remaining < 80*time.Second || remaining > 95*time.Second {
+		t.Fatalf("cooldown remaining = %v, want about 90s", remaining)
+	}
+	if !updated.NextRetryAfter.After(time.Now().Add(80 * time.Second)) {
+		t.Fatalf("auth NextRetryAfter = %v, want about 90s in future", updated.NextRetryAfter)
 	}
 }
 
