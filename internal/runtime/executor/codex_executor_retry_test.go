@@ -90,8 +90,112 @@ func TestNewCodexStatusErrTreatsCapacityAsRetryableRateLimit(t *testing.T) {
 	if got := err.StatusCode(); got != http.StatusTooManyRequests {
 		t.Fatalf("status code = %d, want %d", got, http.StatusTooManyRequests)
 	}
-	if err.RetryAfter() != nil {
-		t.Fatalf("expected nil explicit retryAfter for capacity fallback, got %v", *err.RetryAfter())
+	if err.RetryAfter() == nil {
+		t.Fatal("expected 5m default retryAfter for capacity fallback, got nil")
+	}
+	if *err.RetryAfter() != 5*time.Minute {
+		t.Fatalf("expected 5m default, got %v", *err.RetryAfter())
+	}
+}
+
+func TestNewCodexStatusErrTreatsCurrentModelUnavailableAsRetryableRateLimit(t *testing.T) {
+	body := []byte(`{"error":{"message":"The requested model is currently unavailable. Please switch model."}}`)
+
+	err := newCodexStatusErr(http.StatusBadRequest, body)
+
+	if got := err.StatusCode(); got != http.StatusTooManyRequests {
+		t.Fatalf("status code = %d, want %d", got, http.StatusTooManyRequests)
+	}
+	if err.RetryAfter() == nil {
+		t.Fatal("expected 5m default retryAfter for unavailable-model fallback, got nil")
+	}
+	if *err.RetryAfter() != 5*time.Minute {
+		t.Fatalf("expected 5m default, got %v", *err.RetryAfter())
+	}
+}
+
+func TestParseCodexWebsocketErrorTreatsCapacityAsRetryableRateLimit(t *testing.T) {
+	payload := []byte(`{"type":"error","status":400,"error":{"message":"Selected model is at capacity. Please try a different model."}}`)
+
+	err, ok := parseCodexWebsocketError(payload)
+	if !ok {
+		t.Fatal("expected websocket error to be parsed")
+	}
+
+	statusCoder, ok := err.(interface{ StatusCode() int })
+	if !ok {
+		t.Fatalf("expected status coder, got %T", err)
+	}
+	if got := statusCoder.StatusCode(); got != http.StatusTooManyRequests {
+		t.Fatalf("status code = %d, want %d", got, http.StatusTooManyRequests)
+	}
+}
+
+func TestParseCodexWebsocketErrorTreatsCurrentModelUnavailableAsRetryableRateLimit(t *testing.T) {
+	payload := []byte(`{"type":"error","status":400,"error":{"message":"The requested model is currently unavailable. Please switch model."}}`)
+
+	err, ok := parseCodexWebsocketError(payload)
+	if !ok {
+		t.Fatal("expected websocket error to be parsed")
+	}
+
+	statusCoder, ok := err.(interface{ StatusCode() int })
+	if !ok {
+		t.Fatalf("expected status coder, got %T", err)
+	}
+	if got := statusCoder.StatusCode(); got != http.StatusTooManyRequests {
+		t.Fatalf("status code = %d, want %d", got, http.StatusTooManyRequests)
+	}
+}
+
+func TestParseCodexWebsocketErrorUsesRetryAfterHeader(t *testing.T) {
+	payload := []byte(`{"type":"error","status":429,"error":{"message":"request throttled"},"headers":{"Retry-After":"30"}}`)
+
+	err, ok := parseCodexWebsocketError(payload)
+	if !ok {
+		t.Fatal("expected websocket error to be parsed")
+	}
+
+	statusErr, ok := err.(interface {
+		StatusCode() int
+		RetryAfter() *time.Duration
+	})
+	if !ok {
+		t.Fatalf("expected retryable status error, got %T", err)
+	}
+	if got := statusErr.StatusCode(); got != http.StatusTooManyRequests {
+		t.Fatalf("status code = %d, want %d", got, http.StatusTooManyRequests)
+	}
+	if statusErr.RetryAfter() == nil {
+		t.Fatal("expected RetryAfter, got nil")
+	}
+	if got := *statusErr.RetryAfter(); got != 30*time.Second {
+		t.Fatalf("RetryAfter = %v, want %v", got, 30*time.Second)
+	}
+}
+
+func TestNewCodexStatusErr_CapacityErrorDefaultRetryAfter(t *testing.T) {
+	body := []byte(`{"error":{"message":"The selected model is at capacity"}}`)
+	err := newCodexStatusErr(200, body)
+	if err.code != http.StatusTooManyRequests {
+		t.Errorf("expected 429, got %d", err.code)
+	}
+	if err.retryAfter == nil {
+		t.Fatal("expected default retryAfter for capacity error, got nil")
+	}
+	if *err.retryAfter != 5*time.Minute {
+		t.Errorf("expected 5m default, got %v", *err.retryAfter)
+	}
+}
+
+func TestNewCodexStatusErr_UsageLimitPreservesUpstreamRetryAfter(t *testing.T) {
+	body := []byte(`{"error":{"type":"usage_limit_reached","resets_in_seconds":7200}}`)
+	err := newCodexStatusErr(429, body)
+	if err.retryAfter == nil {
+		t.Fatal("expected retryAfter from upstream, got nil")
+	}
+	if *err.retryAfter != 2*time.Hour {
+		t.Errorf("expected 2h from upstream, got %v", *err.retryAfter)
 	}
 }
 

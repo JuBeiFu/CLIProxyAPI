@@ -124,7 +124,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 		baseURL = "https://chatgpt.com/backend-api/codex"
 	}
 
-	reporter := helps.NewUsageReporter(ctx, e.Identifier(), baseModel, auth)
+	reporter := helps.NewUsageReporter(ctx, e.Identifier(), baseModel, e.cfg, auth)
 	defer reporter.TrackFailure(ctx, &err)
 
 	from := opts.SourceFormat
@@ -272,7 +272,7 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 		baseURL = "https://chatgpt.com/backend-api/codex"
 	}
 
-	reporter := helps.NewUsageReporter(ctx, e.Identifier(), baseModel, auth)
+	reporter := helps.NewUsageReporter(ctx, e.Identifier(), baseModel, e.cfg, auth)
 	defer reporter.TrackFailure(ctx, &err)
 
 	from := opts.SourceFormat
@@ -363,7 +363,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 		baseURL = "https://chatgpt.com/backend-api/codex"
 	}
 
-	reporter := helps.NewUsageReporter(ctx, e.Identifier(), baseModel, auth)
+	reporter := helps.NewUsageReporter(ctx, e.Identifier(), baseModel, e.cfg, auth)
 	defer reporter.TrackFailure(ctx, &err)
 
 	from := opts.SourceFormat
@@ -767,6 +767,10 @@ func newCodexStatusErr(statusCode int, body []byte) statusErr {
 	if retryAfter := parseCodexRetryAfter(errCode, body, time.Now()); retryAfter != nil {
 		err.retryAfter = retryAfter
 	}
+	if err.code == http.StatusTooManyRequests && err.retryAfter == nil && isCodexModelCapacityError(body) {
+		fallback := 5 * time.Minute
+		err.retryAfter = &fallback
+	}
 	return err
 }
 
@@ -793,7 +797,10 @@ func isCodexModelCapacityError(errorBody []byte) bool {
 			continue
 		}
 		if strings.Contains(lower, "selected model is at capacity") ||
-			strings.Contains(lower, "model is at capacity. please try a different model") {
+			strings.Contains(lower, "model is at capacity. please try a different model") ||
+			strings.Contains(lower, "requested model is currently unavailable") ||
+			strings.Contains(lower, "current model is unavailable") ||
+			(strings.Contains(lower, "model unavailable") && strings.Contains(lower, "switch model")) {
 			return true
 		}
 	}
