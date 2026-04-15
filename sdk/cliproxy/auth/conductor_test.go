@@ -36,6 +36,16 @@ func TestIsUsageLimitReachedError(t *testing.T) {
 			err:  &Error{Message: ""},
 			want: false,
 		},
+		{
+			name: "natural language usage limit from ChatGPT",
+			err:  &Error{Message: "The usage limit has been reached"},
+			want: true,
+		},
+		{
+			name: "usage limit in detail field",
+			err:  &Error{Message: `{"detail":"The usage limit has been reached"}`},
+			want: true,
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

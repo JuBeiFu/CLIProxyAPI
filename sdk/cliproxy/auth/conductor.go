@@ -2551,6 +2551,10 @@ func isUsageLimitReachedError(resultErr *Error) bool {
 	if strings.Contains(lower, "usage_limit_reached") {
 		return true
 	}
+	// Match natural language form from ChatGPT: "The usage limit has been reached"
+	if strings.Contains(lower, "usage limit") && strings.Contains(lower, "reached") {
+		return true
+	}
 	if !gjson.Valid(message) {
 		return false
 	}
