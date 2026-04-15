@@ -175,6 +175,38 @@ func synthesizeFileAuths(ctx *SynthesisContext, fullPath string, data []byte) []
 			}
 		}
 	}
+	// Restore persisted quota state so cooldowns survive restart.
+	if quotaRaw, ok := metadata["quota_state"].(map[string]any); ok {
+		exceeded, _ := quotaRaw["exceeded"].(bool)
+		reason, _ := quotaRaw["reason"].(string)
+		backoffLevel := 0
+		if bl, ok := quotaRaw["backoff_level"].(float64); ok {
+			backoffLevel = int(bl)
+		}
+		var nextRecoverAt time.Time
+		if nra, ok := quotaRaw["next_recover_at"].(string); ok && nra != "" {
+			if parsed, errParse := time.Parse(time.RFC3339, nra); errParse == nil {
+				nextRecoverAt = parsed
+			}
+		}
+		var updatedAt time.Time
+		if ua, ok := quotaRaw["updated_at"].(string); ok && ua != "" {
+			if parsed, errParse := time.Parse(time.RFC3339, ua); errParse == nil {
+				updatedAt = parsed
+			}
+		}
+		if !nextRecoverAt.IsZero() && nextRecoverAt.After(now) {
+			a.Quota = coreauth.QuotaState{
+				Exceeded:      exceeded,
+				Reason:        reason,
+				NextRecoverAt: nextRecoverAt,
+				BackoffLevel:  backoffLevel,
+				UpdatedAt:     updatedAt,
+			}
+			a.Unavailable = true
+			a.NextRetryAfter = nextRecoverAt
+		}
+	}
 	if provider == "gemini-cli" {
 		if virtuals := SynthesizeGeminiVirtualAuths(a, metadata, now); len(virtuals) > 0 {
 			for _, v := range virtuals {
