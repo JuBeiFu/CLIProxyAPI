@@ -261,6 +261,265 @@ func (h *Handler) ListAuthFiles(c *gin.Context) {
 	c.JSON(200, gin.H{"files": files})
 }
 
+// ListAvailableAuthFiles returns only auths that are available for scheduling
+// (not disabled, not in quota cooldown).
+func (h *Handler) ListAvailableAuthFiles(c *gin.Context) {
+	if h == nil || h.authManager == nil {
+		c.JSON(500, gin.H{"error": "handler not initialized"})
+		return
+	}
+	now := time.Now()
+	auths := h.authManager.List()
+	files := make([]gin.H, 0, len(auths))
+	totalCount := 0
+	for _, auth := range auths {
+		if auth.Disabled || auth.Status == coreauth.StatusDisabled {
+			continue
+		}
+		totalCount++
+		if auth.Unavailable && auth.NextRetryAfter.After(now) {
+			continue
+		}
+		if auth.Quota.Exceeded && !auth.Quota.NextRecoverAt.IsZero() && auth.Quota.NextRecoverAt.After(now) {
+			continue
+		}
+		if entry := h.buildAuthFileEntry(auth); entry != nil {
+			files = append(files, entry)
+		}
+	}
+	sort.Slice(files, func(i, j int) bool {
+		nameI, _ := files[i]["name"].(string)
+		nameJ, _ := files[j]["name"].(string)
+		return strings.ToLower(nameI) < strings.ToLower(nameJ)
+	})
+	c.JSON(200, gin.H{
+		"files":           files,
+		"available_count": len(files),
+		"total_count":     totalCount,
+	})
+}
+
+// BatchQuotaCheck probes up to 50 codex auths against the upstream API to check
+// their current quota status. Auths that return 429 usage_limit_reached are
+// automatically suspended until their reset time.
+func (h *Handler) BatchQuotaCheck(c *gin.Context) {
+	if h == nil || h.authManager == nil {
+		c.JSON(500, gin.H{"error": "handler not initialized"})
+		return
+	}
+
+	var body struct {
+		AuthIndices []string `json:"auth_indices"`
+		Provider    string   `json:"provider"`
+		CheckAll    bool     `json:"check_all"`
+	}
+	if errBind := c.ShouldBindJSON(&body); errBind != nil {
+		// Allow empty body for check_all
+		body.CheckAll = true
+	}
+	if body.Provider == "" {
+		body.Provider = "codex"
+	}
+
+	auths := h.authManager.List()
+	var candidates []*coreauth.Auth
+	if body.CheckAll {
+		for _, auth := range auths {
+			if auth.Disabled || auth.Status == coreauth.StatusDisabled {
+				continue
+			}
+			if !strings.EqualFold(strings.TrimSpace(auth.Provider), body.Provider) {
+				continue
+			}
+			candidates = append(candidates, auth)
+		}
+	} else {
+		indexSet := make(map[string]bool, len(body.AuthIndices))
+		for _, idx := range body.AuthIndices {
+			indexSet[strings.TrimSpace(idx)] = true
+		}
+		for _, auth := range auths {
+			if auth.Disabled || auth.Status == coreauth.StatusDisabled {
+				continue
+			}
+			if indexSet[auth.Index] || indexSet[auth.ID] {
+				candidates = append(candidates, auth)
+			}
+		}
+	}
+
+	const maxBatch = 50
+	if len(candidates) > maxBatch {
+		candidates = candidates[:maxBatch]
+	}
+
+	type quotaResult struct {
+		AuthID       string `json:"auth_id"`
+		AuthIndex    string `json:"auth_index"`
+		Email        string `json:"email,omitempty"`
+		PlanType     string `json:"plan_type,omitempty"`
+		Available    bool   `json:"available"`
+		StatusCode   int    `json:"status_code"`
+		ErrorType    string `json:"error_type,omitempty"`
+		Message      string `json:"message,omitempty"`
+		ResetsAt     string `json:"resets_at,omitempty"`
+		ResetsIn     int64  `json:"resets_in_seconds,omitempty"`
+		Suspended    bool   `json:"suspended"`
+		Error        string `json:"error,omitempty"`
+	}
+
+	results := make([]quotaResult, len(candidates))
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, maxBatch)
+
+	for i, auth := range candidates {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(idx int, a *coreauth.Auth) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			results[idx] = h.probeCodexQuota(c.Request.Context(), a)
+		}(i, auth)
+	}
+	wg.Wait()
+
+	available := 0
+	exhausted := 0
+	errored := 0
+	for _, r := range results {
+		switch {
+		case r.Available:
+			available++
+		case r.Suspended:
+			exhausted++
+		default:
+			errored++
+		}
+	}
+
+	c.JSON(200, gin.H{
+		"results":   results,
+		"total":     len(results),
+		"available": available,
+		"exhausted": exhausted,
+		"errored":   errored,
+	})
+}
+
+func (h *Handler) probeCodexQuota(ctx context.Context, auth *coreauth.Auth) struct {
+	AuthID     string `json:"auth_id"`
+	AuthIndex  string `json:"auth_index"`
+	Email      string `json:"email,omitempty"`
+	PlanType   string `json:"plan_type,omitempty"`
+	Available  bool   `json:"available"`
+	StatusCode int    `json:"status_code"`
+	ErrorType  string `json:"error_type,omitempty"`
+	Message    string `json:"message,omitempty"`
+	ResetsAt   string `json:"resets_at,omitempty"`
+	ResetsIn   int64  `json:"resets_in_seconds,omitempty"`
+	Suspended  bool   `json:"suspended"`
+	Error      string `json:"error,omitempty"`
+} {
+	type result = struct {
+		AuthID     string `json:"auth_id"`
+		AuthIndex  string `json:"auth_index"`
+		Email      string `json:"email,omitempty"`
+		PlanType   string `json:"plan_type,omitempty"`
+		Available  bool   `json:"available"`
+		StatusCode int    `json:"status_code"`
+		ErrorType  string `json:"error_type,omitempty"`
+		Message    string `json:"message,omitempty"`
+		ResetsAt   string `json:"resets_at,omitempty"`
+		ResetsIn   int64  `json:"resets_in_seconds,omitempty"`
+		Suspended  bool   `json:"suspended"`
+		Error      string `json:"error,omitempty"`
+	}
+
+	r := result{
+		AuthID:    auth.ID,
+		AuthIndex: auth.Index,
+	}
+	if auth.Attributes != nil {
+		r.Email = auth.Attributes["email"]
+		r.PlanType = auth.Attributes["plan_type"]
+	}
+
+	token := tokenValueForAuth(auth)
+	if token == "" {
+		r.Error = "no token"
+		return r
+	}
+
+	// Lightweight probe: POST a minimal request to the codex compact endpoint
+	probeBody := `{"model":"gpt-4o-mini","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"."}]}],"max_output_tokens":1}`
+	req, errReq := http.NewRequestWithContext(ctx, "POST", "https://chatgpt.com/backend-api/codex/responses", strings.NewReader(probeBody))
+	if errReq != nil {
+		r.Error = "request build failed"
+		return r
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{Timeout: 15 * time.Second, Transport: h.apiCallTransport(auth)}
+	resp, errDo := client.Do(req)
+	if errDo != nil {
+		r.Error = errDo.Error()
+		return r
+	}
+	defer resp.Body.Close()
+	respBody, _ := io.ReadAll(resp.Body)
+	r.StatusCode = resp.StatusCode
+
+	switch {
+	case resp.StatusCode == http.StatusTooManyRequests:
+		r.Available = false
+		errorType := strings.TrimSpace(gjson.GetBytes(respBody, "error.type").String())
+		if errorType == "" {
+			errorType = strings.TrimSpace(gjson.GetBytes(respBody, "detail.type").String())
+		}
+		r.ErrorType = errorType
+		r.Message = strings.TrimSpace(gjson.GetBytes(respBody, "error.message").String())
+		if r.Message == "" {
+			r.Message = strings.TrimSpace(gjson.GetBytes(respBody, "detail").String())
+		}
+		if resetsAt := gjson.GetBytes(respBody, "error.resets_at").Int(); resetsAt > 0 {
+			r.ResetsAt = time.Unix(resetsAt, 0).UTC().Format(time.RFC3339)
+		}
+		if resetsIn := gjson.GetBytes(respBody, "error.resets_in_seconds").Int(); resetsIn > 0 {
+			r.ResetsIn = resetsIn
+		}
+		// Auto-suspend via MarkResult
+		retryAfter := retryAfterFromAPICall(resp.StatusCode, respBody)
+		h.authManager.MarkResult(ctx, coreauth.Result{
+			AuthID:     auth.ID,
+			Provider:   strings.TrimSpace(auth.Provider),
+			Success:    false,
+			RetryAfter: retryAfter,
+			Error: &coreauth.Error{
+				Message:    string(respBody),
+				HTTPStatus: resp.StatusCode,
+			},
+		})
+		r.Suspended = true
+
+	case resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden:
+		r.Available = false
+		r.Message = strings.TrimSpace(string(respBody))
+		h.markAPICallResponse(ctx, auth, resp.StatusCode, respBody)
+
+	case resp.StatusCode >= 200 && resp.StatusCode < 300:
+		r.Available = true
+
+	default:
+		r.Available = true // Non-429, non-401/403 — assume available
+		r.Message = strings.TrimSpace(string(respBody))
+		if len(r.Message) > 200 {
+			r.Message = r.Message[:200]
+		}
+	}
+	return r
+}
+
 // GetAuthFileModels returns the models supported by a specific auth file
 func (h *Handler) GetAuthFileModels(c *gin.Context) {
 	name := c.Query("name")
