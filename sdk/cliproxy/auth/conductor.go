@@ -71,6 +71,12 @@ const (
 	revokedDeleteTimeout  = 10 * time.Second
 )
 
+const (
+	defaultRequestRetry        = 2
+	defaultMaxRetryCredentials = 5
+	defaultMaxRetryInterval    = 120 * time.Second
+)
+
 var quotaCooldownDisabled atomic.Bool
 
 // SetQuotaCooldownDisabled toggles quota cooldown scheduling globally.
@@ -1848,7 +1854,13 @@ func (m *Manager) retrySettings() (int, int, time.Duration) {
 	if m == nil {
 		return 0, 0, 0
 	}
-	return int(m.requestRetry.Load()), int(m.maxRetryCredentials.Load()), time.Duration(m.maxRetryInterval.Load())
+	retry := int(m.requestRetry.Load())
+	maxCreds := int(m.maxRetryCredentials.Load())
+	maxWait := time.Duration(m.maxRetryInterval.Load())
+	if retry == 0 && maxCreds == 0 && maxWait == 0 {
+		return defaultRequestRetry, defaultMaxRetryCredentials, defaultMaxRetryInterval
+	}
+	return retry, maxCreds, maxWait
 }
 
 func (m *Manager) closestCooldownWait(providers []string, model string, attempt int) (time.Duration, bool) {
@@ -2455,7 +2467,8 @@ func retryAfterFromError(err error) *time.Duration {
 
 func normalizedRetryAfter(statusCode int, retryAfter *time.Duration, message string) *time.Duration {
 	if retryAfter != nil && *retryAfter > 0 {
-		return new(*retryAfter)
+		d := *retryAfter
+		return &d
 	}
 	if statusCode != http.StatusTooManyRequests {
 		return nil
@@ -2463,7 +2476,12 @@ func normalizedRetryAfter(statusCode int, retryAfter *time.Duration, message str
 	if parsed := usageLimitRetryAfterFromMessage(message, time.Now()); parsed != nil {
 		return parsed
 	}
-	return fallbackRetryAfterFor429Message(message)
+	if parsed := fallbackRetryAfterFor429Message(message); parsed != nil {
+		return parsed
+	}
+	// Any 429 without a recognized pattern gets a conservative fallback
+	fallback := plain429Cooldown
+	return &fallback
 }
 
 func usageLimitRetryAfterFromMessage(message string, now time.Time) *time.Duration {
