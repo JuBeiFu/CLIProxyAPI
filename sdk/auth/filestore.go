@@ -15,6 +15,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/auth/codex"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 )
 
@@ -254,6 +255,51 @@ func (s *FileTokenStore) readAuthFile(path, baseDir string) (*cliproxyauth.Auth,
 	if email, ok := metadata["email"].(string); ok && email != "" {
 		auth.Attributes["email"] = email
 	}
+	if strings.EqualFold(strings.TrimSpace(provider), "codex") {
+		if idTokenRaw, ok := metadata["id_token"].(string); ok {
+			if claims, errParse := codex.ParseJWTToken(idTokenRaw); errParse == nil && claims != nil {
+				if planType := strings.TrimSpace(claims.CodexAuthInfo.ChatgptPlanType); planType != "" {
+					auth.Attributes["plan_type"] = planType
+				}
+				if accountID := strings.TrimSpace(claims.CodexAuthInfo.ChatgptAccountID); accountID != "" {
+					metadata["account_id"] = accountID
+				}
+			}
+		}
+	}
+	// Parse persisted quota state
+	if quotaRaw, ok := metadata["quota_state"].(map[string]any); ok {
+		exceeded, _ := quotaRaw["exceeded"].(bool)
+		reason, _ := quotaRaw["reason"].(string)
+		backoffLevel := 0
+		if bl, ok := quotaRaw["backoff_level"].(float64); ok {
+			backoffLevel = int(bl)
+		}
+		var nextRecoverAt time.Time
+		if nra, ok := quotaRaw["next_recover_at"].(string); ok && nra != "" {
+			if parsed, errParse := time.Parse(time.RFC3339, nra); errParse == nil {
+				nextRecoverAt = parsed
+			}
+		}
+		var updatedAt time.Time
+		if ua, ok := quotaRaw["updated_at"].(string); ok && ua != "" {
+			if parsed, errParse := time.Parse(time.RFC3339, ua); errParse == nil {
+				updatedAt = parsed
+			}
+		}
+		// Only apply if not yet expired
+		if !nextRecoverAt.IsZero() && nextRecoverAt.After(time.Now()) {
+			auth.Quota = cliproxyauth.QuotaState{
+				Exceeded:      exceeded,
+				Reason:        reason,
+				NextRecoverAt: nextRecoverAt,
+				BackoffLevel:  backoffLevel,
+				UpdatedAt:     updatedAt,
+			}
+			auth.Unavailable = true
+			auth.NextRetryAfter = nextRecoverAt
+		}
+	}
 	cliproxyauth.ApplyCustomHeadersFromMetadata(auth)
 	return auth, nil
 }
@@ -301,6 +347,67 @@ func (s *FileTokenStore) resolveAuthPath(auth *cliproxyauth.Auth) (string, error
 		return "", fmt.Errorf("auth filestore: directory not configured")
 	}
 	return filepath.Join(dir, auth.ID), nil
+}
+
+// PersistQuotaState merges quota state into the auth JSON file without overwriting other fields.
+func (s *FileTokenStore) PersistQuotaState(authID string, quota cliproxyauth.QuotaState) error {
+	if s == nil || authID == "" {
+		return fmt.Errorf("invalid arguments")
+	}
+	path := s.resolvePathForAuthID(authID)
+	if path == "" {
+		return fmt.Errorf("no file path for auth %s", authID)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("read auth file: %w", err)
+	}
+	var metadata map[string]any
+	if err := json.Unmarshal(data, &metadata); err != nil {
+		return fmt.Errorf("unmarshal auth file: %w", err)
+	}
+
+	quotaMap := map[string]any{
+		"exceeded":        quota.Exceeded,
+		"reason":          quota.Reason,
+		"next_recover_at": quota.NextRecoverAt.UTC().Format(time.RFC3339),
+		"backoff_level":   quota.BackoffLevel,
+		"updated_at":      quota.UpdatedAt.UTC().Format(time.RFC3339),
+	}
+	metadata["quota_state"] = quotaMap
+
+	updated, err := json.MarshalIndent(metadata, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal auth file: %w", err)
+	}
+	return os.WriteFile(path, updated, 0o600)
+}
+
+// resolvePathForAuthID finds the file path for an auth ID string.
+func (s *FileTokenStore) resolvePathForAuthID(authID string) string {
+	if s == nil || authID == "" {
+		return ""
+	}
+	dir := s.baseDirSnapshot()
+	if dir == "" {
+		return ""
+	}
+	// Auth IDs are relative paths from baseDir — reconstruct full path
+	candidate := filepath.Join(dir, authID)
+	if _, err := os.Stat(candidate); err == nil {
+		return candidate
+	}
+	// Try with .json extension
+	if !strings.HasSuffix(authID, ".json") {
+		candidate = filepath.Join(dir, authID+".json")
+		if _, err := os.Stat(candidate); err == nil {
+			return candidate
+		}
+	}
+	return ""
 }
 
 func (s *FileTokenStore) labelFor(metadata map[string]any) string {

@@ -877,6 +877,311 @@ func TestManager_Execute_UsageLimitReachedSuspendsUntilResetAndSwitchesAuth(t *t
 	if !updated.NextRetryAfter.After(time.Now().Add(80 * time.Second)) {
 		t.Fatalf("auth NextRetryAfter = %v, want about 90s in future", updated.NextRetryAfter)
 	}
+	if !updated.Unavailable {
+		t.Fatalf("expected auth to be unavailable during reset window")
+	}
+}
+
+func TestManager_Execute_UsageLimitReachedBlocksAuthAcrossModelsWithExistingHealthyState(t *testing.T) {
+	m := NewManager(nil, nil, nil)
+	m.SetRetryConfig(1, 100*time.Millisecond, 2)
+
+	executor := &authFallbackExecutor{id: "codex"}
+	m.RegisterExecutor(executor)
+
+	modelLimited := "gpt-5.4"
+	modelHealthy := "gpt-5.4-mini"
+	modelFollowup := "gpt-5.3-codex"
+	resetAt := time.Now().Add(90 * time.Second).Unix()
+
+	limited := &Auth{
+		ID:       "auth-001-usage-limit-cross-model",
+		Provider: "codex",
+		ModelStates: map[string]*ModelState{
+			modelHealthy: {
+				Status:    StatusActive,
+				UpdatedAt: time.Now(),
+			},
+		},
+	}
+	healthy := &Auth{ID: "auth-999-healthy-cross-model", Provider: "codex"}
+
+	if _, errRegister := m.Register(context.Background(), limited); errRegister != nil {
+		t.Fatalf("register limited auth: %v", errRegister)
+	}
+	if _, errRegister := m.Register(context.Background(), healthy); errRegister != nil {
+		t.Fatalf("register healthy auth: %v", errRegister)
+	}
+
+	reg := registry.GetGlobalRegistry()
+	supportedModels := []*registry.ModelInfo{{ID: modelLimited}, {ID: modelHealthy}, {ID: modelFollowup}}
+	reg.RegisterClient(limited.ID, "codex", supportedModels)
+	reg.RegisterClient(healthy.ID, "codex", supportedModels)
+	t.Cleanup(func() {
+		reg.UnregisterClient(limited.ID)
+		reg.UnregisterClient(healthy.ID)
+	})
+
+	m.MarkResult(context.Background(), Result{
+		AuthID:   limited.ID,
+		Provider: "codex",
+		Model:    modelLimited,
+		Success:  false,
+		Error: &Error{
+			HTTPStatus: http.StatusTooManyRequests,
+			Message: `{"error":{"type":"usage_limit_reached","message":"The usage limit has been reached","resets_at":` +
+				strconv.FormatInt(resetAt, 10) + `}}`,
+		},
+	})
+
+	resp, errExecute := m.Execute(context.Background(), []string{"codex"}, cliproxyexecutor.Request{Model: modelFollowup}, cliproxyexecutor.Options{})
+	if errExecute != nil {
+		t.Fatalf("execute error = %v, want nil", errExecute)
+	}
+	if string(resp.Payload) != healthy.ID {
+		t.Fatalf("response payload = %q, want %q", string(resp.Payload), healthy.ID)
+	}
+
+	calls := executor.ExecuteCalls()
+	wantCalls := []string{healthy.ID}
+	if len(calls) != len(wantCalls) {
+		t.Fatalf("execute calls = %v, want %v", calls, wantCalls)
+	}
+	for i := range wantCalls {
+		if calls[i] != wantCalls[i] {
+			t.Fatalf("execute call %d auth = %q, want %q", i, calls[i], wantCalls[i])
+		}
+	}
+}
+
+func TestManager_Execute_SelectedModelAtCapacitySwitchesAuth(t *testing.T) {
+	m := NewManager(nil, nil, nil)
+	m.SetRetryConfig(1, 100*time.Millisecond, 2)
+
+	executor := &authFallbackExecutor{
+		id: "codex",
+		executeErrors: map[string]error{
+			"auth-001-capacity": &Error{
+				HTTPStatus: http.StatusTooManyRequests,
+				Message:    "Selected model is at capacity. Please try a different model.",
+			},
+		},
+	}
+	m.RegisterExecutor(executor)
+
+	capacityAuth := &Auth{ID: "auth-001-capacity", Provider: "codex"}
+	healthy := &Auth{ID: "auth-999-healthy-capacity", Provider: "codex"}
+
+	if _, errRegister := m.Register(context.Background(), capacityAuth); errRegister != nil {
+		t.Fatalf("register capacity auth: %v", errRegister)
+	}
+	if _, errRegister := m.Register(context.Background(), healthy); errRegister != nil {
+		t.Fatalf("register healthy auth: %v", errRegister)
+	}
+
+	model := "gpt-5.4"
+	reg := registry.GetGlobalRegistry()
+	reg.RegisterClient(capacityAuth.ID, "codex", []*registry.ModelInfo{{ID: model}})
+	reg.RegisterClient(healthy.ID, "codex", []*registry.ModelInfo{{ID: model}})
+	t.Cleanup(func() {
+		reg.UnregisterClient(capacityAuth.ID)
+		reg.UnregisterClient(healthy.ID)
+	})
+
+	resp, errExecute := m.Execute(context.Background(), []string{"codex"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
+	if errExecute != nil {
+		t.Fatalf("execute error = %v, want nil", errExecute)
+	}
+	if string(resp.Payload) != healthy.ID {
+		t.Fatalf("response payload = %q, want %q", string(resp.Payload), healthy.ID)
+	}
+
+	calls := executor.ExecuteCalls()
+	wantCalls := []string{capacityAuth.ID, healthy.ID}
+	if len(calls) != len(wantCalls) {
+		t.Fatalf("execute calls = %v, want %v", calls, wantCalls)
+	}
+	for i := range wantCalls {
+		if calls[i] != wantCalls[i] {
+			t.Fatalf("execute call %d auth = %q, want %q", i, calls[i], wantCalls[i])
+		}
+	}
+}
+
+func TestManager_Execute_CurrentModelUnavailableSwitchesAuth(t *testing.T) {
+	m := NewManager(nil, nil, nil)
+	m.SetRetryConfig(1, 100*time.Millisecond, 2)
+
+	executor := &authFallbackExecutor{
+		id: "codex",
+		executeErrors: map[string]error{
+			"auth-001-unavailable": &Error{
+				HTTPStatus: http.StatusTooManyRequests,
+				Message:    "The requested model is currently unavailable. Please switch model.",
+			},
+		},
+	}
+	m.RegisterExecutor(executor)
+
+	unavailableAuth := &Auth{ID: "auth-001-unavailable", Provider: "codex"}
+	healthy := &Auth{ID: "auth-999-healthy-unavailable", Provider: "codex"}
+
+	if _, errRegister := m.Register(context.Background(), unavailableAuth); errRegister != nil {
+		t.Fatalf("register unavailable auth: %v", errRegister)
+	}
+	if _, errRegister := m.Register(context.Background(), healthy); errRegister != nil {
+		t.Fatalf("register healthy auth: %v", errRegister)
+	}
+
+	model := "gpt-5.4"
+	reg := registry.GetGlobalRegistry()
+	reg.RegisterClient(unavailableAuth.ID, "codex", []*registry.ModelInfo{{ID: model}})
+	reg.RegisterClient(healthy.ID, "codex", []*registry.ModelInfo{{ID: model}})
+	t.Cleanup(func() {
+		reg.UnregisterClient(unavailableAuth.ID)
+		reg.UnregisterClient(healthy.ID)
+	})
+
+	resp, errExecute := m.Execute(context.Background(), []string{"codex"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
+	if errExecute != nil {
+		t.Fatalf("execute error = %v, want nil", errExecute)
+	}
+	if string(resp.Payload) != healthy.ID {
+		t.Fatalf("response payload = %q, want %q", string(resp.Payload), healthy.ID)
+	}
+
+	calls := executor.ExecuteCalls()
+	wantCalls := []string{unavailableAuth.ID, healthy.ID}
+	if len(calls) != len(wantCalls) {
+		t.Fatalf("execute calls = %v, want %v", calls, wantCalls)
+	}
+	for i := range wantCalls {
+		if calls[i] != wantCalls[i] {
+			t.Fatalf("execute call %d auth = %q, want %q", i, calls[i], wantCalls[i])
+		}
+	}
+}
+
+func TestManager_ExecuteStream_SelectedModelAtCapacitySwitchesAuth(t *testing.T) {
+	m := NewManager(nil, nil, nil)
+	m.SetRetryConfig(1, 100*time.Millisecond, 2)
+
+	executor := &authFallbackExecutor{
+		id: "codex",
+		streamFirstErrors: map[string]error{
+			"auth-001-capacity-stream": &Error{
+				HTTPStatus: http.StatusTooManyRequests,
+				Message:    "Selected model is at capacity. Please try a different model.",
+			},
+		},
+	}
+	m.RegisterExecutor(executor)
+
+	capacityAuth := &Auth{ID: "auth-001-capacity-stream", Provider: "codex"}
+	healthy := &Auth{ID: "auth-999-healthy-capacity-stream", Provider: "codex"}
+
+	if _, errRegister := m.Register(context.Background(), capacityAuth); errRegister != nil {
+		t.Fatalf("register capacity auth: %v", errRegister)
+	}
+	if _, errRegister := m.Register(context.Background(), healthy); errRegister != nil {
+		t.Fatalf("register healthy auth: %v", errRegister)
+	}
+
+	model := "gpt-5.4"
+	reg := registry.GetGlobalRegistry()
+	reg.RegisterClient(capacityAuth.ID, "codex", []*registry.ModelInfo{{ID: model}})
+	reg.RegisterClient(healthy.ID, "codex", []*registry.ModelInfo{{ID: model}})
+	t.Cleanup(func() {
+		reg.UnregisterClient(capacityAuth.ID)
+		reg.UnregisterClient(healthy.ID)
+	})
+
+	streamResult, errExecute := m.ExecuteStream(context.Background(), []string{"codex"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
+	if errExecute != nil {
+		t.Fatalf("execute stream error = %v, want nil", errExecute)
+	}
+	var payload []byte
+	for chunk := range streamResult.Chunks {
+		if chunk.Err != nil {
+			t.Fatalf("stream chunk error = %v, want nil", chunk.Err)
+		}
+		payload = append(payload, chunk.Payload...)
+	}
+	if string(payload) != healthy.ID {
+		t.Fatalf("stream payload = %q, want %q", string(payload), healthy.ID)
+	}
+
+	calls := executor.StreamCalls()
+	wantCalls := []string{capacityAuth.ID, healthy.ID}
+	if len(calls) != len(wantCalls) {
+		t.Fatalf("stream calls = %v, want %v", calls, wantCalls)
+	}
+	for i := range wantCalls {
+		if calls[i] != wantCalls[i] {
+			t.Fatalf("stream call %d auth = %q, want %q", i, calls[i], wantCalls[i])
+		}
+	}
+}
+
+func TestManager_ExecuteStream_CurrentModelUnavailableSwitchesAuth(t *testing.T) {
+	m := NewManager(nil, nil, nil)
+	m.SetRetryConfig(1, 100*time.Millisecond, 2)
+
+	executor := &authFallbackExecutor{
+		id: "codex",
+		streamFirstErrors: map[string]error{
+			"auth-001-unavailable-stream": &Error{
+				HTTPStatus: http.StatusTooManyRequests,
+				Message:    "The requested model is currently unavailable. Please switch model.",
+			},
+		},
+	}
+	m.RegisterExecutor(executor)
+
+	unavailableAuth := &Auth{ID: "auth-001-unavailable-stream", Provider: "codex"}
+	healthy := &Auth{ID: "auth-999-healthy-unavailable-stream", Provider: "codex"}
+
+	if _, errRegister := m.Register(context.Background(), unavailableAuth); errRegister != nil {
+		t.Fatalf("register unavailable auth: %v", errRegister)
+	}
+	if _, errRegister := m.Register(context.Background(), healthy); errRegister != nil {
+		t.Fatalf("register healthy auth: %v", errRegister)
+	}
+
+	model := "gpt-5.4"
+	reg := registry.GetGlobalRegistry()
+	reg.RegisterClient(unavailableAuth.ID, "codex", []*registry.ModelInfo{{ID: model}})
+	reg.RegisterClient(healthy.ID, "codex", []*registry.ModelInfo{{ID: model}})
+	t.Cleanup(func() {
+		reg.UnregisterClient(unavailableAuth.ID)
+		reg.UnregisterClient(healthy.ID)
+	})
+
+	streamResult, errExecute := m.ExecuteStream(context.Background(), []string{"codex"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
+	if errExecute != nil {
+		t.Fatalf("execute stream error = %v, want nil", errExecute)
+	}
+	var payload []byte
+	for chunk := range streamResult.Chunks {
+		if chunk.Err != nil {
+			t.Fatalf("stream chunk error = %v, want nil", chunk.Err)
+		}
+		payload = append(payload, chunk.Payload...)
+	}
+	if string(payload) != healthy.ID {
+		t.Fatalf("stream payload = %q, want %q", string(payload), healthy.ID)
+	}
+
+	calls := executor.StreamCalls()
+	wantCalls := []string{unavailableAuth.ID, healthy.ID}
+	if len(calls) != len(wantCalls) {
+		t.Fatalf("stream calls = %v, want %v", calls, wantCalls)
+	}
+	for i := range wantCalls {
+		if calls[i] != wantCalls[i] {
+			t.Fatalf("stream call %d auth = %q, want %q", i, calls[i], wantCalls[i])
+		}
+	}
 }
 
 func TestManager_MarkResult_RequestScopedNotFoundDoesNotCooldownAuth(t *testing.T) {
@@ -987,5 +1292,203 @@ func TestManager_RequestScopedNotFoundStopsRetryWithoutSuspendingAuth(t *testing
 	}
 	if state := updatedBad.ModelStates[model]; state != nil {
 		t.Fatalf("expected request-scoped 404 to avoid bad auth model cooldown state, got %#v", state)
+	}
+}
+
+func TestMarkResult_UsageLimitIgnoresCooldownDisabled(t *testing.T) {
+	m := NewManager(nil, nil, nil)
+	auth := &Auth{
+		ID:       "auth-ul",
+		Provider: "codex",
+		Metadata: map[string]any{
+			"disable_cooling": true,
+		},
+		ModelStates: make(map[string]*ModelState),
+	}
+	_, _ = m.Register(context.Background(), auth)
+
+	retryAfter := 2 * time.Hour
+	m.MarkResult(context.Background(), Result{
+		AuthID:     "auth-ul",
+		Provider:   "codex",
+		Model:      "gpt-4",
+		Success:    false,
+		RetryAfter: &retryAfter,
+		Error: &Error{
+			Message:    `{"error":{"type":"usage_limit_reached","resets_in_seconds":7200}}`,
+			HTTPStatus: 429,
+		},
+	})
+
+	got, ok := m.GetByID("auth-ul")
+	if !ok {
+		t.Fatal("auth not found after MarkResult")
+	}
+	if !got.Quota.Exceeded {
+		t.Error("expected Quota.Exceeded = true")
+	}
+	if got.Quota.Reason != "usage_limit" {
+		t.Errorf("expected Quota.Reason = usage_limit, got %q", got.Quota.Reason)
+	}
+	if got.NextRetryAfter.IsZero() {
+		t.Error("expected NextRetryAfter to be set even though cooling is disabled")
+	}
+	if state, exists := got.ModelStates["gpt-4"]; !exists || !state.Quota.Exceeded {
+		t.Error("expected model state gpt-4 to have Quota.Exceeded = true")
+	}
+}
+
+func TestMarkResult_PlainRateLimitRespectsDisabledCooling(t *testing.T) {
+	m := NewManager(nil, nil, nil)
+	auth := &Auth{
+		ID:       "auth-rl",
+		Provider: "codex",
+		Metadata: map[string]any{
+			"disable_cooling": true,
+		},
+		ModelStates: make(map[string]*ModelState),
+	}
+	_, _ = m.Register(context.Background(), auth)
+
+	retryAfter := 60 * time.Second
+	m.MarkResult(context.Background(), Result{
+		AuthID:     "auth-rl",
+		Provider:   "codex",
+		Model:      "gpt-4",
+		Success:    false,
+		RetryAfter: &retryAfter,
+		Error: &Error{
+			Message:    "rate limit exceeded",
+			HTTPStatus: 429,
+		},
+	})
+
+	got, ok := m.GetByID("auth-rl")
+	if !ok {
+		t.Fatal("auth not found")
+	}
+	if !got.NextRetryAfter.IsZero() {
+		t.Errorf("expected NextRetryAfter to be zero for plain rate limit with cooling disabled, got %v", got.NextRetryAfter)
+	}
+}
+
+func TestApplyAuthFailureState_UsageLimitIgnoresDisabledCooling(t *testing.T) {
+	auth := &Auth{
+		ID:       "auth-af",
+		Provider: "codex",
+		Metadata: map[string]any{
+			"disable_cooling": true,
+		},
+	}
+	retryAfter := 3 * time.Hour
+	now := time.Now()
+	applyAuthFailureState(auth, &Error{
+		Message:    `{"error":{"type":"usage_limit_reached","resets_in_seconds":10800}}`,
+		HTTPStatus: 429,
+	}, &retryAfter, now)
+
+	if auth.NextRetryAfter.IsZero() {
+		t.Error("expected NextRetryAfter to be set for usage_limit even with cooling disabled")
+	}
+	if auth.Quota.Reason != "usage_limit" {
+		t.Errorf("expected Quota.Reason = usage_limit, got %q", auth.Quota.Reason)
+	}
+	if !auth.Quota.Exceeded {
+		t.Error("expected Quota.Exceeded = true")
+	}
+}
+
+func TestApplyAuthFailureState_PlainRateLimitRespectsDisabledCooling(t *testing.T) {
+	auth := &Auth{
+		ID:       "auth-af2",
+		Provider: "codex",
+		Metadata: map[string]any{
+			"disable_cooling": true,
+		},
+	}
+	retryAfter := 60 * time.Second
+	now := time.Now()
+	applyAuthFailureState(auth, &Error{
+		Message:    "rate limit exceeded",
+		HTTPStatus: 429,
+	}, &retryAfter, now)
+
+	if !auth.NextRetryAfter.IsZero() {
+		t.Error("expected NextRetryAfter to be zero for plain rate limit with cooling disabled")
+	}
+}
+
+func TestQuotaPersistence_SurvivesRestart(t *testing.T) {
+	persister := &mockPersister{written: make(map[string]QuotaState)}
+	m := NewManager(nil, nil, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	m.StartQuotaFlusher(ctx, persister)
+
+	auth := &Auth{
+		ID:          "auth-persist",
+		Provider:    "codex",
+		Metadata:    map[string]any{},
+		ModelStates: make(map[string]*ModelState),
+	}
+	_, _ = m.Register(context.Background(), auth)
+
+	// Trigger usage_limit 429
+	retryAfter := 2 * time.Hour
+	m.MarkResult(context.Background(), Result{
+		AuthID:     "auth-persist",
+		Provider:   "codex",
+		Model:      "gpt-4",
+		Success:    false,
+		RetryAfter: &retryAfter,
+		Error: &Error{
+			Message:    `{"error":{"type":"usage_limit_reached","resets_in_seconds":7200}}`,
+			HTTPStatus: 429,
+		},
+	})
+
+	// Flush to persister
+	if m.quotaFlusher != nil {
+		m.quotaFlusher.flushOnce()
+	}
+
+	// Verify persisted
+	q, ok := persister.getWritten("auth-persist")
+	if !ok {
+		t.Fatal("expected quota to be persisted")
+	}
+	if !q.Exceeded {
+		t.Error("persisted quota should be exceeded")
+	}
+	if q.Reason != "usage_limit" {
+		t.Errorf("persisted reason should be usage_limit, got %q", q.Reason)
+	}
+	if q.NextRecoverAt.IsZero() {
+		t.Error("persisted NextRecoverAt should not be zero")
+	}
+
+	// Simulate "restart" — new Manager, load auth with persisted quota
+	m2 := NewManager(nil, nil, nil)
+	auth2 := &Auth{
+		ID:             "auth-persist",
+		Provider:       "codex",
+		Quota:          q,
+		Unavailable:    true,
+		NextRetryAfter: q.NextRecoverAt,
+	}
+	_, _ = m2.Register(context.Background(), auth2)
+
+	got, ok := m2.GetByID("auth-persist")
+	if !ok {
+		t.Fatal("auth not found in new manager")
+	}
+	if !got.Unavailable {
+		t.Error("auth should be unavailable after simulated restart")
+	}
+	if !got.Quota.Exceeded {
+		t.Error("auth quota should be exceeded after simulated restart")
+	}
+	if got.Quota.Reason != "usage_limit" {
+		t.Errorf("expected usage_limit, got %q", got.Quota.Reason)
 	}
 }
