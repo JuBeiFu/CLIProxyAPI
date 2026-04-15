@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"context"
 	"sync"
 	"testing"
 	"time"
@@ -154,5 +155,41 @@ func TestQuotaFlusher_SkipsDuplicateFlush(t *testing.T) {
 
 	if _, ok := persister.getWritten("auth-dup"); ok {
 		t.Error("expected second flush to skip unchanged quota")
+	}
+}
+
+func TestManager_StartQuotaFlusher(t *testing.T) {
+	persister := &mockPersister{written: make(map[string]QuotaState)}
+	m := NewManager(nil, nil, nil)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	m.StartQuotaFlusher(ctx, persister)
+
+	now := time.Now()
+	auth := &Auth{
+		ID:       "auth-wired",
+		Provider: "codex",
+		Quota: QuotaState{
+			Exceeded:      true,
+			Reason:        "usage_limit",
+			NextRecoverAt: now.Add(2 * time.Hour),
+			UpdatedAt:     now,
+		},
+	}
+	_, _ = m.Register(nil, auth)
+
+	// Trigger manual flush
+	if m.quotaFlusher != nil {
+		m.quotaFlusher.flushOnce()
+	}
+
+	cancel()
+
+	q, ok := persister.getWritten("auth-wired")
+	if !ok {
+		t.Fatal("expected auth to be flushed via manager")
+	}
+	if q.Reason != "usage_limit" {
+		t.Errorf("expected reason=usage_limit, got %q", q.Reason)
 	}
 }

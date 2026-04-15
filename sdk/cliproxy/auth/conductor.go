@@ -190,6 +190,8 @@ type Manager struct {
 	// Auto refresh state
 	refreshCancel    context.CancelFunc
 	refreshSemaphore chan struct{}
+
+	quotaFlusher *quotaFlusher
 }
 
 // NewManager constructs a manager with optional custom selector and hook.
@@ -2203,6 +2205,12 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 		registry.GetGlobalRegistry().SuspendClientModel(result.AuthID, result.Model, suspendReason)
 	}
 
+	if !result.Success && m.quotaFlusher != nil {
+		if result.Error != nil && result.Error.StatusCode() == http.StatusTooManyRequests {
+			m.quotaFlusher.notifyActivity()
+		}
+	}
+
 	m.hook.OnResult(ctx, result)
 }
 
@@ -3367,6 +3375,16 @@ func (m *Manager) StopAutoRefresh() {
 		m.refreshCancel()
 		m.refreshCancel = nil
 	}
+}
+
+// StartQuotaFlusher starts the background quota persistence loop.
+func (m *Manager) StartQuotaFlusher(ctx context.Context, persister QuotaPersister) {
+	if m == nil || persister == nil {
+		return
+	}
+	f := newQuotaFlusher(m, persister)
+	m.quotaFlusher = f
+	go f.Run(ctx)
 }
 
 func (m *Manager) checkRefreshes(ctx context.Context) {
