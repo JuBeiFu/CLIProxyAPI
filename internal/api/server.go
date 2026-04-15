@@ -261,6 +261,16 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 	s.applyAccessConfig(nil, cfg)
 	if authManager != nil {
 		authManager.SetRetryConfig(cfg.RequestRetry, time.Duration(cfg.MaxRetryInterval)*time.Second, cfg.MaxRetryCredentials)
+		// Start quota state persistence (flush to auth JSON files periodically)
+		if cfg.AuthDir != "" {
+			quotaStore := sdkAuth.GetTokenStore()
+			if dirSetter, ok := quotaStore.(interface{ SetBaseDir(string) }); ok {
+				dirSetter.SetBaseDir(cfg.AuthDir)
+			}
+			if persister, ok := quotaStore.(auth.QuotaPersister); ok {
+				authManager.StartQuotaFlusher(context.Background(), persister)
+			}
+		}
 	}
 	managementasset.SetCurrentConfig(cfg)
 	auth.SetQuotaCooldownDisabled(cfg.DisableCooling)
