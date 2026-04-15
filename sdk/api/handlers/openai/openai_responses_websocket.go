@@ -318,6 +318,7 @@ func normalizeResponseCreateRequest(rawJSON []byte) ([]byte, []byte, *interfaces
 	if errDelete != nil {
 		normalized = bytes.Clone(rawJSON)
 	}
+	normalized = normalizeResponsesStringInput(normalized)
 	normalized, _ = sjson.SetBytes(normalized, "stream", true)
 	if !gjson.GetBytes(normalized, "input").Exists() {
 		normalized, _ = sjson.SetRawBytes(normalized, "input", []byte("[]"))
@@ -333,6 +334,28 @@ func normalizeResponseCreateRequest(rawJSON []byte) ([]byte, []byte, *interfaces
 	return normalized, bytes.Clone(normalized), nil
 }
 
+func normalizeResponsesStringInput(rawJSON []byte) []byte {
+	inputResult := gjson.GetBytes(rawJSON, "input")
+	if inputResult.Type != gjson.String {
+		return rawJSON
+	}
+
+	input, errSet := sjson.SetBytes(
+		[]byte(`[{"type":"message","role":"user","content":[{"type":"input_text","text":""}]}]`),
+		"0.content.0.text",
+		inputResult.String(),
+	)
+	if errSet != nil {
+		return rawJSON
+	}
+
+	updated, errSetRaw := sjson.SetRawBytes(rawJSON, "input", input)
+	if errSetRaw != nil {
+		return rawJSON
+	}
+	return updated
+}
+
 func normalizeResponseSubsequentRequest(rawJSON []byte, lastRequest []byte, lastResponseOutput []byte, allowIncrementalInputWithPreviousResponseID bool) ([]byte, []byte, *interfaces.ErrorMessage) {
 	if len(lastRequest) == 0 {
 		return nil, lastRequest, &interfaces.ErrorMessage{
@@ -341,6 +364,7 @@ func normalizeResponseSubsequentRequest(rawJSON []byte, lastRequest []byte, last
 		}
 	}
 
+	rawJSON = normalizeResponsesStringInput(rawJSON)
 	nextInput := gjson.GetBytes(rawJSON, "input")
 	if !nextInput.Exists() || !nextInput.IsArray() {
 		return nil, lastRequest, &interfaces.ErrorMessage{
@@ -1014,15 +1038,18 @@ func websocketJSONPayloadsFromChunk(chunk []byte) [][]byte {
 func writeResponsesWebsocketError(conn *websocket.Conn, wsTimelineLog *strings.Builder, errMsg *interfaces.ErrorMessage) ([]byte, error) {
 	status := http.StatusInternalServerError
 	errText := http.StatusText(status)
+	originalStatus := status
 	if errMsg != nil {
 		if errMsg.StatusCode > 0 {
 			status = errMsg.StatusCode
+			originalStatus = status
 			errText = http.StatusText(status)
 		}
 		if errMsg.Error != nil && strings.TrimSpace(errMsg.Error.Error()) != "" {
 			errText = errMsg.Error.Error()
 		}
 	}
+	status, errText = handlers.NormalizeClientFacingError(status, errText)
 
 	body := handlers.BuildErrorResponseBody(status, errText)
 	payload := []byte(`{}`)
@@ -1040,6 +1067,9 @@ func writeResponsesWebsocketError(conn *websocket.Conn, wsTimelineLog *strings.B
 		headers := []byte(`{}`)
 		hasHeaders := false
 		for key, values := range errMsg.Addon {
+			if status != originalStatus && strings.EqualFold(key, "Retry-After") {
+				continue
+			}
 			if len(values) == 0 {
 				continue
 			}

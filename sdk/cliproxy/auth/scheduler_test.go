@@ -3,6 +3,7 @@ package auth
 import (
 	"context"
 	"net/http"
+	"sync"
 	"testing"
 	"time"
 
@@ -31,6 +32,66 @@ func (schedulerTestExecutor) CountTokens(ctx context.Context, auth *Auth, req cl
 }
 
 func (schedulerTestExecutor) HttpRequest(ctx context.Context, auth *Auth, req *http.Request) (*http.Response, error) {
+	return nil, nil
+}
+
+type blockingSelectionExecutor struct {
+	mu        sync.Mutex
+	started   map[string]chan struct{}
+	blockExec map[string]chan struct{}
+}
+
+func newBlockingSelectionExecutor() *blockingSelectionExecutor {
+	return &blockingSelectionExecutor{
+		started:   make(map[string]chan struct{}),
+		blockExec: make(map[string]chan struct{}),
+	}
+}
+
+func (e *blockingSelectionExecutor) Identifier() string { return "gemini" }
+
+func (e *blockingSelectionExecutor) Execute(ctx context.Context, auth *Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	authID := ""
+	if auth != nil {
+		authID = auth.ID
+	}
+
+	e.mu.Lock()
+	started := e.started[authID]
+	block := e.blockExec[authID]
+	e.mu.Unlock()
+
+	if started != nil {
+		select {
+		case <-started:
+		default:
+			close(started)
+		}
+	}
+	if block != nil {
+		select {
+		case <-block:
+		case <-ctx.Done():
+			return cliproxyexecutor.Response{}, ctx.Err()
+		}
+	}
+
+	return cliproxyexecutor.Response{Payload: []byte(authID)}, nil
+}
+
+func (e *blockingSelectionExecutor) ExecuteStream(ctx context.Context, auth *Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
+	return nil, nil
+}
+
+func (e *blockingSelectionExecutor) Refresh(ctx context.Context, auth *Auth) (*Auth, error) {
+	return auth, nil
+}
+
+func (e *blockingSelectionExecutor) CountTokens(ctx context.Context, auth *Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	return cliproxyexecutor.Response{}, nil
+}
+
+func (e *blockingSelectionExecutor) HttpRequest(ctx context.Context, auth *Auth, req *http.Request) (*http.Response, error) {
 	return nil, nil
 }
 
@@ -231,6 +292,111 @@ func TestSchedulerPick_CodexWebsocketPrefersWebsocketEnabledAcrossPriorities(t *
 		if got.ID != wantID {
 			t.Fatalf("pickSingle() #%d auth.ID = %q, want %q", index, got.ID, wantID)
 		}
+	}
+}
+
+func TestSchedulerPick_RoundRobinPrefersNewestAuthWithinPriority(t *testing.T) {
+	t.Parallel()
+
+	base := time.Date(2026, time.January, 2, 3, 4, 5, 0, time.UTC)
+	scheduler := newSchedulerForTest(
+		&RoundRobinSelector{},
+		&Auth{ID: "aaa-oldest", Provider: "codex", CreatedAt: base.Add(-2 * time.Hour)},
+		&Auth{ID: "bbb-middle", Provider: "codex", CreatedAt: base.Add(-1 * time.Hour)},
+		&Auth{ID: "zzz-newest", Provider: "codex", CreatedAt: base},
+	)
+
+	want := []string{"zzz-newest", "bbb-middle", "aaa-oldest", "zzz-newest"}
+	for index, wantID := range want {
+		got, errPick := scheduler.pickSingle(context.Background(), "codex", "", cliproxyexecutor.Options{}, nil)
+		if errPick != nil {
+			t.Fatalf("pickSingle() #%d error = %v", index, errPick)
+		}
+		if got == nil {
+			t.Fatalf("pickSingle() #%d auth = nil", index)
+		}
+		if got.ID != wantID {
+			t.Fatalf("pickSingle() #%d auth.ID = %q, want %q", index, got.ID, wantID)
+		}
+	}
+}
+
+func TestSchedulerPick_RoundRobinPrefersHigherPlanTypeWhenCreatedAtMatches(t *testing.T) {
+	t.Parallel()
+
+	createdAt := time.Date(2026, time.February, 3, 4, 5, 6, 0, time.UTC)
+	scheduler := newSchedulerForTest(
+		&RoundRobinSelector{},
+		&Auth{ID: "aaa-free", Provider: "codex", CreatedAt: createdAt, Attributes: map[string]string{"plan_type": "free"}},
+		&Auth{ID: "zzz-plus", Provider: "codex", CreatedAt: createdAt, Attributes: map[string]string{"plan_type": "plus"}},
+	)
+
+	want := []string{"zzz-plus", "aaa-free", "zzz-plus"}
+	for index, wantID := range want {
+		got, errPick := scheduler.pickSingle(context.Background(), "codex", "", cliproxyexecutor.Options{}, nil)
+		if errPick != nil {
+			t.Fatalf("pickSingle() #%d error = %v", index, errPick)
+		}
+		if got == nil {
+			t.Fatalf("pickSingle() #%d auth = nil", index)
+		}
+		if got.ID != wantID {
+			t.Fatalf("pickSingle() #%d auth.ID = %q, want %q", index, got.ID, wantID)
+		}
+	}
+}
+
+func TestSchedulerPick_RoundRobinPrefersLowerInflightBeforeStaticOrder(t *testing.T) {
+	t.Parallel()
+
+	base := time.Date(2026, time.March, 4, 5, 6, 7, 0, time.UTC)
+	scheduler := newSchedulerForTest(
+		&RoundRobinSelector{},
+		&Auth{ID: "zzz-busy-newest", Provider: "codex", CreatedAt: base},
+		&Auth{ID: "aaa-idle-older", Provider: "codex", CreatedAt: base.Add(-1 * time.Hour)},
+	)
+
+	scheduler.acquireInflight("codex", "", "zzz-busy-newest")
+	scheduler.acquireInflight("codex", "", "zzz-busy-newest")
+	t.Cleanup(func() {
+		scheduler.releaseInflight("codex", "", "zzz-busy-newest")
+		scheduler.releaseInflight("codex", "", "zzz-busy-newest")
+	})
+
+	got, errPick := scheduler.pickSingle(context.Background(), "codex", "", cliproxyexecutor.Options{}, nil)
+	if errPick != nil {
+		t.Fatalf("pickSingle() error = %v", errPick)
+	}
+	if got == nil {
+		t.Fatalf("pickSingle() auth = nil")
+	}
+	if got.ID != "aaa-idle-older" {
+		t.Fatalf("pickSingle() auth.ID = %q, want %q", got.ID, "aaa-idle-older")
+	}
+}
+
+func TestSchedulerPick_SkipsTriedAuthAndFallsThroughOrderedCandidates(t *testing.T) {
+	t.Parallel()
+
+	base := time.Date(2026, time.April, 5, 6, 7, 8, 0, time.UTC)
+	scheduler := newSchedulerForTest(
+		&RoundRobinSelector{},
+		&Auth{ID: "aaa-oldest", Provider: "codex", CreatedAt: base.Add(-2 * time.Hour)},
+		&Auth{ID: "bbb-middle", Provider: "codex", CreatedAt: base.Add(-1 * time.Hour)},
+		&Auth{ID: "zzz-newest", Provider: "codex", CreatedAt: base},
+	)
+
+	got, errPick := scheduler.pickSingle(context.Background(), "codex", "", cliproxyexecutor.Options{}, map[string]struct{}{
+		"zzz-newest": {},
+	})
+	if errPick != nil {
+		t.Fatalf("pickSingle() error = %v", errPick)
+	}
+	if got == nil {
+		t.Fatalf("pickSingle() auth = nil")
+	}
+	if got.ID != "bbb-middle" {
+		t.Fatalf("pickSingle() auth.ID = %q, want %q", got.ID, "bbb-middle")
 	}
 }
 
@@ -525,5 +691,99 @@ func TestManager_SchedulerTracksMarkResultCooldownAndRecovery(t *testing.T) {
 	}
 	if len(seen) != 2 {
 		t.Fatalf("len(seen) = %d, want %d", len(seen), 2)
+	}
+}
+
+func TestManagerExecute_PrefersIdleAuthWhileAnotherAuthIsStillInflight(t *testing.T) {
+	t.Parallel()
+
+	manager := NewManager(nil, &RoundRobinSelector{}, nil)
+	executor := newBlockingSelectionExecutor()
+	executor.started["auth-a"] = make(chan struct{})
+	executor.blockExec["auth-a"] = make(chan struct{})
+	manager.RegisterExecutor(executor)
+
+	if _, errRegister := manager.Register(context.Background(), &Auth{ID: "auth-a", Provider: "gemini"}); errRegister != nil {
+		t.Fatalf("Register(auth-a) error = %v", errRegister)
+	}
+	if _, errRegister := manager.Register(context.Background(), &Auth{ID: "auth-b", Provider: "gemini"}); errRegister != nil {
+		t.Fatalf("Register(auth-b) error = %v", errRegister)
+	}
+
+	firstRespCh := make(chan cliproxyexecutor.Response, 1)
+	firstErrCh := make(chan error, 1)
+	go func() {
+		resp, errExecute := manager.Execute(context.Background(), []string{"gemini"}, cliproxyexecutor.Request{}, cliproxyexecutor.Options{})
+		if errExecute != nil {
+			firstErrCh <- errExecute
+			return
+		}
+		firstRespCh <- resp
+	}()
+
+	select {
+	case <-executor.started["auth-a"]:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for auth-a to start")
+	}
+
+	secondResp, errExecute := manager.Execute(context.Background(), []string{"gemini"}, cliproxyexecutor.Request{}, cliproxyexecutor.Options{})
+	if errExecute != nil {
+		t.Fatalf("second Execute() error = %v", errExecute)
+	}
+	if got := string(secondResp.Payload); got != "auth-b" {
+		t.Fatalf("second Execute() payload = %q, want %q", got, "auth-b")
+	}
+
+	thirdSelectedCh := make(chan string, 1)
+	thirdDoneCh := make(chan error, 1)
+	go func() {
+		_, errExecute := manager.Execute(
+			context.Background(),
+			[]string{"gemini"},
+			cliproxyexecutor.Request{},
+			cliproxyexecutor.Options{
+				Metadata: map[string]any{
+					cliproxyexecutor.SelectedAuthCallbackMetadataKey: func(authID string) {
+						select {
+						case thirdSelectedCh <- authID:
+						default:
+						}
+					},
+				},
+			},
+		)
+		thirdDoneCh <- errExecute
+	}()
+
+	select {
+	case selected := <-thirdSelectedCh:
+		if selected != "auth-b" {
+			t.Fatalf("third Execute() selected auth = %q, want %q", selected, "auth-b")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for third Execute() selection")
+	}
+
+	close(executor.blockExec["auth-a"])
+
+	select {
+	case errExecute := <-thirdDoneCh:
+		if errExecute != nil {
+			t.Fatalf("third Execute() error = %v", errExecute)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for third Execute() completion")
+	}
+
+	select {
+	case errExecute := <-firstErrCh:
+		t.Fatalf("first Execute() error = %v", errExecute)
+	case firstResp := <-firstRespCh:
+		if got := string(firstResp.Payload); got != "auth-a" {
+			t.Fatalf("first Execute() payload = %q, want %q", got, "auth-a")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for first Execute() completion")
 	}
 }

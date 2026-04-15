@@ -122,6 +122,71 @@ func authPriority(auth *Auth) int {
 	return parsed
 }
 
+func authPlanTierScore(auth *Auth) int {
+	if auth == nil || auth.Attributes == nil {
+		return 0
+	}
+	switch strings.ToLower(strings.TrimSpace(auth.Attributes["plan_type"])) {
+	case "pro":
+		return 4
+	case "team", "business", "go":
+		return 3
+	case "plus":
+		return 2
+	case "free":
+		return 1
+	default:
+		return 0
+	}
+}
+
+func authQuotaHealthScore(auth *Auth) int {
+	if auth == nil {
+		return 0
+	}
+	if auth.Quota.Exceeded {
+		return 0
+	}
+	score := 100
+	backoff := auth.Quota.BackoffLevel
+	if backoff > 0 {
+		score -= backoff * 10
+	}
+	if !auth.Quota.NextRecoverAt.IsZero() && auth.Quota.NextRecoverAt.After(time.Now()) {
+		score -= 20
+	}
+	if score < 0 {
+		return 0
+	}
+	return score
+}
+
+func authCreatedAtUnix(auth *Auth) int64 {
+	if auth == nil || auth.CreatedAt.IsZero() {
+		return 0
+	}
+	return auth.CreatedAt.UTC().UnixNano()
+}
+
+func authPreferredBefore(left, right *Auth) bool {
+	if left == nil || right == nil {
+		return right == nil && left != nil
+	}
+	if leftPriority, rightPriority := authPriority(left), authPriority(right); leftPriority != rightPriority {
+		return leftPriority > rightPriority
+	}
+	if leftPlan, rightPlan := authPlanTierScore(left), authPlanTierScore(right); leftPlan != rightPlan {
+		return leftPlan > rightPlan
+	}
+	if leftQuota, rightQuota := authQuotaHealthScore(left), authQuotaHealthScore(right); leftQuota != rightQuota {
+		return leftQuota > rightQuota
+	}
+	if leftCreatedAt, rightCreatedAt := authCreatedAtUnix(left), authCreatedAtUnix(right); leftCreatedAt != rightCreatedAt {
+		return leftCreatedAt > rightCreatedAt
+	}
+	return left.ID < right.ID
+}
+
 func canonicalModelKey(model string) string {
 	model = strings.TrimSpace(model)
 	if model == "" {
@@ -215,7 +280,7 @@ func getAvailableAuths(auths []*Auth, provider, model string, now time.Time) ([]
 
 	available := availableByPriority[bestPriority]
 	if len(available) > 1 {
-		sort.Slice(available, func(i, j int) bool { return available[i].ID < available[j].ID })
+		sort.SliceStable(available, func(i, j int) bool { return authPreferredBefore(available[i], available[j]) })
 	}
 	return available, nil
 }
@@ -318,7 +383,24 @@ func groupByVirtualParent(auths []*Auth) (map[string][]*Auth, []string) {
 	for p := range groups {
 		parentOrder = append(parentOrder, p)
 	}
-	sort.Strings(parentOrder)
+	for parent, items := range groups {
+		sort.SliceStable(items, func(i, j int) bool { return authPreferredBefore(items[i], items[j]) })
+		groups[parent] = items
+	}
+	sort.SliceStable(parentOrder, func(i, j int) bool {
+		leftItems := groups[parentOrder[i]]
+		rightItems := groups[parentOrder[j]]
+		if len(leftItems) == 0 || len(rightItems) == 0 {
+			return parentOrder[i] < parentOrder[j]
+		}
+		if authPreferredBefore(leftItems[0], rightItems[0]) {
+			return true
+		}
+		if authPreferredBefore(rightItems[0], leftItems[0]) {
+			return false
+		}
+		return parentOrder[i] < parentOrder[j]
+	})
 	return groups, parentOrder
 }
 
@@ -340,6 +422,19 @@ func isAuthBlockedForModel(auth *Auth, model string, now time.Time) (bool, block
 	}
 	if auth.Disabled || auth.Status == StatusDisabled {
 		return true, blockReasonDisabled, time.Time{}
+	}
+	if auth.Unavailable && auth.NextRetryAfter.After(now) {
+		next := auth.NextRetryAfter
+		if !auth.Quota.NextRecoverAt.IsZero() && auth.Quota.NextRecoverAt.After(now) {
+			next = auth.Quota.NextRecoverAt
+		}
+		if next.Before(now) {
+			next = now
+		}
+		if auth.Quota.Exceeded {
+			return true, blockReasonCooldown, next
+		}
+		return true, blockReasonOther, next
 	}
 	if model != "" {
 		if len(auth.ModelStates) > 0 {
@@ -376,19 +471,6 @@ func isAuthBlockedForModel(auth *Auth, model string, now time.Time) (bool, block
 			}
 		}
 		return false, blockReasonNone, time.Time{}
-	}
-	if auth.Unavailable && auth.NextRetryAfter.After(now) {
-		next := auth.NextRetryAfter
-		if !auth.Quota.NextRecoverAt.IsZero() && auth.Quota.NextRecoverAt.After(now) {
-			next = auth.Quota.NextRecoverAt
-		}
-		if next.Before(now) {
-			next = now
-		}
-		if auth.Quota.Exceeded {
-			return true, blockReasonCooldown, next
-		}
-		return true, blockReasonOther, next
 	}
 	return false, blockReasonNone, time.Time{}
 }

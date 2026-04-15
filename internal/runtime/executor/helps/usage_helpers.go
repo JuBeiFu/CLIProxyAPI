@@ -3,12 +3,17 @@ package helps
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
+	"net"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/logging"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/proxypool"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/usage"
 	"github.com/tidwall/gjson"
@@ -21,19 +26,28 @@ type UsageReporter struct {
 	authID      string
 	authIndex   string
 	apiKey      string
+	requestID   string
 	source      string
 	requestedAt time.Time
+	cfg         *config.Config
+	auth        *cliproxyauth.Auth
+	mu          sync.Mutex
+	lastFailure usage.Detail
 	once        sync.Once
 }
 
-func NewUsageReporter(ctx context.Context, provider, model string, auth *cliproxyauth.Auth) *UsageReporter {
+func NewUsageReporter(ctx context.Context, provider, model string, args ...any) *UsageReporter {
+	cfg, auth := usageReporterArgs(args...)
 	apiKey := APIKeyFromContext(ctx)
 	reporter := &UsageReporter{
 		provider:    provider,
 		model:       model,
 		requestedAt: time.Now(),
 		apiKey:      apiKey,
+		requestID:   resolveUsageRequestID(ctx),
 		source:      resolveUsageSource(auth, apiKey),
+		cfg:         cfg,
+		auth:        auth,
 	}
 	if auth != nil {
 		reporter.authID = auth.ID
@@ -47,7 +61,39 @@ func (r *UsageReporter) Publish(ctx context.Context, detail usage.Detail) {
 }
 
 func (r *UsageReporter) PublishFailure(ctx context.Context) {
-	r.publishWithOutcome(ctx, usage.Detail{}, true)
+	detail := usage.Detail{}
+	if statusCode := StatusCodeFromContext(ctx); statusCode >= 400 {
+		detail.StatusCode = statusCode
+	}
+	detail.CompactFailure = CompactFailureFromContext(ctx, r.cfg, r.auth, "", nil)
+	r.rememberFailure(detail)
+	r.publishWithOutcome(ctx, detail, true)
+}
+
+func (r *UsageReporter) PublishFailureWithError(ctx context.Context, err error) {
+	detail := usage.Detail{}
+	if err != nil {
+		type statusCoder interface {
+			StatusCode() int
+		}
+		var statusErr statusCoder
+		if errors.As(err, &statusErr) && statusErr != nil {
+			detail.StatusCode = statusErr.StatusCode()
+		}
+		message := strings.TrimSpace(err.Error())
+		if len(message) > 512 {
+			message = message[:512]
+		}
+		detail.ErrorMessage = message
+	}
+	if detail.StatusCode == 0 {
+		if statusCode := StatusCodeFromContext(ctx); statusCode >= 400 {
+			detail.StatusCode = statusCode
+		}
+	}
+	detail.CompactFailure = CompactFailureFromContext(ctx, r.cfg, r.auth, detail.ErrorMessage, err)
+	r.rememberFailure(detail)
+	r.publishWithOutcome(ctx, detail, true)
 }
 
 func (r *UsageReporter) TrackFailure(ctx context.Context, errPtr *error) {
@@ -55,7 +101,7 @@ func (r *UsageReporter) TrackFailure(ctx context.Context, errPtr *error) {
 		return
 	}
 	if *errPtr != nil {
-		r.PublishFailure(ctx)
+		r.PublishFailureWithError(ctx, *errPtr)
 	}
 }
 
@@ -91,6 +137,9 @@ func (r *UsageReporter) buildRecord(detail usage.Detail, failed bool) usage.Reco
 	if r == nil {
 		return usage.Record{Detail: detail, Failed: failed}
 	}
+	if failed {
+		detail = mergeFailureDiagnostics(detail, r.rememberedFailure())
+	}
 	return usage.Record{
 		Provider:    r.provider,
 		Model:       r.model,
@@ -98,6 +147,7 @@ func (r *UsageReporter) buildRecord(detail usage.Detail, failed bool) usage.Reco
 		APIKey:      r.apiKey,
 		AuthID:      r.authID,
 		AuthIndex:   r.authIndex,
+		RequestID:   r.requestID,
 		RequestedAt: r.requestedAt,
 		Latency:     r.latency(),
 		Failed:      failed,
@@ -114,6 +164,312 @@ func (r *UsageReporter) latency() time.Duration {
 		return 0
 	}
 	return latency
+}
+
+func usageReporterArgs(args ...any) (*config.Config, *cliproxyauth.Auth) {
+	var cfg *config.Config
+	var auth *cliproxyauth.Auth
+	for _, arg := range args {
+		switch value := arg.(type) {
+		case *config.Config:
+			cfg = value
+		case *cliproxyauth.Auth:
+			auth = value
+		}
+	}
+	return cfg, auth
+}
+
+func (r *UsageReporter) rememberFailure(detail usage.Detail) {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.lastFailure = mergeFailureDiagnostics(detail, r.lastFailure)
+}
+
+func (r *UsageReporter) rememberedFailure() usage.Detail {
+	if r == nil {
+		return usage.Detail{}
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	detail := r.lastFailure
+	detail.CompactFailure = cloneUsageCompactFailure(detail.CompactFailure)
+	return detail
+}
+
+func mergeFailureDiagnostics(detail usage.Detail, fallback usage.Detail) usage.Detail {
+	if detail.StatusCode == 0 {
+		detail.StatusCode = fallback.StatusCode
+	}
+	if strings.TrimSpace(detail.ErrorMessage) == "" {
+		detail.ErrorMessage = strings.TrimSpace(fallback.ErrorMessage)
+	}
+	if detail.CompactFailure == nil {
+		detail.CompactFailure = cloneUsageCompactFailure(fallback.CompactFailure)
+	}
+	return detail
+}
+
+func cloneUsageCompactFailure(sample *usage.CompactFailureSample) *usage.CompactFailureSample {
+	if sample == nil {
+		return nil
+	}
+	cloned := *sample
+	return &cloned
+}
+
+func resolveUsageRequestID(ctx context.Context) string {
+	if ctx == nil {
+		return ""
+	}
+	if requestID := strings.TrimSpace(logging.GetRequestID(ctx)); requestID != "" {
+		return requestID
+	}
+	ginCtx, ok := ctx.Value("gin").(*gin.Context)
+	if !ok || ginCtx == nil {
+		return ""
+	}
+	if requestID := strings.TrimSpace(logging.GetGinRequestID(ginCtx)); requestID != "" {
+		return requestID
+	}
+	if value, exists := ginCtx.Get("REQUEST_ID"); exists {
+		switch typed := value.(type) {
+		case string:
+			return strings.TrimSpace(typed)
+		case fmt.Stringer:
+			return strings.TrimSpace(typed.String())
+		default:
+			if value != nil {
+				return strings.TrimSpace(fmt.Sprintf("%v", value))
+			}
+		}
+	}
+	return ""
+}
+
+func StatusCodeFromContext(ctx context.Context) int {
+	if ctx == nil {
+		return 0
+	}
+	ginCtx, ok := ctx.Value("gin").(*gin.Context)
+	if !ok || ginCtx == nil || ginCtx.Writer == nil {
+		return 0
+	}
+	status := ginCtx.Writer.Status()
+	if status <= 0 {
+		return 0
+	}
+	return status
+}
+
+func CompactFailureFromContext(ctx context.Context, cfg *config.Config, auth *cliproxyauth.Auth, errorMessage string, err error) *usage.CompactFailureSample {
+	if ctx == nil {
+		return nil
+	}
+	ginCtx, ok := ctx.Value("gin").(*gin.Context)
+	if !ok || ginCtx == nil || ginCtx.Request == nil {
+		return nil
+	}
+	path := strings.TrimSpace(ginCtx.FullPath())
+	if path == "" && ginCtx.Request.URL != nil {
+		path = strings.TrimSpace(ginCtx.Request.URL.Path)
+	}
+	if !strings.EqualFold(ginCtx.Request.Method, "POST") || path != "/v1/responses/compact" {
+		return nil
+	}
+
+	statusCode := StatusCodeFromContext(ctx)
+	sample := &usage.CompactFailureSample{
+		Endpoint:          path,
+		UpstreamURL:       CompactFailureUpstreamURL(ctx),
+		FailureStage:      CompactFailureStage(err, statusCode),
+		ErrorClass:        CompactFailureErrorClass(err, errorMessage),
+		Summary:           CompactFailureSummary(errorMessage),
+		RequestBodyBytes:  CompactFailureRequestBodyBytes(ctx),
+		ResponseBodyBytes: CompactFailureResponseBodyBytes(ctx),
+	}
+
+	if ctx.Err() != nil {
+		sample.ContextCanceled = errors.Is(ctx.Err(), context.Canceled)
+		sample.ContextDeadlineExceeded = errors.Is(ctx.Err(), context.DeadlineExceeded)
+	}
+	if err != nil {
+		sample.ContextCanceled = sample.ContextCanceled || errors.Is(err, context.Canceled)
+		sample.ContextDeadlineExceeded = sample.ContextDeadlineExceeded || errors.Is(err, context.DeadlineExceeded)
+	}
+
+	resolution := proxypool.Resolve(cfg, auth)
+	sample.ProxySelectionSource = strings.TrimSpace(resolution.Source)
+	switch {
+	case strings.TrimSpace(resolution.ProxyURL) != "":
+		sample.ProxyMode = "proxy"
+		sample.ProxyTarget = strings.TrimSpace(resolution.ProxyURL)
+	default:
+		sample.ProxyMode = "direct"
+	}
+	profileParts := make([]string, 0, 2)
+	if pool := strings.TrimSpace(resolution.ProxyPool); pool != "" {
+		profileParts = append(profileParts, pool)
+	}
+	if name := strings.TrimSpace(resolution.ProxyName); name != "" {
+		profileParts = append(profileParts, name)
+	}
+	sample.ProxyProfile = strings.Join(profileParts, "/")
+
+	if sample.Summary == "" && sample.ErrorClass == "" && sample.FailureStage == "" && sample.UpstreamURL == "" {
+		return nil
+	}
+	return sample
+}
+
+func CompactFailureUpstreamURL(ctx context.Context) string {
+	ginCtx, ok := ctx.Value("gin").(*gin.Context)
+	if !ok || ginCtx == nil {
+		return ""
+	}
+	if value, exists := ginCtx.Get(apiAttemptsKey); exists {
+		if attempts, ok := value.([]*upstreamAttempt); ok {
+			for idx := len(attempts) - 1; idx >= 0; idx-- {
+				attempt := attempts[idx]
+				if attempt == nil {
+					continue
+				}
+				if upstreamURL := compactFailureLoggedUpstreamURL(attempt.request); upstreamURL != "" {
+					return upstreamURL
+				}
+			}
+		}
+	}
+	if value, exists := ginCtx.Get(apiRequestKey); exists {
+		switch typed := value.(type) {
+		case []byte:
+			return compactFailureLoggedUpstreamURL(string(typed))
+		case string:
+			return compactFailureLoggedUpstreamURL(typed)
+		}
+	}
+	return ""
+}
+
+func compactFailureLoggedUpstreamURL(text string) string {
+	const prefix = "Upstream URL: "
+	lines := strings.Split(text, "\n")
+	for idx := len(lines) - 1; idx >= 0; idx-- {
+		line := strings.TrimSpace(lines[idx])
+		if strings.HasPrefix(line, prefix) {
+			return strings.TrimSpace(strings.TrimPrefix(line, prefix))
+		}
+	}
+	return ""
+}
+
+func CompactFailureRequestBodyBytes(ctx context.Context) int {
+	ginCtx, ok := ctx.Value("gin").(*gin.Context)
+	if !ok || ginCtx == nil {
+		return 0
+	}
+	if ginCtx.Request != nil && ginCtx.Request.ContentLength > 0 {
+		return int(ginCtx.Request.ContentLength)
+	}
+	return 0
+}
+
+func CompactFailureResponseBodyBytes(ctx context.Context) int {
+	ginCtx, ok := ctx.Value("gin").(*gin.Context)
+	if !ok || ginCtx == nil {
+		return 0
+	}
+	if value, exists := ginCtx.Get(apiResponseKey); exists {
+		switch typed := value.(type) {
+		case []byte:
+			return len(typed)
+		case string:
+			return len(typed)
+		}
+	}
+	return 0
+}
+
+func CompactFailureStage(err error, statusCode int) string {
+	if err == nil {
+		if statusCode >= 400 {
+			return "upstream_http_status"
+		}
+		return ""
+	}
+	message := strings.ToLower(strings.TrimSpace(err.Error()))
+	switch {
+	case strings.Contains(message, "context canceled"):
+		return "client_or_parent_cancel"
+	case strings.Contains(message, "context deadline exceeded"):
+		return "upstream_roundtrip_timeout"
+	case strings.Contains(message, "tls"):
+		return "tls_handshake"
+	case strings.Contains(message, "dial tcp"):
+		return "tcp_connect"
+	case strings.Contains(message, "read tcp"):
+		return "upstream_read"
+	case strings.Contains(message, "write tcp"):
+		return "upstream_write"
+	case strings.Contains(message, "lookup ") || strings.Contains(message, "no such host"):
+		return "dns_lookup"
+	case statusCode >= 400:
+		return "upstream_http_status"
+	default:
+		return "request_execution"
+	}
+}
+
+func CompactFailureErrorClass(err error, errorMessage string) string {
+	combined := strings.ToLower(strings.TrimSpace(strings.Join([]string{errorMessage, ErrorString(err)}, " ")))
+	switch {
+	case strings.Contains(combined, "context deadline exceeded"):
+		return "timeout"
+	case strings.Contains(combined, "context canceled"):
+		return "canceled"
+	case strings.Contains(combined, "connection reset by peer"):
+		return "connection_reset"
+	case strings.Contains(combined, "i/o timeout"):
+		return "network_timeout"
+	case strings.Contains(combined, "no such host"), strings.Contains(combined, "lookup "):
+		return "dns_error"
+	case strings.Contains(combined, "tls"):
+		return "tls_error"
+	case strings.Contains(combined, "proxyconnect"), strings.Contains(combined, "proxy"):
+		return "proxy_error"
+	case strings.Contains(combined, "too many requests"), strings.Contains(combined, "usage_limit_reached"), strings.Contains(combined, "rate limit"):
+		return "rate_limited"
+	case strings.Contains(combined, "unauthorized"), strings.Contains(combined, "authentication"), strings.Contains(combined, "invalid api key"):
+		return "authentication_error"
+	case strings.Contains(combined, "forbidden"), strings.Contains(combined, "access denied"):
+		return "access_denied"
+	case strings.Contains(combined, "server had an error processing your request"), strings.Contains(combined, "bad gateway"):
+		return "upstream_server_error"
+	default:
+		var netErr net.Error
+		if errors.As(err, &netErr) && netErr.Timeout() {
+			return "network_timeout"
+		}
+		return ""
+	}
+}
+
+func CompactFailureSummary(errorMessage string) string {
+	summary := strings.TrimSpace(errorMessage)
+	if len(summary) > 240 {
+		summary = summary[:237] + "..."
+	}
+	return summary
+}
+
+func ErrorString(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
 }
 
 func APIKeyFromContext(ctx context.Context) string {

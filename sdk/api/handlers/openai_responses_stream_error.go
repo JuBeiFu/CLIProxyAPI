@@ -22,6 +22,8 @@ func openAIResponsesStreamErrorCode(status int) string {
 		return "insufficient_quota"
 	case http.StatusTooManyRequests:
 		return "rate_limit_exceeded"
+	case http.StatusServiceUnavailable:
+		return "service_unavailable"
 	case http.StatusNotFound:
 		return "model_not_found"
 	case http.StatusRequestTimeout:
@@ -43,6 +45,8 @@ func openAIResponsesStreamErrorCode(status int) string {
 // non-streaming responses, but streaming clients validate SSE `data:` payloads against a union
 // of chunks that requires a top-level `type` field.
 func BuildOpenAIResponsesStreamErrorChunk(status int, errText string, sequenceNumber int) []byte {
+	status, errText = NormalizeClientFacingError(status, errText)
+
 	if status <= 0 {
 		status = http.StatusInternalServerError
 	}

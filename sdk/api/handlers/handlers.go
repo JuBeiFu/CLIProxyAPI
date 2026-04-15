@@ -23,6 +23,8 @@ import (
 	coreexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/config"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v6/sdk/translator"
+	"github.com/tidwall/gjson"
+	"github.com/tidwall/sjson"
 	"golang.org/x/net/context"
 )
 
@@ -113,6 +115,8 @@ func WithExecutionSessionID(ctx context.Context, sessionID string) context.Conte
 // BuildErrorResponseBody builds an OpenAI-compatible JSON error response body.
 // If errText is already valid JSON, it is returned as-is to preserve upstream error payloads.
 func BuildErrorResponseBody(status int, errText string) []byte {
+	status, errText = NormalizeClientFacingError(status, errText)
+
 	if status <= 0 {
 		status = http.StatusInternalServerError
 	}
@@ -137,6 +141,9 @@ func BuildErrorResponseBody(status int, errText string) []byte {
 	case http.StatusTooManyRequests:
 		errType = "rate_limit_error"
 		code = "rate_limit_exceeded"
+	case http.StatusServiceUnavailable:
+		errType = "server_error"
+		code = "service_unavailable"
 	case http.StatusNotFound:
 		errType = "invalid_request_error"
 		code = "model_not_found"
@@ -158,6 +165,58 @@ func BuildErrorResponseBody(status int, errText string) []byte {
 		return []byte(fmt.Sprintf(`{"error":{"message":%q,"type":"server_error","code":"internal_server_error"}}`, errText))
 	}
 	return payload
+}
+
+func NormalizeClientFacingError(status int, errText string) (int, string) {
+	if status != http.StatusTooManyRequests {
+		return status, errText
+	}
+
+	trimmed := strings.TrimSpace(errText)
+	if trimmed == "" {
+		return http.StatusServiceUnavailable, errText
+	}
+
+	if json.Valid([]byte(trimmed)) {
+		payload := []byte(trimmed)
+		normalized := normalizeClientFacing429JSON(payload)
+		return http.StatusServiceUnavailable, string(normalized)
+	}
+
+	return http.StatusServiceUnavailable, errText
+}
+
+func normalizeClientFacing429JSON(payload []byte) []byte {
+	if len(payload) == 0 || !json.Valid(payload) {
+		return payload
+	}
+
+	normalized := bytes.Clone(payload)
+
+	if gjson.GetBytes(normalized, "error").Exists() {
+		if !gjson.GetBytes(normalized, "error.code").Exists() {
+			normalized, _ = sjson.SetBytes(normalized, "error.code", "service_unavailable")
+		}
+		if !gjson.GetBytes(normalized, "error.type").Exists() {
+			normalized, _ = sjson.SetBytes(normalized, "error.type", "server_error")
+		}
+	}
+	if gjson.GetBytes(normalized, "error.code").Exists() {
+		normalized, _ = sjson.SetBytes(normalized, "error.code", "service_unavailable")
+	}
+	if gjson.GetBytes(normalized, "error.type").Exists() {
+		normalized, _ = sjson.SetBytes(normalized, "error.type", "server_error")
+	}
+	if gjson.GetBytes(normalized, "type").Exists() && !gjson.GetBytes(normalized, "code").Exists() {
+		normalized, _ = sjson.SetBytes(normalized, "code", "service_unavailable")
+	}
+	if gjson.GetBytes(normalized, "code").Exists() {
+		normalized, _ = sjson.SetBytes(normalized, "code", "service_unavailable")
+	}
+	if gjson.GetBytes(normalized, "type").Exists() {
+		normalized, _ = sjson.SetBytes(normalized, "type", "error")
+	}
+	return normalized
 }
 
 // StreamingKeepAliveInterval returns the SSE keep-alive interval for this server.
@@ -915,7 +974,7 @@ func enrichAuthSelectionError(err error, providers []string, model string) error
 	}
 
 	status := authErr.HTTPStatus
-	if status <= 0 {
+	if status <= 0 || status == http.StatusTooManyRequests {
 		status = http.StatusServiceUnavailable
 	}
 
@@ -933,8 +992,19 @@ func (h *BaseAPIHandler) WriteErrorResponse(c *gin.Context, msg *interfaces.Erro
 	if msg != nil && msg.StatusCode > 0 {
 		status = msg.StatusCode
 	}
+	errText := http.StatusText(status)
+	if msg != nil && msg.Error != nil {
+		if v := strings.TrimSpace(msg.Error.Error()); v != "" {
+			errText = v
+		}
+	}
+	normalizedStatus, normalizedErrText := NormalizeClientFacingError(status, errText)
+	status = normalizedStatus
 	if msg != nil && msg.Addon != nil && PassthroughHeadersEnabled(h.Cfg) {
 		for key, values := range msg.Addon {
+			if normalizedStatus != msg.StatusCode && strings.EqualFold(key, "Retry-After") {
+				continue
+			}
 			if len(values) == 0 {
 				continue
 			}
@@ -945,14 +1015,7 @@ func (h *BaseAPIHandler) WriteErrorResponse(c *gin.Context, msg *interfaces.Erro
 		}
 	}
 
-	errText := http.StatusText(status)
-	if msg != nil && msg.Error != nil {
-		if v := strings.TrimSpace(msg.Error.Error()); v != "" {
-			errText = v
-		}
-	}
-
-	body := BuildErrorResponseBody(status, errText)
+	body := BuildErrorResponseBody(status, normalizedErrText)
 	// Append first to preserve upstream response logs, then drop duplicate payloads if already recorded.
 	var previous []byte
 	if existing, exists := c.Get("API_RESPONSE"); exists {

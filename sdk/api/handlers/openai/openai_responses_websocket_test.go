@@ -3,6 +3,7 @@ package openai
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -22,6 +23,108 @@ import (
 	sdkconfig "github.com/router-for-me/CLIProxyAPI/v6/sdk/config"
 	"github.com/tidwall/gjson"
 )
+
+func TestWriteResponsesWebsocketError_Maps429ToServiceUnavailable(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upgrader := websocket.Upgrader{}
+		conn, errUpgrade := upgrader.Upgrade(w, r, nil)
+		if errUpgrade != nil {
+			t.Fatalf("upgrade websocket: %v", errUpgrade)
+		}
+		defer func() {
+			_ = conn.Close()
+		}()
+
+		_, errWrite := writeResponsesWebsocketError(conn, nil, &interfaces.ErrorMessage{
+			StatusCode: http.StatusTooManyRequests,
+			Error:      errors.New(`{"error":{"code":"model_cooldown","message":"All credentials for model gpt-5.4 are cooling down"}}`),
+			Addon: http.Header{
+				"Retry-After": {"30"},
+			},
+		})
+		if errWrite != nil {
+			t.Fatalf("writeResponsesWebsocketError: %v", errWrite)
+		}
+	}))
+	defer server.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http")
+	conn, _, errDial := websocket.DefaultDialer.Dial(wsURL, nil)
+	if errDial != nil {
+		t.Fatalf("dial websocket: %v", errDial)
+	}
+	defer func() {
+		_ = conn.Close()
+	}()
+
+	_, payload, errRead := conn.ReadMessage()
+	if errRead != nil {
+		t.Fatalf("read websocket message: %v", errRead)
+	}
+
+	var body map[string]any
+	if errUnmarshal := json.Unmarshal(payload, &body); errUnmarshal != nil {
+		t.Fatalf("unmarshal payload: %v", errUnmarshal)
+	}
+	if got := int(gjson.GetBytes(payload, "status").Int()); got != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want %d", got, http.StatusServiceUnavailable)
+	}
+	if got := gjson.GetBytes(payload, "error.code").String(); got != "service_unavailable" {
+		t.Fatalf("error.code = %q, want %q", got, "service_unavailable")
+	}
+	if gjson.GetBytes(payload, "headers.Retry-After").Exists() {
+		t.Fatalf("headers.Retry-After must be omitted when 429 is normalized: %s", payload)
+	}
+}
+
+func TestWriteResponsesWebsocketError_MapsCurrentModelUnavailable429ToServiceUnavailable(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upgrader := websocket.Upgrader{}
+		conn, errUpgrade := upgrader.Upgrade(w, r, nil)
+		if errUpgrade != nil {
+			t.Fatalf("upgrade websocket: %v", errUpgrade)
+		}
+		defer func() {
+			_ = conn.Close()
+		}()
+
+		_, errWrite := writeResponsesWebsocketError(conn, nil, &interfaces.ErrorMessage{
+			StatusCode: http.StatusTooManyRequests,
+			Error:      errors.New(`{"error":{"message":"The requested model is currently unavailable. Please switch model.","type":"rate_limit_exceeded"}}`),
+			Addon: http.Header{
+				"Retry-After": {"30"},
+			},
+		})
+		if errWrite != nil {
+			t.Fatalf("writeResponsesWebsocketError: %v", errWrite)
+		}
+	}))
+	defer server.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http")
+	conn, _, errDial := websocket.DefaultDialer.Dial(wsURL, nil)
+	if errDial != nil {
+		t.Fatalf("dial websocket: %v", errDial)
+	}
+	defer func() {
+		_ = conn.Close()
+	}()
+
+	_, payload, errRead := conn.ReadMessage()
+	if errRead != nil {
+		t.Fatalf("read websocket message: %v", errRead)
+	}
+
+	if got := int(gjson.GetBytes(payload, "status").Int()); got != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want %d", got, http.StatusServiceUnavailable)
+	}
+	if got := gjson.GetBytes(payload, "error.code").String(); got != "service_unavailable" {
+		t.Fatalf("error.code = %q, want %q", got, "service_unavailable")
+	}
+	if gjson.GetBytes(payload, "headers.Retry-After").Exists() {
+		t.Fatalf("headers.Retry-After must be omitted when 429 is normalized: %s", payload)
+	}
+}
 
 type websocketCaptureExecutor struct {
 	streamCalls int
@@ -289,6 +392,38 @@ func TestNormalizeResponsesWebsocketRequestCreate(t *testing.T) {
 	}
 	if gjson.GetBytes(normalized, "model").String() != "test-model" {
 		t.Fatalf("unexpected model: %s", gjson.GetBytes(normalized, "model").String())
+	}
+	if !bytes.Equal(last, normalized) {
+		t.Fatalf("last request snapshot should match normalized request")
+	}
+}
+
+func TestNormalizeResponsesWebsocketRequestCreateStringInput(t *testing.T) {
+	raw := []byte(`{"type":"response.create","model":"test-model","input":"reply with pong"}`)
+
+	normalized, last, errMsg := normalizeResponsesWebsocketRequest(raw, nil, nil)
+	if errMsg != nil {
+		t.Fatalf("unexpected error: %v", errMsg.Error)
+	}
+	input := gjson.GetBytes(normalized, "input").Array()
+	if len(input) != 1 {
+		t.Fatalf("normalized input len = %d, want 1", len(input))
+	}
+	if got := input[0].Get("type").String(); got != "message" {
+		t.Fatalf("input[0].type = %q, want %q", got, "message")
+	}
+	if got := input[0].Get("role").String(); got != "user" {
+		t.Fatalf("input[0].role = %q, want %q", got, "user")
+	}
+	content := input[0].Get("content").Array()
+	if len(content) != 1 {
+		t.Fatalf("content len = %d, want 1", len(content))
+	}
+	if got := content[0].Get("type").String(); got != "input_text" {
+		t.Fatalf("content[0].type = %q, want %q", got, "input_text")
+	}
+	if got := content[0].Get("text").String(); got != "reply with pong" {
+		t.Fatalf("content[0].text = %q, want %q", got, "reply with pong")
 	}
 	if !bytes.Equal(last, normalized) {
 		t.Fatalf("last request snapshot should match normalized request")

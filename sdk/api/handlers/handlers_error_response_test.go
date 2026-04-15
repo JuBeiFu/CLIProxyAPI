@@ -30,8 +30,8 @@ func TestWriteErrorResponse_AddonHeadersDisabledByDefault(t *testing.T) {
 		},
 	})
 
-	if recorder.Code != http.StatusTooManyRequests {
-		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusTooManyRequests)
+	if recorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusServiceUnavailable)
 	}
 	if got := recorder.Header().Get("Retry-After"); got != "" {
 		t.Fatalf("Retry-After should be empty when passthrough is disabled, got %q", got)
@@ -58,11 +58,11 @@ func TestWriteErrorResponse_AddonHeadersEnabled(t *testing.T) {
 		},
 	})
 
-	if recorder.Code != http.StatusTooManyRequests {
-		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusTooManyRequests)
+	if recorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusServiceUnavailable)
 	}
-	if got := recorder.Header().Get("Retry-After"); got != "30" {
-		t.Fatalf("Retry-After = %q, want %q", got, "30")
+	if got := recorder.Header().Get("Retry-After"); got != "" {
+		t.Fatalf("Retry-After = %q, want empty after 429 normalization", got)
 	}
 	if got := recorder.Header().Values("X-Request-Id"); !reflect.DeepEqual(got, []string{"new-1", "new-2"}) {
 		t.Fatalf("X-Request-Id = %#v, want %#v", got, []string{"new-1", "new-2"})
@@ -91,7 +91,7 @@ func TestEnrichAuthSelectionError_DefaultsTo503WithContext(t *testing.T) {
 	}
 }
 
-func TestEnrichAuthSelectionError_PreservesExplicitStatus(t *testing.T) {
+func TestEnrichAuthSelectionError_MapsExplicit429To503(t *testing.T) {
 	in := &coreauth.Error{Code: "auth_unavailable", Message: "no auth available", HTTPStatus: http.StatusTooManyRequests}
 	out := enrichAuthSelectionError(in, []string{"gemini"}, "gemini-2.5-pro")
 
@@ -99,8 +99,111 @@ func TestEnrichAuthSelectionError_PreservesExplicitStatus(t *testing.T) {
 	if !errors.As(out, &got) || got == nil {
 		t.Fatalf("expected coreauth.Error, got %T", out)
 	}
-	if got.StatusCode() != http.StatusTooManyRequests {
-		t.Fatalf("status = %d, want %d", got.StatusCode(), http.StatusTooManyRequests)
+	if got.StatusCode() != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want %d", got.StatusCode(), http.StatusServiceUnavailable)
+	}
+}
+
+func TestEnrichAuthSelectionError_Converts429UnavailableTo503(t *testing.T) {
+	in := &coreauth.Error{Code: "auth_unavailable", Message: "no auth available", HTTPStatus: http.StatusTooManyRequests}
+	out := enrichAuthSelectionError(in, []string{"codex"}, "gpt-5.4")
+
+	var got *coreauth.Error
+	if !errors.As(out, &got) || got == nil {
+		t.Fatalf("expected coreauth.Error, got %T", out)
+	}
+	if got.StatusCode() != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want %d", got.StatusCode(), http.StatusServiceUnavailable)
+	}
+	if !strings.Contains(got.Message, "providers=codex") {
+		t.Fatalf("message missing provider context: %q", got.Message)
+	}
+}
+
+func TestWriteErrorResponse_Maps429To503ForCodexClientFacingErrors(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodGet, "/", nil)
+
+	handler := NewBaseAPIHandlers(nil, nil)
+	handler.WriteErrorResponse(c, &interfaces.ErrorMessage{
+		StatusCode: http.StatusTooManyRequests,
+		Error: &coreauth.Error{
+			Code:       "auth_unavailable",
+			Message:    "no auth available (providers=codex, model=gpt-5.4)",
+			HTTPStatus: http.StatusTooManyRequests,
+		},
+		Addon: http.Header{
+			"Retry-After": {"30"},
+		},
+	})
+
+	if recorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusServiceUnavailable)
+	}
+	if strings.Contains(recorder.Body.String(), "rate_limit_exceeded") {
+		t.Fatalf("body unexpectedly preserved rate_limit_exceeded semantics: %q", recorder.Body.String())
+	}
+}
+
+func TestWriteErrorResponse_MapsModelCooldown429To503(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodGet, "/", nil)
+
+	handler := NewBaseAPIHandlers(nil, nil)
+	handler.WriteErrorResponse(c, &interfaces.ErrorMessage{
+		StatusCode: http.StatusTooManyRequests,
+		Error:      errors.New(`{"error":{"code":"model_cooldown","message":"All credentials for model gpt-5.4 are cooling down"}}`),
+	})
+
+	if recorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusServiceUnavailable)
+	}
+	if strings.Contains(recorder.Body.String(), "rate_limit_exceeded") {
+		t.Fatalf("body unexpectedly preserved rate_limit_exceeded semantics: %q", recorder.Body.String())
+	}
+}
+
+func TestWriteErrorResponse_MapsModelCapacity429To503(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodGet, "/", nil)
+
+	handler := NewBaseAPIHandlers(nil, nil)
+	handler.WriteErrorResponse(c, &interfaces.ErrorMessage{
+		StatusCode: http.StatusTooManyRequests,
+		Error:      errors.New(`{"error":{"message":"Selected model is at capacity. Please try a different model.","type":"rate_limit_exceeded"}}`),
+	})
+
+	if recorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusServiceUnavailable)
+	}
+	if strings.Contains(recorder.Body.String(), "rate_limit_exceeded") {
+		t.Fatalf("body unexpectedly preserved rate_limit_exceeded semantics: %q", recorder.Body.String())
+	}
+}
+
+func TestWriteErrorResponse_MapsCurrentModelUnavailable429To503(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodGet, "/", nil)
+
+	handler := NewBaseAPIHandlers(nil, nil)
+	handler.WriteErrorResponse(c, &interfaces.ErrorMessage{
+		StatusCode: http.StatusTooManyRequests,
+		Error:      errors.New(`{"error":{"message":"The requested model is currently unavailable. Please switch model.","type":"rate_limit_exceeded"}}`),
+	})
+
+	if recorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusServiceUnavailable)
+	}
+	if strings.Contains(recorder.Body.String(), "rate_limit_exceeded") {
+		t.Fatalf("body unexpectedly preserved rate_limit_exceeded semantics: %q", recorder.Body.String())
 	}
 }
 

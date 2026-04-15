@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
@@ -318,6 +319,157 @@ func TestEnrichCodexWebsocketBridgeFollowupRequestRestoresBlankInstructions(t *t
 
 	if got := gjson.GetBytes(enriched, "instructions").String(); got != "keep going until DONE" {
 		t.Fatalf("instructions = %q, want %q", got, "keep going until DONE")
+	}
+}
+
+func TestCodexWebsocketExecuteHandshakeCapacityReturnsRetryableRateLimit(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"error":{"message":"Selected model is at capacity. Please try a different model."}}`))
+	}))
+	defer server.Close()
+
+	exec := NewCodexWebsocketsExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"base_url": server.URL,
+		"api_key":  "test",
+	}}
+	req := cliproxyexecutor.Request{
+		Model:   "gpt-5.4",
+		Payload: []byte(`{"model":"gpt-5.4","input":[{"role":"user","content":"hello"}]}`),
+	}
+	opts := cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("openai-response")}
+
+	_, err := exec.Execute(context.Background(), auth, req, opts)
+	if err == nil {
+		t.Fatal("expected handshake error")
+	}
+
+	statusCoder, ok := err.(interface{ StatusCode() int })
+	if !ok {
+		t.Fatalf("expected status coder, got %T", err)
+	}
+	if got := statusCoder.StatusCode(); got != http.StatusTooManyRequests {
+		t.Fatalf("status code = %d, want %d", got, http.StatusTooManyRequests)
+	}
+}
+
+func TestCodexWebsocketExecuteStreamHandshakeCapacityReturnsRetryableRateLimit(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"error":{"message":"Selected model is at capacity. Please try a different model."}}`))
+	}))
+	defer server.Close()
+
+	exec := NewCodexWebsocketsExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"base_url": server.URL,
+		"api_key":  "test",
+	}}
+	req := cliproxyexecutor.Request{
+		Model:   "gpt-5.4",
+		Payload: []byte(`{"model":"gpt-5.4","input":[{"role":"user","content":"hello"}]}`),
+	}
+	opts := cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("openai-response")}
+
+	_, err := exec.ExecuteStream(context.Background(), auth, req, opts)
+	if err == nil {
+		t.Fatal("expected handshake error")
+	}
+
+	statusCoder, ok := err.(interface{ StatusCode() int })
+	if !ok {
+		t.Fatalf("expected status coder, got %T", err)
+	}
+	if got := statusCoder.StatusCode(); got != http.StatusTooManyRequests {
+		t.Fatalf("status code = %d, want %d", got, http.StatusTooManyRequests)
+	}
+}
+
+func TestCodexWebsocketExecuteHandshakeUsageLimitReturnsRetryAfter(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{"error":{"type":"usage_limit_reached","message":"The usage limit has been reached","resets_in_seconds":45}}`))
+	}))
+	defer server.Close()
+
+	exec := NewCodexWebsocketsExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"base_url": server.URL,
+		"api_key":  "test",
+	}}
+	req := cliproxyexecutor.Request{
+		Model:   "gpt-5.4",
+		Payload: []byte(`{"model":"gpt-5.4","input":[{"role":"user","content":"hello"}]}`),
+	}
+	opts := cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("openai-response")}
+
+	_, err := exec.Execute(context.Background(), auth, req, opts)
+	if err == nil {
+		t.Fatal("expected handshake error")
+	}
+
+	statusErr, ok := err.(interface {
+		StatusCode() int
+		RetryAfter() *time.Duration
+	})
+	if !ok {
+		t.Fatalf("expected retryable status error, got %T", err)
+	}
+	if got := statusErr.StatusCode(); got != http.StatusTooManyRequests {
+		t.Fatalf("status code = %d, want %d", got, http.StatusTooManyRequests)
+	}
+	if statusErr.RetryAfter() == nil {
+		t.Fatal("expected RetryAfter, got nil")
+	}
+	if got := *statusErr.RetryAfter(); got != 45*time.Second {
+		t.Fatalf("RetryAfter = %v, want %v", got, 45*time.Second)
+	}
+}
+
+func TestCodexWebsocketExecuteHandshakeRetryAfterHeaderFallback(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Retry-After", "30")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{"error":{"message":"request throttled"}}`))
+	}))
+	defer server.Close()
+
+	exec := NewCodexWebsocketsExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"base_url": server.URL,
+		"api_key":  "test",
+	}}
+	req := cliproxyexecutor.Request{
+		Model:   "gpt-5.4",
+		Payload: []byte(`{"model":"gpt-5.4","input":[{"role":"user","content":"hello"}]}`),
+	}
+	opts := cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("openai-response")}
+
+	_, err := exec.Execute(context.Background(), auth, req, opts)
+	if err == nil {
+		t.Fatal("expected handshake error")
+	}
+
+	statusErr, ok := err.(interface {
+		StatusCode() int
+		RetryAfter() *time.Duration
+	})
+	if !ok {
+		t.Fatalf("expected retryable status error, got %T", err)
+	}
+	if got := statusErr.StatusCode(); got != http.StatusTooManyRequests {
+		t.Fatalf("status code = %d, want %d", got, http.StatusTooManyRequests)
+	}
+	if statusErr.RetryAfter() == nil {
+		t.Fatal("expected RetryAfter, got nil")
+	}
+	if got := *statusErr.RetryAfter(); got != 30*time.Second {
+		t.Fatalf("RetryAfter = %v, want %v", got, 30*time.Second)
 	}
 }
 

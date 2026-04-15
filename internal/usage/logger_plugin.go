@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/logging"
 	coreusage "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/usage"
 )
 
@@ -89,12 +90,16 @@ type modelStats struct {
 
 // RequestDetail stores the timestamp, latency, and token usage for a single request.
 type RequestDetail struct {
-	Timestamp time.Time  `json:"timestamp"`
-	LatencyMs int64      `json:"latency_ms"`
-	Source    string     `json:"source"`
-	AuthIndex string     `json:"auth_index"`
-	Tokens    TokenStats `json:"tokens"`
-	Failed    bool       `json:"failed"`
+	Timestamp      time.Time                       `json:"timestamp"`
+	LatencyMs      int64                           `json:"latency_ms"`
+	RequestID      string                          `json:"request_id,omitempty"`
+	Source         string                          `json:"source"`
+	AuthIndex      string                          `json:"auth_index"`
+	Tokens         TokenStats                      `json:"tokens"`
+	Failed         bool                            `json:"failed"`
+	StatusCode     int                             `json:"status_code,omitempty"`
+	ErrorMessage   string                          `json:"error_message,omitempty"`
+	CompactFailure *coreusage.CompactFailureSample `json:"compact_failure,omitempty"`
 }
 
 // TokenStats captures the token usage breakdown for a request.
@@ -173,6 +178,11 @@ func (s *RequestStatistics) Record(ctx context.Context, record coreusage.Record)
 	if !failed {
 		failed = !resolveSuccess(ctx)
 	}
+	statusCode := record.Detail.StatusCode
+	if statusCode == 0 && failed {
+		statusCode = resolveStatusCode(ctx)
+	}
+	errorMessage := strings.TrimSpace(record.Detail.ErrorMessage)
 	success := !failed
 	modelName := record.Model
 	if modelName == "" {
@@ -198,12 +208,16 @@ func (s *RequestStatistics) Record(ctx context.Context, record coreusage.Record)
 		s.apis[statsKey] = stats
 	}
 	s.updateAPIStats(stats, modelName, RequestDetail{
-		Timestamp: timestamp,
-		LatencyMs: normaliseLatency(record.Latency),
-		Source:    record.Source,
-		AuthIndex: record.AuthIndex,
-		Tokens:    detail,
-		Failed:    failed,
+		Timestamp:      timestamp,
+		LatencyMs:      normaliseLatency(record.Latency),
+		RequestID:      resolveRequestID(ctx, record),
+		Source:         record.Source,
+		AuthIndex:      record.AuthIndex,
+		Tokens:         detail,
+		Failed:         failed,
+		StatusCode:     statusCode,
+		ErrorMessage:   errorMessage,
+		CompactFailure: cloneCompactFailureSample(record.Detail.CompactFailure),
 	})
 
 	s.requestsByDay[dayKey]++
@@ -249,7 +263,10 @@ func (s *RequestStatistics) Snapshot() StatisticsSnapshot {
 		}
 		for modelName, modelStatsValue := range stats.Models {
 			requestDetails := make([]RequestDetail, len(modelStatsValue.Details))
-			copy(requestDetails, modelStatsValue.Details)
+			for idx, detail := range modelStatsValue.Details {
+				detail.CompactFailure = cloneCompactFailureSample(detail.CompactFailure)
+				requestDetails[idx] = detail
+			}
 			apiSnapshot.Models[modelName] = ModelSnapshot{
 				TotalRequests: modelStatsValue.TotalRequests,
 				TotalTokens:   modelStatsValue.TotalTokens,
@@ -340,6 +357,7 @@ func (s *RequestStatistics) MergeSnapshot(snapshot StatisticsSnapshot) MergeResu
 				if detail.Timestamp.IsZero() {
 					detail.Timestamp = time.Now()
 				}
+				detail.CompactFailure = cloneCompactFailureSample(detail.CompactFailure)
 				key := dedupKey(apiName, modelName, detail)
 				if _, exists := seen[key]; exists {
 					result.Skipped++
@@ -384,13 +402,16 @@ func dedupKey(apiName, modelName string, detail RequestDetail) string {
 	timestamp := detail.Timestamp.UTC().Format(time.RFC3339Nano)
 	tokens := normaliseTokenStats(detail.Tokens)
 	return fmt.Sprintf(
-		"%s|%s|%s|%s|%s|%t|%d|%d|%d|%d|%d",
+		"%s|%s|%s|%s|%s|%s|%t|%d|%s|%d|%d|%d|%d|%d",
 		apiName,
 		modelName,
 		timestamp,
+		detail.RequestID,
 		detail.Source,
 		detail.AuthIndex,
 		detail.Failed,
+		detail.StatusCode,
+		strings.TrimSpace(detail.ErrorMessage),
 		tokens.InputTokens,
 		tokens.OutputTokens,
 		tokens.ReasoningTokens,
@@ -424,12 +445,60 @@ func resolveAPIIdentifier(ctx context.Context, record coreusage.Record) string {
 	return "unknown"
 }
 
+func resolveStatusCode(ctx context.Context) int {
+	if ctx == nil {
+		return 0
+	}
+	ginCtx, ok := ctx.Value("gin").(*gin.Context)
+	if !ok || ginCtx == nil || ginCtx.Writer == nil {
+		return 0
+	}
+	status := ginCtx.Writer.Status()
+	if status <= 0 {
+		return 0
+	}
+	return status
+}
+
+func resolveRequestID(ctx context.Context, record coreusage.Record) string {
+	requestID := strings.TrimSpace(record.RequestID)
+	if requestID != "" {
+		return requestID
+	}
+	if ctx == nil {
+		return ""
+	}
+	if requestID = strings.TrimSpace(logging.GetRequestID(ctx)); requestID != "" {
+		return requestID
+	}
+	ginCtx, ok := ctx.Value("gin").(*gin.Context)
+	if !ok || ginCtx == nil {
+		return ""
+	}
+	if requestID = strings.TrimSpace(logging.GetGinRequestID(ginCtx)); requestID != "" {
+		return requestID
+	}
+	if value, exists := ginCtx.Get("REQUEST_ID"); exists {
+		switch typed := value.(type) {
+		case string:
+			return strings.TrimSpace(typed)
+		case fmt.Stringer:
+			return strings.TrimSpace(typed.String())
+		default:
+			if value != nil {
+				return strings.TrimSpace(fmt.Sprintf("%v", value))
+			}
+		}
+	}
+	return ""
+}
+
 func resolveSuccess(ctx context.Context) bool {
 	if ctx == nil {
 		return true
 	}
 	ginCtx, ok := ctx.Value("gin").(*gin.Context)
-	if !ok || ginCtx == nil {
+	if !ok || ginCtx == nil || ginCtx.Writer == nil {
 		return true
 	}
 	status := ginCtx.Writer.Status()
@@ -473,6 +542,14 @@ func normaliseLatency(latency time.Duration) int64 {
 		return 0
 	}
 	return latency.Milliseconds()
+}
+
+func cloneCompactFailureSample(sample *coreusage.CompactFailureSample) *coreusage.CompactFailureSample {
+	if sample == nil {
+		return nil
+	}
+	cloned := *sample
+	return &cloned
 }
 
 func formatHour(hour int) string {

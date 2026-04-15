@@ -37,6 +37,7 @@ type authScheduler struct {
 	providers     map[string]*providerScheduler
 	authProviders map[string]string
 	mixedCursors  map[string]int
+	inflight      map[string]int
 }
 
 // providerScheduler stores auth metadata and model shards for a single provider.
@@ -170,6 +171,7 @@ func newAuthScheduler(selector Selector) *authScheduler {
 		providers:     make(map[string]*providerScheduler),
 		authProviders: make(map[string]string),
 		mixedCursors:  make(map[string]int),
+		inflight:      make(map[string]int),
 	}
 }
 
@@ -194,6 +196,61 @@ func (s *authScheduler) setSelector(selector Selector) {
 	defer s.mu.Unlock()
 	s.strategy = selectorStrategy(selector)
 	clear(s.mixedCursors)
+}
+
+func schedulerInflightKey(providerKey, modelKey, authID string) string {
+	providerKey = strings.ToLower(strings.TrimSpace(providerKey))
+	modelKey = canonicalModelKey(modelKey)
+	authID = strings.TrimSpace(authID)
+	if providerKey == "" || authID == "" {
+		return ""
+	}
+	return providerKey + "|" + modelKey + "|" + authID
+}
+
+func (s *authScheduler) acquireInflight(provider, model, authID string) {
+	if s == nil {
+		return
+	}
+	key := schedulerInflightKey(provider, model, authID)
+	if key == "" {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.inflight == nil {
+		s.inflight = make(map[string]int)
+	}
+	s.inflight[key]++
+}
+
+func (s *authScheduler) releaseInflight(provider, model, authID string) {
+	if s == nil {
+		return
+	}
+	key := schedulerInflightKey(provider, model, authID)
+	if key == "" {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	current := s.inflight[key]
+	if current <= 1 {
+		delete(s.inflight, key)
+		return
+	}
+	s.inflight[key] = current - 1
+}
+
+func (s *authScheduler) inflightCountLocked(providerKey, modelKey, authID string) int {
+	if s == nil || len(s.inflight) == 0 {
+		return 0
+	}
+	key := schedulerInflightKey(providerKey, modelKey, authID)
+	if key == "" {
+		return 0
+	}
+	return s.inflight[key]
 }
 
 // rebuild recreates the complete scheduler state from an auth snapshot.
@@ -270,7 +327,13 @@ func (s *authScheduler) pickSingle(ctx context.Context, provider, model string, 
 		}
 		return true
 	}
-	if picked := shard.pickReadyLocked(preferWebsocket, s.strategy, predicate); picked != nil {
+	load := func(entry *scheduledAuth) int {
+		if entry == nil || entry.auth == nil {
+			return 0
+		}
+		return s.inflightCountLocked(providerKey, modelKey, entry.auth.ID)
+	}
+	if picked := shard.pickReadyLocked(preferWebsocket, s.strategy, predicate, load); picked != nil {
 		return picked, nil
 	}
 	return nil, shard.unavailableErrorLocked(provider, model, predicate)
@@ -323,7 +386,13 @@ func (s *authScheduler) pickMixed(ctx context.Context, providers []string, model
 			_, ok := tried[pinnedAuthID]
 			return !ok
 		}
-		if picked := shard.pickReadyLocked(false, s.strategy, predicate); picked != nil {
+		load := func(entry *scheduledAuth) int {
+			if entry == nil || entry.auth == nil {
+				return 0
+			}
+			return s.inflightCountLocked(providerKey, modelKey, entry.auth.ID)
+		}
+		if picked := shard.pickReadyLocked(false, s.strategy, predicate, load); picked != nil {
 			return picked, providerKey, nil
 		}
 		return nil, "", shard.unavailableErrorLocked("mixed", model, predicate)
@@ -363,7 +432,13 @@ func (s *authScheduler) pickMixed(ctx context.Context, providers []string, model
 			if shard == nil {
 				continue
 			}
-			picked := shard.pickReadyAtPriorityLocked(false, bestPriority, s.strategy, predicate)
+			load := func(entry *scheduledAuth) int {
+				if entry == nil || entry.auth == nil {
+					return 0
+				}
+				return s.inflightCountLocked(providerKey, modelKey, entry.auth.ID)
+			}
+			picked := shard.pickReadyAtPriorityLocked(false, bestPriority, s.strategy, predicate, load)
 			if picked != nil {
 				return picked, providerKey, nil
 			}
@@ -417,7 +492,13 @@ func (s *authScheduler) pickMixed(ctx context.Context, providers []string, model
 		if shard == nil {
 			continue
 		}
-		picked := shard.pickReadyAtPriorityLocked(false, bestPriority, schedulerStrategyRoundRobin, predicate)
+		load := func(entry *scheduledAuth) int {
+			if entry == nil || entry.auth == nil {
+				return 0
+			}
+			return s.inflightCountLocked(providerKey, modelKey, entry.auth.ID)
+		}
+		picked := shard.pickReadyAtPriorityLocked(false, bestPriority, schedulerStrategyRoundRobin, predicate, load)
 		if picked == nil {
 			continue
 		}
@@ -757,7 +838,7 @@ func (m *modelScheduler) promoteExpiredLocked(now time.Time) {
 }
 
 // pickReadyLocked selects the next ready auth from the highest available priority bucket.
-func (m *modelScheduler) pickReadyLocked(preferWebsocket bool, strategy schedulerStrategy, predicate func(*scheduledAuth) bool) *Auth {
+func (m *modelScheduler) pickReadyLocked(preferWebsocket bool, strategy schedulerStrategy, predicate func(*scheduledAuth) bool, load func(*scheduledAuth) int) *Auth {
 	if m == nil {
 		return nil
 	}
@@ -766,7 +847,7 @@ func (m *modelScheduler) pickReadyLocked(preferWebsocket bool, strategy schedule
 	if !okPriority {
 		return nil
 	}
-	return m.pickReadyAtPriorityLocked(preferWebsocket, priorityReady, strategy, predicate)
+	return m.pickReadyAtPriorityLocked(preferWebsocket, priorityReady, strategy, predicate, load)
 }
 
 // highestReadyPriorityLocked returns the highest priority bucket that still has a matching ready auth.
@@ -802,7 +883,7 @@ func (m *modelScheduler) highestReadyPriorityLocked(preferWebsocket bool, predic
 
 // pickReadyAtPriorityLocked selects the next ready auth from a specific priority bucket.
 // The caller must ensure expired entries are already promoted when needed.
-func (m *modelScheduler) pickReadyAtPriorityLocked(preferWebsocket bool, priority int, strategy schedulerStrategy, predicate func(*scheduledAuth) bool) *Auth {
+func (m *modelScheduler) pickReadyAtPriorityLocked(preferWebsocket bool, priority int, strategy schedulerStrategy, predicate func(*scheduledAuth) bool, load func(*scheduledAuth) int) *Auth {
 	if m == nil {
 		return nil
 	}
@@ -818,7 +899,7 @@ func (m *modelScheduler) pickReadyAtPriorityLocked(preferWebsocket bool, priorit
 	if strategy == schedulerStrategyFillFirst {
 		picked = view.pickFirst(predicate)
 	} else {
-		picked = view.pickRoundRobin(predicate)
+		picked = view.pickRoundRobin(predicate, load)
 	}
 	if picked == nil || picked.auth == nil {
 		return nil
@@ -918,8 +999,11 @@ func (m *modelScheduler) rebuildIndexesLocked() {
 		}
 	}
 	for priority, entries := range priorityBuckets {
-		sort.Slice(entries, func(i, j int) bool {
-			return entries[i].auth.ID < entries[j].auth.ID
+		sort.SliceStable(entries, func(i, j int) bool {
+			if entries[i] == nil || entries[j] == nil {
+				return entries[i] != nil
+			}
+			return authPreferredBefore(entries[i].auth, entries[j].auth)
 		})
 		bucket := buildReadyBucket(entries)
 		if cursorState, ok := cursorStates[priority]; ok && bucket != nil {
@@ -986,7 +1070,29 @@ func buildReadyView(entries []*scheduledAuth) readyView {
 	for parent := range groups {
 		view.parentOrder = append(view.parentOrder, parent)
 	}
-	sort.Strings(view.parentOrder)
+	for parent, items := range groups {
+		sort.SliceStable(items, func(i, j int) bool {
+			if items[i] == nil || items[j] == nil {
+				return items[i] != nil
+			}
+			return authPreferredBefore(items[i].auth, items[j].auth)
+		})
+		groups[parent] = items
+	}
+	sort.SliceStable(view.parentOrder, func(i, j int) bool {
+		leftItems := groups[view.parentOrder[i]]
+		rightItems := groups[view.parentOrder[j]]
+		if len(leftItems) == 0 || len(rightItems) == 0 {
+			return view.parentOrder[i] < view.parentOrder[j]
+		}
+		if authPreferredBefore(leftItems[0].auth, rightItems[0].auth) {
+			return true
+		}
+		if authPreferredBefore(rightItems[0].auth, leftItems[0].auth) {
+			return false
+		}
+		return view.parentOrder[i] < view.parentOrder[j]
+	})
 	for _, parent := range view.parentOrder {
 		view.children[parent] = &childBucket{items: append([]*scheduledAuth(nil), groups[parent]...)}
 	}
@@ -1004,9 +1110,20 @@ func (v *readyView) pickFirst(predicate func(*scheduledAuth) bool) *scheduledAut
 }
 
 // pickRoundRobin returns the next ready entry using flat or grouped round-robin traversal.
-func (v *readyView) pickRoundRobin(predicate func(*scheduledAuth) bool) *scheduledAuth {
+func inflightLoadValue(load func(*scheduledAuth) int, entry *scheduledAuth) int {
+	if load == nil {
+		return 0
+	}
+	value := load(entry)
+	if value < 0 {
+		return 0
+	}
+	return value
+}
+
+func (v *readyView) pickRoundRobin(predicate func(*scheduledAuth) bool, load func(*scheduledAuth) int) *scheduledAuth {
 	if len(v.parentOrder) > 1 && len(v.children) > 0 {
-		return v.pickGroupedRoundRobin(predicate)
+		return v.pickGroupedRoundRobin(predicate, load)
 	}
 	if len(v.flat) == 0 {
 		return nil
@@ -1015,24 +1132,41 @@ func (v *readyView) pickRoundRobin(predicate func(*scheduledAuth) bool) *schedul
 	if len(v.flat) > 0 {
 		start = v.cursor % len(v.flat)
 	}
+	bestIndex := -1
+	bestLoad := 0
 	for offset := 0; offset < len(v.flat); offset++ {
 		index := (start + offset) % len(v.flat)
 		entry := v.flat[index]
 		if predicate != nil && !predicate(entry) {
 			continue
 		}
-		v.cursor = index + 1
-		return entry
+		entryLoad := inflightLoadValue(load, entry)
+		if bestIndex >= 0 && entryLoad >= bestLoad {
+			continue
+		}
+		bestIndex = index
+		bestLoad = entryLoad
+		if bestLoad == 0 {
+			break
+		}
 	}
-	return nil
+	if bestIndex < 0 {
+		return nil
+	}
+	v.cursor = bestIndex + 1
+	return v.flat[bestIndex]
 }
 
 // pickGroupedRoundRobin rotates across parents first and then within the selected parent.
-func (v *readyView) pickGroupedRoundRobin(predicate func(*scheduledAuth) bool) *scheduledAuth {
+func (v *readyView) pickGroupedRoundRobin(predicate func(*scheduledAuth) bool, load func(*scheduledAuth) int) *scheduledAuth {
 	start := 0
 	if len(v.parentOrder) > 0 {
 		start = v.parentCursor % len(v.parentOrder)
 	}
+	bestParentIndex := -1
+	bestItemIndex := -1
+	bestLoad := 0
+	var bestEntry *scheduledAuth
 	for offset := 0; offset < len(v.parentOrder); offset++ {
 		parentIndex := (start + offset) % len(v.parentOrder)
 		parent := v.parentOrder[parentIndex]
@@ -1047,10 +1181,30 @@ func (v *readyView) pickGroupedRoundRobin(predicate func(*scheduledAuth) bool) *
 			if predicate != nil && !predicate(entry) {
 				continue
 			}
-			child.cursor = itemIndex + 1
-			v.parentCursor = parentIndex + 1
-			return entry
+			entryLoad := inflightLoadValue(load, entry)
+			if bestEntry != nil && entryLoad >= bestLoad {
+				continue
+			}
+			bestEntry = entry
+			bestLoad = entryLoad
+			bestParentIndex = parentIndex
+			bestItemIndex = itemIndex
+			if bestLoad == 0 {
+				break
+			}
+		}
+		if bestEntry != nil && bestLoad == 0 {
+			break
 		}
 	}
-	return nil
+	if bestEntry == nil || bestParentIndex < 0 || bestItemIndex < 0 {
+		return nil
+	}
+	parent := v.parentOrder[bestParentIndex]
+	child := v.children[parent]
+	if child != nil {
+		child.cursor = bestItemIndex + 1
+	}
+	v.parentCursor = bestParentIndex + 1
+	return bestEntry
 }
