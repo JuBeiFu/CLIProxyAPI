@@ -401,6 +401,12 @@ func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
 			entry["account"] = account
 		}
 	}
+	if planType := codexPlanType(auth); planType != "" {
+		entry["plan_type"] = planType
+	}
+	if accountID := codexChatGPTAccountID(auth); accountID != "" {
+		entry["chatgpt_account_id"] = accountID
+	}
 	if !auth.CreatedAt.IsZero() {
 		entry["created_at"] = auth.CreatedAt
 	}
@@ -505,6 +511,46 @@ func extractCodexIDTokenClaims(auth *coreauth.Auth) gin.H {
 		return nil
 	}
 	return result
+}
+
+func codexPlanType(auth *coreauth.Auth) string {
+	if auth == nil {
+		return ""
+	}
+	if auth.Attributes != nil {
+		if planType := strings.TrimSpace(auth.Attributes["plan_type"]); planType != "" {
+			return planType
+		}
+	}
+	claims := extractCodexIDTokenClaims(auth)
+	if claims == nil {
+		return ""
+	}
+	if planType, ok := claims["plan_type"].(string); ok {
+		return strings.TrimSpace(planType)
+	}
+	return ""
+}
+
+func codexChatGPTAccountID(auth *coreauth.Auth) string {
+	if auth == nil {
+		return ""
+	}
+	if auth.Metadata != nil {
+		if accountID, ok := auth.Metadata["account_id"].(string); ok {
+			if trimmed := strings.TrimSpace(accountID); trimmed != "" {
+				return trimmed
+			}
+		}
+	}
+	claims := extractCodexIDTokenClaims(auth)
+	if claims == nil {
+		return ""
+	}
+	if accountID, ok := claims["chatgpt_account_id"].(string); ok {
+		return strings.TrimSpace(accountID)
+	}
+	return ""
 }
 
 func authEmail(auth *coreauth.Auth) string {
@@ -1026,6 +1072,50 @@ func (h *Handler) buildAuthFromFileData(path string, data []byte) (*coreauth.Aut
 	}
 	if hasLastRefresh {
 		auth.LastRefreshedAt = lastRefresh
+	}
+	if strings.EqualFold(strings.TrimSpace(provider), "codex") {
+		if idTokenRaw, ok := metadata["id_token"].(string); ok {
+			if claims, errParse := codex.ParseJWTToken(idTokenRaw); errParse == nil && claims != nil {
+				if planType := strings.TrimSpace(claims.CodexAuthInfo.ChatgptPlanType); planType != "" {
+					auth.Attributes["plan_type"] = planType
+				}
+				if accountID := strings.TrimSpace(claims.CodexAuthInfo.ChatgptAccountID); accountID != "" {
+					metadata["account_id"] = accountID
+				}
+			}
+		}
+	}
+	// Parse persisted quota state
+	if quotaRaw, ok := metadata["quota_state"].(map[string]any); ok {
+		exceeded, _ := quotaRaw["exceeded"].(bool)
+		reason, _ := quotaRaw["reason"].(string)
+		backoffLevel := 0
+		if bl, ok := quotaRaw["backoff_level"].(float64); ok {
+			backoffLevel = int(bl)
+		}
+		var nextRecoverAt time.Time
+		if nra, ok := quotaRaw["next_recover_at"].(string); ok && nra != "" {
+			if parsed, errParse := time.Parse(time.RFC3339, nra); errParse == nil {
+				nextRecoverAt = parsed
+			}
+		}
+		var updatedAt time.Time
+		if ua, ok := quotaRaw["updated_at"].(string); ok && ua != "" {
+			if parsed, errParse := time.Parse(time.RFC3339, ua); errParse == nil {
+				updatedAt = parsed
+			}
+		}
+		if !nextRecoverAt.IsZero() && nextRecoverAt.After(time.Now()) {
+			auth.Quota = coreauth.QuotaState{
+				Exceeded:      exceeded,
+				Reason:        reason,
+				NextRecoverAt: nextRecoverAt,
+				BackoffLevel:  backoffLevel,
+				UpdatedAt:     updatedAt,
+			}
+			auth.Unavailable = true
+			auth.NextRetryAfter = nextRecoverAt
+		}
 	}
 	if h != nil && h.authManager != nil {
 		if existing, ok := h.authManager.GetByID(authID); ok {
