@@ -87,6 +87,32 @@ func TestRoundRobinSelectorPick_PriorityBuckets(t *testing.T) {
 	}
 }
 
+func TestRoundRobinSelectorPick_PrefersNewerAndHigherPlanWithinPriority(t *testing.T) {
+	t.Parallel()
+
+	selector := &RoundRobinSelector{}
+	base := time.Date(2026, time.January, 2, 3, 4, 5, 0, time.UTC)
+	auths := []*Auth{
+		{ID: "aaa-old-free", Provider: "codex", CreatedAt: base.Add(-2 * time.Hour), Attributes: map[string]string{"plan_type": "free"}},
+		{ID: "bbb-mid-plus", Provider: "codex", CreatedAt: base.Add(-1 * time.Hour), Attributes: map[string]string{"plan_type": "plus"}},
+		{ID: "zzz-new-plus", Provider: "codex", CreatedAt: base, Attributes: map[string]string{"plan_type": "plus"}},
+	}
+
+	want := []string{"zzz-new-plus", "bbb-mid-plus", "aaa-old-free", "zzz-new-plus"}
+	for i, id := range want {
+		got, err := selector.Pick(context.Background(), "codex", "", cliproxyexecutor.Options{}, auths)
+		if err != nil {
+			t.Fatalf("Pick() #%d error = %v", i, err)
+		}
+		if got == nil {
+			t.Fatalf("Pick() #%d auth = nil", i)
+		}
+		if got.ID != id {
+			t.Fatalf("Pick() #%d auth.ID = %q, want %q", i, got.ID, id)
+		}
+	}
+}
+
 func TestFillFirstSelectorPick_PriorityFallbackCooldown(t *testing.T) {
 	t.Parallel()
 
@@ -311,6 +337,49 @@ func TestIsAuthBlockedForModel_UnavailableWithoutNextRetryIsNotBlocked(t *testin
 	}
 }
 
+func TestIsAuthBlockedForModel_AuthLevelQuotaCooldownBlocksAcrossModels(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now()
+	next := now.Add(2 * time.Minute)
+	auth := &Auth{
+		ID:             "quota-auth",
+		Unavailable:    true,
+		NextRetryAfter: next,
+		Quota: QuotaState{
+			Exceeded:      true,
+			Reason:        "quota",
+			NextRecoverAt: next,
+		},
+		ModelStates: map[string]*ModelState{
+			"model-a": {
+				Status:         StatusError,
+				Unavailable:    true,
+				NextRetryAfter: next,
+				Quota: QuotaState{
+					Exceeded:      true,
+					Reason:        "quota",
+					NextRecoverAt: next,
+				},
+			},
+		},
+	}
+
+	blocked, reason, gotNext := isAuthBlockedForModel(auth, "model-b", now)
+	if !blocked {
+		t.Fatalf("blocked = false, want true")
+	}
+	if reason != blockReasonCooldown {
+		t.Fatalf("reason = %v, want %v", reason, blockReasonCooldown)
+	}
+	if gotNext.IsZero() {
+		t.Fatalf("next = zero, want %v", next)
+	}
+	if gotNext.Sub(next) > time.Second || next.Sub(gotNext) > time.Second {
+		t.Fatalf("next = %v, want %v", gotNext, next)
+	}
+}
+
 func TestFillFirstSelectorPick_ThinkingSuffixFallsBackToBaseModelState(t *testing.T) {
 	t.Parallel()
 
@@ -525,5 +594,49 @@ func TestRoundRobinSelectorPick_MixedVirtualAndNonVirtualFallsBackToFlat(t *test
 		if got.ID != expectedID {
 			t.Fatalf("Pick() #%d auth.ID = %q, want %q", i, got.ID, expectedID)
 		}
+	}
+}
+
+func TestIsAuthBlockedForModel_UsageLimitAlwaysBlocked(t *testing.T) {
+	now := time.Now()
+	auth := &Auth{
+		ID:             "auth-block",
+		Unavailable:    true,
+		NextRetryAfter: now.Add(2 * time.Hour),
+		Quota: QuotaState{
+			Exceeded:      true,
+			Reason:        "usage_limit",
+			NextRecoverAt: now.Add(2 * time.Hour),
+		},
+	}
+
+	blocked, reason, _ := isAuthBlockedForModel(auth, "gpt-4", now)
+	if !blocked {
+		t.Error("expected auth to be blocked for usage_limit")
+	}
+	if reason != blockReasonCooldown {
+		t.Errorf("expected blockReasonCooldown, got %v", reason)
+	}
+}
+
+func TestIsAuthBlockedForModel_RateLimitBlockedNormally(t *testing.T) {
+	now := time.Now()
+	auth := &Auth{
+		ID:             "auth-rl",
+		Unavailable:    true,
+		NextRetryAfter: now.Add(30 * time.Second),
+		Quota: QuotaState{
+			Exceeded:      true,
+			Reason:        "rate_limit",
+			NextRecoverAt: now.Add(30 * time.Second),
+		},
+	}
+
+	blocked, reason, _ := isAuthBlockedForModel(auth, "gpt-4", now)
+	if !blocked {
+		t.Error("expected auth to be blocked for rate_limit with future NextRetryAfter")
+	}
+	if reason != blockReasonCooldown {
+		t.Errorf("expected blockReasonCooldown, got %v", reason)
 	}
 }
