@@ -1417,3 +1417,78 @@ func TestApplyAuthFailureState_PlainRateLimitRespectsDisabledCooling(t *testing.
 		t.Error("expected NextRetryAfter to be zero for plain rate limit with cooling disabled")
 	}
 }
+
+func TestQuotaPersistence_SurvivesRestart(t *testing.T) {
+	persister := &mockPersister{written: make(map[string]QuotaState)}
+	m := NewManager(nil, nil, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	m.StartQuotaFlusher(ctx, persister)
+
+	auth := &Auth{
+		ID:          "auth-persist",
+		Provider:    "codex",
+		Metadata:    map[string]any{},
+		ModelStates: make(map[string]*ModelState),
+	}
+	_, _ = m.Register(context.Background(), auth)
+
+	// Trigger usage_limit 429
+	retryAfter := 2 * time.Hour
+	m.MarkResult(context.Background(), Result{
+		AuthID:     "auth-persist",
+		Provider:   "codex",
+		Model:      "gpt-4",
+		Success:    false,
+		RetryAfter: &retryAfter,
+		Error: &Error{
+			Message:    `{"error":{"type":"usage_limit_reached","resets_in_seconds":7200}}`,
+			HTTPStatus: 429,
+		},
+	})
+
+	// Flush to persister
+	if m.quotaFlusher != nil {
+		m.quotaFlusher.flushOnce()
+	}
+
+	// Verify persisted
+	q, ok := persister.getWritten("auth-persist")
+	if !ok {
+		t.Fatal("expected quota to be persisted")
+	}
+	if !q.Exceeded {
+		t.Error("persisted quota should be exceeded")
+	}
+	if q.Reason != "usage_limit" {
+		t.Errorf("persisted reason should be usage_limit, got %q", q.Reason)
+	}
+	if q.NextRecoverAt.IsZero() {
+		t.Error("persisted NextRecoverAt should not be zero")
+	}
+
+	// Simulate "restart" — new Manager, load auth with persisted quota
+	m2 := NewManager(nil, nil, nil)
+	auth2 := &Auth{
+		ID:             "auth-persist",
+		Provider:       "codex",
+		Quota:          q,
+		Unavailable:    true,
+		NextRetryAfter: q.NextRecoverAt,
+	}
+	_, _ = m2.Register(context.Background(), auth2)
+
+	got, ok := m2.GetByID("auth-persist")
+	if !ok {
+		t.Fatal("auth not found in new manager")
+	}
+	if !got.Unavailable {
+		t.Error("auth should be unavailable after simulated restart")
+	}
+	if !got.Quota.Exceeded {
+		t.Error("auth quota should be exceeded after simulated restart")
+	}
+	if got.Quota.Reason != "usage_limit" {
+		t.Errorf("expected usage_limit, got %q", got.Quota.Reason)
+	}
+}
