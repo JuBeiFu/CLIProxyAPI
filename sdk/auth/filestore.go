@@ -349,6 +349,67 @@ func (s *FileTokenStore) resolveAuthPath(auth *cliproxyauth.Auth) (string, error
 	return filepath.Join(dir, auth.ID), nil
 }
 
+// PersistQuotaState merges quota state into the auth JSON file without overwriting other fields.
+func (s *FileTokenStore) PersistQuotaState(authID string, quota cliproxyauth.QuotaState) error {
+	if s == nil || authID == "" {
+		return fmt.Errorf("invalid arguments")
+	}
+	path := s.resolvePathForAuthID(authID)
+	if path == "" {
+		return fmt.Errorf("no file path for auth %s", authID)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("read auth file: %w", err)
+	}
+	var metadata map[string]any
+	if err := json.Unmarshal(data, &metadata); err != nil {
+		return fmt.Errorf("unmarshal auth file: %w", err)
+	}
+
+	quotaMap := map[string]any{
+		"exceeded":        quota.Exceeded,
+		"reason":          quota.Reason,
+		"next_recover_at": quota.NextRecoverAt.UTC().Format(time.RFC3339),
+		"backoff_level":   quota.BackoffLevel,
+		"updated_at":      quota.UpdatedAt.UTC().Format(time.RFC3339),
+	}
+	metadata["quota_state"] = quotaMap
+
+	updated, err := json.MarshalIndent(metadata, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal auth file: %w", err)
+	}
+	return os.WriteFile(path, updated, 0o600)
+}
+
+// resolvePathForAuthID finds the file path for an auth ID string.
+func (s *FileTokenStore) resolvePathForAuthID(authID string) string {
+	if s == nil || authID == "" {
+		return ""
+	}
+	dir := s.baseDirSnapshot()
+	if dir == "" {
+		return ""
+	}
+	// Auth IDs are relative paths from baseDir — reconstruct full path
+	candidate := filepath.Join(dir, authID)
+	if _, err := os.Stat(candidate); err == nil {
+		return candidate
+	}
+	// Try with .json extension
+	if !strings.HasSuffix(authID, ".json") {
+		candidate = filepath.Join(dir, authID+".json")
+		if _, err := os.Stat(candidate); err == nil {
+			return candidate
+		}
+	}
+	return ""
+}
+
 func (s *FileTokenStore) labelFor(metadata map[string]any) string {
 	if metadata == nil {
 		return ""

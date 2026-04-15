@@ -8,6 +8,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 )
 
 func TestExtractAccessToken(t *testing.T) {
@@ -203,5 +205,63 @@ func TestReadAuthFile_IgnoresExpiredQuotaState(t *testing.T) {
 	}
 	if auth.Quota.Exceeded {
 		t.Error("expected Quota.Exceeded = false for expired quota")
+	}
+}
+
+func TestFileTokenStore_PersistQuotaState(t *testing.T) {
+	dir := t.TempDir()
+	store := NewFileTokenStore()
+	store.SetBaseDir(dir)
+
+	// Write initial auth file
+	authData := map[string]any{
+		"type":  "codex",
+		"token": "test-token",
+		"email": "test@example.com",
+	}
+	raw, _ := json.Marshal(authData)
+	path := filepath.Join(dir, "test-persist.json")
+	os.WriteFile(path, raw, 0o600)
+
+	// Read to get the auth ID
+	auth, err := store.readAuthFile(path, dir)
+	if err != nil {
+		t.Fatalf("readAuthFile error: %v", err)
+	}
+
+	quota := cliproxyauth.QuotaState{
+		Exceeded:      true,
+		Reason:        "usage_limit",
+		NextRecoverAt: time.Now().Add(2 * time.Hour).UTC().Truncate(time.Second),
+		BackoffLevel:  3,
+		UpdatedAt:     time.Now().UTC().Truncate(time.Second),
+	}
+
+	err = store.PersistQuotaState(auth.ID, quota)
+	if err != nil {
+		t.Fatalf("PersistQuotaState error: %v", err)
+	}
+
+	// Re-read and verify quota was persisted
+	reloaded, err := store.readAuthFile(path, dir)
+	if err != nil {
+		t.Fatalf("readAuthFile after persist: %v", err)
+	}
+	if !reloaded.Quota.Exceeded {
+		t.Error("expected Exceeded = true after persist")
+	}
+	if reloaded.Quota.Reason != "usage_limit" {
+		t.Errorf("expected reason=usage_limit, got %q", reloaded.Quota.Reason)
+	}
+
+	// Verify original fields preserved
+	data2, _ := os.ReadFile(path)
+	var check map[string]any
+	json.Unmarshal(data2, &check)
+	if check["token"] != "test-token" {
+		t.Error("expected original token to be preserved")
+	}
+	if check["email"] != "test@example.com" {
+		t.Error("expected original email to be preserved")
 	}
 }
