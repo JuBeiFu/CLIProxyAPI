@@ -489,7 +489,7 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 		baseURL = "https://chatgpt.com/backend-api/codex"
 	}
 
-	reporter := helps.NewUsageReporter(ctx, e.Identifier(), baseModel, auth)
+	reporter := helps.NewUsageReporter(ctx, e.Identifier(), baseModel, e.cfg, auth)
 	defer reporter.TrackFailure(ctx, &err)
 
 	from := opts.SourceFormat
@@ -569,7 +569,7 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 			return e.CodexExecutor.Execute(ctx, auth, req, opts)
 		}
 		if respHS != nil && respHS.StatusCode > 0 {
-			return resp, statusErr{code: respHS.StatusCode, msg: string(bodyErr)}
+			return resp, codexHandshakeStatusErr(respHS, bodyErr)
 		}
 		helps.RecordAPIWebsocketError(ctx, e.cfg, "dial", errDial)
 		return resp, errDial
@@ -704,7 +704,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 		baseURL = "https://chatgpt.com/backend-api/codex"
 	}
 
-	reporter := helps.NewUsageReporter(ctx, e.Identifier(), baseModel, auth)
+	reporter := helps.NewUsageReporter(ctx, e.Identifier(), baseModel, e.cfg, auth)
 	defer reporter.TrackFailure(ctx, &err)
 
 	from := opts.SourceFormat
@@ -781,7 +781,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 			return e.CodexExecutor.ExecuteStream(ctx, auth, req, opts)
 		}
 		if respHS != nil && respHS.StatusCode > 0 {
-			return nil, statusErr{code: respHS.StatusCode, msg: string(bodyErr)}
+			return nil, codexHandshakeStatusErr(respHS, bodyErr)
 		}
 		helps.RecordAPIWebsocketError(ctx, e.cfg, "dial", errDial)
 		if sess != nil {
@@ -926,7 +926,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 				terminateReason = "upstream_error"
 				terminateErr = wsErr
 				helps.RecordAPIWebsocketError(ctx, e.cfg, "upstream_error", wsErr)
-				reporter.PublishFailure(ctx)
+				reporter.PublishFailureWithError(ctx, wsErr)
 				if sess != nil {
 					e.invalidateUpstreamConn(sess, conn, "upstream_error", wsErr)
 				}
@@ -1315,10 +1315,25 @@ func parseCodexWebsocketError(payload []byte) (error, bool) {
 	}
 
 	headers := parseCodexWebsocketErrorHeaders(payload)
+	statusErr := newCodexStatusErr(status, out)
+	if statusErr.code == http.StatusTooManyRequests && statusErr.retryAfter == nil {
+		statusErr.retryAfter = parseRetryAfterHeader(headers, time.Now())
+	}
 	return statusErrWithHeaders{
-		statusErr: statusErr{code: status, msg: string(out)},
+		statusErr: statusErr,
 		headers:   headers,
 	}, true
+}
+
+func codexHandshakeStatusErr(resp *http.Response, body []byte) statusErr {
+	if resp == nil {
+		return newCodexStatusErr(0, body)
+	}
+	err := newCodexStatusErr(resp.StatusCode, body)
+	if err.code == http.StatusTooManyRequests && err.retryAfter == nil {
+		err.retryAfter = parseRetryAfterHeader(resp.Header, time.Now())
+	}
+	return err
 }
 
 func parseCodexWebsocketErrorHeaders(payload []byte) http.Header {
