@@ -3710,6 +3710,26 @@ func (m *Manager) refreshAuth(ctx context.Context, id string) {
 			}
 			return
 		}
+		// For 429 errors during refresh, feed them through MarkResult so that
+		// cooldown tiering (usage_limit vs rate_limit) is applied consistently.
+		statusCode := statusCodeFromResult(resultErr)
+		if statusCode == http.StatusTooManyRequests {
+			retryAfter := retryAfterFromError(err)
+			m.MarkResult(ctx, Result{
+				AuthID:     id,
+				Provider:   auth.Provider,
+				Success:    false,
+				RetryAfter: retryAfter,
+				Error:      resultErr,
+			})
+			m.mu.Lock()
+			if current := m.auths[id]; current != nil {
+				current.NextRefreshAfter = now.Add(refreshFailureBackoff)
+				m.auths[id] = current
+			}
+			m.mu.Unlock()
+			return
+		}
 		m.mu.Lock()
 		if current := m.auths[id]; current != nil {
 			current.NextRefreshAfter = now.Add(refreshFailureBackoff)

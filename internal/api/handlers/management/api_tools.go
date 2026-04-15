@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -17,6 +18,7 @@ import (
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/proxyutil"
 	log "github.com/sirupsen/logrus"
+	"github.com/tidwall/gjson"
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/google"
 )
@@ -194,6 +196,7 @@ func (h *Handler) APICall(c *gin.Context) {
 
 	resp, errDo := httpClient.Do(req)
 	if errDo != nil {
+		h.markAPICallFailure(c.Request.Context(), auth, errDo)
 		log.WithError(errDo).Debug("management APICall request failed")
 		c.JSON(http.StatusBadGateway, gin.H{"error": "request failed"})
 		return
@@ -209,6 +212,8 @@ func (h *Handler) APICall(c *gin.Context) {
 		c.JSON(http.StatusBadGateway, gin.H{"error": "failed to read response"})
 		return
 	}
+
+	h.markAPICallResponse(c.Request.Context(), auth, resp.StatusCode, respBody)
 
 	c.JSON(http.StatusOK, apiCallResponse{
 		StatusCode: resp.StatusCode,
@@ -265,6 +270,96 @@ func (h *Handler) resolveTokenForAuth(ctx context.Context, auth *coreauth.Auth) 
 	}
 
 	return tokenValueForAuth(auth), nil
+}
+
+func (h *Handler) markAPICallFailure(ctx context.Context, auth *coreauth.Auth, err error) {
+	if h == nil || h.authManager == nil || auth == nil || err == nil {
+		return
+	}
+	authID := strings.TrimSpace(auth.ID)
+	if authID == "" {
+		return
+	}
+	h.authManager.MarkResult(ctx, coreauth.Result{
+		AuthID:   authID,
+		Provider: strings.TrimSpace(auth.Provider),
+		Success:  false,
+		Error: &coreauth.Error{
+			Message:    err.Error(),
+			Retryable:  true,
+			HTTPStatus: http.StatusBadGateway,
+		},
+	})
+}
+
+func (h *Handler) markAPICallResponse(
+	ctx context.Context,
+	auth *coreauth.Auth,
+	statusCode int,
+	body []byte,
+) {
+	if h == nil || h.authManager == nil || auth == nil {
+		return
+	}
+	authID := strings.TrimSpace(auth.ID)
+	if authID == "" {
+		return
+	}
+
+	provider := strings.TrimSpace(auth.Provider)
+	if statusCode >= 200 && statusCode < 300 {
+		h.authManager.MarkResult(ctx, coreauth.Result{
+			AuthID:   authID,
+			Provider: provider,
+			Success:  true,
+		})
+		return
+	}
+
+	resultErr := &coreauth.Error{
+		Message:    strings.TrimSpace(string(body)),
+		Retryable:  statusCode >= 500 || statusCode == http.StatusTooManyRequests,
+		HTTPStatus: statusCode,
+	}
+	retryAfter := retryAfterFromAPICall(statusCode, body)
+	h.authManager.MarkResult(ctx, coreauth.Result{
+		AuthID:     authID,
+		Provider:   provider,
+		Success:    false,
+		RetryAfter: retryAfter,
+		Error:      resultErr,
+	})
+}
+
+func retryAfterFromAPICall(statusCode int, body []byte) *time.Duration {
+	if statusCode != http.StatusTooManyRequests {
+		return nil
+	}
+	bodyText := strings.TrimSpace(string(body))
+	if bodyText == "" {
+		return nil
+	}
+	lower := strings.ToLower(bodyText)
+	isUsageLimit := strings.TrimSpace(gjson.GetBytes(body, "error.type").String()) == "usage_limit_reached" ||
+		(strings.Contains(lower, "usage limit") && strings.Contains(lower, "reached"))
+	if isUsageLimit {
+		if resetsAt := gjson.GetBytes(body, "error.resets_at").Int(); resetsAt > 0 {
+			resetAt := time.Unix(resetsAt, 0)
+			if resetAt.After(time.Now()) {
+				retryAfter := time.Until(resetAt)
+				return &retryAfter
+			}
+		}
+		if resetsInSeconds := gjson.GetBytes(body, "error.resets_in_seconds").Int(); resetsInSeconds > 0 {
+			retryAfter := time.Duration(resetsInSeconds) * time.Second
+			return &retryAfter
+		}
+	}
+	if seconds, errAtoi := strconv.Atoi(strings.TrimSpace(gjson.GetBytes(body, "retry_after").String())); errAtoi == nil && seconds > 0 {
+		retryAfter := time.Duration(seconds) * time.Second
+		return &retryAfter
+	}
+	return nil
 }
 
 func (h *Handler) refreshGeminiOAuthAccessToken(ctx context.Context, auth *coreauth.Auth) (string, error) {
