@@ -450,8 +450,9 @@ func (h *Handler) probeCodexQuota(ctx context.Context, auth *coreauth.Auth) stru
 		return r
 	}
 
-	// Lightweight probe: POST a minimal request to the codex compact endpoint
-	probeBody := `{"model":"gpt-4o-mini","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"."}]}],"max_output_tokens":1}`
+	// Lightweight probe: POST a minimal request to the codex compact endpoint.
+	// Use gpt-5.4-mini which is widely available across plan types.
+	probeBody := `{"model":"gpt-5.4-mini","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"."}]}]}`
 	req, errReq := http.NewRequestWithContext(ctx, "POST", "https://chatgpt.com/backend-api/codex/responses", strings.NewReader(probeBody))
 	if errReq != nil {
 		r.Error = "request build failed"
