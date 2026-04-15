@@ -436,6 +436,43 @@ func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
 			log.WithError(err).Warnf("failed to stat auth file %s", path)
 		}
 	}
+	// Quota state
+	if auth.Quota.Exceeded || auth.Quota.Reason != "" || !auth.Quota.NextRecoverAt.IsZero() {
+		quotaEntry := gin.H{
+			"exceeded":      auth.Quota.Exceeded,
+			"reason":        auth.Quota.Reason,
+			"backoff_level": auth.Quota.BackoffLevel,
+		}
+		if !auth.Quota.NextRecoverAt.IsZero() {
+			quotaEntry["next_recover_at"] = auth.Quota.NextRecoverAt
+		}
+		entry["quota"] = quotaEntry
+	}
+
+	// Model states summary
+	if len(auth.ModelStates) > 0 {
+		available, cooldown, disabled := 0, 0, 0
+		now := time.Now()
+		for _, state := range auth.ModelStates {
+			if state == nil {
+				continue
+			}
+			switch {
+			case state.Status == coreauth.StatusDisabled:
+				disabled++
+			case state.Unavailable && state.NextRetryAfter.After(now):
+				cooldown++
+			default:
+				available++
+			}
+		}
+		entry["model_states_summary"] = gin.H{
+			"available": available,
+			"cooldown":  cooldown,
+			"disabled":  disabled,
+		}
+	}
+
 	if claims := extractCodexIDTokenClaims(auth); claims != nil {
 		entry["id_token"] = claims
 	}

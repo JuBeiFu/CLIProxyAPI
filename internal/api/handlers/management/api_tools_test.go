@@ -446,3 +446,67 @@ func testCodexJWTForManagement(t *testing.T, planType, accountID string) string 
 	}
 	return encode(headerBytes) + "." + encode(payloadBytes) + "."
 }
+
+func TestBuildAuthFileEntry_ExposesQuota(t *testing.T) {
+	h := &Handler{}
+	now := time.Now()
+	auth := &coreauth.Auth{
+		ID:         "auth-entry",
+		Provider:   "codex",
+		FileName:   "test.json",
+		Label:      "test",
+		Status:     coreauth.StatusActive,
+		Attributes: map[string]string{"path": "/tmp/test.json"},
+		Quota: coreauth.QuotaState{
+			Exceeded:      true,
+			Reason:        "usage_limit",
+			NextRecoverAt: now.Add(2 * time.Hour),
+			BackoffLevel:  3,
+		},
+		ModelStates: map[string]*coreauth.ModelState{
+			"gpt-4":  {Unavailable: false},
+			"o1":     {Unavailable: true, NextRetryAfter: now.Add(1 * time.Hour), Quota: coreauth.QuotaState{Exceeded: true}},
+			"gpt-4o": {Status: coreauth.StatusDisabled},
+		},
+	}
+
+	entry := h.buildAuthFileEntry(auth)
+	if entry == nil {
+		t.Fatal("expected non-nil entry")
+	}
+
+	// Check quota field exists
+	quota, ok := entry["quota"]
+	if !ok {
+		t.Fatal("expected 'quota' field in entry")
+	}
+	quotaMap, ok := quota.(gin.H)
+	if !ok {
+		t.Fatalf("expected quota to be gin.H, got %T", quota)
+	}
+	if quotaMap["exceeded"] != true {
+		t.Error("expected quota.exceeded = true")
+	}
+	if quotaMap["reason"] != "usage_limit" {
+		t.Errorf("expected quota.reason = usage_limit, got %v", quotaMap["reason"])
+	}
+
+	// Check model_states_summary
+	summary, ok := entry["model_states_summary"]
+	if !ok {
+		t.Fatal("expected 'model_states_summary' field")
+	}
+	summaryMap, ok := summary.(gin.H)
+	if !ok {
+		t.Fatalf("expected summary to be gin.H, got %T", summary)
+	}
+	if summaryMap["available"] != 1 {
+		t.Errorf("expected 1 available, got %v", summaryMap["available"])
+	}
+	if summaryMap["cooldown"] != 1 {
+		t.Errorf("expected 1 cooldown, got %v", summaryMap["cooldown"])
+	}
+	if summaryMap["disabled"] != 1 {
+		t.Errorf("expected 1 disabled, got %v", summaryMap["disabled"])
+	}
+}
