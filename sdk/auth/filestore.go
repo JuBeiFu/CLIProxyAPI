@@ -15,6 +15,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/auth/codex"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 )
 
@@ -253,6 +254,51 @@ func (s *FileTokenStore) readAuthFile(path, baseDir string) (*cliproxyauth.Auth,
 	}
 	if email, ok := metadata["email"].(string); ok && email != "" {
 		auth.Attributes["email"] = email
+	}
+	if strings.EqualFold(strings.TrimSpace(provider), "codex") {
+		if idTokenRaw, ok := metadata["id_token"].(string); ok {
+			if claims, errParse := codex.ParseJWTToken(idTokenRaw); errParse == nil && claims != nil {
+				if planType := strings.TrimSpace(claims.CodexAuthInfo.ChatgptPlanType); planType != "" {
+					auth.Attributes["plan_type"] = planType
+				}
+				if accountID := strings.TrimSpace(claims.CodexAuthInfo.ChatgptAccountID); accountID != "" {
+					metadata["account_id"] = accountID
+				}
+			}
+		}
+	}
+	// Parse persisted quota state
+	if quotaRaw, ok := metadata["quota_state"].(map[string]any); ok {
+		exceeded, _ := quotaRaw["exceeded"].(bool)
+		reason, _ := quotaRaw["reason"].(string)
+		backoffLevel := 0
+		if bl, ok := quotaRaw["backoff_level"].(float64); ok {
+			backoffLevel = int(bl)
+		}
+		var nextRecoverAt time.Time
+		if nra, ok := quotaRaw["next_recover_at"].(string); ok && nra != "" {
+			if parsed, errParse := time.Parse(time.RFC3339, nra); errParse == nil {
+				nextRecoverAt = parsed
+			}
+		}
+		var updatedAt time.Time
+		if ua, ok := quotaRaw["updated_at"].(string); ok && ua != "" {
+			if parsed, errParse := time.Parse(time.RFC3339, ua); errParse == nil {
+				updatedAt = parsed
+			}
+		}
+		// Only apply if not yet expired
+		if !nextRecoverAt.IsZero() && nextRecoverAt.After(time.Now()) {
+			auth.Quota = cliproxyauth.QuotaState{
+				Exceeded:      exceeded,
+				Reason:        reason,
+				NextRecoverAt: nextRecoverAt,
+				BackoffLevel:  backoffLevel,
+				UpdatedAt:     updatedAt,
+			}
+			auth.Unavailable = true
+			auth.NextRetryAfter = nextRecoverAt
+		}
 	}
 	cliproxyauth.ApplyCustomHeadersFromMetadata(auth)
 	return auth, nil

@@ -1,6 +1,14 @@
 package auth
 
-import "testing"
+import (
+	"encoding/base64"
+	"encoding/json"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+)
 
 func TestExtractAccessToken(t *testing.T) {
 	t.Parallel()
@@ -76,5 +84,124 @@ func TestExtractAccessToken(t *testing.T) {
 				t.Errorf("extractAccessToken() = %q, want %q", got, tt.expected)
 			}
 		})
+	}
+}
+
+func TestFileTokenStoreList_CodexExtractsPlanTypeFromIDToken(t *testing.T) {
+	t.Parallel()
+
+	baseDir := t.TempDir()
+	store := NewFileTokenStore()
+	store.SetBaseDir(baseDir)
+
+	path := filepath.Join(baseDir, "codex-user@example.com-plus.json")
+	idToken := testCodexJWTForFileStore(t, "plus", "acct_plus_123")
+	raw := []byte(`{"type":"codex","email":"codex-user@example.com","id_token":"` + idToken + `"}`)
+	if err := os.WriteFile(path, raw, 0o600); err != nil {
+		t.Fatalf("write auth file: %v", err)
+	}
+
+	items, err := store.List(t.Context())
+	if err != nil {
+		t.Fatalf("List returned error: %v", err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("List returned %d items, want 1", len(items))
+	}
+	if got := strings.TrimSpace(items[0].Attributes["plan_type"]); got != "plus" {
+		t.Fatalf("attributes.plan_type = %q, want %q", got, "plus")
+	}
+}
+
+func testCodexJWTForFileStore(t *testing.T, planType, accountID string) string {
+	t.Helper()
+
+	headerBytes, err := json.Marshal(map[string]any{"alg": "none", "typ": "JWT"})
+	if err != nil {
+		t.Fatalf("marshal header: %v", err)
+	}
+	payloadBytes, err := json.Marshal(map[string]any{
+		"email": "codex-user@example.com",
+		"https://api.openai.com/auth": map[string]any{
+			"chatgpt_plan_type":  planType,
+			"chatgpt_account_id": accountID,
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal payload: %v", err)
+	}
+	encode := func(raw []byte) string {
+		return strings.TrimRight(base64.URLEncoding.EncodeToString(raw), "=")
+	}
+	return encode(headerBytes) + "." + encode(payloadBytes) + "."
+}
+
+func TestReadAuthFile_ParsesQuotaState(t *testing.T) {
+	dir := t.TempDir()
+	store := NewFileTokenStore()
+	store.SetBaseDir(dir)
+
+	futureTime := time.Now().Add(2 * time.Hour).UTC().Truncate(time.Second)
+	authData := map[string]any{
+		"type":  "codex",
+		"token": "test-token",
+		"quota_state": map[string]any{
+			"exceeded":        true,
+			"reason":          "usage_limit",
+			"next_recover_at": futureTime.Format(time.RFC3339),
+			"backoff_level":   float64(3),
+		},
+	}
+	raw, _ := json.Marshal(authData)
+	path := filepath.Join(dir, "test-auth.json")
+	os.WriteFile(path, raw, 0o600)
+
+	auth, err := store.readAuthFile(path, dir)
+	if err != nil {
+		t.Fatalf("readAuthFile error: %v", err)
+	}
+	if !auth.Quota.Exceeded {
+		t.Error("expected Quota.Exceeded = true")
+	}
+	if auth.Quota.Reason != "usage_limit" {
+		t.Errorf("expected reason=usage_limit, got %q", auth.Quota.Reason)
+	}
+	if auth.Quota.BackoffLevel != 3 {
+		t.Errorf("expected backoff_level=3, got %d", auth.Quota.BackoffLevel)
+	}
+	if auth.Quota.NextRecoverAt.IsZero() {
+		t.Error("expected NextRecoverAt to be set")
+	}
+	if !auth.Unavailable {
+		t.Error("expected auth.Unavailable = true")
+	}
+}
+
+func TestReadAuthFile_IgnoresExpiredQuotaState(t *testing.T) {
+	dir := t.TempDir()
+	store := NewFileTokenStore()
+	store.SetBaseDir(dir)
+
+	pastTime := time.Now().Add(-1 * time.Hour).UTC().Truncate(time.Second)
+	authData := map[string]any{
+		"type":  "codex",
+		"token": "test-token",
+		"quota_state": map[string]any{
+			"exceeded":        true,
+			"reason":          "usage_limit",
+			"next_recover_at": pastTime.Format(time.RFC3339),
+			"backoff_level":   float64(2),
+		},
+	}
+	raw, _ := json.Marshal(authData)
+	path := filepath.Join(dir, "test-expired.json")
+	os.WriteFile(path, raw, 0o600)
+
+	auth, err := store.readAuthFile(path, dir)
+	if err != nil {
+		t.Fatalf("readAuthFile error: %v", err)
+	}
+	if auth.Quota.Exceeded {
+		t.Error("expected Quota.Exceeded = false for expired quota")
 	}
 }
