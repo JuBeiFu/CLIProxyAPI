@@ -184,29 +184,37 @@ func ApplyPlanTypeRefreshDecision(auth *Auth, jwtPlan, realPlan string, probeSuc
 
 	switch {
 	case isPaidPlan(submitted) && isFreePlan(realNorm):
-		// Downgrade suspected. Only take ownership of Disabled if not already
-		// disabled for a different reason.
+		// Downgrade suspected. Ownership of this disable is tracked by the
+		// downgrade_detected_at metadata (persisted to disk, survives reloads).
+		// StatusMessage is set for operator visibility but is a best-effort
+		// signal — it is NOT the authoritative owner flag (filestore does not
+		// persist it, so it would reset to empty on every file reload).
+		_, ownedByUs := downgradeDetectedAt(auth)
 		if !auth.Disabled {
 			auth.Disabled = true
 			auth.Status = StatusDisabled
 			auth.StatusMessage = fmt.Sprintf("%ssubmitted=%s upstream=%s",
 				downgradeDetectedPrefix, submitted, realNorm)
 			setDowngradeDetectedAt(auth, now.UTC())
-		} else if strings.HasPrefix(auth.StatusMessage, downgradeDetectedPrefix) {
-			// We already own this disable — preserve original timestamp if set.
-			if _, ok := downgradeDetectedAt(auth); !ok {
-				setDowngradeDetectedAt(auth, now.UTC())
-			}
+		} else if ownedByUs {
+			// We already own this disable — preserve original timestamp.
+			// Refresh the StatusMessage for UI/log clarity (safe because we
+			// verified ownership via the persisted timestamp).
+			auth.StatusMessage = fmt.Sprintf("%ssubmitted=%s upstream=%s",
+				downgradeDetectedPrefix, submitted, realNorm)
 		}
-		// If disabled by another reason (e.g. 401), leave Disabled/StatusMessage/
-		// timestamp alone.
+		// If disabled for another reason (no downgrade timestamp), leave the
+		// foreign disable alone.
 
 	case isPaidPlan(submitted) && isPaidPlan(realNorm):
-		// Confirmed paid. Re-enable only if we disabled it ourselves.
-		if auth.Disabled && strings.HasPrefix(auth.StatusMessage, downgradeDetectedPrefix) {
-			auth.Disabled = false
-			auth.Status = StatusActive
-			auth.StatusMessage = ""
+		// Confirmed paid. Re-enable only if WE disabled it (have a downgrade
+		// timestamp — the authoritative, persisted ownership marker).
+		if auth.Disabled {
+			if _, ownedByUs := downgradeDetectedAt(auth); ownedByUs {
+				auth.Disabled = false
+				auth.Status = StatusActive
+				auth.StatusMessage = ""
+			}
 		}
 		clearDowngradeDetectedAt(auth)
 	}

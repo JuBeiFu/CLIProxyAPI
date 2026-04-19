@@ -224,6 +224,36 @@ func TestApplyPlanTypeRefreshDecision_TimestampResetsOnFlip(t *testing.T) {
 	}
 }
 
+// Regression: StatusMessage is not persisted to codex auth JSON files on disk,
+// so after a container restart (or file-reload event) the in-memory auth has
+// Disabled=true but StatusMessage="". The re-enable contract must rely on the
+// persisted cliproxy_codex_downgrade_detected_at timestamp, NOT on a
+// StatusMessage prefix that may have been wiped by reload.
+func TestApplyPlanTypeRefreshDecision_ReEnableWorksAfterStatusMessageLost(t *testing.T) {
+	t.Parallel()
+	a := newTestAuthMeta()
+	setSubmittedPlanType(a, "plus")
+	// Simulate post-reload state: disabled, timestamp preserved (we own it),
+	// but StatusMessage wiped by the filestore round-trip.
+	a.Disabled = true
+	a.Status = StatusDisabled
+	a.StatusMessage = "" // <- key: reload lost it
+	setDowngradeDetectedAt(a, time.Date(2026, 4, 19, 8, 0, 0, 0, time.UTC))
+
+	// Probe comes back paid.
+	ApplyPlanTypeRefreshDecision(a, "plus", "plus", true, time.Date(2026, 4, 19, 10, 0, 0, 0, time.UTC))
+
+	if a.Disabled {
+		t.Fatalf("expected re-enable via downgrade_detected_at ownership; still disabled")
+	}
+	if a.Status != StatusActive {
+		t.Fatalf("Status = %v, want Active", a.Status)
+	}
+	if _, ok := downgradeDetectedAt(a); ok {
+		t.Fatalf("timestamp should be cleared on re-enable")
+	}
+}
+
 func TestDowngradeDetectedPrefix_IsStable(t *testing.T) {
 	t.Parallel()
 	// Guard against accidental rename — re-enable logic depends on this exact prefix.
