@@ -1,0 +1,186 @@
+package auth
+
+import (
+	"context"
+	"net/http"
+	"sync"
+	"testing"
+	"time"
+
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
+)
+
+// forcedRefreshTestExecutor records which auth IDs had Refresh called and
+// optionally simulates what /wham/usage probe would have returned for each
+// by invoking ApplyPlanTypeRefreshDecision with the configured value.
+type forcedRefreshTestExecutor struct {
+	id           string
+	mu           sync.Mutex
+	refreshedIDs []string
+	// probeResults maps auth ID → simulated probed plan_type. Empty value means
+	// "probe failed, don't apply decision".
+	probeResults map[string]string
+}
+
+func (e *forcedRefreshTestExecutor) Identifier() string { return e.id }
+func (e *forcedRefreshTestExecutor) Execute(ctx context.Context, a *Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	return cliproxyexecutor.Response{}, nil
+}
+func (e *forcedRefreshTestExecutor) ExecuteStream(ctx context.Context, a *Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
+	return nil, nil
+}
+func (e *forcedRefreshTestExecutor) CountTokens(ctx context.Context, a *Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	return cliproxyexecutor.Response{}, nil
+}
+func (e *forcedRefreshTestExecutor) HttpRequest(ctx context.Context, a *Auth, r *http.Request) (*http.Response, error) {
+	return nil, nil
+}
+func (e *forcedRefreshTestExecutor) Refresh(ctx context.Context, auth *Auth) (*Auth, error) {
+	e.mu.Lock()
+	e.refreshedIDs = append(e.refreshedIDs, auth.ID)
+	probed, ok := e.probeResults[auth.ID]
+	e.mu.Unlock()
+	if ok && probed != "" {
+		ApplyPlanTypeRefreshDecision(auth, submittedPlanType(auth), probed, true, time.Now())
+	}
+	return auth, nil
+}
+func (e *forcedRefreshTestExecutor) refreshed() []string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return append([]string(nil), e.refreshedIDs...)
+}
+
+// Only scope-matching auths get refreshed.
+func TestRunForcedRefreshOnce_RefreshesScopeAuthsOnly(t *testing.T) {
+	t.Parallel()
+	m := NewManager(nil, nil, nil)
+	exec := &forcedRefreshTestExecutor{id: "codex", probeResults: map[string]string{}}
+	m.RegisterExecutor(exec)
+
+	m.auths = map[string]*Auth{
+		"A_paid_unprobed":  mustAuthKeyed("A_paid_unprobed", "codex", "plus", "", false),
+		"B_paid_free":      mustAuthKeyed("B_paid_free", "codex", "plus", "free", false),
+		"C_paid_confirmed": mustAuthKeyed("C_paid_confirmed", "codex", "plus", "plus", false),
+		"D_free_submitted": mustAuthKeyed("D_free_submitted", "codex", "free", "", false),
+	}
+
+	m.runForcedRefreshOnce(context.Background(), DefaultDowngradeDeletionGrace)
+
+	got := exec.refreshed()
+	want := map[string]bool{"A_paid_unprobed": true, "B_paid_free": true}
+	if len(got) != len(want) {
+		t.Fatalf("refreshed %v, want keys %v", got, want)
+	}
+	for _, id := range got {
+		if !want[id] {
+			t.Errorf("unexpected refresh of %s", id)
+		}
+	}
+}
+
+// Disabled auths in scope ARE refreshed — that's the re-enable path.
+func TestRunForcedRefreshOnce_IncludesDisabled(t *testing.T) {
+	t.Parallel()
+	m := NewManager(nil, nil, nil)
+	exec := &forcedRefreshTestExecutor{id: "codex", probeResults: map[string]string{}}
+	m.RegisterExecutor(exec)
+
+	m.auths = map[string]*Auth{
+		"disabled_paid_free": mustAuthKeyed("disabled_paid_free", "codex", "plus", "free", true),
+	}
+	// Simulate that ApplyPlanTypeRefreshDecision had set disable + timestamp
+	// earlier — but NOT yet past grace window.
+	m.auths["disabled_paid_free"].StatusMessage = downgradeDetectedPrefix + "submitted=plus upstream=free"
+	setDowngradeDetectedAt(m.auths["disabled_paid_free"], time.Now().Add(-30*time.Minute))
+
+	m.runForcedRefreshOnce(context.Background(), DefaultDowngradeDeletionGrace)
+
+	got := exec.refreshed()
+	if len(got) != 1 || got[0] != "disabled_paid_free" {
+		t.Fatalf("expected disabled auth refreshed, got %v", got)
+	}
+	// Still present (not deleted, since grace not yet elapsed)
+	if _, present := m.auths["disabled_paid_free"]; !present {
+		t.Fatalf("auth should still be in manager (within grace)")
+	}
+}
+
+// Past the 2h grace window, still free → auth is deleted from the manager.
+func TestRunForcedRefreshOnce_DeletesAfterGrace(t *testing.T) {
+	t.Parallel()
+	m := NewManager(nil, nil, nil)
+	exec := &forcedRefreshTestExecutor{id: "codex", probeResults: map[string]string{}}
+	m.RegisterExecutor(exec)
+
+	grace := 2 * time.Hour
+	a := mustAuthKeyed("stale_downgrade", "codex", "plus", "free", true)
+	a.StatusMessage = downgradeDetectedPrefix + "submitted=plus upstream=free"
+	setDowngradeDetectedAt(a, time.Now().Add(-3*time.Hour)) // 3h ago > 2h grace
+	m.auths = map[string]*Auth{"stale_downgrade": a}
+
+	m.runForcedRefreshOnce(context.Background(), grace)
+
+	if _, present := m.auths["stale_downgrade"]; present {
+		t.Fatalf("auth must have been deleted (3h > 2h grace)")
+	}
+	// Because deletion short-circuits the refresh path, Refresh should NOT
+	// have been called for this auth.
+	if len(exec.refreshed()) != 0 {
+		t.Fatalf("should not refresh after deletion, got %v", exec.refreshed())
+	}
+}
+
+// Before grace elapses, auth is kept and refreshed normally.
+func TestRunForcedRefreshOnce_KeepsBeforeGrace(t *testing.T) {
+	t.Parallel()
+	m := NewManager(nil, nil, nil)
+	exec := &forcedRefreshTestExecutor{id: "codex", probeResults: map[string]string{}}
+	m.RegisterExecutor(exec)
+
+	grace := 2 * time.Hour
+	a := mustAuthKeyed("recent_downgrade", "codex", "plus", "free", true)
+	a.StatusMessage = downgradeDetectedPrefix + "submitted=plus upstream=free"
+	setDowngradeDetectedAt(a, time.Now().Add(-30*time.Minute))
+	m.auths = map[string]*Auth{"recent_downgrade": a}
+
+	m.runForcedRefreshOnce(context.Background(), grace)
+
+	if _, present := m.auths["recent_downgrade"]; !present {
+		t.Fatalf("auth should be kept within grace")
+	}
+}
+
+// A paid-confirmed auth (in scope? no!) shouldn't be refreshed by forced loop.
+func TestRunForcedRefreshOnce_DoesNotTouchConfirmedPaid(t *testing.T) {
+	t.Parallel()
+	m := NewManager(nil, nil, nil)
+	exec := &forcedRefreshTestExecutor{id: "codex", probeResults: map[string]string{}}
+	m.RegisterExecutor(exec)
+
+	m.auths = map[string]*Auth{
+		"confirmed_paid": mustAuthKeyed("confirmed_paid", "codex", "plus", "plus", false),
+	}
+
+	m.runForcedRefreshOnce(context.Background(), DefaultDowngradeDeletionGrace)
+
+	if len(exec.refreshed()) != 0 {
+		t.Fatalf("confirmed paid must not be touched, got %v", exec.refreshed())
+	}
+}
+
+func mustAuthKeyed(id, provider, submitted, probed string, disabled bool) *Auth {
+	a := &Auth{
+		ID:       id,
+		Provider: provider,
+		Metadata: map[string]any{},
+		Disabled: disabled,
+	}
+	if submitted != "" {
+		setSubmittedPlanType(a, submitted)
+	}
+	if probed != "" {
+		setProbedPlanType(a, probed)
+	}
+	return a
+}

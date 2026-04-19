@@ -188,8 +188,9 @@ type Manager struct {
 	rtProvider RoundTripperProvider
 
 	// Auto refresh state
-	refreshCancel    context.CancelFunc
-	refreshSemaphore chan struct{}
+	refreshCancel       context.CancelFunc
+	refreshSemaphore    chan struct{}
+	forcedRefreshCancel context.CancelFunc
 
 	quotaFlusher *quotaFlusher
 }
@@ -1148,6 +1149,15 @@ func (m *Manager) Register(ctx context.Context, auth *Auth) (*Auth, error) {
 	}
 	_ = m.persist(ctx, auth)
 	m.hook.OnAuthRegistered(ctx, auth.Clone())
+	// Codex auths get a fire-and-forget immediate refresh so the real plan_type
+	// (via /wham/usage) is known within seconds of import, not 5 minutes later.
+	// Only codex needs this — other providers don't have the JWT/usage mismatch
+	// problem this solves.
+	if strings.EqualFold(strings.TrimSpace(auth.Provider), "codex") {
+		if m.executorFor(auth.Provider) != nil {
+			go m.refreshAuth(context.Background(), authClone.ID)
+		}
+	}
 	return auth.Clone(), nil
 }
 

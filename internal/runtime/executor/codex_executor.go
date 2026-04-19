@@ -660,8 +660,29 @@ func (e *CodexExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*
 	// Use unified key in files
 	auth.Metadata["expired"] = td.Expire
 	auth.Metadata["type"] = "codex"
-	now := time.Now().Format(time.RFC3339)
-	auth.Metadata["last_refresh"] = now
+	now := time.Now()
+	auth.Metadata["last_refresh"] = now.Format(time.RFC3339)
+
+	// Resolve the authoritative plan_type by probing /wham/usage with the
+	// freshly-refreshed access token. The JWT's chatgpt_plan_type is a cached
+	// snapshot (can lag by hours); /wham/usage is live. On probe failure we
+	// leave existing plan_type untouched — ApplyPlanTypeRefreshDecision won't
+	// mutate Disabled or Attributes without an authoritative reading.
+	jwtPlan := ""
+	if claims, jwtErr := codexauth.ParseJWTToken(td.IDToken); jwtErr == nil {
+		jwtPlan = strings.ToLower(strings.TrimSpace(claims.CodexAuthInfo.ChatgptPlanType))
+	} else {
+		log.Warnf("codex executor: parse id_token JWT for auth %s failed: %v", auth.ID, jwtErr)
+	}
+	realPlan, probeErr := svc.FetchWhamUsagePlanType(ctx, td.AccessToken)
+	probeOK := probeErr == nil && strings.TrimSpace(realPlan) != ""
+	if probeErr != nil {
+		log.Warnf("codex executor: /wham/usage probe for auth %s failed: %v", auth.ID, probeErr)
+	}
+	cliproxyauth.ApplyPlanTypeRefreshDecision(auth, jwtPlan, realPlan, probeOK, now)
+	if auth.Disabled && strings.HasPrefix(auth.StatusMessage, "codex_downgrade_detected: ") {
+		log.Warnf("codex executor: auth %s disabled by downgrade detection: %s", auth.ID, auth.StatusMessage)
+	}
 	return auth, nil
 }
 

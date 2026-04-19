@@ -691,6 +691,15 @@ func (s *Service) Run(ctx context.Context) error {
 		interval := 15 * time.Minute
 		s.coreManager.StartAutoRefresh(context.Background(), interval)
 		log.Infof("core auth auto-refresh started (interval=%s)", interval)
+
+		// Short-cycle forced refresh targets paid-submitted-but-currently-free
+		// codex auths: it probes /wham/usage every 5 minutes (bypassing the
+		// Disabled skip) so downgrade state flips are caught fast and stale
+		// downgrades are deleted after the 2h grace window.
+		forcedInterval := coreauth.DefaultForcedRefreshInterval
+		forcedGrace := coreauth.DefaultDowngradeDeletionGrace
+		s.coreManager.StartAutoForcedRefresh(context.Background(), forcedInterval, forcedGrace)
+		log.Infof("core auth forced refresh started (interval=%s, downgrade-grace=%s, scope=codex submitted-paid+probed-free)", forcedInterval, forcedGrace)
 	}
 
 	select {
@@ -728,6 +737,7 @@ func (s *Service) Shutdown(ctx context.Context) error {
 		}
 		if s.coreManager != nil {
 			s.coreManager.StopAutoRefresh()
+			s.coreManager.StopAutoForcedRefresh()
 		}
 		if s.watcher != nil {
 			if err := s.watcher.Stop(); err != nil {
