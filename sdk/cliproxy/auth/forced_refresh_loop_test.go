@@ -59,16 +59,25 @@ func TestRunForcedRefreshOnce_RefreshesScopeAuthsOnly(t *testing.T) {
 	m.RegisterExecutor(exec)
 
 	m.auths = map[string]*Auth{
-		"A_paid_unprobed":  mustAuthKeyed("A_paid_unprobed", "codex", "plus", "", false),
-		"B_paid_free":      mustAuthKeyed("B_paid_free", "codex", "plus", "free", false),
-		"C_paid_confirmed": mustAuthKeyed("C_paid_confirmed", "codex", "plus", "plus", false),
-		"D_free_submitted": mustAuthKeyed("D_free_submitted", "codex", "free", "", false),
+		"A_paid_unprobed":    mustAuthKeyed("A_paid_unprobed", "codex", "plus", "", false),
+		"B_paid_free":        mustAuthKeyed("B_paid_free", "codex", "plus", "free", false),
+		"C_paid_confirmed":   mustAuthKeyed("C_paid_confirmed", "codex", "plus", "plus", false),
+		"D_free_unprobed":    mustAuthKeyed("D_free_unprobed", "codex", "free", "", false),
+		"E_free_probed_free": mustAuthKeyed("E_free_probed_free", "codex", "free", "free", false),
 	}
 
 	m.runForcedRefreshOnce(context.Background(), DefaultDowngradeDeletionGrace)
 
 	got := exec.refreshed()
-	want := map[string]bool{"A_paid_unprobed": true, "B_paid_free": true}
+	// Rule 1: never-probed auths are always in scope (including D, which was
+	// submitted=free — the first probe is still needed to classify).
+	// Rule 2: already-probed paid+free (B) stays in scope.
+	// Confirmed-paid C and settled free+free E stay OUT.
+	want := map[string]bool{
+		"A_paid_unprobed": true,
+		"B_paid_free":     true,
+		"D_free_unprobed": true,
+	}
 	if len(got) != len(want) {
 		t.Fatalf("refreshed %v, want keys %v", got, want)
 	}

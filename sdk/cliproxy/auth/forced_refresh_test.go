@@ -43,17 +43,28 @@ func TestShouldForceRefresh_Scope(t *testing.T) {
 			expect: false,
 		},
 		{
-			name:   "free_submitted_never_in",
+			// Never-probed: include regardless of submitted so every auth
+			// gets its first-ever /wham/usage classification.
+			name:   "free_submitted_never_probed_IN_for_first_probe",
 			auth:   mustAuth("codex", "free", "", false),
-			expect: false,
+			expect: true,
 		},
 		{
-			name:   "free_submitted_probed_free_never_in",
+			// No submitted pin either — still probe once to classify.
+			name:   "empty_submitted_never_probed_IN_for_first_probe",
+			auth:   mustAuth("codex", "", "", false),
+			expect: true,
+		},
+		{
+			// Probed confirmed free AND submitted was free → settled, exit scope.
+			name:   "free_submitted_probed_free_out",
 			auth:   mustAuth("codex", "free", "free", false),
 			expect: false,
 		},
 		{
-			name:   "empty_submitted_out",
+			// Probed free but submitted pin missing → settled (no paid contract
+			// to watch for). Exit scope.
+			name:   "empty_submitted_probed_free_out",
 			auth:   mustAuth("codex", "", "free", false),
 			expect: false,
 		},

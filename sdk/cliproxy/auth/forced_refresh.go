@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	log "github.com/sirupsen/logrus"
@@ -22,9 +23,17 @@ const DefaultForcedRefreshInterval = 5 * time.Minute
 const DefaultDowngradeDeletionGrace = 2 * time.Hour
 
 // shouldForceRefresh returns true iff the auth is within the short-cycle
-// scope: codex provider, submitted plan_type is paid, AND probed plan_type is
-// either unknown or free. Disabled is irrelevant — disabled auths MUST be
-// refreshed so they can be re-enabled on activation.
+// scope. Disabled is irrelevant — disabled auths MUST be refreshed so they
+// can be re-enabled on activation. Rules:
+//
+//  1. Never-probed codex auths (probed == "") are always in scope, regardless
+//     of submitted, so every codex auth gets probed at least once shortly
+//     after import/startup. After that first probe the decision fn backfills
+//     the submitted pin and writes probed, so the auth naturally exits (or
+//     stays in) scope on the next check.
+//  2. Already-probed codex auths stay in scope only when submitted is paid
+//     AND probed is free — the re-activation-watching state.
+//  3. Non-codex providers are never in scope.
 func shouldForceRefresh(auth *Auth) bool {
 	if auth == nil {
 		return false
@@ -32,12 +41,12 @@ func shouldForceRefresh(auth *Auth) bool {
 	if !strings.EqualFold(strings.TrimSpace(auth.Provider), "codex") {
 		return false
 	}
-	submitted := submittedPlanType(auth)
-	if !isPaidPlan(submitted) {
-		return false
-	}
 	probed := probedPlanType(auth)
-	return probed == "" || isFreePlan(probed)
+	if probed == "" {
+		return true
+	}
+	submitted := submittedPlanType(auth)
+	return isPaidPlan(submitted) && isFreePlan(probed)
 }
 
 // shouldDeleteDowngradedAuth decides whether a forced-refresh pass should
@@ -135,9 +144,10 @@ func (m *Manager) runForcedRefreshOnce(ctx context.Context, grace time.Duration)
 	}
 	snapshot := m.snapshotAuths()
 	now := time.Now()
+	var wg sync.WaitGroup
 	for _, a := range snapshot {
 		if ctx.Err() != nil {
-			return
+			break
 		}
 		if !shouldForceRefresh(a) {
 			continue
@@ -155,8 +165,20 @@ func (m *Manager) runForcedRefreshOnce(ctx context.Context, grace time.Duration)
 		if !m.reserveForcedRefreshSlot(a.ID, now) {
 			continue
 		}
-		m.refreshAuth(ctx, a.ID)
+		// Parallel via refreshSemaphore — same cap as the regular refresh
+		// loop. A 194-auth initial pass drops from ~8 min (sequential) to
+		// ~25s at concurrency 16 (two HTTP RTTs per refresh). We wait for
+		// all spawned refreshes before returning so (a) tests can observe
+		// results deterministically, and (b) the next 5m tick never piles
+		// up on top of a still-running pass.
+		id := a.ID
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			m.refreshAuthWithLimit(ctx, id)
+		}()
 	}
+	wg.Wait()
 }
 
 // reserveForcedRefreshSlot is the forced-loop equivalent of markRefreshPending,
