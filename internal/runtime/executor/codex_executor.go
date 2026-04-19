@@ -669,12 +669,23 @@ func (e *CodexExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*
 	// leave existing plan_type untouched — ApplyPlanTypeRefreshDecision won't
 	// mutate Disabled or Attributes without an authoritative reading.
 	jwtPlan := ""
+	accountID := ""
 	if claims, jwtErr := codexauth.ParseJWTToken(td.IDToken); jwtErr == nil {
 		jwtPlan = strings.ToLower(strings.TrimSpace(claims.CodexAuthInfo.ChatgptPlanType))
+		accountID = strings.TrimSpace(claims.CodexAuthInfo.ChatgptAccountID)
 	} else {
 		log.Warnf("codex executor: parse id_token JWT for auth %s failed: %v", auth.ID, jwtErr)
 	}
-	realPlan, probeErr := svc.FetchWhamUsagePlanType(ctx, td.AccessToken)
+	// The Chatgpt-Account-Id header is required: without it OpenAI returns
+	// a user-level aggregate that defaults to "plus" whenever the user owns
+	// any paid subscription, completely masking per-account downgrades. Fall
+	// back to Metadata["account_id"] if JWT parse failed.
+	if accountID == "" {
+		if v, ok := auth.Metadata["account_id"].(string); ok {
+			accountID = strings.TrimSpace(v)
+		}
+	}
+	realPlan, probeErr := svc.FetchWhamUsagePlanType(ctx, td.AccessToken, accountID)
 	probeOK := probeErr == nil && strings.TrimSpace(realPlan) != ""
 	if probeErr != nil {
 		log.Warnf("codex executor: /wham/usage probe for auth %s failed: %v", auth.ID, probeErr)

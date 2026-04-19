@@ -29,12 +29,63 @@ func TestFetchWhamUsagePlanType_Plus(t *testing.T) {
 			}),
 		},
 	}
-	got, err := auth.FetchWhamUsagePlanType(context.Background(), "test-access-token")
+	got, err := auth.FetchWhamUsagePlanType(context.Background(), "test-access-token", "acct-abc")
 	if err != nil {
 		t.Fatalf("unexpected err: %v", err)
 	}
 	if got != "plus" {
 		t.Fatalf("plan_type = %q, want plus", got)
+	}
+}
+
+// Without Chatgpt-Account-Id, OpenAI returns user-level aggregate that
+// masks per-account downgrades. Our probe MUST include the header when
+// account_id is known, otherwise free accounts look plus.
+func TestFetchWhamUsagePlanType_SendsChatgptAccountIDHeader(t *testing.T) {
+	t.Parallel()
+	var sawHeader string
+	auth := &CodexAuth{
+		httpClient: &http.Client{
+			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				sawHeader = req.Header.Get("Chatgpt-Account-Id")
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Body:       io.NopCloser(strings.NewReader(`{"plan_type":"free"}`)),
+					Header:     make(http.Header),
+					Request:    req,
+				}, nil
+			}),
+		},
+	}
+	_, _ = auth.FetchWhamUsagePlanType(context.Background(), "tok", "19b85ed9-2043-4a9b-aa8d-49eccf8d9131")
+	if sawHeader != "19b85ed9-2043-4a9b-aa8d-49eccf8d9131" {
+		t.Fatalf("Chatgpt-Account-Id header = %q, want the id we passed", sawHeader)
+	}
+}
+
+// When account_id is empty, we omit the header (fallback for very early
+// refresh attempts where JWT hasn't been parsed yet).
+func TestFetchWhamUsagePlanType_OmitsHeaderWhenAccountIDEmpty(t *testing.T) {
+	t.Parallel()
+	var hasHeader bool
+	auth := &CodexAuth{
+		httpClient: &http.Client{
+			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				if _, ok := req.Header["Chatgpt-Account-Id"]; ok {
+					hasHeader = true
+				}
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Body:       io.NopCloser(strings.NewReader(`{"plan_type":"plus"}`)),
+					Header:     make(http.Header),
+					Request:    req,
+				}, nil
+			}),
+		},
+	}
+	_, _ = auth.FetchWhamUsagePlanType(context.Background(), "tok", "")
+	if hasHeader {
+		t.Fatalf("Chatgpt-Account-Id header should be absent when accountID empty")
 	}
 }
 
@@ -53,7 +104,7 @@ func TestFetchWhamUsagePlanType_Free(t *testing.T) {
 			}),
 		},
 	}
-	got, err := auth.FetchWhamUsagePlanType(context.Background(), "tok")
+	got, err := auth.FetchWhamUsagePlanType(context.Background(), "tok", "")
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -76,7 +127,7 @@ func TestFetchWhamUsagePlanType_HTTPError(t *testing.T) {
 			}),
 		},
 	}
-	got, err := auth.FetchWhamUsagePlanType(context.Background(), "tok")
+	got, err := auth.FetchWhamUsagePlanType(context.Background(), "tok", "")
 	if err == nil {
 		t.Fatalf("expected error for 401")
 	}
@@ -102,7 +153,7 @@ func TestFetchWhamUsagePlanType_MalformedJSON(t *testing.T) {
 			}),
 		},
 	}
-	got, err := auth.FetchWhamUsagePlanType(context.Background(), "tok")
+	got, err := auth.FetchWhamUsagePlanType(context.Background(), "tok", "")
 	// Malformed JSON: either returns empty string with no error (gjson treats as empty),
 	// or returns an error. Either is acceptable — but got MUST be empty.
 	if got != "" {
@@ -113,7 +164,7 @@ func TestFetchWhamUsagePlanType_MalformedJSON(t *testing.T) {
 func TestFetchWhamUsagePlanType_EmptyToken(t *testing.T) {
 	t.Parallel()
 	auth := &CodexAuth{httpClient: &http.Client{}}
-	_, err := auth.FetchWhamUsagePlanType(context.Background(), "")
+	_, err := auth.FetchWhamUsagePlanType(context.Background(), "", "")
 	if err == nil {
 		t.Fatalf("expected error for empty access token")
 	}
@@ -128,7 +179,7 @@ func TestFetchWhamUsagePlanType_NetworkError(t *testing.T) {
 			}),
 		},
 	}
-	got, err := auth.FetchWhamUsagePlanType(context.Background(), "tok")
+	got, err := auth.FetchWhamUsagePlanType(context.Background(), "tok", "")
 	if err == nil {
 		t.Fatalf("expected error for network failure")
 	}

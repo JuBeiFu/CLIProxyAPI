@@ -19,11 +19,14 @@ import (
 const codexUsageURL = "https://chatgpt.com/backend-api/wham/usage"
 
 // FetchWhamUsagePlanType calls /wham/usage with the given access_token and
-// returns the live plan_type (e.g. "plus", "free", …). Empty string + nil
-// error means the endpoint succeeded but did not include a plan_type; callers
-// should treat that like a fetch failure and not overwrite any stored
-// plan_type.
-func (o *CodexAuth) FetchWhamUsagePlanType(ctx context.Context, accessToken string) (string, error) {
+// returns the live plan_type (e.g. "plus", "free", …). The chatgptAccountID
+// is REQUIRED for the response to reflect the specific account's billing
+// state — without the Chatgpt-Account-Id header OpenAI returns a user-level
+// aggregate that defaults to "plus" when the user owns any paid subscription
+// anywhere, masking per-account downgrades completely. Empty string + nil
+// error means the endpoint succeeded but did not include a plan_type;
+// callers should treat that like a fetch failure.
+func (o *CodexAuth) FetchWhamUsagePlanType(ctx context.Context, accessToken, chatgptAccountID string) (string, error) {
 	accessToken = strings.TrimSpace(accessToken)
 	if accessToken == "" {
 		return "", errors.New("codex: FetchWhamUsagePlanType: empty access token")
@@ -35,7 +38,10 @@ func (o *CodexAuth) FetchWhamUsagePlanType(ctx context.Context, accessToken stri
 	}
 	req.Header.Set("Authorization", "Bearer "+accessToken)
 	req.Header.Set("Accept", "application/json")
-	req.Header.Set("User-Agent", "codex_cli_rs/0.48.0 (macOS 15.2; arm64) (libc unknown)")
+	req.Header.Set("User-Agent", "codex_cli_rs/0.76.0 (Debian 13.0.0; x86_64) WindowsTerminal")
+	if accountID := strings.TrimSpace(chatgptAccountID); accountID != "" {
+		req.Header.Set("Chatgpt-Account-Id", accountID)
+	}
 
 	resp, err := o.httpClient.Do(req)
 	if err != nil {
