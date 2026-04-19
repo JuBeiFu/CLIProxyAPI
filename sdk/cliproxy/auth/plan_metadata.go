@@ -14,19 +14,26 @@ import (
 const downgradeDetectedPrefix = "codex_downgrade_detected: "
 
 const (
-	// metadataSubmittedPlanTypeKey pins the plan_type observed at first
+	// MetadataSubmittedPlanTypeKey pins the plan_type observed at first
 	// successful refresh, used to distinguish "this account was submitted as
 	// a paid plan" from the live probed state. Never overwritten once set.
-	metadataSubmittedPlanTypeKey = "cliproxy_submitted_plan_type"
+	MetadataSubmittedPlanTypeKey = "cliproxy_submitted_plan_type"
 
-	// metadataProbedPlanTypeKey stores the most recent plan_type returned by
-	// the /wham/usage probe. Overwritten on each probe.
-	metadataProbedPlanTypeKey = "cliproxy_codex_probed_plan_type"
+	// MetadataProbedPlanTypeKey stores the most recent plan_type returned by
+	// the /wham/usage probe. Overwritten on each probe. Exported so auth-file
+	// hydrate paths (filestore, watcher synthesizer, management handler) can
+	// prefer this value over the stale JWT chatgpt_plan_type claim when
+	// rebuilding Auth.Attributes["plan_type"] from persisted metadata.
+	MetadataProbedPlanTypeKey = "cliproxy_codex_probed_plan_type"
 
 	// metadataDowngradeDetectedAtKey records when we first disabled an auth
 	// because submitted==paid but probed==free. Cleared on re-enable. Used
 	// to enforce the 2h grace window before permanent deletion.
 	metadataDowngradeDetectedAtKey = "cliproxy_codex_downgrade_detected_at"
+
+	// Unexported aliases to preserve existing internal references.
+	metadataSubmittedPlanTypeKey = MetadataSubmittedPlanTypeKey
+	metadataProbedPlanTypeKey    = MetadataProbedPlanTypeKey
 )
 
 func isPaidPlan(planType string) bool {

@@ -165,14 +165,25 @@ func synthesizeFileAuths(ctx *SynthesisContext, fullPath string, data []byte) []
 	}
 	coreauth.ApplyCustomHeadersFromMetadata(a)
 	ApplyAuthExcludedModelsMeta(a, cfg, perAccountExcluded, "oauth")
-	// For codex auth files, extract plan_type from the JWT id_token.
+	// For codex auth files, resolve plan_type with priority:
+	//   probed (cliproxy_codex_probed_plan_type, live /wham/usage truth) >
+	//   JWT claim (stale snapshot).
+	// Without this guard, file reload would clobber probed=free back to
+	// JWT-claim=plus and defeat downgrade detection.
 	if provider == "codex" {
-		if idTokenRaw, ok := metadata["id_token"].(string); ok && strings.TrimSpace(idTokenRaw) != "" {
-			if claims, errParse := codex.ParseJWTToken(idTokenRaw); errParse == nil && claims != nil {
-				if pt := strings.TrimSpace(claims.CodexAuthInfo.ChatgptPlanType); pt != "" {
-					a.Attributes["plan_type"] = pt
+		planType := ""
+		if probed, ok := metadata[coreauth.MetadataProbedPlanTypeKey].(string); ok {
+			planType = strings.TrimSpace(probed)
+		}
+		if planType == "" {
+			if idTokenRaw, ok := metadata["id_token"].(string); ok && strings.TrimSpace(idTokenRaw) != "" {
+				if claims, errParse := codex.ParseJWTToken(idTokenRaw); errParse == nil && claims != nil {
+					planType = strings.TrimSpace(claims.CodexAuthInfo.ChatgptPlanType)
 				}
 			}
+		}
+		if planType != "" {
+			a.Attributes["plan_type"] = planType
 		}
 	}
 	// Restore persisted quota state so cooldowns survive restart.
