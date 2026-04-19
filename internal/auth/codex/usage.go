@@ -18,6 +18,22 @@ import (
 // field in the id_token JWT is a cached snapshot and can lag by hours.
 const codexUsageURL = "https://chatgpt.com/backend-api/wham/usage"
 
+// NewCodexAuthWithClient builds a CodexAuth that uses the supplied
+// http.Client verbatim (no SetProxy wrapping). Use this when the caller has
+// already built an auth-aware transport (e.g. via
+// helps.NewProxyAwareHTTPClient) and needs the probe to travel through the
+// SAME egress as the auth's real traffic. Egress IP materially changes what
+// /wham/usage returns — routing a free-plan auth through its configured
+// free-warp pool yields the true per-account plan_type, while hitting
+// /wham/usage from a data-center IP returns a user-level aggregate that
+// defaults to plus and hides per-account downgrades.
+func NewCodexAuthWithClient(client *http.Client) *CodexAuth {
+	if client == nil {
+		client = &http.Client{}
+	}
+	return &CodexAuth{httpClient: client}
+}
+
 // FetchWhamUsagePlanType calls /wham/usage with the given access_token and
 // returns the live plan_type (e.g. "plus", "free", …). The chatgptAccountID
 // is REQUIRED for the response to reflect the specific account's billing

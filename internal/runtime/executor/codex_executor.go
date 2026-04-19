@@ -685,7 +685,19 @@ func (e *CodexExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*
 			accountID = strings.TrimSpace(v)
 		}
 	}
-	realPlan, probeErr := svc.FetchWhamUsagePlanType(ctx, td.AccessToken, accountID)
+	// The /wham/usage probe MUST go through the same egress as the auth's
+	// real request dispatch path. OpenAI returns materially different
+	// plan_type values depending on the source IP / proxy: a free-plan auth
+	// routed through its configured free-warp pool reports plan_type=free
+	// (accurate), while the same account queried from a data-center IP
+	// returns a user-level aggregate that defaults to plus and hides the
+	// downgrade. Reusing svc (which was built from SDK-level config and
+	// does NOT apply auth-specific proxy routing) was the root cause of
+	// every free account looking like plus. Build a proxy-aware client and
+	// run the probe through it.
+	probeClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
+	probeSvc := codexauth.NewCodexAuthWithClient(probeClient)
+	realPlan, probeErr := probeSvc.FetchWhamUsagePlanType(ctx, td.AccessToken, accountID)
 	probeOK := probeErr == nil && strings.TrimSpace(realPlan) != ""
 	if probeErr != nil {
 		log.Warnf("codex executor: /wham/usage probe for auth %s failed: %v", auth.ID, probeErr)
