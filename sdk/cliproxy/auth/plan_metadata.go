@@ -26,6 +26,26 @@ const (
 	// rebuilding Auth.Attributes["plan_type"] from persisted metadata.
 	MetadataProbedPlanTypeKey = "cliproxy_codex_probed_plan_type"
 
+	// MetadataBoundProxyEntryKey stores the pool-entry name this auth has
+	// been bound to after the multi-path plan probe. Empirically the
+	// /wham/usage plan_type differs across OpenAI edge nodes (different
+	// egress IPs hit different regions whose plan_type caches are out of
+	// sync), so we probe each pool entry until one reports a paid plan and
+	// pin the auth to that entry. Both the probe and the real dispatch go
+	// through the bound entry so OpenAI sees the same node for both, which
+	// makes the cached plan_type decision trustworthy. Special value
+	// BoundProxyEntryDirect means direct egress (all pool entries reported
+	// free, direct reported paid). Empty string means unbound — either
+	// never probed, or all paths returned free so the auth is genuinely
+	// free and eligible for the 5min forced-refresh retry cycle.
+	MetadataBoundProxyEntryKey = "cliproxy_bound_proxy_entry"
+
+	// BoundProxyEntryDirect is the sentinel value stored in
+	// MetadataBoundProxyEntryKey when the auth should use direct egress
+	// (no proxy) because every pool entry reported a free plan but direct
+	// reported a paid plan.
+	BoundProxyEntryDirect = "__direct__"
+
 	// metadataDowngradeDetectedAtKey records when we first disabled an auth
 	// because submitted==paid but probed==free. Cleared on re-enable. Used
 	// to enforce the 2h grace window before permanent deletion.
@@ -34,7 +54,36 @@ const (
 	// Unexported aliases to preserve existing internal references.
 	metadataSubmittedPlanTypeKey = MetadataSubmittedPlanTypeKey
 	metadataProbedPlanTypeKey    = MetadataProbedPlanTypeKey
+	metadataBoundProxyEntryKey   = MetadataBoundProxyEntryKey
 )
+
+// BoundProxyEntry returns the pool entry name this auth is bound to, or
+// empty string if unbound. BoundProxyEntryDirect is returned for auths
+// pinned to direct egress.
+func BoundProxyEntry(auth *Auth) string {
+	if auth == nil || auth.Metadata == nil {
+		return ""
+	}
+	v, _ := auth.Metadata[metadataBoundProxyEntryKey].(string)
+	return strings.TrimSpace(v)
+}
+
+// SetBoundProxyEntry overwrites the bound pool-entry name. Empty string
+// clears the binding.
+func SetBoundProxyEntry(auth *Auth, name string) {
+	if auth == nil {
+		return
+	}
+	v := strings.TrimSpace(name)
+	if auth.Metadata == nil {
+		auth.Metadata = make(map[string]any)
+	}
+	if v == "" {
+		delete(auth.Metadata, metadataBoundProxyEntryKey)
+		return
+	}
+	auth.Metadata[metadataBoundProxyEntryKey] = v
+}
 
 func isPaidPlan(planType string) bool {
 	switch strings.ToLower(strings.TrimSpace(planType)) {

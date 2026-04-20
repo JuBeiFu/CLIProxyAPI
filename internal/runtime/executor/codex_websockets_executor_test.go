@@ -536,6 +536,102 @@ func TestCodexWebsocketExecuteNonStreamSynthesizesChatCompletionContent(t *testi
 	}
 }
 
+func TestCodexWebsocketExecuteStreamZeroUsageCompletionReturnsError(t *testing.T) {
+	upgrader := websocket.Upgrader{
+		CheckOrigin: func(r *http.Request) bool { return true },
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !websocket.IsWebSocketUpgrade(r) {
+			http.Error(w, "upgrade required", http.StatusUpgradeRequired)
+			return
+		}
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Errorf("Upgrade() error = %v", err)
+			return
+		}
+		defer conn.Close()
+
+		if _, _, err := conn.ReadMessage(); err != nil {
+			t.Errorf("ReadMessage() error = %v", err)
+			return
+		}
+
+		// Simulate the "clean-but-empty" upstream: response.created followed by
+		// a reasoning delta (which must NOT count as user content) and then a
+		// response.completed with usage.total_tokens=0 and no actual output.
+		frames := [][]byte{
+			[]byte(`{"type":"response.created","response":{"id":"resp-empty"}}`),
+			[]byte(`{"type":"response.reasoning_summary_text.delta","delta":"thinking..."}`),
+			[]byte(`{"type":"response.completed","response":{"id":"resp-empty","model":"gpt-5.4","status":"completed","output":[],"usage":{"input_tokens":0,"output_tokens":0,"total_tokens":0}}}`),
+		}
+		for _, frame := range frames {
+			if err := conn.WriteMessage(websocket.TextMessage, frame); err != nil {
+				t.Errorf("WriteMessage() error = %v", err)
+				return
+			}
+		}
+	}))
+	defer server.Close()
+
+	exec := NewCodexWebsocketsExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{
+		ID:       "auth-zero",
+		Provider: "codex",
+		Attributes: map[string]string{
+			"api_key":    "sk-test",
+			"base_url":   server.URL,
+			"websockets": "true",
+		},
+	}
+	req := cliproxyexecutor.Request{
+		Model:   "gpt-5.4",
+		Payload: []byte(`{"model":"gpt-5.4","input":[{"role":"user","content":"hi"}]}`),
+	}
+	opts := cliproxyexecutor.Options{
+		Stream:       true,
+		SourceFormat: sdktranslator.FromString("openai-response"),
+	}
+
+	result, err := exec.ExecuteStream(context.Background(), auth, req, opts)
+	if err != nil {
+		t.Fatalf("ExecuteStream() error = %v", err)
+	}
+	if result == nil || result.Chunks == nil {
+		t.Fatalf("expected stream result with chunks")
+	}
+
+	var gotErr error
+	sawCompleted := false
+	for chunk := range result.Chunks {
+		if chunk.Err != nil {
+			gotErr = chunk.Err
+			continue
+		}
+		if len(chunk.Payload) > 0 {
+			// response.completed must NOT be forwarded when we flag the stream
+			// as zero-usage; otherwise downstream sees a misleading 0-token
+			// success.
+			if gjson.GetBytes(chunk.Payload, "type").String() == "response.completed" {
+				sawCompleted = true
+			}
+		}
+	}
+	if gotErr == nil {
+		t.Fatal("expected error chunk for zero-usage completion, got nil")
+	}
+	if sawCompleted {
+		t.Fatalf("response.completed chunk was forwarded to client; expected it to be suppressed")
+	}
+	statusCoder, ok := gotErr.(interface{ StatusCode() int })
+	if !ok {
+		t.Fatalf("expected status coder error, got %T: %v", gotErr, gotErr)
+	}
+	if got := statusCoder.StatusCode(); got != http.StatusBadGateway {
+		t.Fatalf("StatusCode = %d, want %d", got, http.StatusBadGateway)
+	}
+}
+
 func TestCodexWebsocketExecuteNonStreamSynthesizesResponsesFunctionCallOutput(t *testing.T) {
 	upgrader := websocket.Upgrader{
 		CheckOrigin: func(r *http.Request) bool { return true },

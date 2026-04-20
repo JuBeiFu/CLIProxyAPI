@@ -22,6 +22,34 @@ const DefaultForcedRefreshInterval = 5 * time.Minute
 // ApplyPlanTypeRefreshDecision, so only continuously-free accounts get deleted.
 const DefaultDowngradeDeletionGrace = 2 * time.Hour
 
+// DefaultBoundReprobeInterval is how old a bound-paid auth's last refresh
+// must be before the forced loop re-probes it. OpenAI's per-edge plan_type
+// cache can flip plus→free on an already-bound account over time (account
+// cancellation, billing lag, risk flags); the binding points to a specific
+// edge so we must re-walk the pool periodically to catch silent flips.
+//
+// Empirically observed 2026-04-21: for newly-registered / just-upgraded
+// accounts the OpenAI edge caches are VOLATILE — a single bound path can
+// flip plus→free within 2–3 minutes (verified across 5 samples on
+// cli-proxy-api-free). Setting this equal to the forced-refresh tick
+// interval (5min) means every paid+bound auth gets re-validated on every
+// tick, keeping the cached probed/bound state within one tick of reality.
+// Probe cost per tick ≈ N probes (break on first paid), so ~200 accounts
+// at ~1-5 HTTP calls each ≈ 1 req/sec average against OpenAI — well
+// within budget.
+const DefaultBoundReprobeInterval = 5 * time.Minute
+
+// BoundProxyHealthChecker, when non-nil, is consulted by shouldForceRefresh
+// to also bring back into scope any codex auth whose pinned proxy entry is
+// no longer usable (disabled in config, removed from pool, or marked
+// unhealthy by the proxy HealthManager). Returning true triggers a full
+// multi-path re-probe which will select a new binding.
+//
+// The registration lives in the sdk/cliproxy layer because that's where
+// proxy config and HealthManager are reachable; forced_refresh lives one
+// layer below and cannot import them directly.
+var BoundProxyHealthChecker func(*Auth) bool
+
 // shouldForceRefresh returns true iff the auth is within the short-cycle
 // scope. Disabled is irrelevant — disabled auths MUST be refreshed so they
 // can be re-enabled on activation. Rules:
@@ -31,9 +59,27 @@ const DefaultDowngradeDeletionGrace = 2 * time.Hour
 //     after import/startup. After that first probe the decision fn backfills
 //     the submitted pin and writes probed, so the auth naturally exits (or
 //     stays in) scope on the next check.
-//  2. Already-probed codex auths stay in scope only when submitted is paid
-//     AND probed is free — the re-activation-watching state.
-//  3. Non-codex providers are never in scope.
+//  2. Already-probed codex auths stay in scope when submitted is paid AND
+//     probed is free — the re-activation-watching state.
+//  3. Already-probed codex auths with probed=paid but NO bound proxy entry
+//     are in scope so the multi-path probe runs and pins a usable node.
+//     Without this, auths that were probed under the pre-binding code
+//     (single path, no binding persisted) would never get a binding and
+//     would continue being dispatched via FNV-hash — which lands on a
+//     node that might currently return free, masking them as free in
+//     practice even though cached probed=plus.
+//  4. Already-probed codex auths are ALSO in scope when their bound pool
+//     entry has become unusable (dead proxy / config removal). The probe
+//     re-picks a healthy binding, keeping the auth serving without an
+//     operator touch.
+//  5. Already-probed codex auths with probed=paid AND a binding that has
+//     gone stale (>DefaultBoundReprobeInterval since last refresh) are in
+//     scope so we can re-validate against OpenAI's per-edge plan_type
+//     cache. OpenAI does flip plus→free on accounts silently (cancellation,
+//     risk flags, billing lag); without this periodic re-probe those auths
+//     would be dispatched as plus while actually serving free quota until
+//     the access_token finally expires 10 days later.
+//  6. Non-codex providers are never in scope.
 func shouldForceRefresh(auth *Auth) bool {
 	if auth == nil {
 		return false
@@ -46,7 +92,34 @@ func shouldForceRefresh(auth *Auth) bool {
 		return true
 	}
 	submitted := submittedPlanType(auth)
-	return isPaidPlan(submitted) && isFreePlan(probed)
+	if isPaidPlan(submitted) && isFreePlan(probed) {
+		return true
+	}
+	if isPaidPlan(probed) && BoundProxyEntry(auth) == "" {
+		return true
+	}
+	if BoundProxyHealthChecker != nil && BoundProxyHealthChecker(auth) {
+		return true
+	}
+	// Rule 5: bound paid + stale last-refresh. File-loaded auths don't
+	// populate the in-memory LastRefreshedAt field directly — it's the
+	// Metadata["last_refresh"] string that persists across reloads — so we
+	// mirror shouldRefresh's fallback and consult both. Without this
+	// fallback the rule would never fire for any auth loaded from disk
+	// (their LastRefreshedAt is zero until they're refreshed in-process),
+	// leaving stale bindings uncaught until some other trigger fires.
+	if isPaidPlan(probed) && BoundProxyEntry(auth) != "" {
+		lastRefresh := auth.LastRefreshedAt
+		if lastRefresh.IsZero() {
+			if ts, ok := authLastRefreshTimestamp(auth); ok {
+				lastRefresh = ts
+			}
+		}
+		if !lastRefresh.IsZero() && time.Since(lastRefresh) >= DefaultBoundReprobeInterval {
+			return true
+		}
+	}
+	return false
 }
 
 // shouldDeleteDowngradedAuth decides whether a forced-refresh pass should

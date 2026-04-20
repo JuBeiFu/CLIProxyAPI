@@ -33,13 +33,79 @@ func TestShouldForceRefresh_Scope(t *testing.T) {
 			expect: true,
 		},
 		{
-			name:   "paid_submitted_probed_plus_out",
-			auth:   mustAuth("codex", "plus", "plus", false),
+			// Confirmed paid WITH binding: settled, out of scope.
+			name:   "paid_submitted_probed_plus_bound_out",
+			auth:   mustAuthWithBinding("codex", "plus", "plus", false, "free-proxy-1"),
 			expect: false,
 		},
 		{
-			name:   "paid_submitted_probed_pro_out",
-			auth:   mustAuth("codex", "pro", "pro", false),
+			name:   "paid_submitted_probed_pro_bound_out",
+			auth:   mustAuthWithBinding("codex", "pro", "pro", false, "free-proxy-2"),
+			expect: false,
+		},
+		{
+			// Confirmed paid WITHOUT binding: multi-path probe hasn't pinned
+			// a node yet. Must re-probe so dispatch has a trustworthy egress.
+			name:   "paid_submitted_probed_plus_unbound_in",
+			auth:   mustAuth("codex", "plus", "plus", false),
+			expect: true,
+		},
+		{
+			// Direct-egress binding counts as settled (multi-path probe
+			// picked direct as the paid-reporting path).
+			name:   "paid_submitted_probed_plus_bound_direct_out",
+			auth:   mustAuthWithBinding("codex", "plus", "plus", false, BoundProxyEntryDirect),
+			expect: false,
+		},
+		{
+			// Rule 5: bound paid with FRESH last_refresh (within reprobe
+			// interval) is still settled — no stale binding yet.
+			name:   "paid_bound_fresh_refresh_out",
+			auth:   mustAuthBoundWithRefresh("codex", "plus", "plus", "free-proxy-1", time.Now().Add(-DefaultBoundReprobeInterval/2)),
+			expect: false,
+		},
+		{
+			// Rule 5: bound paid whose binding is OLDER than the reprobe
+			// interval is back in scope — OpenAI's per-edge cache may have
+			// flipped plus→free silently on that entry.
+			name:   "paid_bound_stale_refresh_in",
+			auth:   mustAuthBoundWithRefresh("codex", "plus", "plus", "free-proxy-1", time.Now().Add(-DefaultBoundReprobeInterval-time.Second)),
+			expect: true,
+		},
+		{
+			// Rule 5 must NOT fire when LastRefreshedAt is zero (never
+			// recorded) AND Metadata["last_refresh"] is absent. We don't
+			// want to spam re-probes on mocked/test auths that lack the
+			// timestamp entirely.
+			name:   "paid_bound_zero_refresh_out",
+			auth:   mustAuthWithBinding("codex", "plus", "plus", false, "free-proxy-1"),
+			expect: false,
+		},
+		{
+			// Rule 5 must fire when LastRefreshedAt is zero but
+			// Metadata["last_refresh"] says the refresh was long ago. This
+			// is the file-loaded-auth case: LastRefreshedAt is only
+			// populated in-process on actual refresh; file-hydrated auths
+			// carry only the metadata string until their first in-process
+			// refresh.
+			name: "paid_bound_metadata_only_stale_in",
+			auth: func() *Auth {
+				a := mustAuthWithBinding("codex", "plus", "plus", false, "free-proxy-1")
+				stale := time.Now().Add(-DefaultBoundReprobeInterval - time.Minute).UTC().Format(time.RFC3339)
+				a.Metadata["last_refresh"] = stale
+				return a
+			}(),
+			expect: true,
+		},
+		{
+			// Metadata-only fresh: within reprobe window, should stay out.
+			name: "paid_bound_metadata_only_fresh_out",
+			auth: func() *Auth {
+				a := mustAuthWithBinding("codex", "plus", "plus", false, "free-proxy-1")
+				fresh := time.Now().Add(-DefaultBoundReprobeInterval / 2).UTC().Format(time.RFC3339)
+				a.Metadata["last_refresh"] = fresh
+				return a
+			}(),
 			expect: false,
 		},
 		{
@@ -91,6 +157,24 @@ func TestShouldForceRefresh_Scope(t *testing.T) {
 			}
 		})
 	}
+}
+
+// mustAuthWithBinding builds an auth and pins it to the given pool-entry
+// name (or BoundProxyEntryDirect). Used to exercise the "probed=paid WITH
+// binding" settled branch.
+func mustAuthWithBinding(provider, submitted, probed string, disabled bool, entry string) *Auth {
+	a := mustAuth(provider, submitted, probed, disabled)
+	SetBoundProxyEntry(a, entry)
+	return a
+}
+
+// mustAuthBoundWithRefresh builds a bound auth AND sets LastRefreshedAt so
+// the periodic-reprobe rule can be exercised. Freshness of refreshedAt
+// determines whether the stale-binding rule fires.
+func mustAuthBoundWithRefresh(provider, submitted, probed, entry string, refreshedAt time.Time) *Auth {
+	a := mustAuthWithBinding(provider, submitted, probed, false, entry)
+	a.LastRefreshedAt = refreshedAt
+	return a
 }
 
 func mustAuth(provider, submitted, probed string, disabled bool) *Auth {

@@ -1342,6 +1342,12 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 		debugLogAuthSelection(entry, auth, provider, req.Model)
 		publishSelectedAuthMetadata(opts.Metadata, auth.ID)
 
+		// Opportunistic async re-probe for codex bound paid auths whose
+		// binding is older than AsyncBindingProbeTTL. Fires in a goroutine
+		// so the current dispatch isn't delayed; the probe result
+		// protects subsequent requests from stale bindings.
+		m.KickAsyncBindingProbe(auth.ID)
+
 		tried[auth.ID] = struct{}{}
 		execCtx := ctx
 		if rt := m.roundTripperFor(auth); rt != nil {
@@ -1515,6 +1521,9 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 		entry := logEntryWithRequestID(ctx)
 		debugLogAuthSelection(entry, auth, provider, req.Model)
 		publishSelectedAuthMetadata(opts.Metadata, auth.ID)
+
+		// Opportunistic async re-probe — mirrors the Execute path.
+		m.KickAsyncBindingProbe(auth.ID)
 
 		tried[auth.ID] = struct{}{}
 		execCtx := ctx
@@ -2737,8 +2746,36 @@ func terminalAuthFailureReason(resultErr *Error) string {
 	}
 }
 
+// shouldDisableDueToRefreshTokenReuse detects the OpenAI
+// "refresh_token_reused" / "Your refresh token has already been used"
+// error, which occurs when another rotator (a second CPA instance, or
+// opai-team's background refresh thread, or register_sdk) consumed the
+// rt chain first. The server invalidates the token permanently; no
+// retry will succeed. Rather than delete the auth file (which the
+// generic terminalAuthFailureReason path does for other terminal
+// errors), disable it in-place so the operator can inspect the zombie
+// and decide whether to delete or re-OAuth. Returns a stable reason
+// prefix so the filestore-persistence path can round-trip the status.
+func shouldDisableDueToRefreshTokenReuse(auth *Auth, resultErr *Error) (bool, string) {
+	if !isCodexAuth(auth) || auth == nil || resultErr == nil {
+		return false, ""
+	}
+	lower := strings.ToLower(resultErr.Message)
+	if !strings.Contains(lower, "refresh_token_reused") &&
+		!strings.Contains(lower, "refresh token has already been used") {
+		return false, ""
+	}
+	return true, "revoked: refresh_token_reused"
+}
+
 func shouldDeleteRevokedAuth(auth *Auth, resultErr *Error) (bool, string) {
 	if !isCodexAuth(auth) || !hasPersistedAuthRecord(auth) {
+		return false, ""
+	}
+	// refresh_token_reused is handled separately (disable, not delete)
+	// so operators can see the zombie + distinguish from other terminal
+	// revocations.
+	if reuse, _ := shouldDisableDueToRefreshTokenReuse(auth, resultErr); reuse {
 		return false, ""
 	}
 	reason := terminalAuthFailureReason(resultErr)
@@ -3670,6 +3707,75 @@ func (m *Manager) markRefreshPending(id string, now time.Time) bool {
 	return true
 }
 
+// AsyncBindingProbeTTL bounds how often the dispatch-time kick can fire
+// for the same auth. 60s means: up to one async re-probe per auth per
+// minute under sustained traffic, zero when idle. Short enough to catch
+// OpenAI's per-edge plan_type flips (observed 2-3 min intervals on
+// freshly-upgraded accounts), long enough not to overlap with the 5min
+// forced_refresh sweep that covers the whole pool.
+const AsyncBindingProbeTTL = 60 * time.Second
+
+// KickAsyncBindingProbe is called from the dispatch hot path right after
+// the selector commits an auth. It asynchronously kicks a full refresh +
+// multi-path probe when the bound codex auth's last refresh is older than
+// AsyncBindingProbeTTL. Dispatch is NOT blocked; the current request
+// still goes out through the existing (possibly stale) binding, but the
+// probe result arrives in time to protect subsequent requests from
+// burning free quota on the same stale binding.
+//
+// Gates (all must hold to fire):
+//   - auth is codex and probed=paid (free/unprobed auths are handled by
+//     the 5min forced_refresh scope)
+//   - last_refresh >= TTL ago (both in-memory LastRefreshedAt AND the
+//     file-hydrated Metadata["last_refresh"] fallback are consulted)
+//   - markRefreshPending succeeds (not disabled, no in-flight refresh)
+//
+// Concurrency: markRefreshPending acquires m.mu.Lock exclusively, so two
+// concurrent dispatches of the same auth race to set NextRefreshAfter;
+// only the first wins. The other becomes a no-op. Refresh_token rotation
+// thus never runs twice in parallel for the same auth.
+func (m *Manager) KickAsyncBindingProbe(authID string) {
+	if m == nil || strings.TrimSpace(authID) == "" {
+		return
+	}
+	m.mu.RLock()
+	auth, ok := m.auths[authID]
+	m.mu.RUnlock()
+	if !ok || auth == nil {
+		return
+	}
+	if !isCodexAuth(auth) {
+		return
+	}
+	if !isPaidPlan(probedPlanType(auth)) {
+		// Unprobed or free accounts: the 5min forced_refresh scope
+		// already covers them. No point firing an extra probe here.
+		return
+	}
+
+	now := time.Now()
+	last := auth.LastRefreshedAt
+	if last.IsZero() {
+		if ts, okTs := authLastRefreshTimestamp(auth); okTs {
+			last = ts
+		}
+	}
+	if !last.IsZero() && now.Sub(last) < AsyncBindingProbeTTL {
+		return
+	}
+
+	if !m.markRefreshPending(authID, now) {
+		return
+	}
+
+	// refreshAuthWithLimit acquires m.refreshSemaphore, so the full pool
+	// of async probes shares the existing 16-slot pipeline with forced
+	// refreshes and the 15min auto-refresh loop. If the pool is
+	// saturated, this goroutine parks until a slot opens — still
+	// non-blocking for the caller thanks to the `go` prefix.
+	go m.refreshAuthWithLimit(context.Background(), authID)
+}
+
 func (m *Manager) refreshAuth(ctx context.Context, id string) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -3694,6 +3800,38 @@ func (m *Manager) refreshAuth(ctx context.Context, id string) {
 	now := time.Now()
 	if err != nil {
 		resultErr := resultErrorFromError(err)
+		// Refresh-token-reuse must be checked BEFORE the delete path:
+		// this class of terminal failure should disable the auth in
+		// place (operator-visible) rather than silently delete the
+		// file. Applies to both persisted and in-memory codex auths.
+		// Persist the Disabled flag to disk so watcher/reload paths
+		// don't resurrect the zombie on the next tick.
+		if disableReuse, reuseReason := shouldDisableDueToRefreshTokenReuse(auth, resultErr); disableReuse {
+			var authSnapshot *Auth
+			m.mu.Lock()
+			if current := m.auths[id]; current != nil {
+				applyTerminalAuthDisabledState(current, resultErr, reuseReason, now)
+				current.NextRefreshAfter = time.Time{}
+				m.auths[id] = current
+				authSnapshot = current.Clone()
+			}
+			m.mu.Unlock()
+			if authSnapshot != nil {
+				if m.scheduler != nil {
+					m.scheduler.upsertAuth(authSnapshot)
+				}
+				// Persist the terminal-disable state so a subsequent
+				// file-watcher event or process restart doesn't
+				// rehydrate the zombie back to Disabled=false and
+				// burn another refresh attempt (which would only
+				// re-derive the same reused-token failure).
+				if err := m.persist(ctx, authSnapshot); err != nil {
+					log.Warnf("codex auth %s: persist disabled state failed: %v", auth.ID, err)
+				}
+			}
+			log.Warnf("codex auth %s disabled due to refresh_token_reused (concurrent rotator invalidated the token)", auth.ID)
+			return
+		}
 		if deleteAuth, reason := shouldDeleteRevokedAuth(auth, resultErr); deleteAuth {
 			var removedAuth *Auth
 			m.mu.Lock()

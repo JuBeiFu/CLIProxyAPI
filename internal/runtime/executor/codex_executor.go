@@ -669,40 +669,37 @@ func (e *CodexExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*
 	// leave existing plan_type untouched — ApplyPlanTypeRefreshDecision won't
 	// mutate Disabled or Attributes without an authoritative reading.
 	jwtPlan := ""
-	accountID := ""
 	if claims, jwtErr := codexauth.ParseJWTToken(td.IDToken); jwtErr == nil {
 		jwtPlan = strings.ToLower(strings.TrimSpace(claims.CodexAuthInfo.ChatgptPlanType))
-		accountID = strings.TrimSpace(claims.CodexAuthInfo.ChatgptAccountID)
 	} else {
 		log.Warnf("codex executor: parse id_token JWT for auth %s failed: %v", auth.ID, jwtErr)
 	}
-	// The Chatgpt-Account-Id header is required: without it OpenAI returns
-	// a user-level aggregate that defaults to "plus" whenever the user owns
-	// any paid subscription, completely masking per-account downgrades. Fall
-	// back to Metadata["account_id"] if JWT parse failed.
-	if accountID == "" {
-		if v, ok := auth.Metadata["account_id"].(string); ok {
-			accountID = strings.TrimSpace(v)
-		}
-	}
-	// The /wham/usage probe MUST go through the same egress as the auth's
-	// real request dispatch path. OpenAI returns materially different
-	// plan_type values depending on the source IP / proxy: a free-plan auth
-	// routed through its configured free-warp pool reports plan_type=free
-	// (accurate), while the same account queried from a data-center IP
-	// returns a user-level aggregate that defaults to plus and hides the
-	// downgrade. Reusing svc (which was built from SDK-level config and
-	// does NOT apply auth-specific proxy routing) was the root cause of
-	// every free account looking like plus. Build a proxy-aware client and
-	// run the probe through it.
-	probeClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
-	probeSvc := codexauth.NewCodexAuthWithClient(probeClient)
-	realPlan, probeErr := probeSvc.FetchWhamUsagePlanType(ctx, td.AccessToken, accountID)
-	probeOK := probeErr == nil && strings.TrimSpace(realPlan) != ""
-	if probeErr != nil {
-		log.Warnf("codex executor: /wham/usage probe for auth %s failed: %v", auth.ID, probeErr)
+	// Multi-path probe: walk every pool entry (shuffled) and stop as soon
+	// as one reports a paid plan. Falls back to direct egress last. This
+	// masks OpenAI's per-edge plan_type cache disagreement (different
+	// proxy IPs hit different regions, and a newly-upgraded account's
+	// plus status propagates unevenly). We pin the auth to the first
+	// entry that observed a paid plan, so the real dispatch path later
+	// sees the same node and OpenAI's cache decision is self-consistent.
+	// Header note: Chatgpt-Account-Id has no observable effect on the
+	// response (verified 2026-04-20 across 5 egress paths); we omit it.
+	realPlan, boundEntry, probeOK := helps.ProbeCodexPlanAcrossPool(ctx, e.cfg, auth, td.AccessToken)
+	if !probeOK {
+		log.Warnf("codex executor: /wham/usage multi-path probe for auth %s failed on every candidate", auth.ID)
 	}
 	cliproxyauth.ApplyPlanTypeRefreshDecision(auth, jwtPlan, realPlan, probeOK, now)
+	if probeOK {
+		if boundEntry != "" {
+			// Found a path reporting paid plan; pin the auth so later
+			// dispatches go through the same node.
+			cliproxyauth.SetBoundProxyEntry(auth, boundEntry)
+		} else {
+			// Every path reported free. Clear any previous binding so the
+			// next probe tries afresh (e.g., after the account finishes
+			// upgrade on OpenAI's side).
+			cliproxyauth.SetBoundProxyEntry(auth, "")
+		}
+	}
 	if auth.Disabled && strings.HasPrefix(auth.StatusMessage, "codex_downgrade_detected: ") {
 		log.Warnf("codex executor: auth %s disabled by downgrade detection: %s", auth.ID, auth.StatusMessage)
 	}

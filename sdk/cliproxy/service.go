@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/api"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/proxypool"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/executor"
 	_ "github.com/router-for-me/CLIProxyAPI/v6/internal/usage"
@@ -695,11 +696,16 @@ func (s *Service) Run(ctx context.Context) error {
 		// Short-cycle forced refresh targets paid-submitted-but-currently-free
 		// codex auths: it probes /wham/usage every 5 minutes (bypassing the
 		// Disabled skip) so downgrade state flips are caught fast and stale
-		// downgrades are deleted after the 2h grace window.
+		// downgrades are deleted after the 2h grace window. It ALSO re-probes
+		// auths whose pinned proxy entry has become unusable so dead proxies
+		// trigger automatic re-binding without operator intervention.
+		coreauth.BoundProxyHealthChecker = func(a *coreauth.Auth) bool {
+			return isBoundProxyUnusable(s.cfg, a)
+		}
 		forcedInterval := coreauth.DefaultForcedRefreshInterval
 		forcedGrace := coreauth.DefaultDowngradeDeletionGrace
 		s.coreManager.StartAutoForcedRefresh(context.Background(), forcedInterval, forcedGrace)
-		log.Infof("core auth forced refresh started (interval=%s, downgrade-grace=%s, scope=codex submitted-paid+probed-free)", forcedInterval, forcedGrace)
+		log.Infof("core auth forced refresh started (interval=%s, downgrade-grace=%s, bound-reprobe=%s, scope=codex {submitted-paid+probed-free, unbound, bound-entry-unhealthy, stale-bound-paid})", forcedInterval, forcedGrace, coreauth.DefaultBoundReprobeInterval)
 	}
 
 	select {
@@ -709,6 +715,47 @@ func (s *Service) Run(ctx context.Context) error {
 	case err = <-s.serverErr:
 		return err
 	}
+}
+
+// isBoundProxyUnusable reports whether a codex auth's pinned proxy entry
+// is no longer viable (disabled, removed from config, or marked unhealthy
+// by the HealthManager). Used by the forced-refresh loop to kick a
+// re-probe that picks a fresh binding. Returns false for auths that are
+// unbound or pinned to direct — those do not need re-binding.
+func isBoundProxyUnusable(cfg *config.Config, auth *coreauth.Auth) bool {
+	if cfg == nil || auth == nil {
+		return false
+	}
+	bound := coreauth.BoundProxyEntry(auth)
+	if bound == "" || bound == coreauth.BoundProxyEntryDirect {
+		return false
+	}
+	poolName := strings.TrimSpace(auth.ProxyPool)
+	if poolName == "" {
+		poolName = strings.TrimSpace(cfg.DefaultProxyPool)
+	}
+	if poolName == "" {
+		return true // binding references a pool we can no longer resolve
+	}
+	pool := cfg.ProxyPoolByName(poolName)
+	if pool == nil {
+		return true
+	}
+	manager := proxypool.DefaultHealthManager()
+	for _, entry := range pool.Entries {
+		if entry.Name != bound {
+			continue
+		}
+		if entry.Disabled || strings.TrimSpace(entry.URL) == "" {
+			return true
+		}
+		if manager != nil && !manager.IsUsable(pool.Name, entry.Name) {
+			return true
+		}
+		return false
+	}
+	// Binding references a pool entry that has since been removed.
+	return true
 }
 
 // Shutdown gracefully stops background workers and the HTTP server.

@@ -59,11 +59,12 @@ func TestRunForcedRefreshOnce_RefreshesScopeAuthsOnly(t *testing.T) {
 	m.RegisterExecutor(exec)
 
 	m.auths = map[string]*Auth{
-		"A_paid_unprobed":    mustAuthKeyed("A_paid_unprobed", "codex", "plus", "", false),
-		"B_paid_free":        mustAuthKeyed("B_paid_free", "codex", "plus", "free", false),
-		"C_paid_confirmed":   mustAuthKeyed("C_paid_confirmed", "codex", "plus", "plus", false),
-		"D_free_unprobed":    mustAuthKeyed("D_free_unprobed", "codex", "free", "", false),
-		"E_free_probed_free": mustAuthKeyed("E_free_probed_free", "codex", "free", "free", false),
+		"A_paid_unprobed":          mustAuthKeyed("A_paid_unprobed", "codex", "plus", "", false),
+		"B_paid_free":              mustAuthKeyed("B_paid_free", "codex", "plus", "free", false),
+		"C_paid_confirmed_bound":   mustAuthBound("C_paid_confirmed_bound", "codex", "plus", "plus", "free-proxy-1"),
+		"D_free_unprobed":          mustAuthKeyed("D_free_unprobed", "codex", "free", "", false),
+		"E_free_probed_free":       mustAuthKeyed("E_free_probed_free", "codex", "free", "free", false),
+		"F_paid_confirmed_unbound": mustAuthKeyed("F_paid_confirmed_unbound", "codex", "plus", "plus", false),
 	}
 
 	m.runForcedRefreshOnce(context.Background(), DefaultDowngradeDeletionGrace)
@@ -72,11 +73,15 @@ func TestRunForcedRefreshOnce_RefreshesScopeAuthsOnly(t *testing.T) {
 	// Rule 1: never-probed auths are always in scope (including D, which was
 	// submitted=free — the first probe is still needed to classify).
 	// Rule 2: already-probed paid+free (B) stays in scope.
-	// Confirmed-paid C and settled free+free E stay OUT.
+	// Rule 3: paid+paid WITHOUT a binding (F) is in scope — multi-path
+	// probe needs to run so the auth gets pinned to a usable node.
+	// Rule 4 (via HealthChecker) not exercised in this test.
+	// Confirmed-paid WITH binding (C) and settled free+free (E) stay OUT.
 	want := map[string]bool{
-		"A_paid_unprobed": true,
-		"B_paid_free":     true,
-		"D_free_unprobed": true,
+		"A_paid_unprobed":          true,
+		"B_paid_free":               true,
+		"D_free_unprobed":          true,
+		"F_paid_confirmed_unbound": true,
 	}
 	if len(got) != len(want) {
 		t.Fatalf("refreshed %v, want keys %v", got, want)
@@ -168,13 +173,14 @@ func TestRunForcedRefreshOnce_DoesNotTouchConfirmedPaid(t *testing.T) {
 	m.RegisterExecutor(exec)
 
 	m.auths = map[string]*Auth{
-		"confirmed_paid": mustAuthKeyed("confirmed_paid", "codex", "plus", "plus", false),
+		// paid+paid WITH binding: settled, out of scope.
+		"confirmed_paid_bound": mustAuthBound("confirmed_paid_bound", "codex", "plus", "plus", "free-proxy-1"),
 	}
 
 	m.runForcedRefreshOnce(context.Background(), DefaultDowngradeDeletionGrace)
 
 	if len(exec.refreshed()) != 0 {
-		t.Fatalf("confirmed paid must not be touched, got %v", exec.refreshed())
+		t.Fatalf("confirmed paid with binding must not be touched, got %v", exec.refreshed())
 	}
 }
 
@@ -191,5 +197,14 @@ func mustAuthKeyed(id, provider, submitted, probed string, disabled bool) *Auth 
 	if probed != "" {
 		setProbedPlanType(a, probed)
 	}
+	return a
+}
+
+// mustAuthBound is like mustAuthKeyed but also pins the auth to the given
+// pool-entry name. Used to exercise the "probed=paid WITH binding"
+// exclusion branch of shouldForceRefresh.
+func mustAuthBound(id, provider, submitted, probed, entry string) *Auth {
+	a := mustAuthKeyed(id, provider, submitted, probed, false)
+	SetBoundProxyEntry(a, entry)
 	return a
 }

@@ -35,14 +35,19 @@ func NewCodexAuthWithClient(client *http.Client) *CodexAuth {
 }
 
 // FetchWhamUsagePlanType calls /wham/usage with the given access_token and
-// returns the live plan_type (e.g. "plus", "free", …). The chatgptAccountID
-// is REQUIRED for the response to reflect the specific account's billing
-// state — without the Chatgpt-Account-Id header OpenAI returns a user-level
-// aggregate that defaults to "plus" when the user owns any paid subscription
-// anywhere, masking per-account downgrades completely. Empty string + nil
+// returns the live plan_type (e.g. "plus", "free", …). Empty string + nil
 // error means the endpoint succeeded but did not include a plan_type;
 // callers should treat that like a fetch failure.
-func (o *CodexAuth) FetchWhamUsagePlanType(ctx context.Context, accessToken, chatgptAccountID string) (string, error) {
+//
+// Do NOT send a Chatgpt-Account-Id header. Empirically (probed
+// 2026-04-20 against multiple real auths), the bearer-only request returns
+// the access_token's own user_id and that user's true plan_type — accounts
+// that are actually free report "free" here. Adding Chatgpt-Account-Id
+// switches the response to a workspace/account-id–scoped view that defaults
+// to "plus" for any user who owns a paid workspace anywhere, completely
+// masking per-account downgrades. The earlier inverted comment in this file
+// described the wrong direction; bearer-only is the live per-account truth.
+func (o *CodexAuth) FetchWhamUsagePlanType(ctx context.Context, accessToken string) (string, error) {
 	accessToken = strings.TrimSpace(accessToken)
 	if accessToken == "" {
 		return "", errors.New("codex: FetchWhamUsagePlanType: empty access token")
@@ -55,9 +60,6 @@ func (o *CodexAuth) FetchWhamUsagePlanType(ctx context.Context, accessToken, cha
 	req.Header.Set("Authorization", "Bearer "+accessToken)
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("User-Agent", "codex_cli_rs/0.76.0 (Debian 13.0.0; x86_64) WindowsTerminal")
-	if accountID := strings.TrimSpace(chatgptAccountID); accountID != "" {
-		req.Header.Set("Chatgpt-Account-Id", accountID)
-	}
 
 	resp, err := o.httpClient.Do(req)
 	if err != nil {
