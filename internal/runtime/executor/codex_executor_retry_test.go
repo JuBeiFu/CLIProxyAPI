@@ -5,6 +5,9 @@ import (
 	"strconv"
 	"testing"
 	"time"
+
+	codexauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/codex"
+	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 )
 
 func TestParseCodexRetryAfter(t *testing.T) {
@@ -196,6 +199,112 @@ func TestNewCodexStatusErr_UsageLimitPreservesUpstreamRetryAfter(t *testing.T) {
 	}
 	if *err.retryAfter != 2*time.Hour {
 		t.Errorf("expected 2h from upstream, got %v", *err.retryAfter)
+	}
+}
+
+func TestApplyRefreshedCodexTokenState_UpdatesMetadataAndStorage(t *testing.T) {
+	storage := &codexauth.CodexTokenStorage{
+		IDToken:      "old-id",
+		AccessToken:  "old-access",
+		RefreshToken: "old-refresh",
+		AccountID:    "old-account",
+		LastRefresh:  "old-last-refresh",
+		Email:        "old@example.com",
+		Type:         "codex",
+		Expire:       "old-expire",
+	}
+	auth := &cliproxyauth.Auth{
+		ID:       "auth-1",
+		Provider: "codex",
+		Metadata: map[string]any{"type": "codex"},
+		Storage:  storage,
+	}
+	td := &codexauth.CodexTokenData{
+		IDToken:      "new-id",
+		AccessToken:  "new-access",
+		RefreshToken: "new-refresh",
+		AccountID:    "new-account",
+		Email:        "new@example.com",
+		Expire:       "new-expire",
+	}
+	now := time.Date(2026, 4, 22, 10, 11, 12, 0, time.UTC)
+
+	applyRefreshedCodexTokenState(auth, storage, td, now)
+
+	if got := auth.Metadata["id_token"]; got != td.IDToken {
+		t.Fatalf("metadata id_token = %v, want %q", got, td.IDToken)
+	}
+	if got := auth.Metadata["access_token"]; got != td.AccessToken {
+		t.Fatalf("metadata access_token = %v, want %q", got, td.AccessToken)
+	}
+	if got := auth.Metadata["refresh_token"]; got != td.RefreshToken {
+		t.Fatalf("metadata refresh_token = %v, want %q", got, td.RefreshToken)
+	}
+	if got := auth.Metadata["account_id"]; got != td.AccountID {
+		t.Fatalf("metadata account_id = %v, want %q", got, td.AccountID)
+	}
+	if got := auth.Metadata["email"]; got != td.Email {
+		t.Fatalf("metadata email = %v, want %q", got, td.Email)
+	}
+	if got := auth.Metadata["expired"]; got != td.Expire {
+		t.Fatalf("metadata expired = %v, want %q", got, td.Expire)
+	}
+	if got := auth.Metadata["type"]; got != "codex" {
+		t.Fatalf("metadata type = %v, want codex", got)
+	}
+	if got := auth.Metadata["last_refresh"]; got != now.Format(time.RFC3339) {
+		t.Fatalf("metadata last_refresh = %v, want %q", got, now.Format(time.RFC3339))
+	}
+	if storage.IDToken != td.IDToken {
+		t.Fatalf("storage id_token = %q, want %q", storage.IDToken, td.IDToken)
+	}
+	if storage.AccessToken != td.AccessToken {
+		t.Fatalf("storage access_token = %q, want %q", storage.AccessToken, td.AccessToken)
+	}
+	if storage.RefreshToken != td.RefreshToken {
+		t.Fatalf("storage refresh_token = %q, want %q", storage.RefreshToken, td.RefreshToken)
+	}
+	if storage.AccountID != td.AccountID {
+		t.Fatalf("storage account_id = %q, want %q", storage.AccountID, td.AccountID)
+	}
+	if storage.Email != td.Email {
+		t.Fatalf("storage email = %q, want %q", storage.Email, td.Email)
+	}
+	if storage.Expire != td.Expire {
+		t.Fatalf("storage expired = %q, want %q", storage.Expire, td.Expire)
+	}
+	if storage.LastRefresh != now.Format(time.RFC3339) {
+		t.Fatalf("storage last_refresh = %q, want %q", storage.LastRefresh, now.Format(time.RFC3339))
+	}
+}
+
+func TestApplyRefreshedCodexTokenState_PreservesExistingRefreshTokenWhenUpstreamOmitted(t *testing.T) {
+	storage := &codexauth.CodexTokenStorage{
+		RefreshToken: "old-refresh",
+		Type:         "codex",
+	}
+	auth := &cliproxyauth.Auth{
+		ID:       "auth-2",
+		Provider: "codex",
+		Metadata: map[string]any{"type": "codex", "refresh_token": "old-refresh"},
+		Storage:  storage,
+	}
+	td := &codexauth.CodexTokenData{
+		IDToken:     "new-id",
+		AccessToken: "new-access",
+		AccountID:   "new-account",
+		Email:       "new@example.com",
+		Expire:      "new-expire",
+	}
+	now := time.Date(2026, 4, 22, 10, 12, 13, 0, time.UTC)
+
+	applyRefreshedCodexTokenState(auth, storage, td, now)
+
+	if got := auth.Metadata["refresh_token"]; got != "old-refresh" {
+		t.Fatalf("metadata refresh_token = %v, want %q", got, "old-refresh")
+	}
+	if storage.RefreshToken != "old-refresh" {
+		t.Fatalf("storage refresh_token = %q, want %q", storage.RefreshToken, "old-refresh")
 	}
 }
 

@@ -248,19 +248,11 @@ func TestManager_RefreshAuth_DeletesPersistedAuthOnOrgRequired(t *testing.T) {
 	}
 }
 
-func TestManager_RefreshAuth_DisablesPersistedAuthOnRefreshTokenReused(t *testing.T) {
-	// When OpenAI returns "refresh_token_reused" (a concurrent rotator
-	// already consumed the rt chain), the auth should be DISABLED in
-	// place rather than deleted. Operator-visible so they can decide
-	// whether to re-OAuth or purge.
+func TestManager_RefreshAuth_DeletesPersistedAuthOnRefreshTokenReused(t *testing.T) {
 	store := &deletingStore{}
 	mgr := NewManager(store, nil, nil)
 	mgr.RegisterExecutor(&revokedRefreshExecutor{
 		id: "codex",
-		// Note: HTTPStatus=0 deliberately — RefreshTokens in
-		// openai_auth.go wraps the 401 in a plain fmt.Errorf that
-		// doesn't implement StatusCoder, so resultErrorFromError has
-		// status=0. The detection must be message-only.
 		err: &Error{
 			HTTPStatus: 0,
 			Message:    `token refresh failed with status 401: {"error":{"message":"Your refresh token has already been used...","code":"refresh_token_reused"}}`,
@@ -274,22 +266,35 @@ func TestManager_RefreshAuth_DisablesPersistedAuthOnRefreshTokenReused(t *testin
 
 	mgr.refreshAuth(context.Background(), auth.ID)
 
-	stored, ok := mgr.GetByID(auth.ID)
-	if !ok {
-		t.Fatal("expected reused-token auth to stay registered (disabled, not deleted)")
+	if _, ok := mgr.GetByID(auth.ID); ok {
+		t.Fatal("expected reused-token auth to be removed after refresh failure")
 	}
-	if !stored.Disabled {
-		t.Fatal("expected reused-token auth to be disabled")
+	waitForDeletedIDs(t, store, []string{auth.ID})
+}
+
+func TestManager_MarkResult_DeletesPersistedAuthOnRefreshTokenReused(t *testing.T) {
+	store := &deletingStore{}
+	mgr := NewManager(store, nil, nil)
+	auth := newPersistedCodexAuth("auths/request-reused.json")
+	if _, err := mgr.Register(WithSkipPersist(context.Background()), auth); err != nil {
+		t.Fatalf("Register returned error: %v", err)
 	}
-	if stored.Status != StatusDisabled {
-		t.Fatalf("expected Status=StatusDisabled, got %v", stored.Status)
+
+	mgr.MarkResult(context.Background(), Result{
+		AuthID:   auth.ID,
+		Provider: "codex",
+		Model:    "gpt-5.4",
+		Success:  false,
+		Error: &Error{
+			HTTPStatus: 0,
+			Message:    `token refresh failed with status 401: {"error":{"message":"Your refresh token has already been used...","code":"refresh_token_reused"}}`,
+		},
+	})
+
+	if _, ok := mgr.GetByID(auth.ID); ok {
+		t.Fatal("expected reused-token auth to be removed from manager")
 	}
-	if !strings.Contains(stored.StatusMessage, "refresh_token_reused") {
-		t.Fatalf("expected StatusMessage to mention refresh_token_reused, got %q", stored.StatusMessage)
-	}
-	if len(store.deleted) != 0 {
-		t.Fatalf("reused-token path must not delete the auth file, got %v", store.deleted)
-	}
+	waitForDeletedIDs(t, store, []string{auth.ID})
 }
 
 func TestManager_RefreshAuth_KeepsNonTerminalFailures(t *testing.T) {

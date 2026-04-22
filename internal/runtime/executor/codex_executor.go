@@ -149,6 +149,24 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	body = stripCodexUnsupportedResponseFields(body, shouldPreserveCodexPreviousResponseID(ctx, auth, from, body))
 	body, _ = sjson.DeleteBytes(body, "stream_options")
 	body = normalizeCodexInstructions(body)
+	gptDrawRequested := IsGptDrawModel(requestedModel) || IsGptDrawModel(baseModel)
+	if gptDrawRequested {
+		name := requestedModel
+		if !IsGptDrawModel(name) {
+			name = baseModel
+		}
+		if auth != nil {
+			allowed, used, limit := globalGptDrawQuota.CheckAndIncrement(auth.ID)
+			if !allowed {
+				return resp, statusErr{code: 429, msg: gptDrawQuotaErrMsg(auth.ID, used, limit)}
+			}
+		}
+		if upstream, patched := transformGptDrawPayload(name, body); upstream != "" {
+			body = patched
+		}
+	} else {
+		body = maybeAttachImageGenerationTool(baseModel, body)
+	}
 
 	url := strings.TrimSuffix(baseURL, "/") + "/responses"
 	httpReq, err := e.cacheHelper(ctx, from, url, req, body)
@@ -387,6 +405,24 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 	body, _ = sjson.DeleteBytes(body, "stream_options")
 	body, _ = sjson.SetBytes(body, "model", baseModel)
 	body = normalizeCodexInstructions(body)
+	gptDrawRequestedStream := IsGptDrawModel(requestedModel) || IsGptDrawModel(baseModel)
+	if gptDrawRequestedStream {
+		name := requestedModel
+		if !IsGptDrawModel(name) {
+			name = baseModel
+		}
+		if auth != nil {
+			allowed, used, limit := globalGptDrawQuota.CheckAndIncrement(auth.ID)
+			if !allowed {
+				return nil, statusErr{code: 429, msg: gptDrawQuotaErrMsg(auth.ID, used, limit)}
+			}
+		}
+		if upstream, patched := transformGptDrawPayload(name, body); upstream != "" {
+			body = patched
+		}
+	} else {
+		body = maybeAttachImageGenerationTool(baseModel, body)
+	}
 
 	url := strings.TrimSuffix(baseURL, "/") + "/responses"
 	httpReq, err := e.cacheHelper(ctx, from, url, req, body)
@@ -648,20 +684,9 @@ func (e *CodexExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*
 	if auth.Metadata == nil {
 		auth.Metadata = make(map[string]any)
 	}
-	auth.Metadata["id_token"] = td.IDToken
-	auth.Metadata["access_token"] = td.AccessToken
-	if td.RefreshToken != "" {
-		auth.Metadata["refresh_token"] = td.RefreshToken
-	}
-	if td.AccountID != "" {
-		auth.Metadata["account_id"] = td.AccountID
-	}
-	auth.Metadata["email"] = td.Email
-	// Use unified key in files
-	auth.Metadata["expired"] = td.Expire
-	auth.Metadata["type"] = "codex"
 	now := time.Now()
-	auth.Metadata["last_refresh"] = now.Format(time.RFC3339)
+	storage, _ := auth.Storage.(*codexauth.CodexTokenStorage)
+	applyRefreshedCodexTokenState(auth, storage, td, now)
 
 	// Resolve the authoritative plan_type by probing /wham/usage with the
 	// freshly-refreshed access token. The JWT's chatgpt_plan_type is a cached
@@ -704,6 +729,41 @@ func (e *CodexExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*
 		log.Warnf("codex executor: auth %s disabled by downgrade detection: %s", auth.ID, auth.StatusMessage)
 	}
 	return auth, nil
+}
+
+func applyRefreshedCodexTokenState(auth *cliproxyauth.Auth, storage *codexauth.CodexTokenStorage, td *codexauth.CodexTokenData, now time.Time) {
+	if auth == nil || td == nil {
+		return
+	}
+	if auth.Metadata == nil {
+		auth.Metadata = make(map[string]any)
+	}
+	auth.Metadata["id_token"] = td.IDToken
+	auth.Metadata["access_token"] = td.AccessToken
+	if td.RefreshToken != "" {
+		auth.Metadata["refresh_token"] = td.RefreshToken
+	}
+	if td.AccountID != "" {
+		auth.Metadata["account_id"] = td.AccountID
+	}
+	auth.Metadata["email"] = td.Email
+	auth.Metadata["expired"] = td.Expire
+	auth.Metadata["type"] = "codex"
+	auth.Metadata["last_refresh"] = now.Format(time.RFC3339)
+	if storage != nil {
+		storage.IDToken = td.IDToken
+		storage.AccessToken = td.AccessToken
+		if td.RefreshToken != "" {
+			storage.RefreshToken = td.RefreshToken
+		}
+		if td.AccountID != "" {
+			storage.AccountID = td.AccountID
+		}
+		storage.LastRefresh = now.Format(time.RFC3339)
+		storage.Email = td.Email
+		storage.Expire = td.Expire
+		storage.Type = "codex"
+	}
 }
 
 func (e *CodexExecutor) cacheHelper(ctx context.Context, from sdktranslator.Format, url string, req cliproxyexecutor.Request, rawJSON []byte) (*http.Request, error) {

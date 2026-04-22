@@ -2713,6 +2713,8 @@ func terminalAuthFailureReason(resultErr *Error) string {
 		"authorization lost",
 		"forbidden",
 		"unauthorized",
+		"refresh_token_reused",
+		"refresh token has already been used",
 		"token_revoked",
 		"token_invalidated",
 		"account_deactivated",
@@ -2746,36 +2748,8 @@ func terminalAuthFailureReason(resultErr *Error) string {
 	}
 }
 
-// shouldDisableDueToRefreshTokenReuse detects the OpenAI
-// "refresh_token_reused" / "Your refresh token has already been used"
-// error, which occurs when another rotator (a second CPA instance, or
-// opai-team's background refresh thread, or register_sdk) consumed the
-// rt chain first. The server invalidates the token permanently; no
-// retry will succeed. Rather than delete the auth file (which the
-// generic terminalAuthFailureReason path does for other terminal
-// errors), disable it in-place so the operator can inspect the zombie
-// and decide whether to delete or re-OAuth. Returns a stable reason
-// prefix so the filestore-persistence path can round-trip the status.
-func shouldDisableDueToRefreshTokenReuse(auth *Auth, resultErr *Error) (bool, string) {
-	if !isCodexAuth(auth) || auth == nil || resultErr == nil {
-		return false, ""
-	}
-	lower := strings.ToLower(resultErr.Message)
-	if !strings.Contains(lower, "refresh_token_reused") &&
-		!strings.Contains(lower, "refresh token has already been used") {
-		return false, ""
-	}
-	return true, "revoked: refresh_token_reused"
-}
-
 func shouldDeleteRevokedAuth(auth *Auth, resultErr *Error) (bool, string) {
 	if !isCodexAuth(auth) || !hasPersistedAuthRecord(auth) {
-		return false, ""
-	}
-	// refresh_token_reused is handled separately (disable, not delete)
-	// so operators can see the zombie + distinguish from other terminal
-	// revocations.
-	if reuse, _ := shouldDisableDueToRefreshTokenReuse(auth, resultErr); reuse {
 		return false, ""
 	}
 	reason := terminalAuthFailureReason(resultErr)
@@ -3800,38 +3774,6 @@ func (m *Manager) refreshAuth(ctx context.Context, id string) {
 	now := time.Now()
 	if err != nil {
 		resultErr := resultErrorFromError(err)
-		// Refresh-token-reuse must be checked BEFORE the delete path:
-		// this class of terminal failure should disable the auth in
-		// place (operator-visible) rather than silently delete the
-		// file. Applies to both persisted and in-memory codex auths.
-		// Persist the Disabled flag to disk so watcher/reload paths
-		// don't resurrect the zombie on the next tick.
-		if disableReuse, reuseReason := shouldDisableDueToRefreshTokenReuse(auth, resultErr); disableReuse {
-			var authSnapshot *Auth
-			m.mu.Lock()
-			if current := m.auths[id]; current != nil {
-				applyTerminalAuthDisabledState(current, resultErr, reuseReason, now)
-				current.NextRefreshAfter = time.Time{}
-				m.auths[id] = current
-				authSnapshot = current.Clone()
-			}
-			m.mu.Unlock()
-			if authSnapshot != nil {
-				if m.scheduler != nil {
-					m.scheduler.upsertAuth(authSnapshot)
-				}
-				// Persist the terminal-disable state so a subsequent
-				// file-watcher event or process restart doesn't
-				// rehydrate the zombie back to Disabled=false and
-				// burn another refresh attempt (which would only
-				// re-derive the same reused-token failure).
-				if err := m.persist(ctx, authSnapshot); err != nil {
-					log.Warnf("codex auth %s: persist disabled state failed: %v", auth.ID, err)
-				}
-			}
-			log.Warnf("codex auth %s disabled due to refresh_token_reused (concurrent rotator invalidated the token)", auth.ID)
-			return
-		}
 		if deleteAuth, reason := shouldDeleteRevokedAuth(auth, resultErr); deleteAuth {
 			var removedAuth *Auth
 			m.mu.Lock()
