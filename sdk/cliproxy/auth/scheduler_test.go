@@ -1,14 +1,17 @@
 package auth
 
 import (
+	"bytes"
 	"context"
 	"net/http"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
+	log "github.com/sirupsen/logrus"
 )
 
 type schedulerTestExecutor struct{}
@@ -180,6 +183,110 @@ func TestSchedulerPick_FillFirstSticksToFirstReady(t *testing.T) {
 	}
 }
 
+func TestSchedulerPick_FillFirstStableSelectionSkipsSwitchLog(t *testing.T) {
+	var buffer bytes.Buffer
+	previousOutput := log.StandardLogger().Out
+	previousLevel := log.GetLevel()
+	log.SetOutput(&buffer)
+	log.SetLevel(log.InfoLevel)
+	t.Cleanup(func() {
+		log.SetOutput(previousOutput)
+		log.SetLevel(previousLevel)
+	})
+
+	scheduler := newSchedulerForTest(
+		&FillFirstSelector{},
+		&Auth{ID: "b", Provider: "gemini"},
+		&Auth{ID: "a", Provider: "gemini"},
+	)
+
+	ctx := context.Background()
+	for index := 0; index < 3; index++ {
+		got, errPick := scheduler.pickSingle(ctx, "gemini", "", cliproxyexecutor.Options{}, nil)
+		if errPick != nil {
+			t.Fatalf("pickSingle() #%d error = %v", index, errPick)
+		}
+		if got == nil || got.ID != "a" {
+			t.Fatalf("pickSingle() #%d auth = %v, want a", index, got)
+		}
+	}
+
+	if logOutput := buffer.String(); strings.Contains(logOutput, "fill-first auth switched") {
+		t.Fatalf("expected no switch log, got %q", logOutput)
+	}
+}
+
+func TestSchedulerPick_FillFirstAuthSwitchLogsSelectionSnapshot(t *testing.T) {
+	var buffer bytes.Buffer
+	previousOutput := log.StandardLogger().Out
+	previousLevel := log.GetLevel()
+	log.SetOutput(&buffer)
+	log.SetLevel(log.InfoLevel)
+	t.Cleanup(func() {
+		log.SetOutput(previousOutput)
+		log.SetLevel(previousLevel)
+	})
+
+	nextRetry := time.Now().Add(5 * time.Minute)
+	scheduler := newSchedulerForTest(
+		&FillFirstSelector{},
+		&Auth{
+			ID:             "aaa-plus",
+			Provider:       "codex",
+			CreatedAt:      time.Date(2026, time.April, 24, 3, 0, 0, 0, time.UTC),
+			Unavailable:    true,
+			NextRetryAfter: nextRetry,
+			Quota: QuotaState{
+				Exceeded:      true,
+				BackoffLevel:  2,
+				NextRecoverAt: nextRetry,
+			},
+			Attributes: map[string]string{"plan_type": "plus", "priority": "10"},
+		},
+		&Auth{
+			ID:        "bbb-free",
+			Provider:  "codex",
+			CreatedAt: time.Date(2026, time.April, 24, 2, 0, 0, 0, time.UTC),
+			Attributes: map[string]string{
+				"plan_type": "free",
+				"priority":  "10",
+			},
+		},
+	)
+
+	ctx := context.Background()
+	scheduler.lastSelections["single:codex:"] = "aaa-plus"
+
+	got, errPick := scheduler.pickSingle(ctx, "codex", "", cliproxyexecutor.Options{}, nil)
+	if errPick != nil {
+		t.Fatalf("pickSingle() error = %v", errPick)
+	}
+	if got == nil || got.ID != "bbb-free" {
+		t.Fatalf("pickSingle() auth = %v, want bbb-free", got)
+	}
+
+	logOutput := buffer.String()
+	for _, want := range []string{
+		"fill-first auth switched",
+		"previous_auth_id=aaa-plus",
+		"selected_auth_id=bbb-free",
+		"selection_attempt=1",
+		"request_retry=false",
+		"provider=codex",
+		"selection_snapshot=",
+		"aaa-plus",
+		"bbb-free",
+		"plan_type=plus",
+		"plan_type=free",
+		"quota_backoff=2",
+		"unavailable=true",
+	} {
+		if !strings.Contains(logOutput, want) {
+			t.Fatalf("expected log to contain %q, got %q", want, logOutput)
+		}
+	}
+}
+
 func TestSchedulerPick_PromotesExpiredCooldownBeforePick(t *testing.T) {
 	t.Parallel()
 
@@ -343,6 +450,32 @@ func TestSchedulerPick_RoundRobinPrefersHigherPlanTypeWhenCreatedAtMatches(t *te
 		if got.ID != wantID {
 			t.Fatalf("pickSingle() #%d auth.ID = %q, want %q", index, got.ID, wantID)
 		}
+	}
+}
+
+func TestSchedulerPick_PreferBestAuthUsesFirstOrderedCandidate(t *testing.T) {
+	t.Parallel()
+
+	createdAt := time.Date(2026, time.February, 3, 4, 5, 6, 0, time.UTC)
+	scheduler := newSchedulerForTest(
+		&RoundRobinSelector{},
+		&Auth{ID: "aaa-free", Provider: "codex", CreatedAt: createdAt, Attributes: map[string]string{"plan_type": "free"}},
+		&Auth{ID: "zzz-plus", Provider: "codex", CreatedAt: createdAt, Attributes: map[string]string{"plan_type": "plus"}},
+	)
+
+	got, errPick := scheduler.pickSingle(context.Background(), "codex", "", cliproxyexecutor.Options{
+		Metadata: map[string]any{
+			cliproxyexecutor.PreferBestAuthMetadataKey: true,
+		},
+	}, nil)
+	if errPick != nil {
+		t.Fatalf("pickSingle() error = %v", errPick)
+	}
+	if got == nil {
+		t.Fatal("pickSingle() auth = nil")
+	}
+	if got.ID != "zzz-plus" {
+		t.Fatalf("pickSingle() auth.ID = %q, want %q", got.ID, "zzz-plus")
 	}
 }
 

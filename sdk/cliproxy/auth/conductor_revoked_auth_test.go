@@ -295,6 +295,9 @@ func TestManager_MarkResult_DeletesPersistedAuthOnRefreshTokenReused(t *testing.
 		t.Fatal("expected reused-token auth to be removed from manager")
 	}
 	waitForDeletedIDs(t, store, []string{auth.ID})
+	if !HasRevokedAuthTombstone(auth, time.Now()) {
+		t.Fatal("expected refresh_token_reused auth to leave a tombstone")
+	}
 }
 
 func TestManager_RefreshAuth_KeepsNonTerminalFailures(t *testing.T) {

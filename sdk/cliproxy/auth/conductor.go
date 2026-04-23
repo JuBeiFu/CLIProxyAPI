@@ -24,6 +24,7 @@ import (
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
+	"github.com/tidwall/sjson"
 )
 
 // ProviderExecutor defines the contract required by Manager to execute provider calls.
@@ -184,6 +185,10 @@ type Manager struct {
 	// It is initialized in NewManager; never Load() before first Store().
 	runtimeConfig atomic.Value
 
+	responseBindingsMu sync.Mutex
+	responseBindings   map[string]string
+	responseCompacts   map[string][]byte
+
 	// Optional HTTP RoundTripper provider injected by host.
 	rtProvider RoundTripperProvider
 
@@ -211,6 +216,8 @@ func NewManager(store Store, selector Selector, hook Hook) *Manager {
 		auths:            make(map[string]*Auth),
 		providerOffsets:  make(map[string]int),
 		modelPoolOffsets: make(map[string]int),
+		responseBindings: make(map[string]string),
+		responseCompacts: make(map[string][]byte),
 		refreshSemaphore: make(chan struct{}, refreshMaxConcurrency),
 	}
 	// atomic.Value requires non-nil initial value.
@@ -679,7 +686,7 @@ func (m *Manager) availableAuthsForRouteModel(auths []*Auth, provider, routeMode
 
 	available := availableByPriority[bestPriority]
 	if len(available) > 1 {
-		sort.Slice(available, func(i, j int) bool { return available[i].ID < available[j].ID })
+		sort.SliceStable(available, func(i, j int) bool { return authPreferredBefore(available[i], available[j]) })
 	}
 	return available, nil
 }
@@ -1135,6 +1142,9 @@ func (m *Manager) Register(ctx context.Context, auth *Auth) (*Auth, error) {
 	if auth == nil {
 		return nil, nil
 	}
+	if hasRevokedAuthTombstoneMemory(auth, time.Now()) {
+		return auth.Clone(), nil
+	}
 	if auth.ID == "" {
 		auth.ID = uuid.NewString()
 	}
@@ -1165,6 +1175,9 @@ func (m *Manager) Register(ctx context.Context, auth *Auth) (*Auth, error) {
 func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 	if auth == nil || auth.ID == "" {
 		return nil, nil
+	}
+	if hasRevokedAuthTombstoneMemory(auth, time.Now()) {
+		return auth.Clone(), nil
 	}
 	m.mu.Lock()
 	if existing, ok := m.auths[auth.ID]; ok && existing != nil {
@@ -1206,6 +1219,9 @@ func (m *Manager) Load(ctx context.Context) error {
 	m.auths = make(map[string]*Auth, len(items))
 	for _, auth := range items {
 		if auth == nil || auth.ID == "" {
+			continue
+		}
+		if hasRevokedAuthTombstoneMemory(auth, time.Now()) {
 			continue
 		}
 		auth.EnsureIndex()
@@ -1320,6 +1336,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 	}
 	routeModel := req.Model
 	opts = ensureRequestedModelMetadata(opts, routeModel)
+	opts = ensureResponseBindingMetadata(req, opts, m.lookupBoundAuthID)
 	tried := make(map[string]struct{})
 	attempted := make(map[string]struct{})
 	var lastErr error
@@ -1366,6 +1383,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			resultModel := m.stateModelForExecution(auth, routeModel, upstreamModel, pooled)
 			execReq := req
 			execReq.Model = upstreamModel
+			execReq = m.expandCompactPreviousResponseRequest(execReq, opts)
 			resp, errExec := executor.Execute(execCtx, auth, execReq, opts)
 			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: errExec == nil}
 			if errExec != nil {
@@ -1389,6 +1407,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 				continue
 			}
 			m.MarkResult(execCtx, result)
+			m.bindResponseFromPayload(auth.ID, execReq.Payload, resp.Payload)
 			lease.Release()
 			return resp, nil
 		}
@@ -1409,6 +1428,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 	}
 	routeModel := req.Model
 	opts = ensureRequestedModelMetadata(opts, routeModel)
+	opts = ensureResponseBindingMetadata(req, opts, m.lookupBoundAuthID)
 	tried := make(map[string]struct{})
 	attempted := make(map[string]struct{})
 	var lastErr error
@@ -1492,6 +1512,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 	}
 	routeModel := req.Model
 	opts = ensureRequestedModelMetadata(opts, routeModel)
+	opts = ensureResponseBindingMetadata(req, opts, m.lookupBoundAuthID)
 	tried := make(map[string]struct{})
 	attempted := make(map[string]struct{})
 	var lastErr error
@@ -1537,7 +1558,8 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 		}
 		attempted[auth.ID] = struct{}{}
 		lease := m.acquireInflightLease(provider, routeModel, auth.ID)
-		streamResult, errStream := m.executeStreamWithModelPool(execCtx, executor, auth, provider, req, opts, routeModel, models, pooled, lease)
+		execReq := m.expandCompactPreviousResponseRequest(req, opts)
+		streamResult, errStream := m.executeStreamWithModelPool(execCtx, executor, auth, provider, execReq, opts, routeModel, models, pooled, lease)
 		if errStream != nil {
 			if errCtx := execCtx.Err(); errCtx != nil {
 				lease.Release()
@@ -1551,7 +1573,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			lastErr = errStream
 			continue
 		}
-		return streamResult, nil
+		return m.bindResponseFromStreamResult(auth.ID, execReq.Payload, streamResult), nil
 	}
 }
 
@@ -1574,6 +1596,316 @@ func ensureRequestedModelMetadata(opts cliproxyexecutor.Options, requestedModel 
 	meta[cliproxyexecutor.RequestedModelMetadataKey] = requestedModel
 	opts.Metadata = meta
 	return opts
+}
+
+func ensureResponseBindingMetadata(req cliproxyexecutor.Request, opts cliproxyexecutor.Options, lookup func(string) string) cliproxyexecutor.Options {
+	if len(opts.Metadata) > 0 && pinnedAuthIDFromMetadata(opts.Metadata) != "" {
+		return opts
+	}
+	if strings.EqualFold(strings.TrimSpace(opts.Alt), "responses/compact") && compactRequestPrefersBestAuth(req, opts) {
+		return ensureCompactSelectionMetadata(opts)
+	}
+	if lookup == nil {
+		return opts
+	}
+	responseID := previousResponseIDFromRequest(req, opts)
+	if responseID == "" {
+		return opts
+	}
+	authID := strings.TrimSpace(lookup(responseID))
+	if authID == "" {
+		return opts
+	}
+	if len(opts.Metadata) == 0 {
+		opts.Metadata = map[string]any{cliproxyexecutor.PinnedAuthMetadataKey: authID}
+		return opts
+	}
+	meta := make(map[string]any, len(opts.Metadata)+1)
+	for k, v := range opts.Metadata {
+		meta[k] = v
+	}
+	meta[cliproxyexecutor.PinnedAuthMetadataKey] = authID
+	opts.Metadata = meta
+	return opts
+}
+
+func ensureCompactSelectionMetadata(opts cliproxyexecutor.Options) cliproxyexecutor.Options {
+	if len(opts.Metadata) == 0 {
+		opts.Metadata = map[string]any{cliproxyexecutor.PreferBestAuthMetadataKey: true}
+		return opts
+	}
+	if raw, ok := opts.Metadata[cliproxyexecutor.PreferBestAuthMetadataKey]; ok {
+		if prefer, okBool := raw.(bool); okBool && prefer {
+			return opts
+		}
+	}
+	meta := make(map[string]any, len(opts.Metadata)+1)
+	for k, v := range opts.Metadata {
+		meta[k] = v
+	}
+	meta[cliproxyexecutor.PreferBestAuthMetadataKey] = true
+	opts.Metadata = meta
+	return opts
+}
+
+func compactRequestPrefersBestAuth(req cliproxyexecutor.Request, opts cliproxyexecutor.Options) bool {
+	for _, payload := range [][]byte{req.Payload, opts.OriginalRequest} {
+		if len(payload) == 0 || !gjson.ValidBytes(payload) {
+			continue
+		}
+		input := gjson.GetBytes(payload, "input")
+		if input.Exists() {
+			switch input.Type {
+			case gjson.String:
+				if strings.TrimSpace(input.String()) != "" {
+					return true
+				}
+			case gjson.JSON:
+				if input.IsArray() && len(input.Array()) > 0 {
+					return true
+				}
+			default:
+				if strings.TrimSpace(input.Raw) != "" && input.Raw != "null" {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+func previousResponseIDFromRequest(req cliproxyexecutor.Request, opts cliproxyexecutor.Options) string {
+	for _, payload := range [][]byte{req.Payload, opts.OriginalRequest} {
+		if len(payload) == 0 || !gjson.ValidBytes(payload) {
+			continue
+		}
+		if responseID := strings.TrimSpace(gjson.GetBytes(payload, "previous_response_id").String()); responseID != "" {
+			return responseID
+		}
+	}
+	return ""
+}
+
+func responseIDFromResponsePayload(payload []byte) string {
+	if len(payload) == 0 || !gjson.ValidBytes(payload) {
+		return ""
+	}
+	if responseID := strings.TrimSpace(gjson.GetBytes(payload, "id").String()); responseID != "" {
+		return responseID
+	}
+	return strings.TrimSpace(gjson.GetBytes(payload, "response.id").String())
+}
+
+func responseIDFromStreamChunk(payload []byte) string {
+	payload = bytes.TrimSpace(payload)
+	if len(payload) == 0 {
+		return ""
+	}
+	if bytes.HasPrefix(payload, []byte("data:")) {
+		payload = bytes.TrimSpace(payload[len("data:"):])
+	}
+	if len(payload) == 0 || !gjson.ValidBytes(payload) {
+		return ""
+	}
+	eventType := strings.TrimSpace(gjson.GetBytes(payload, "type").String())
+	if eventType != "response.completed" && eventType != "response.done" {
+		return ""
+	}
+	return strings.TrimSpace(gjson.GetBytes(payload, "response.id").String())
+}
+
+func compactRequestNeedsTranscriptRewrite(req cliproxyexecutor.Request, opts cliproxyexecutor.Options) bool {
+	if !strings.EqualFold(strings.TrimSpace(opts.Alt), "responses/compact") {
+		return false
+	}
+	if compactRequestPrefersBestAuth(req, opts) {
+		return false
+	}
+	return previousResponseIDFromRequest(req, opts) != ""
+}
+
+func compactTranscriptFromPayload(reqPayload, respPayload []byte) []byte {
+	if len(reqPayload) == 0 || !gjson.ValidBytes(reqPayload) || len(respPayload) == 0 || !gjson.ValidBytes(respPayload) {
+		return nil
+	}
+
+	reqInput := gjson.GetBytes(reqPayload, "input")
+	respOutput := gjson.GetBytes(respPayload, "output")
+	if !reqInput.Exists() || !respOutput.Exists() || !respOutput.IsArray() {
+		return nil
+	}
+
+	transcript := []byte(`[]`)
+	switch {
+	case reqInput.IsArray():
+		for _, item := range reqInput.Array() {
+			if strings.TrimSpace(item.Raw) == "" {
+				continue
+			}
+			var err error
+			transcript, err = sjson.SetRawBytes(transcript, "-1", []byte(item.Raw))
+			if err != nil {
+				return nil
+			}
+		}
+	case reqInput.Type == gjson.String && strings.TrimSpace(reqInput.String()) != "":
+		message := []byte(`{"type":"message","role":"user","content":[{"type":"input_text","text":""}]}`)
+		message, _ = sjson.SetBytes(message, "content.0.text", reqInput.String())
+		var err error
+		transcript, err = sjson.SetRawBytes(transcript, "-1", message)
+		if err != nil {
+			return nil
+		}
+	default:
+		return nil
+	}
+	for _, item := range respOutput.Array() {
+		if strings.TrimSpace(item.Raw) == "" {
+			continue
+		}
+		itemType := strings.TrimSpace(item.Get("type").String())
+		if itemType != "message" && itemType != "function_call" && itemType != "function_call_output" && itemType != "custom_tool_call" && itemType != "custom_tool_call_output" {
+			continue
+		}
+		var err error
+		transcript, err = sjson.SetRawBytes(transcript, "-1", []byte(item.Raw))
+		if err != nil {
+			return nil
+		}
+	}
+	if len(gjson.ParseBytes(transcript).Array()) == 0 {
+		return nil
+	}
+	return transcript
+}
+
+func (m *Manager) lookupCompactTranscript(responseID string) []byte {
+	if m == nil {
+		return nil
+	}
+	responseID = strings.TrimSpace(responseID)
+	if responseID == "" {
+		return nil
+	}
+	m.responseBindingsMu.Lock()
+	defer m.responseBindingsMu.Unlock()
+	if raw, ok := m.responseCompacts[responseID]; ok && len(raw) > 0 {
+		return bytes.Clone(raw)
+	}
+	return nil
+}
+
+func (m *Manager) bindCompactTranscript(responseID string, transcript []byte) {
+	if m == nil {
+		return
+	}
+	responseID = strings.TrimSpace(responseID)
+	if responseID == "" || len(transcript) == 0 || !gjson.ValidBytes(transcript) {
+		return
+	}
+	m.responseBindingsMu.Lock()
+	if m.responseCompacts == nil {
+		m.responseCompacts = make(map[string][]byte)
+	}
+	m.responseCompacts[responseID] = bytes.Clone(transcript)
+	m.responseBindingsMu.Unlock()
+}
+
+func (m *Manager) expandCompactPreviousResponseRequest(req cliproxyexecutor.Request, opts cliproxyexecutor.Options) cliproxyexecutor.Request {
+	if !compactRequestNeedsTranscriptRewrite(req, opts) {
+		return req
+	}
+	responseID := previousResponseIDFromRequest(req, opts)
+	if responseID == "" {
+		return req
+	}
+	transcript := m.lookupCompactTranscript(responseID)
+	if len(transcript) == 0 {
+		return req
+	}
+	rewritten := req
+	payload := req.Payload
+	if len(payload) == 0 && len(opts.OriginalRequest) > 0 {
+		payload = opts.OriginalRequest
+	}
+	if len(payload) == 0 || !gjson.ValidBytes(payload) {
+		payload = []byte(`{}`)
+	} else {
+		payload = bytes.Clone(payload)
+	}
+	payload, _ = sjson.DeleteBytes(payload, "previous_response_id")
+	payload, _ = sjson.SetRawBytes(payload, "input", transcript)
+	rewritten.Payload = payload
+	return rewritten
+}
+
+func (m *Manager) lookupBoundAuthID(responseID string) string {
+	if m == nil {
+		return ""
+	}
+	responseID = strings.TrimSpace(responseID)
+	if responseID == "" {
+		return ""
+	}
+	m.responseBindingsMu.Lock()
+	defer m.responseBindingsMu.Unlock()
+	return strings.TrimSpace(m.responseBindings[responseID])
+}
+
+func (m *Manager) bindResponseToAuth(responseID, authID string) {
+	if m == nil {
+		return
+	}
+	responseID = strings.TrimSpace(responseID)
+	authID = strings.TrimSpace(authID)
+	if responseID == "" || authID == "" {
+		return
+	}
+	m.responseBindingsMu.Lock()
+	if m.responseBindings == nil {
+		m.responseBindings = make(map[string]string)
+	}
+	m.responseBindings[responseID] = authID
+	m.responseBindingsMu.Unlock()
+}
+
+func (m *Manager) bindResponseFromPayload(authID string, reqPayload []byte, respPayload []byte) {
+	responseID := responseIDFromResponsePayload(respPayload)
+	if responseID == "" {
+		return
+	}
+	m.bindResponseToAuth(responseID, authID)
+	if transcript := compactTranscriptFromPayload(reqPayload, respPayload); len(transcript) > 0 {
+		m.bindCompactTranscript(responseID, transcript)
+	}
+}
+
+func (m *Manager) bindResponseFromStreamResult(authID string, reqPayload []byte, result *cliproxyexecutor.StreamResult) *cliproxyexecutor.StreamResult {
+	if m == nil || result == nil || result.Chunks == nil {
+		return result
+	}
+	out := make(chan cliproxyexecutor.StreamChunk)
+	transcriptReq := bytes.Clone(reqPayload)
+	go func() {
+		defer close(out)
+		for chunk := range result.Chunks {
+			if chunk.Err == nil {
+				if responseID := responseIDFromStreamChunk(chunk.Payload); responseID != "" {
+					m.bindResponseToAuth(responseID, authID)
+					payload := bytes.TrimSpace(chunk.Payload)
+					if bytes.HasPrefix(payload, []byte("data:")) {
+						payload = bytes.TrimSpace(payload[len("data:"):])
+					}
+					responsePayload := []byte(gjson.GetBytes(payload, "response").Raw)
+					if transcript := compactTranscriptFromPayload(transcriptReq, responsePayload); len(transcript) > 0 {
+						m.bindCompactTranscript(responseID, transcript)
+					}
+				}
+			}
+			out <- chunk
+		}
+	}()
+	return &cliproxyexecutor.StreamResult{Headers: result.Headers, Chunks: out}
 }
 
 func hasRequestedModelMetadata(meta map[string]any) bool {
@@ -2848,6 +3180,7 @@ func (m *Manager) deleteRevokedAuth(auth *Auth, warning string, source string) {
 	if source == "" {
 		source = "request"
 	}
+	RegisterRevokedAuthTombstone(auth, warning, time.Now())
 	if m.scheduler != nil {
 		m.scheduler.removeAuth(authID)
 	}
@@ -3116,10 +3449,18 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 		m.mu.RUnlock()
 		return nil, nil, errAvailable
 	}
-	selected, errPick := m.selector.Pick(ctx, provider, selectionArgForSelector(m.selector, model), opts, available)
-	if errPick != nil {
-		m.mu.RUnlock()
-		return nil, nil, errPick
+	selected := (*Auth)(nil)
+	if preferBestAuthFromMetadata(opts.Metadata) {
+		if len(available) > 0 {
+			selected = available[0]
+		}
+	} else {
+		var errPick error
+		selected, errPick = m.selector.Pick(ctx, provider, selectionArgForSelector(m.selector, model), opts, available)
+		if errPick != nil {
+			m.mu.RUnlock()
+			return nil, nil, errPick
+		}
 	}
 	if selected == nil {
 		m.mu.RUnlock()
@@ -3245,10 +3586,18 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 		m.mu.RUnlock()
 		return nil, nil, "", errAvailable
 	}
-	selected, errPick := m.selector.Pick(ctx, "mixed", selectionArgForSelector(m.selector, model), opts, available)
-	if errPick != nil {
-		m.mu.RUnlock()
-		return nil, nil, "", errPick
+	selected := (*Auth)(nil)
+	if preferBestAuthFromMetadata(opts.Metadata) {
+		if len(available) > 0 {
+			selected = available[0]
+		}
+	} else {
+		var errPick error
+		selected, errPick = m.selector.Pick(ctx, "mixed", selectionArgForSelector(m.selector, model), opts, available)
+		if errPick != nil {
+			m.mu.RUnlock()
+			return nil, nil, "", errPick
+		}
 	}
 	if selected == nil {
 		m.mu.RUnlock()
@@ -3463,6 +3812,9 @@ func (m *Manager) snapshotAuths() []*Auth {
 
 func (m *Manager) shouldRefresh(a *Auth, now time.Time) bool {
 	if a == nil || a.Disabled {
+		return false
+	}
+	if hasRevokedAuthTombstoneMemory(a, now) {
 		return false
 	}
 	if !a.NextRefreshAfter.IsZero() && now.Before(a.NextRefreshAfter) {
@@ -3716,6 +4068,9 @@ func (m *Manager) KickAsyncBindingProbe(authID string) {
 	auth, ok := m.auths[authID]
 	m.mu.RUnlock()
 	if !ok || auth == nil {
+		return
+	}
+	if hasRevokedAuthTombstoneMemory(auth, time.Now()) {
 		return
 	}
 	if !isCodexAuth(auth) {

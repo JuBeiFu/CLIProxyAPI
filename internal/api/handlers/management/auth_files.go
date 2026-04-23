@@ -32,6 +32,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/misc"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/executor"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	sdkAuth "github.com/router-for-me/CLIProxyAPI/v6/sdk/auth"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
@@ -247,6 +248,10 @@ func (h *Handler) ListAuthFiles(c *gin.Context) {
 		return
 	}
 	auths := h.authManager.List()
+	if payload, ok := h.cachedListAuthFilesPayload(auths); ok {
+		c.Data(http.StatusOK, "application/json; charset=utf-8", payload)
+		return
+	}
 	files := make([]gin.H, 0, len(auths))
 	for _, auth := range auths {
 		if entry := h.buildAuthFileEntry(auth); entry != nil {
@@ -258,7 +263,13 @@ func (h *Handler) ListAuthFiles(c *gin.Context) {
 		nameJ, _ := files[j]["name"].(string)
 		return strings.ToLower(nameI) < strings.ToLower(nameJ)
 	})
-	c.JSON(200, gin.H{"files": files})
+	payload, errMarshal := json.Marshal(gin.H{"files": files})
+	if errMarshal != nil {
+		c.JSON(200, gin.H{"files": files})
+		return
+	}
+	h.storeCachedListAuthFilesPayload(auths, payload)
+	c.Data(http.StatusOK, "application/json; charset=utf-8", payload)
 }
 
 // ListAvailableAuthFiles returns only auths that are available for scheduling
@@ -296,6 +307,27 @@ func (h *Handler) ListAvailableAuthFiles(c *gin.Context) {
 		"files":           files,
 		"available_count": len(files),
 		"total_count":     totalCount,
+	})
+}
+
+// GptDrawQuota returns the per-auth daily gpt-draw usage counters plus the
+// configured limit. Entries with stale dates are surfaced as count=0 for today.
+func (h *Handler) GptDrawQuota(c *gin.Context) {
+	entries, limit := executor.GptDrawQuotaSnapshot()
+	type row struct {
+		AuthID string `json:"auth_id"`
+		Date   string `json:"date"`
+		Used   int    `json:"used"`
+		Limit  int    `json:"limit"`
+	}
+	out := make([]row, 0, len(entries))
+	for id, e := range entries {
+		out = append(out, row{AuthID: id, Date: e.Date, Used: e.Count, Limit: limit})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].AuthID < out[j].AuthID })
+	c.JSON(http.StatusOK, gin.H{
+		"limit":   limit,
+		"entries": out,
 	})
 }
 
@@ -768,6 +800,75 @@ func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
 		}
 	}
 	return entry
+}
+
+func (h *Handler) cachedListAuthFilesPayload(auths []*coreauth.Auth) ([]byte, bool) {
+	if h == nil {
+		return nil, false
+	}
+	ttl := h.listAuthFilesCacheTTL
+	if ttl <= 0 {
+		return nil, false
+	}
+	signature := authFilesSignature(auths)
+	now := time.Now()
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.listAuthFilesCache.payload != nil &&
+		h.listAuthFilesCache.signature == signature &&
+		now.Before(h.listAuthFilesCache.expiresAt) {
+		return append([]byte(nil), h.listAuthFilesCache.payload...), true
+	}
+	return nil, false
+}
+
+func (h *Handler) storeCachedListAuthFilesPayload(auths []*coreauth.Auth, payload []byte) {
+	if h == nil {
+		return
+	}
+	ttl := h.listAuthFilesCacheTTL
+	if ttl <= 0 || len(payload) == 0 {
+		return
+	}
+	signature := authFilesSignature(auths)
+	h.mu.Lock()
+	h.listAuthFilesCache = authFilesCacheEntry{
+		signature: signature,
+		expiresAt: time.Now().Add(ttl),
+		payload:   append([]byte(nil), payload...),
+	}
+	h.mu.Unlock()
+}
+
+func authFilesSignature(auths []*coreauth.Auth) string {
+	if len(auths) == 0 {
+		return "empty"
+	}
+	parts := make([]string, 0, len(auths))
+	for _, auth := range auths {
+		if auth == nil {
+			continue
+		}
+		parts = append(parts, strings.Join([]string{
+			auth.ID,
+			auth.FileName,
+			auth.Label,
+			string(auth.Status),
+			auth.StatusMessage,
+			strconv.FormatBool(auth.Disabled),
+			strconv.FormatBool(auth.Unavailable),
+			auth.UpdatedAt.UTC().Format(time.RFC3339Nano),
+			auth.LastRefreshedAt.UTC().Format(time.RFC3339Nano),
+			auth.NextRetryAfter.UTC().Format(time.RFC3339Nano),
+			auth.Quota.Reason,
+			strconv.FormatBool(auth.Quota.Exceeded),
+			auth.Quota.NextRecoverAt.UTC().Format(time.RFC3339Nano),
+		}, "\x00"))
+	}
+	sort.Strings(parts)
+	sum := sha256.Sum256([]byte(strings.Join(parts, "\x01")))
+	return hex.EncodeToString(sum[:])
 }
 
 func extractCodexIDTokenClaims(auth *coreauth.Auth) gin.H {

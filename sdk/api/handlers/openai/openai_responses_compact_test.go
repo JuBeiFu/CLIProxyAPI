@@ -14,12 +14,14 @@ import (
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	coreexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 	sdkconfig "github.com/router-for-me/CLIProxyAPI/v6/sdk/config"
+	"github.com/tidwall/gjson"
 )
 
 type compactCaptureExecutor struct {
 	alt          string
 	sourceFormat string
 	calls        int
+	payload      []byte
 }
 
 func (e *compactCaptureExecutor) Identifier() string { return "test-provider" }
@@ -28,6 +30,7 @@ func (e *compactCaptureExecutor) Execute(ctx context.Context, auth *coreauth.Aut
 	e.calls++
 	e.alt = opts.Alt
 	e.sourceFormat = opts.SourceFormat.String()
+	e.payload = append(e.payload[:0], req.Payload...)
 	return coreexecutor.Response{Payload: []byte(`{"ok":true}`)}, nil
 }
 
@@ -116,5 +119,38 @@ func TestOpenAIResponsesCompactExecute(t *testing.T) {
 	}
 	if strings.TrimSpace(resp.Body.String()) != `{"ok":true}` {
 		t.Fatalf("body = %s", resp.Body.String())
+	}
+}
+
+func TestOpenAIResponsesCompactPassesPreviousResponseIDThroughHandler(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	executor := &compactCaptureExecutor{}
+	manager := coreauth.NewManager(nil, nil, nil)
+	manager.RegisterExecutor(executor)
+
+	auth := &coreauth.Auth{ID: "auth3", Provider: executor.Identifier(), Status: coreauth.StatusActive}
+	if _, err := manager.Register(context.Background(), auth); err != nil {
+		t.Fatalf("Register auth: %v", err)
+	}
+	registry.GetGlobalRegistry().RegisterClient(auth.ID, auth.Provider, []*registry.ModelInfo{{ID: "test-model"}})
+	t.Cleanup(func() {
+		registry.GetGlobalRegistry().UnregisterClient(auth.ID)
+	})
+
+	base := handlers.NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, manager)
+	h := NewOpenAIResponsesAPIHandler(base)
+	router := gin.New()
+	router.POST("/v1/responses/compact", h.Compact)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses/compact", strings.NewReader(`{"model":"test-model","previous_response_id":"resp-prev"}`))
+	req.Header.Set("Content-Type", "application/json")
+	resp := httptest.NewRecorder()
+	router.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", resp.Code, http.StatusOK)
+	}
+	if got := gjson.GetBytes(executor.payload, "previous_response_id").String(); got != "resp-prev" {
+		t.Fatalf("previous_response_id = %q, want %q; payload=%s", got, "resp-prev", string(executor.payload))
 	}
 }

@@ -84,6 +84,9 @@ func shouldForceRefresh(auth *Auth) bool {
 	if auth == nil {
 		return false
 	}
+	if hasRevokedAuthTombstoneMemory(auth, time.Now()) {
+		return false
+	}
 	if !strings.EqualFold(strings.TrimSpace(auth.Provider), "codex") {
 		return false
 	}
@@ -265,6 +268,9 @@ func (m *Manager) reserveForcedRefreshSlot(id string, now time.Time) bool {
 	defer m.mu.Unlock()
 	auth, ok := m.auths[id]
 	if !ok || auth == nil {
+		return false
+	}
+	if hasRevokedAuthTombstoneMemory(auth, now) {
 		return false
 	}
 	if !auth.NextRefreshAfter.IsZero() && now.Before(auth.NextRefreshAfter) {

@@ -144,7 +144,7 @@ func (s *FileTokenStore) List(ctx context.Context) ([]*cliproxyauth.Auth, error)
 		if err != nil {
 			return nil
 		}
-		if auth != nil {
+		if auth != nil && !cliproxyauth.HasRevokedAuthTombstone(auth, time.Now()) {
 			entries = append(entries, auth)
 		}
 		return nil

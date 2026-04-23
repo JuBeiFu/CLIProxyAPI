@@ -8,6 +8,7 @@ package chat_completions
 import (
 	"bytes"
 	"context"
+	"strings"
 	"time"
 
 	"github.com/tidwall/gjson"
@@ -183,7 +184,25 @@ func ConvertCodexResponseToOpenAI(_ context.Context, modelName string, originalR
 
 	} else if dataType == "response.output_item.done" {
 		itemResult := rootResult.Get("item")
-		if !itemResult.Exists() || itemResult.Get("type").String() != "function_call" {
+		if !itemResult.Exists() {
+			return [][]byte{}
+		}
+		itemType := itemResult.Get("type").String()
+		if itemType == "image_generation_call" {
+			result := itemResult.Get("result").String()
+			if result == "" {
+				return [][]byte{}
+			}
+			format := itemResult.Get("output_format").String()
+			if format == "" {
+				format = "png"
+			}
+			delta := "![image](data:image/" + format + ";base64," + result + ")"
+			template, _ = sjson.SetBytes(template, "choices.0.delta.role", "assistant")
+			template, _ = sjson.SetBytes(template, "choices.0.delta.content", delta)
+			return [][]byte{template}
+		}
+		if itemType != "function_call" {
 			return [][]byte{}
 		}
 
@@ -290,11 +309,22 @@ func ConvertCodexResponseToOpenAINonStream(_ context.Context, _ string, original
 		outputArray := outputResult.Array()
 		var contentText string
 		var reasoningText string
+		var imageDataURIs []string
 
 		for _, outputItem := range outputArray {
 			outputType := outputItem.Get("type").String()
 
 			switch outputType {
+			case "image_generation_call":
+				result := outputItem.Get("result").String()
+				if result == "" {
+					continue
+				}
+				format := outputItem.Get("output_format").String()
+				if format == "" {
+					format = "png"
+				}
+				imageDataURIs = append(imageDataURIs, "data:image/"+format+";base64,"+result)
 			case "reasoning":
 				// Extract reasoning content from summary
 				if summaryResult := outputItem.Get("summary"); summaryResult.IsArray() {
@@ -340,6 +370,25 @@ func ConvertCodexResponseToOpenAINonStream(_ context.Context, _ string, original
 
 				toolCalls = append(toolCalls, functionCallTemplate)
 			}
+		}
+
+		// Merge image generation outputs into the assistant message content
+		// as markdown data URIs so chat-completions clients can render them.
+		if len(imageDataURIs) > 0 {
+			var b strings.Builder
+			if contentText != "" {
+				b.WriteString(contentText)
+				b.WriteString("\n\n")
+			}
+			for i, uri := range imageDataURIs {
+				if i > 0 {
+					b.WriteString("\n\n")
+				}
+				b.WriteString("![image](")
+				b.WriteString(uri)
+				b.WriteString(")")
+			}
+			contentText = b.String()
 		}
 
 		// Set content and reasoning content if found

@@ -124,6 +124,7 @@ func (w *Watcher) prepareAuthUpdatesLocked(auths []*coreauth.Auth, force bool) [
 		if existing, ok := w.currentAuths[id]; !ok {
 			updates = append(updates, AuthUpdate{Action: AuthUpdateActionAdd, ID: id, Auth: auth.Clone()})
 		} else if force || !authEqual(existing, auth) {
+			preserveStableAuthTimestamps(existing, auth)
 			updates = append(updates, AuthUpdate{Action: AuthUpdateActionModify, ID: id, Auth: auth.Clone()})
 		}
 	}

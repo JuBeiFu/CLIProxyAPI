@@ -21,6 +21,15 @@ import (
 // healthy slow path (warp/socks) still succeeds.
 const multiProbeTimeout = 20 * time.Second
 
+var fetchPlanTypeWithProxy = func(ctx context.Context, proxyURL, accessToken string) (string, error) {
+	client, err := buildProbeClient(proxyURL)
+	if err != nil {
+		return "", err
+	}
+	svc := codexauth.NewCodexAuthWithClient(client)
+	return svc.FetchWhamUsagePlanType(ctx, accessToken)
+}
+
 // ProbeCodexPlanAcrossPool tries /wham/usage through every entry of the
 // auth's configured proxy pool (shuffled), stopping as soon as one reports
 // a paid plan (plus/pro/team/enterprise). If every pool entry reports free
@@ -48,13 +57,26 @@ func ProbeCodexPlanAcrossPool(
 ) (plan string, boundEntry string, probeOK bool) {
 	pool := resolveCodexProbePool(cfg, auth)
 	candidates := shuffledHealthyEntries(pool)
+	boundPreferredName := strings.TrimSpace(cliproxyauth.BoundProxyEntry(auth))
 
 	type probeCandidate struct {
 		entryName string // "" maps to BoundProxyEntryDirect at bind time
 		proxyURL  string // "" means direct
 	}
 	ordered := make([]probeCandidate, 0, len(candidates)+1)
+	if boundPreferredName != "" && boundPreferredName != cliproxyauth.BoundProxyEntryDirect {
+		for _, e := range candidates {
+			if e.Name != boundPreferredName {
+				continue
+			}
+			ordered = append(ordered, probeCandidate{entryName: e.Name, proxyURL: e.URL})
+			break
+		}
+	}
 	for _, e := range candidates {
+		if boundPreferredName != "" && e.Name == boundPreferredName {
+			continue
+		}
 		ordered = append(ordered, probeCandidate{entryName: e.Name, proxyURL: e.URL})
 	}
 	// Direct egress is always appended as last-resort fallback.
@@ -67,13 +89,8 @@ func ProbeCodexPlanAcrossPool(
 		if ctx.Err() != nil {
 			break
 		}
-		client, buildErr := buildProbeClient(c.proxyURL)
-		if buildErr != nil {
-			continue
-		}
 		probeCtx, cancel := context.WithTimeout(ctx, multiProbeTimeout)
-		svc := codexauth.NewCodexAuthWithClient(client)
-		got, probeErr := svc.FetchWhamUsagePlanType(probeCtx, accessToken)
+		got, probeErr := fetchPlanTypeWithProxy(probeCtx, c.proxyURL, accessToken)
 		cancel()
 		if probeErr != nil {
 			continue

@@ -13,6 +13,8 @@ const RequestedModelMetadataKey = "requested_model"
 const (
 	// PinnedAuthMetadataKey locks execution to a specific auth ID.
 	PinnedAuthMetadataKey = "pinned_auth_id"
+	// PreferBestAuthMetadataKey requests deterministic best-auth selection over round-robin.
+	PreferBestAuthMetadataKey = "prefer_best_auth"
 	// SelectedAuthMetadataKey stores the auth ID selected by the scheduler.
 	SelectedAuthMetadataKey = "selected_auth_id"
 	// SelectedAuthCallbackMetadataKey carries an optional callback invoked with the selected auth ID.

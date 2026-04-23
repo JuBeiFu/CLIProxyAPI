@@ -54,6 +54,10 @@ func (w *Watcher) processEvents(ctx context.Context) {
 			if !ok {
 				return
 			}
+			if w.shouldCoalesceAuthEvent(event) {
+				w.scheduleAuthEvent(event)
+				continue
+			}
 			w.handleEvent(event)
 		case errWatch, ok := <-w.watcher.Errors:
 			if !ok {
@@ -115,20 +119,84 @@ func (w *Watcher) handleEvent(event fsnotify.Event) {
 		return
 	}
 	if event.Op&(fsnotify.Create|fsnotify.Write) != 0 {
-		if unchanged, errSame := w.authFileUnchanged(event.Name); errSame == nil && unchanged {
+		data, errRead := readFileForWatcher(event.Name)
+		if errRead != nil {
+			log.Errorf("failed to read auth file %s: %v", filepath.Base(event.Name), errRead)
+			return
+		}
+		if unchanged, errSame := w.authFileUnchangedData(event.Name, data); errSame == nil && unchanged {
 			log.Debugf("auth file unchanged (hash match), skipping reload: %s", filepath.Base(event.Name))
 			return
 		}
 		log.Infof("auth file changed (%s): %s, processing incrementally", event.Op.String(), filepath.Base(event.Name))
-		w.addOrUpdateClient(event.Name)
+		w.processAuthFileData(event.Name, data)
 	}
 }
 
+func (w *Watcher) shouldCoalesceAuthEvent(event fsnotify.Event) bool {
+	if w == nil {
+		return false
+	}
+	authOps := fsnotify.Create | fsnotify.Write | fsnotify.Remove | fsnotify.Rename
+	if event.Op&authOps == 0 {
+		return false
+	}
+	normalizedName := w.normalizeAuthPath(event.Name)
+	normalizedAuthDir := w.normalizeAuthPath(w.authDir)
+	return strings.HasPrefix(normalizedName, normalizedAuthDir) && strings.HasSuffix(normalizedName, ".json")
+}
+
+func (w *Watcher) scheduleAuthEvent(event fsnotify.Event) {
+	if w == nil {
+		return
+	}
+	key := w.normalizeAuthPath(event.Name)
+	if key == "" {
+		return
+	}
+
+	w.authEventMu.Lock()
+	if w.pendingAuthEvents == nil {
+		w.pendingAuthEvents = make(map[string]fsnotify.Event)
+	}
+	if w.authEventTimers == nil {
+		w.authEventTimers = make(map[string]*time.Timer)
+	}
+	pending := w.pendingAuthEvents[key]
+	pending.Name = event.Name
+	pending.Op |= event.Op
+	w.pendingAuthEvents[key] = pending
+
+	if timer, ok := w.authEventTimers[key]; ok && timer != nil {
+		timer.Reset(authEventDebounceWindow)
+		w.authEventMu.Unlock()
+		return
+	}
+
+	timer := time.AfterFunc(authEventDebounceWindow, func() {
+		w.authEventMu.Lock()
+		pendingEvent, ok := w.pendingAuthEvents[key]
+		delete(w.pendingAuthEvents, key)
+		delete(w.authEventTimers, key)
+		w.authEventMu.Unlock()
+		if !ok || w.stopped.Load() {
+			return
+		}
+		w.handleEvent(pendingEvent)
+	})
+	w.authEventTimers[key] = timer
+	w.authEventMu.Unlock()
+}
+
 func (w *Watcher) authFileUnchanged(path string) (bool, error) {
-	data, errRead := os.ReadFile(path)
+	data, errRead := readFileForWatcher(path)
 	if errRead != nil {
 		return false, errRead
 	}
+	return w.authFileUnchangedData(path, data)
+}
+
+func (w *Watcher) authFileUnchangedData(path string, data []byte) (bool, error) {
 	if len(data) == 0 {
 		return false, nil
 	}

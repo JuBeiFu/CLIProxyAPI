@@ -24,15 +24,22 @@ import (
 // Returns:
 //   - *http.Client: An HTTP client with configured proxy or transport
 func NewProxyAwareHTTPClient(ctx context.Context, cfg *config.Config, auth *cliproxyauth.Auth, timeout time.Duration) *http.Client {
+	httpClient, _ := NewProxyAwareHTTPClientWithResolution(ctx, cfg, auth, timeout)
+	return httpClient
+}
+
+// NewProxyAwareHTTPClientWithResolution returns the configured HTTP client and
+// the effective proxy resolution that produced its transport selection.
+func NewProxyAwareHTTPClientWithResolution(ctx context.Context, cfg *config.Config, auth *cliproxyauth.Auth, timeout time.Duration) (*http.Client, proxypool.Resolution) {
 	httpClient := &http.Client{}
 	if timeout > 0 {
 		httpClient.Timeout = timeout
 	}
 
 	// Priority 1/2: explicit auth/global proxy-url or proxy-pool selection.
-	if transport, _ := proxypool.BuildHTTPRoundTripper(cfg, auth); transport != nil {
+	if transport, resolution := proxypool.BuildHTTPRoundTripper(cfg, auth); transport != nil {
 		httpClient.Transport = transport
-		return httpClient
+		return httpClient, resolution
 	}
 
 	// Priority 3: Use RoundTripper from context (typically from RoundTripperFor)
@@ -40,5 +47,5 @@ func NewProxyAwareHTTPClient(ctx context.Context, cfg *config.Config, auth *clip
 		httpClient.Transport = rt
 	}
 
-	return httpClient
+	return httpClient, proxypool.Resolution{}
 }

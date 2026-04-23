@@ -4,9 +4,11 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/tls"
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptrace"
 	"sort"
 	"strings"
 	"time"
@@ -36,6 +38,135 @@ const (
 )
 
 var dataTag = []byte("data:")
+
+const codexSlowTimingThreshold = 30 * time.Second
+
+type codexUpstreamTiming struct {
+	endpoint        string
+	model           string
+	authID          string
+	proxySource     string
+	proxyPool       string
+	proxyName       string
+	proxyURL        string
+	proxyFallback   bool
+	status          int
+	bytesRead       int
+	startedAt       time.Time
+	prepare         time.Duration
+	httpDo          time.Duration
+	readBody        time.Duration
+	translate       time.Duration
+	traceConn       time.Duration
+	traceTLS        time.Duration
+	traceWroteReq   time.Duration
+	traceFirstByte  time.Duration
+	traceReusedConn bool
+	traceWasIdle    bool
+	traceIdleTime   time.Duration
+	streamLines     int
+	streamChunks    int
+	streamErrText   string
+}
+
+func logSlowCodexUpstreamTiming(ctx context.Context, timing codexUpstreamTiming) {
+	total := time.Since(timing.startedAt)
+	if total < codexSlowTimingThreshold {
+		return
+	}
+	errText := strings.TrimSpace(timing.streamErrText)
+	if errText == "" {
+		errText = "-"
+	}
+	helps.LogWithRequestID(ctx).Infof(
+		"codex upstream timing endpoint=%s model=%s auth_id=%s proxy_source=%s proxy_pool=%s proxy_name=%s proxy_url=%s proxy_fallback_direct=%t status=%d total=%s prepare=%s http_do=%s read_body=%s translate=%s http_conn=%s http_tls=%s http_wrote_req=%s http_first_byte=%s http_conn_reused=%t http_conn_was_idle=%t http_conn_idle=%s response_bytes=%d stream_lines=%d stream_chunks=%d stream_err=%s",
+		timing.endpoint,
+		timing.model,
+		strings.TrimSpace(timing.authID),
+		strings.TrimSpace(timing.proxySource),
+		strings.TrimSpace(timing.proxyPool),
+		strings.TrimSpace(timing.proxyName),
+		strings.TrimSpace(timing.proxyURL),
+		timing.proxyFallback,
+		timing.status,
+		total.Round(time.Millisecond),
+		timing.prepare.Round(time.Millisecond),
+		timing.httpDo.Round(time.Millisecond),
+		timing.readBody.Round(time.Millisecond),
+		timing.translate.Round(time.Millisecond),
+		timing.traceConn.Round(time.Millisecond),
+		timing.traceTLS.Round(time.Millisecond),
+		timing.traceWroteReq.Round(time.Millisecond),
+		timing.traceFirstByte.Round(time.Millisecond),
+		timing.traceReusedConn,
+		timing.traceWasIdle,
+		timing.traceIdleTime.Round(time.Millisecond),
+		timing.bytesRead,
+		timing.streamLines,
+		timing.streamChunks,
+		errText,
+	)
+}
+
+type codexHTTPTraceState struct {
+	startedAt    time.Time
+	connectStart time.Time
+	gotConnAt    time.Time
+	tlsStart     time.Time
+	wroteReqAt   time.Time
+	firstByteAt  time.Time
+	reusedConn   bool
+}
+
+func withCodexHTTPTrace(ctx context.Context, timing *codexUpstreamTiming) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if timing == nil {
+		return ctx
+	}
+	state := &codexHTTPTraceState{startedAt: time.Now()}
+	trace := &httptrace.ClientTrace{
+		GetConn: func(string) {
+			state.connectStart = time.Now()
+		},
+		GotConn: func(info httptrace.GotConnInfo) {
+			state.gotConnAt = time.Now()
+			state.reusedConn = info.Reused
+			timing.traceWasIdle = info.WasIdle
+			timing.traceIdleTime = info.IdleTime
+		},
+		TLSHandshakeStart: func() {
+			state.tlsStart = time.Now()
+		},
+		TLSHandshakeDone: func(_ tls.ConnectionState, _ error) {
+			if !state.tlsStart.IsZero() {
+				timing.traceTLS += time.Since(state.tlsStart)
+			}
+		},
+		WroteRequest: func(httptrace.WroteRequestInfo) {
+			state.wroteReqAt = time.Now()
+			if !state.gotConnAt.IsZero() {
+				timing.traceWroteReq += state.wroteReqAt.Sub(state.gotConnAt)
+			} else if !state.startedAt.IsZero() {
+				timing.traceWroteReq += state.wroteReqAt.Sub(state.startedAt)
+			}
+		},
+		GotFirstResponseByte: func() {
+			state.firstByteAt = time.Now()
+			if !state.connectStart.IsZero() && !state.gotConnAt.IsZero() {
+				timing.traceConn += state.gotConnAt.Sub(state.connectStart)
+			} else if !state.startedAt.IsZero() {
+				timing.traceConn += time.Since(state.startedAt)
+			}
+			if !state.wroteReqAt.IsZero() {
+				timing.traceFirstByte += time.Since(state.wroteReqAt)
+			}
+			timing.traceReusedConn = state.reusedConn
+		},
+	}
+	return httptrace.WithClientTrace(ctx, trace)
+}
 
 func shouldPreserveCodexPreviousResponseID(ctx context.Context, auth *cliproxyauth.Auth, from sdktranslator.Format, body []byte) bool {
 	if from == sdktranslator.FromString("openai-response") && strings.TrimSpace(gjson.GetBytes(body, "previous_response_id").String()) != "" {
@@ -109,7 +240,7 @@ func (e *CodexExecutor) HttpRequest(ctx context.Context, auth *cliproxyauth.Auth
 	if err := e.PrepareRequest(httpReq, auth); err != nil {
 		return nil, err
 	}
-	httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
+	httpClient, _ := helps.NewProxyAwareHTTPClientWithResolution(ctx, e.cfg, auth, 0)
 	return httpClient.Do(httpReq)
 }
 
@@ -117,6 +248,14 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	if opts.Alt == "responses/compact" {
 		return e.executeCompact(ctx, auth, req, opts)
 	}
+	timing := codexUpstreamTiming{endpoint: "responses", model: thinking.ParseSuffix(req.Model).ModelName, startedAt: time.Now()}
+	if auth != nil {
+		timing.authID = auth.ID
+	}
+	defer func() {
+		logSlowCodexUpstreamTiming(ctx, timing)
+	}()
+	prepareStarted := time.Now()
 	baseModel := thinking.ParseSuffix(req.Model).ModelName
 
 	apiKey, baseURL := codexCreds(auth)
@@ -191,12 +330,22 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 		AuthType:  authType,
 		AuthValue: authValue,
 	})
-	httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
-	httpResp, err := httpClient.Do(httpReq)
+	httpClient, resolution := helps.NewProxyAwareHTTPClientWithResolution(ctx, e.cfg, auth, 0)
+	timing.proxySource = resolution.Source
+	timing.proxyPool = resolution.ProxyPool
+	timing.proxyName = resolution.ProxyName
+	timing.proxyURL = resolution.ProxyURL
+	timing.proxyFallback = resolution.FallbackToDirect
+	timing.prepare = time.Since(prepareStarted)
+	traceCtx := withCodexHTTPTrace(httpReq.Context(), &timing)
+	httpStarted := time.Now()
+	httpResp, err := httpClient.Do(httpReq.WithContext(traceCtx))
+	timing.httpDo = time.Since(httpStarted)
 	if err != nil {
 		helps.RecordAPIResponseError(ctx, e.cfg, err)
 		return resp, err
 	}
+	timing.status = httpResp.StatusCode
 	defer func() {
 		if errClose := httpResp.Body.Close(); errClose != nil {
 			log.Errorf("codex executor: close response body error: %v", errClose)
@@ -204,13 +353,19 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	}()
 	helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
+		readStarted := time.Now()
 		b, _ := io.ReadAll(httpResp.Body)
+		timing.readBody += time.Since(readStarted)
+		timing.bytesRead += len(b)
 		helps.AppendAPIResponseChunk(ctx, e.cfg, b)
 		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), b))
 		err = newCodexStatusErr(httpResp.StatusCode, b)
 		return resp, err
 	}
+	readStarted := time.Now()
 	data, err := io.ReadAll(httpResp.Body)
+	timing.readBody = time.Since(readStarted)
+	timing.bytesRead = len(data)
 	if err != nil {
 		helps.RecordAPIResponseError(ctx, e.cfg, err)
 		return resp, err
@@ -274,7 +429,9 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 		}
 
 		var param any
+		translateStarted := time.Now()
 		out := sdktranslator.TranslateNonStream(ctx, to, from, req.Model, originalPayload, body, completedData, &param)
+		timing.translate += time.Since(translateStarted)
 		resp = cliproxyexecutor.Response{Payload: out, Headers: httpResp.Header.Clone()}
 		return resp, nil
 	}
@@ -283,6 +440,14 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 }
 
 func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (resp cliproxyexecutor.Response, err error) {
+	timing := codexUpstreamTiming{endpoint: "responses/compact", model: thinking.ParseSuffix(req.Model).ModelName, startedAt: time.Now()}
+	if auth != nil {
+		timing.authID = auth.ID
+	}
+	defer func() {
+		logSlowCodexUpstreamTiming(ctx, timing)
+	}()
+	prepareStarted := time.Now()
 	baseModel := thinking.ParseSuffix(req.Model).ModelName
 
 	apiKey, baseURL := codexCreds(auth)
@@ -312,6 +477,9 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 	body = helps.ApplyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", body, originalTranslated, requestedModel)
 	body, _ = sjson.SetBytes(body, "model", baseModel)
 	body, _ = sjson.DeleteBytes(body, "stream")
+	if compactRequestHasInlineInput(body) {
+		body, _ = sjson.DeleteBytes(body, "previous_response_id")
+	}
 	body = normalizeCodexInstructions(body)
 
 	url := strings.TrimSuffix(baseURL, "/") + "/responses/compact"
@@ -337,12 +505,22 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 		AuthType:  authType,
 		AuthValue: authValue,
 	})
-	httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
-	httpResp, err := httpClient.Do(httpReq)
+	httpClient, resolution := helps.NewProxyAwareHTTPClientWithResolution(ctx, e.cfg, auth, 0)
+	timing.proxySource = resolution.Source
+	timing.proxyPool = resolution.ProxyPool
+	timing.proxyName = resolution.ProxyName
+	timing.proxyURL = resolution.ProxyURL
+	timing.proxyFallback = resolution.FallbackToDirect
+	timing.prepare = time.Since(prepareStarted)
+	traceCtx := withCodexHTTPTrace(httpReq.Context(), &timing)
+	httpStarted := time.Now()
+	httpResp, err := httpClient.Do(httpReq.WithContext(traceCtx))
+	timing.httpDo = time.Since(httpStarted)
 	if err != nil {
 		helps.RecordAPIResponseError(ctx, e.cfg, err)
 		return resp, err
 	}
+	timing.status = httpResp.StatusCode
 	defer func() {
 		if errClose := httpResp.Body.Close(); errClose != nil {
 			log.Errorf("codex executor: close response body error: %v", errClose)
@@ -350,13 +528,19 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 	}()
 	helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
+		readStarted := time.Now()
 		b, _ := io.ReadAll(httpResp.Body)
+		timing.readBody += time.Since(readStarted)
+		timing.bytesRead += len(b)
 		helps.AppendAPIResponseChunk(ctx, e.cfg, b)
 		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), b))
 		err = newCodexStatusErr(httpResp.StatusCode, b)
 		return resp, err
 	}
+	readStarted := time.Now()
 	data, err := io.ReadAll(httpResp.Body)
+	timing.readBody = time.Since(readStarted)
+	timing.bytesRead = len(data)
 	if err != nil {
 		helps.RecordAPIResponseError(ctx, e.cfg, err)
 		return resp, err
@@ -365,15 +549,40 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 	reporter.Publish(ctx, helps.ParseOpenAIUsage(data))
 	reporter.EnsurePublished(ctx)
 	var param any
+	translateStarted := time.Now()
 	out := sdktranslator.TranslateNonStream(ctx, to, from, req.Model, originalPayload, body, data, &param)
+	timing.translate = time.Since(translateStarted)
 	resp = cliproxyexecutor.Response{Payload: out, Headers: httpResp.Header.Clone()}
 	return resp, nil
+}
+
+func compactRequestHasInlineInput(body []byte) bool {
+	input := gjson.GetBytes(body, "input")
+	if !input.Exists() {
+		return false
+	}
+	switch input.Type {
+	case gjson.String:
+		return strings.TrimSpace(input.String()) != ""
+	case gjson.JSON:
+		if input.IsArray() {
+			return len(input.Array()) > 0
+		}
+		return strings.TrimSpace(input.Raw) != "" && input.Raw != "null"
+	default:
+		return strings.TrimSpace(input.Raw) != "" && input.Raw != "null"
+	}
 }
 
 func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (_ *cliproxyexecutor.StreamResult, err error) {
 	if opts.Alt == "responses/compact" {
 		return nil, statusErr{code: http.StatusBadRequest, msg: "streaming not supported for /responses/compact"}
 	}
+	timing := codexUpstreamTiming{endpoint: "responses_stream", model: thinking.ParseSuffix(req.Model).ModelName, startedAt: time.Now()}
+	if auth != nil {
+		timing.authID = auth.ID
+	}
+	prepareStarted := time.Now()
 	baseModel := thinking.ParseSuffix(req.Model).ModelName
 
 	apiKey, baseURL := codexCreds(auth)
@@ -448,15 +657,29 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 		AuthValue: authValue,
 	})
 
-	httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
-	httpResp, err := httpClient.Do(httpReq)
+	httpClient, resolution := helps.NewProxyAwareHTTPClientWithResolution(ctx, e.cfg, auth, 0)
+	timing.proxySource = resolution.Source
+	timing.proxyPool = resolution.ProxyPool
+	timing.proxyName = resolution.ProxyName
+	timing.proxyURL = resolution.ProxyURL
+	timing.proxyFallback = resolution.FallbackToDirect
+	timing.prepare = time.Since(prepareStarted)
+	traceCtx := withCodexHTTPTrace(httpReq.Context(), &timing)
+	httpStarted := time.Now()
+	httpResp, err := httpClient.Do(httpReq.WithContext(traceCtx))
+	timing.httpDo = time.Since(httpStarted)
 	if err != nil {
 		helps.RecordAPIResponseError(ctx, e.cfg, err)
+		logSlowCodexUpstreamTiming(ctx, timing)
 		return nil, err
 	}
+	timing.status = httpResp.StatusCode
 	helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
+		readStarted := time.Now()
 		data, readErr := io.ReadAll(httpResp.Body)
+		timing.readBody += time.Since(readStarted)
+		timing.bytesRead += len(data)
 		if errClose := httpResp.Body.Close(); errClose != nil {
 			log.Errorf("codex executor: close response body error: %v", errClose)
 		}
@@ -467,6 +690,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 		helps.AppendAPIResponseChunk(ctx, e.cfg, data)
 		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), data))
 		err = newCodexStatusErr(httpResp.StatusCode, data)
+		logSlowCodexUpstreamTiming(ctx, timing)
 		return nil, err
 	}
 	out := make(chan cliproxyexecutor.StreamChunk)
@@ -476,12 +700,15 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 			if errClose := httpResp.Body.Close(); errClose != nil {
 				log.Errorf("codex executor: close response body error: %v", errClose)
 			}
+			logSlowCodexUpstreamTiming(ctx, timing)
 		}()
 		scanner := bufio.NewScanner(httpResp.Body)
 		scanner.Buffer(nil, 52_428_800) // 50MB
 		var param any
 		for scanner.Scan() {
+			timing.streamLines++
 			line := scanner.Bytes()
+			timing.bytesRead += len(line)
 			helps.AppendAPIResponseChunk(ctx, e.cfg, line)
 
 			if bytes.HasPrefix(line, dataTag) {
@@ -493,14 +720,22 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 				}
 			}
 
+			translateStarted := time.Now()
 			chunks := sdktranslator.TranslateStream(ctx, to, from, req.Model, originalPayload, body, bytes.Clone(line), &param)
+			timing.translate += time.Since(translateStarted)
+			timing.streamChunks += len(chunks)
 			for i := range chunks {
 				out <- cliproxyexecutor.StreamChunk{Payload: chunks[i]}
 			}
 		}
+		timing.readBody = time.Since(httpStarted) - timing.httpDo - timing.translate
+		if timing.readBody < 0 {
+			timing.readBody = 0
+		}
 		if errScan := scanner.Err(); errScan != nil {
 			helps.RecordAPIResponseError(ctx, e.cfg, errScan)
 			reporter.PublishFailure(ctx)
+			timing.streamErrText = errScan.Error()
 			out <- cliproxyexecutor.StreamChunk{Err: errScan}
 		}
 	}()

@@ -416,6 +416,104 @@ func TestAddOrUpdateClientTriggersReloadAndHash(t *testing.T) {
 	}
 }
 
+func TestHandleEventWriteReadsAuthFileOnce(t *testing.T) {
+	tmpDir := t.TempDir()
+	authFile := filepath.Join(tmpDir, "sample.json")
+	if err := os.WriteFile(authFile, []byte(`{"type":"codex","email":"u@example.com"}`), 0o644); err != nil {
+		t.Fatalf("failed to create auth file: %v", err)
+	}
+
+	origReadFile := readFileForWatcher
+	defer func() { readFileForWatcher = origReadFile }()
+
+	var readCount int32
+	readFileForWatcher = func(path string) ([]byte, error) {
+		atomic.AddInt32(&readCount, 1)
+		return os.ReadFile(path)
+	}
+
+	w := &Watcher{
+		authDir:          tmpDir,
+		lastAuthHashes:   make(map[string]string),
+		lastAuthContents: make(map[string]*coreauth.Auth),
+		fileAuthsByPath:  make(map[string]map[string]*coreauth.Auth),
+	}
+	w.SetConfig(&config.Config{AuthDir: tmpDir})
+
+	w.handleEvent(fsnotify.Event{Name: authFile, Op: fsnotify.Write})
+
+	if got := atomic.LoadInt32(&readCount); got != 1 {
+		t.Fatalf("expected one auth file read, got %d", got)
+	}
+}
+
+func TestHandleEventWriteSkipsRevokedTombstonedAuthFile(t *testing.T) {
+	tmpDir := t.TempDir()
+	authFile := filepath.Join(tmpDir, "sample.json")
+	if err := os.WriteFile(authFile, []byte(`{"type":"codex","email":"u@example.com"}`), 0o644); err != nil {
+		t.Fatalf("failed to create auth file: %v", err)
+	}
+
+	coreauth.RegisterRevokedAuthTombstone(&coreauth.Auth{
+		ID:       "sample.json",
+		FileName: "sample.json",
+		Provider: "codex",
+		Attributes: map[string]string{
+			"path": authFile,
+		},
+	}, "revoked: refresh_token_reused", time.Now())
+
+	w := &Watcher{
+		authDir:          tmpDir,
+		lastAuthHashes:   make(map[string]string),
+		lastAuthContents: make(map[string]*coreauth.Auth),
+		fileAuthsByPath:  make(map[string]map[string]*coreauth.Auth),
+	}
+	w.SetConfig(&config.Config{AuthDir: tmpDir})
+
+	w.handleEvent(fsnotify.Event{Name: authFile, Op: fsnotify.Write})
+
+	if len(w.lastAuthHashes) != 1 {
+		t.Fatalf("expected tombstoned auth file hash to be cached once, got hashes=%v", w.lastAuthHashes)
+	}
+	if len(w.currentAuths) != 0 {
+		t.Fatalf("expected no runtime auths for tombstoned file, got %d", len(w.currentAuths))
+	}
+}
+
+func TestScheduleAuthEventCoalescesRapidDuplicateWrites(t *testing.T) {
+	tmpDir := t.TempDir()
+	authFile := filepath.Join(tmpDir, "sample.json")
+	if err := os.WriteFile(authFile, []byte(`{"type":"codex","email":"u@example.com"}`), 0o644); err != nil {
+		t.Fatalf("failed to create auth file: %v", err)
+	}
+
+	origReadFile := readFileForWatcher
+	defer func() { readFileForWatcher = origReadFile }()
+
+	var readCount int32
+	readFileForWatcher = func(path string) ([]byte, error) {
+		atomic.AddInt32(&readCount, 1)
+		return os.ReadFile(path)
+	}
+
+	w := &Watcher{
+		authDir:          tmpDir,
+		lastAuthHashes:   make(map[string]string),
+		lastAuthContents: make(map[string]*coreauth.Auth),
+		fileAuthsByPath:  make(map[string]map[string]*coreauth.Auth),
+	}
+	w.SetConfig(&config.Config{AuthDir: tmpDir})
+
+	w.scheduleAuthEvent(fsnotify.Event{Name: authFile, Op: fsnotify.Write})
+	w.scheduleAuthEvent(fsnotify.Event{Name: authFile, Op: fsnotify.Write})
+	time.Sleep(2 * authEventDebounceWindow)
+
+	if got := atomic.LoadInt32(&readCount); got != 1 {
+		t.Fatalf("expected one auth file read after coalescing, got %d", got)
+	}
+}
+
 func TestRemoveClientRemovesHash(t *testing.T) {
 	tmpDir := t.TempDir()
 	authFile := filepath.Join(tmpDir, "sample.json")
@@ -1600,6 +1698,90 @@ func TestPrepareAuthUpdatesLockedForceAndDelete(t *testing.T) {
 	updates = w.prepareAuthUpdatesLocked([]*coreauth.Auth{}, false)
 	if len(updates) != 1 || updates[0].Action != AuthUpdateActionDelete || updates[0].ID != "a" {
 		t.Fatalf("expected delete for missing auth, got %+v", updates)
+	}
+}
+
+func TestPrepareAuthUpdatesLockedPreservesCreatedAtForExistingAuth(t *testing.T) {
+	createdAt := time.Date(2026, 4, 24, 3, 48, 27, 0, time.UTC)
+	updatedAt := createdAt.Add(4 * time.Minute)
+	w := &Watcher{
+		currentAuths: map[string]*coreauth.Auth{
+			"a": {
+				ID:        "a",
+				Provider:  "codex",
+				Label:     "old",
+				CreatedAt: createdAt,
+				UpdatedAt: createdAt,
+			},
+		},
+		authQueue: make(chan AuthUpdate, 4),
+	}
+
+	updates := w.prepareAuthUpdatesLocked([]*coreauth.Auth{{
+		ID:        "a",
+		Provider:  "codex",
+		Label:     "new",
+		CreatedAt: updatedAt,
+		UpdatedAt: updatedAt,
+	}}, false)
+
+	if len(updates) != 1 || updates[0].Action != AuthUpdateActionModify {
+		t.Fatalf("expected modify update, got %+v", updates)
+	}
+	got := w.currentAuths["a"]
+	if got == nil {
+		t.Fatal("expected auth to remain in currentAuths")
+	}
+	if !got.CreatedAt.Equal(createdAt) {
+		t.Fatalf("expected CreatedAt %s, got %s", createdAt.Format(time.RFC3339Nano), got.CreatedAt.Format(time.RFC3339Nano))
+	}
+	if !updates[0].Auth.CreatedAt.Equal(createdAt) {
+		t.Fatalf("expected update CreatedAt %s, got %s", createdAt.Format(time.RFC3339Nano), updates[0].Auth.CreatedAt.Format(time.RFC3339Nano))
+	}
+	if !got.UpdatedAt.Equal(updatedAt) {
+		t.Fatalf("expected UpdatedAt %s, got %s", updatedAt.Format(time.RFC3339Nano), got.UpdatedAt.Format(time.RFC3339Nano))
+	}
+}
+
+func TestComputePerPathUpdatesLockedPreservesCreatedAtForExistingAuth(t *testing.T) {
+	createdAt := time.Date(2026, 4, 24, 3, 44, 6, 0, time.UTC)
+	updatedAt := createdAt.Add(9 * time.Minute)
+	w := &Watcher{
+		currentAuths: map[string]*coreauth.Auth{
+			"sample.json": {
+				ID:        "sample.json",
+				Provider:  "codex",
+				Label:     "old",
+				CreatedAt: createdAt,
+				UpdatedAt: createdAt,
+			},
+		},
+	}
+
+	updates := w.computePerPathUpdatesLocked(
+		map[string]*coreauth.Auth{
+			"sample.json": {ID: "sample.json", Provider: "codex", CreatedAt: createdAt, UpdatedAt: createdAt},
+		},
+		map[string]*coreauth.Auth{
+			"sample.json": {ID: "sample.json", Provider: "codex", Label: "new", CreatedAt: updatedAt, UpdatedAt: updatedAt},
+		},
+	)
+
+	if len(updates) != 1 || updates[0].Action != AuthUpdateActionModify {
+		t.Fatalf("expected modify update, got %+v", updates)
+	}
+	got := w.currentAuths["sample.json"]
+	if got == nil {
+		t.Fatal("expected auth to remain in currentAuths")
+	}
+	if !got.CreatedAt.Equal(createdAt) {
+		t.Fatalf("expected CreatedAt %s, got %s", createdAt.Format(time.RFC3339Nano), got.CreatedAt.Format(time.RFC3339Nano))
+	}
+	if !updates[0].Auth.CreatedAt.Equal(createdAt) {
+		t.Fatalf("expected update CreatedAt %s, got %s", createdAt.Format(time.RFC3339Nano), updates[0].Auth.CreatedAt.Format(time.RFC3339Nano))
+	}
+	if !got.UpdatedAt.Equal(updatedAt) {
+		t.Fatalf("expected UpdatedAt %s, got %s", updatedAt.Format(time.RFC3339Nano), got.UpdatedAt.Format(time.RFC3339Nano))
 	}
 }
 

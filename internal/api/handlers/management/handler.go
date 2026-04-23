@@ -50,6 +50,14 @@ type Handler struct {
 	logDir              string
 	postAuthHook        coreauth.PostAuthHook
 	proxyHealth         *proxypool.HealthManager
+	listAuthFilesCache  authFilesCacheEntry
+	listAuthFilesCacheTTL time.Duration
+}
+
+type authFilesCacheEntry struct {
+	signature string
+	expiresAt time.Time
+	payload   []byte
 }
 
 // NewHandler creates a new management handler instance.
@@ -67,6 +75,7 @@ func NewHandler(cfg *config.Config, configFilePath string, manager *coreauth.Man
 		allowRemoteOverride: envSecret != "",
 		envSecret:           envSecret,
 		proxyHealth:         proxypool.DefaultHealthManager(),
+		listAuthFilesCacheTTL: 3 * time.Second,
 	}
 	h.startAttemptCleanup()
 	return h

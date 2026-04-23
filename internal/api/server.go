@@ -653,6 +653,7 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.GET("/auth-files", s.mgmt.ListAuthFiles)
 		mgmt.GET("/auth-files/available", s.mgmt.ListAvailableAuthFiles)
 		mgmt.POST("/auth-files/quota-check", s.mgmt.BatchQuotaCheck)
+		mgmt.GET("/auth-files/gpt-draw-quota", s.mgmt.GptDrawQuota)
 		mgmt.GET("/auth-files/ban-records", s.mgmt.ListAuthBanRecords)
 		mgmt.GET("/auth-files/models", s.mgmt.GetAuthFileModels)
 		mgmt.GET("/model-definitions/:channel", s.mgmt.GetStaticModelDefinitions)

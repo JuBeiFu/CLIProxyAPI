@@ -22,6 +22,8 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
+var readFileForWatcher = os.ReadFile
+
 func (w *Watcher) reloadClients(rescanAuth bool, affectedOAuthProviders []string, forceAuthRefresh bool) {
 	log.Debugf("starting full client load process")
 
@@ -141,11 +143,15 @@ func (w *Watcher) reloadClients(rescanAuth bool, affectedOAuthProviders []string
 }
 
 func (w *Watcher) addOrUpdateClient(path string) {
-	data, errRead := os.ReadFile(path)
+	data, errRead := readFileForWatcher(path)
 	if errRead != nil {
 		log.Errorf("failed to read auth file %s: %v", filepath.Base(path), errRead)
 		return
 	}
+	w.processAuthFileData(path, data)
+}
+
+func (w *Watcher) processAuthFileData(path string, data []byte) {
 	if len(data) == 0 {
 		log.Debugf("ignoring empty auth file: %s", filepath.Base(path))
 		return
@@ -154,6 +160,26 @@ func (w *Watcher) addOrUpdateClient(path string) {
 	sum := sha256.Sum256(data)
 	curHash := hex.EncodeToString(sum[:])
 	normalized := w.normalizeAuthPath(path)
+	if coreauth.HasRevokedAuthTombstoneForPath(path, time.Now()) {
+		w.clientsMutex.Lock()
+		if w.lastAuthHashes == nil {
+			w.lastAuthHashes = make(map[string]string)
+		}
+		w.lastAuthHashes[normalized] = curHash
+		oldByID := make(map[string]*coreauth.Auth, len(w.fileAuthsByPath[normalized]))
+		for id, a := range w.fileAuthsByPath[normalized] {
+			oldByID[id] = a
+		}
+		delete(w.lastAuthContents, normalized)
+		delete(w.fileAuthsByPath, normalized)
+		updates := w.computePerPathUpdatesLocked(oldByID, map[string]*coreauth.Auth{})
+		w.clientsMutex.Unlock()
+		if len(updates) > 0 {
+			log.Debugf("skipping tombstoned auth file reload: %s", filepath.Base(path))
+			w.dispatchAuthUpdates(updates)
+		}
+		return
+	}
 
 	// Parse new auth content for diff comparison
 	var newAuth coreauth.Auth
@@ -259,6 +285,7 @@ func (w *Watcher) computePerPathUpdatesLocked(oldByID, newByID map[string]*corea
 			updates = append(updates, AuthUpdate{Action: AuthUpdateActionAdd, ID: id, Auth: newAuth.Clone()})
 			continue
 		}
+		preserveStableAuthTimestamps(existing, newAuth)
 		if !authEqual(existing, newAuth) {
 			w.currentAuths[id] = newAuth.Clone()
 			updates = append(updates, AuthUpdate{Action: AuthUpdateActionModify, ID: id, Auth: newAuth.Clone()})
@@ -274,10 +301,22 @@ func (w *Watcher) computePerPathUpdatesLocked(oldByID, newByID map[string]*corea
 	return updates
 }
 
+func preserveStableAuthTimestamps(existing, next *coreauth.Auth) {
+	if existing == nil || next == nil {
+		return
+	}
+	if !existing.CreatedAt.IsZero() {
+		next.CreatedAt = existing.CreatedAt
+	}
+}
+
 func authSliceToMap(auths []*coreauth.Auth) map[string]*coreauth.Auth {
 	byID := make(map[string]*coreauth.Auth, len(auths))
 	for _, a := range auths {
 		if a == nil || strings.TrimSpace(a.ID) == "" {
+			continue
+		}
+		if coreauth.HasRevokedAuthTombstone(a, time.Now()) {
 			continue
 		}
 		byID[a.ID] = a

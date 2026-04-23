@@ -1449,6 +1449,114 @@
           "xhigh"
         ]
       }
+    },
+    {
+      "id": "gpt-5.5",
+      "object": "model",
+      "created": 1772668800,
+      "owned_by": "openai",
+      "type": "openai",
+      "display_name": "GPT 5.5",
+      "version": "gpt-5.5",
+      "description": "Stable version of GPT 5.5",
+      "context_length": 1050000,
+      "max_completion_tokens": 128000,
+      "supported_parameters": [
+        "tools"
+      ],
+      "thinking": {
+        "levels": [
+          "low",
+          "medium",
+          "high",
+          "xhigh"
+        ]
+      }
+    },
+    {
+      "id": "gpt-5.5-mini",
+      "object": "model",
+      "created": 1773705600,
+      "owned_by": "openai",
+      "type": "openai",
+      "display_name": "GPT 5.5 Mini",
+      "version": "gpt-5.5-mini",
+      "description": "GPT-5.5 mini brings the strengths of GPT-5.5 to a faster, more efficient model designed for high-volume workloads.",
+      "context_length": 400000,
+      "max_completion_tokens": 128000,
+      "supported_parameters": [
+        "tools"
+      ],
+      "thinking": {
+        "levels": [
+          "low",
+          "medium",
+          "high",
+          "xhigh"
+        ]
+      }
+    },
+    {
+      "id": "gpt-5.5-codex",
+      "object": "model",
+      "created": 1770307200,
+      "owned_by": "openai",
+      "type": "openai",
+      "display_name": "GPT 5.5 Codex",
+      "version": "gpt-5.5",
+      "description": "Stable version of GPT 5.5 Codex, The best model for coding and agentic tasks across domains.",
+      "context_length": 400000,
+      "max_completion_tokens": 128000,
+      "supported_parameters": [
+        "tools"
+      ],
+      "thinking": {
+        "levels": [
+          "low",
+          "medium",
+          "high",
+          "xhigh"
+        ]
+      }
+    },
+    {
+      "id": "gpt-draw-1024x1024",
+      "object": "model",
+      "created": 1776816000,
+      "owned_by": "openai",
+      "type": "openai",
+      "display_name": "GPT Draw 1024x1024",
+      "version": "gpt-draw",
+      "description": "Image generation via Codex image_generation tool, 1024x1024.",
+      "context_length": 400000,
+      "max_completion_tokens": 128000,
+      "supported_parameters": []
+    },
+    {
+      "id": "gpt-draw-1024x1536",
+      "object": "model",
+      "created": 1776816000,
+      "owned_by": "openai",
+      "type": "openai",
+      "display_name": "GPT Draw 1024x1536",
+      "version": "gpt-draw",
+      "description": "Image generation via Codex image_generation tool, 1024x1536 (portrait).",
+      "context_length": 400000,
+      "max_completion_tokens": 128000,
+      "supported_parameters": []
+    },
+    {
+      "id": "gpt-draw-1536x1024",
+      "object": "model",
+      "created": 1776816000,
+      "owned_by": "openai",
+      "type": "openai",
+      "display_name": "GPT Draw 1536x1024",
+      "version": "gpt-draw",
+      "description": "Image generation via Codex image_generation tool, 1536x1024 (landscape).",
+      "context_length": 400000,
+      "max_completion_tokens": 128000,
+      "supported_parameters": []
     }
   ],
   "codex-team": [
@@ -1724,6 +1832,114 @@
           "xhigh"
         ]
       }
+    },
+    {
+      "id": "gpt-5.5",
+      "object": "model",
+      "created": 1772668800,
+      "owned_by": "openai",
+      "type": "openai",
+      "display_name": "GPT 5.5",
+      "version": "gpt-5.5",
+      "description": "Stable version of GPT 5.5",
+      "context_length": 1050000,
+      "max_completion_tokens": 128000,
+      "supported_parameters": [
+        "tools"
+      ],
+      "thinking": {
+        "levels": [
+          "low",
+          "medium",
+          "high",
+          "xhigh"
+        ]
+      }
+    },
+    {
+      "id": "gpt-5.5-mini",
+      "object": "model",
+      "created": 1773705600,
+      "owned_by": "openai",
+      "type": "openai",
+      "display_name": "GPT 5.5 Mini",
+      "version": "gpt-5.5-mini",
+      "description": "GPT-5.5 mini brings the strengths of GPT-5.5 to a faster, more efficient model designed for high-volume workloads.",
+      "context_length": 400000,
+      "max_completion_tokens": 128000,
+      "supported_parameters": [
+        "tools"
+      ],
+      "thinking": {
+        "levels": [
+          "low",
+          "medium",
+          "high",
+          "xhigh"
+        ]
+      }
+    },
+    {
+      "id": "gpt-5.5-codex",
+      "object": "model",
+      "created": 1770307200,
+      "owned_by": "openai",
+      "type": "openai",
+      "display_name": "GPT 5.5 Codex",
+      "version": "gpt-5.5",
+      "description": "Stable version of GPT 5.5 Codex, The best model for coding and agentic tasks across domains.",
+      "context_length": 400000,
+      "max_completion_tokens": 128000,
+      "supported_parameters": [
+        "tools"
+      ],
+      "thinking": {
+        "levels": [
+          "low",
+          "medium",
+          "high",
+          "xhigh"
+        ]
+      }
+    },
+    {
+      "id": "gpt-draw-1024x1024",
+      "object": "model",
+      "created": 1776816000,
+      "owned_by": "openai",
+      "type": "openai",
+      "display_name": "GPT Draw 1024x1024",
+      "version": "gpt-draw",
+      "description": "Image generation via Codex image_generation tool, 1024x1024.",
+      "context_length": 400000,
+      "max_completion_tokens": 128000,
+      "supported_parameters": []
+    },
+    {
+      "id": "gpt-draw-1024x1536",
+      "object": "model",
+      "created": 1776816000,
+      "owned_by": "openai",
+      "type": "openai",
+      "display_name": "GPT Draw 1024x1536",
+      "version": "gpt-draw",
+      "description": "Image generation via Codex image_generation tool, 1024x1536 (portrait).",
+      "context_length": 400000,
+      "max_completion_tokens": 128000,
+      "supported_parameters": []
+    },
+    {
+      "id": "gpt-draw-1536x1024",
+      "object": "model",
+      "created": 1776816000,
+      "owned_by": "openai",
+      "type": "openai",
+      "display_name": "GPT Draw 1536x1024",
+      "version": "gpt-draw",
+      "description": "Image generation via Codex image_generation tool, 1536x1024 (landscape).",
+      "context_length": 400000,
+      "max_completion_tokens": 128000,
+      "supported_parameters": []
     }
   ],
   "codex-plus": [
@@ -1978,6 +2194,29 @@
       }
     },
     {
+      "id": "gpt-5.5-codex-spark",
+      "object": "model",
+      "created": 1770912000,
+      "owned_by": "openai",
+      "type": "openai",
+      "display_name": "GPT 5.5 Codex Spark",
+      "version": "gpt-5.5",
+      "description": "Ultra-fast coding model.",
+      "context_length": 128000,
+      "max_completion_tokens": 128000,
+      "supported_parameters": [
+        "tools"
+      ],
+      "thinking": {
+        "levels": [
+          "low",
+          "medium",
+          "high",
+          "xhigh"
+        ]
+      }
+    },
+    {
       "id": "gpt-5.4",
       "object": "model",
       "created": 1772668800,
@@ -2022,6 +2261,114 @@
           "xhigh"
         ]
       }
+    },
+    {
+      "id": "gpt-5.5",
+      "object": "model",
+      "created": 1772668800,
+      "owned_by": "openai",
+      "type": "openai",
+      "display_name": "GPT 5.5",
+      "version": "gpt-5.5",
+      "description": "Stable version of GPT 5.5",
+      "context_length": 1050000,
+      "max_completion_tokens": 128000,
+      "supported_parameters": [
+        "tools"
+      ],
+      "thinking": {
+        "levels": [
+          "low",
+          "medium",
+          "high",
+          "xhigh"
+        ]
+      }
+    },
+    {
+      "id": "gpt-5.5-mini",
+      "object": "model",
+      "created": 1773705600,
+      "owned_by": "openai",
+      "type": "openai",
+      "display_name": "GPT 5.5 Mini",
+      "version": "gpt-5.5-mini",
+      "description": "GPT-5.5 mini brings the strengths of GPT-5.5 to a faster, more efficient model designed for high-volume workloads.",
+      "context_length": 400000,
+      "max_completion_tokens": 128000,
+      "supported_parameters": [
+        "tools"
+      ],
+      "thinking": {
+        "levels": [
+          "low",
+          "medium",
+          "high",
+          "xhigh"
+        ]
+      }
+    },
+    {
+      "id": "gpt-5.5-codex",
+      "object": "model",
+      "created": 1770307200,
+      "owned_by": "openai",
+      "type": "openai",
+      "display_name": "GPT 5.5 Codex",
+      "version": "gpt-5.5",
+      "description": "Stable version of GPT 5.5 Codex, The best model for coding and agentic tasks across domains.",
+      "context_length": 400000,
+      "max_completion_tokens": 128000,
+      "supported_parameters": [
+        "tools"
+      ],
+      "thinking": {
+        "levels": [
+          "low",
+          "medium",
+          "high",
+          "xhigh"
+        ]
+      }
+    },
+    {
+      "id": "gpt-draw-1024x1024",
+      "object": "model",
+      "created": 1776816000,
+      "owned_by": "openai",
+      "type": "openai",
+      "display_name": "GPT Draw 1024x1024",
+      "version": "gpt-draw",
+      "description": "Image generation via Codex image_generation tool, 1024x1024.",
+      "context_length": 400000,
+      "max_completion_tokens": 128000,
+      "supported_parameters": []
+    },
+    {
+      "id": "gpt-draw-1024x1536",
+      "object": "model",
+      "created": 1776816000,
+      "owned_by": "openai",
+      "type": "openai",
+      "display_name": "GPT Draw 1024x1536",
+      "version": "gpt-draw",
+      "description": "Image generation via Codex image_generation tool, 1024x1536 (portrait).",
+      "context_length": 400000,
+      "max_completion_tokens": 128000,
+      "supported_parameters": []
+    },
+    {
+      "id": "gpt-draw-1536x1024",
+      "object": "model",
+      "created": 1776816000,
+      "owned_by": "openai",
+      "type": "openai",
+      "display_name": "GPT Draw 1536x1024",
+      "version": "gpt-draw",
+      "description": "Image generation via Codex image_generation tool, 1536x1024 (landscape).",
+      "context_length": 400000,
+      "max_completion_tokens": 128000,
+      "supported_parameters": []
     }
   ],
   "codex-pro": [
@@ -2276,6 +2623,29 @@
       }
     },
     {
+      "id": "gpt-5.5-codex-spark",
+      "object": "model",
+      "created": 1770912000,
+      "owned_by": "openai",
+      "type": "openai",
+      "display_name": "GPT 5.5 Codex Spark",
+      "version": "gpt-5.5",
+      "description": "Ultra-fast coding model.",
+      "context_length": 128000,
+      "max_completion_tokens": 128000,
+      "supported_parameters": [
+        "tools"
+      ],
+      "thinking": {
+        "levels": [
+          "low",
+          "medium",
+          "high",
+          "xhigh"
+        ]
+      }
+    },
+    {
       "id": "gpt-5.4",
       "object": "model",
       "created": 1772668800,
@@ -2320,6 +2690,114 @@
           "xhigh"
         ]
       }
+    },
+    {
+      "id": "gpt-5.5",
+      "object": "model",
+      "created": 1772668800,
+      "owned_by": "openai",
+      "type": "openai",
+      "display_name": "GPT 5.5",
+      "version": "gpt-5.5",
+      "description": "Stable version of GPT 5.5",
+      "context_length": 1050000,
+      "max_completion_tokens": 128000,
+      "supported_parameters": [
+        "tools"
+      ],
+      "thinking": {
+        "levels": [
+          "low",
+          "medium",
+          "high",
+          "xhigh"
+        ]
+      }
+    },
+    {
+      "id": "gpt-5.5-mini",
+      "object": "model",
+      "created": 1773705600,
+      "owned_by": "openai",
+      "type": "openai",
+      "display_name": "GPT 5.5 Mini",
+      "version": "gpt-5.5-mini",
+      "description": "GPT-5.5 mini brings the strengths of GPT-5.5 to a faster, more efficient model designed for high-volume workloads.",
+      "context_length": 400000,
+      "max_completion_tokens": 128000,
+      "supported_parameters": [
+        "tools"
+      ],
+      "thinking": {
+        "levels": [
+          "low",
+          "medium",
+          "high",
+          "xhigh"
+        ]
+      }
+    },
+    {
+      "id": "gpt-5.5-codex",
+      "object": "model",
+      "created": 1770307200,
+      "owned_by": "openai",
+      "type": "openai",
+      "display_name": "GPT 5.5 Codex",
+      "version": "gpt-5.5",
+      "description": "Stable version of GPT 5.5 Codex, The best model for coding and agentic tasks across domains.",
+      "context_length": 400000,
+      "max_completion_tokens": 128000,
+      "supported_parameters": [
+        "tools"
+      ],
+      "thinking": {
+        "levels": [
+          "low",
+          "medium",
+          "high",
+          "xhigh"
+        ]
+      }
+    },
+    {
+      "id": "gpt-draw-1024x1024",
+      "object": "model",
+      "created": 1776816000,
+      "owned_by": "openai",
+      "type": "openai",
+      "display_name": "GPT Draw 1024x1024",
+      "version": "gpt-draw",
+      "description": "Image generation via Codex image_generation tool, 1024x1024.",
+      "context_length": 400000,
+      "max_completion_tokens": 128000,
+      "supported_parameters": []
+    },
+    {
+      "id": "gpt-draw-1024x1536",
+      "object": "model",
+      "created": 1776816000,
+      "owned_by": "openai",
+      "type": "openai",
+      "display_name": "GPT Draw 1024x1536",
+      "version": "gpt-draw",
+      "description": "Image generation via Codex image_generation tool, 1024x1536 (portrait).",
+      "context_length": 400000,
+      "max_completion_tokens": 128000,
+      "supported_parameters": []
+    },
+    {
+      "id": "gpt-draw-1536x1024",
+      "object": "model",
+      "created": 1776816000,
+      "owned_by": "openai",
+      "type": "openai",
+      "display_name": "GPT Draw 1536x1024",
+      "version": "gpt-draw",
+      "description": "Image generation via Codex image_generation tool, 1536x1024 (landscape).",
+      "context_length": 400000,
+      "max_completion_tokens": 128000,
+      "supported_parameters": []
     }
   ],
   "qwen": [

@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"fmt"
 	"sort"
 	"strings"
 	"sync"
@@ -9,6 +10,7 @@ import (
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
+	log "github.com/sirupsen/logrus"
 )
 
 // schedulerStrategy identifies which built-in routing semantics the scheduler should apply.
@@ -38,6 +40,7 @@ type authScheduler struct {
 	authProviders map[string]string
 	mixedCursors  map[string]int
 	inflight      map[string]int
+	lastSelections map[string]string
 }
 
 // providerScheduler stores auth metadata and model shards for a single provider.
@@ -167,11 +170,12 @@ func normalizeCursor(cursor, size int) int {
 // newAuthScheduler constructs an empty scheduler configured for the supplied selector strategy.
 func newAuthScheduler(selector Selector) *authScheduler {
 	return &authScheduler{
-		strategy:      selectorStrategy(selector),
-		providers:     make(map[string]*providerScheduler),
-		authProviders: make(map[string]string),
-		mixedCursors:  make(map[string]int),
-		inflight:      make(map[string]int),
+		strategy:       selectorStrategy(selector),
+		providers:      make(map[string]*providerScheduler),
+		authProviders:  make(map[string]string),
+		mixedCursors:   make(map[string]int),
+		inflight:       make(map[string]int),
+		lastSelections: make(map[string]string),
 	}
 }
 
@@ -206,6 +210,10 @@ func schedulerInflightKey(providerKey, modelKey, authID string) string {
 		return ""
 	}
 	return providerKey + "|" + modelKey + "|" + authID
+}
+
+func schedulerSelectionKeySingle(providerKey, modelKey string) string {
+	return "single:" + providerKey + ":" + modelKey
 }
 
 func (s *authScheduler) acquireInflight(provider, model, authID string) {
@@ -251,6 +259,33 @@ func (s *authScheduler) inflightCountLocked(providerKey, modelKey, authID string
 		return 0
 	}
 	return s.inflight[key]
+}
+
+func (s *authScheduler) logFillFirstSelectionSwitchLocked(ctx context.Context, routeKey string, providerKey string, modelKey string, shard *modelScheduler, picked *Auth, selectionAttempt int) {
+	if s == nil || picked == nil || routeKey == "" {
+		return
+	}
+	previousAuthID := strings.TrimSpace(s.lastSelections[routeKey])
+	s.lastSelections[routeKey] = picked.ID
+	if previousAuthID == "" || previousAuthID == picked.ID {
+		return
+	}
+	if !log.IsLevelEnabled(log.InfoLevel) {
+		return
+	}
+	entry := logEntryWithRequestID(ctx)
+	if entry == nil {
+		return
+	}
+	entry.WithFields(log.Fields{
+		"provider":           providerKey,
+		"model":              modelKey,
+		"previous_auth_id":   previousAuthID,
+		"selected_auth_id":   picked.ID,
+		"selection_attempt":  selectionAttempt,
+		"request_retry":      selectionAttempt > 1,
+		"selection_snapshot": shard.selectionSnapshotLocked(modelKey, 5),
+	}).Info("fill-first auth switched")
 }
 
 // rebuild recreates the complete scheduler state from an auth snapshot.
@@ -302,6 +337,10 @@ func (s *authScheduler) pickSingle(ctx context.Context, provider, model string, 
 	modelKey := canonicalModelKey(model)
 	pinnedAuthID := pinnedAuthIDFromMetadata(opts.Metadata)
 	preferWebsocket := cliproxyexecutor.DownstreamWebsocket(ctx) && providerKey == "codex" && pinnedAuthID == ""
+	strategy := s.strategy
+	if preferBestAuthFromMetadata(opts.Metadata) {
+		strategy = schedulerStrategyFillFirst
+	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -333,7 +372,19 @@ func (s *authScheduler) pickSingle(ctx context.Context, provider, model string, 
 		}
 		return s.inflightCountLocked(providerKey, modelKey, entry.auth.ID)
 	}
-	if picked := shard.pickReadyLocked(preferWebsocket, s.strategy, predicate, load); picked != nil {
+	selectionAttempt := len(tried) + 1
+	if strategy == schedulerStrategyFillFirst {
+		priorityReady, okPriority := shard.highestReadyPriorityLocked(preferWebsocket, predicate)
+		if !okPriority {
+			return nil, shard.unavailableErrorLocked(provider, model, predicate)
+		}
+		if picked := shard.pickReadyAtPriorityLocked(preferWebsocket, priorityReady, strategy, predicate, load); picked != nil {
+			s.logFillFirstSelectionSwitchLocked(ctx, schedulerSelectionKeySingle(providerKey, modelKey), providerKey, modelKey, shard, picked, selectionAttempt)
+			return picked, nil
+		}
+		return nil, shard.unavailableErrorLocked(provider, model, predicate)
+	}
+	if picked := shard.pickReadyLocked(preferWebsocket, strategy, predicate, load); picked != nil {
 		return picked, nil
 	}
 	return nil, shard.unavailableErrorLocked(provider, model, predicate)
@@ -362,6 +413,10 @@ func (s *authScheduler) pickMixed(ctx context.Context, providers []string, model
 		return picked, providerKey, nil
 	}
 	pinnedAuthID := pinnedAuthIDFromMetadata(opts.Metadata)
+	strategy := s.strategy
+	if preferBestAuthFromMetadata(opts.Metadata) {
+		strategy = schedulerStrategyFillFirst
+	}
 	modelKey := canonicalModelKey(model)
 
 	s.mu.Lock()
@@ -392,7 +447,7 @@ func (s *authScheduler) pickMixed(ctx context.Context, providers []string, model
 			}
 			return s.inflightCountLocked(providerKey, modelKey, entry.auth.ID)
 		}
-		if picked := shard.pickReadyLocked(false, s.strategy, predicate, load); picked != nil {
+		if picked := shard.pickReadyLocked(false, strategy, predicate, load); picked != nil {
 			return picked, providerKey, nil
 		}
 		return nil, "", shard.unavailableErrorLocked("mixed", model, predicate)
@@ -426,7 +481,7 @@ func (s *authScheduler) pickMixed(ctx context.Context, providers []string, model
 		return nil, "", s.mixedUnavailableErrorLocked(normalized, model, tried)
 	}
 
-	if s.strategy == schedulerStrategyFillFirst {
+	if strategy == schedulerStrategyFillFirst {
 		for providerIndex, providerKey := range normalized {
 			shard := candidateShards[providerIndex]
 			if shard == nil {
@@ -438,7 +493,7 @@ func (s *authScheduler) pickMixed(ctx context.Context, providers []string, model
 				}
 				return s.inflightCountLocked(providerKey, modelKey, entry.auth.ID)
 			}
-			picked := shard.pickReadyAtPriorityLocked(false, bestPriority, s.strategy, predicate, load)
+			picked := shard.pickReadyAtPriorityLocked(false, bestPriority, strategy, predicate, load)
 			if picked != nil {
 				return picked, providerKey, nil
 			}
@@ -583,6 +638,18 @@ func containsProvider(providers []string, provider string) bool {
 		}
 	}
 	return false
+}
+
+func preferBestAuthFromMetadata(meta map[string]any) bool {
+	if len(meta) == 0 {
+		return false
+	}
+	raw, ok := meta[cliproxyexecutor.PreferBestAuthMetadataKey]
+	if !ok || raw == nil {
+		return false
+	}
+	prefer, ok := raw.(bool)
+	return ok && prefer
 }
 
 // upsertAuthLocked updates one auth in-place while the scheduler mutex is held.
@@ -919,6 +986,87 @@ func (m *modelScheduler) readyCountAtPriorityLocked(preferWebsocket bool, priori
 		return len(bucket.ws.flat)
 	}
 	return len(bucket.all.flat)
+}
+
+func (m *modelScheduler) selectionSnapshotLocked(modelKey string, limit int) string {
+	if m == nil || len(m.entries) == 0 {
+		return ""
+	}
+	if limit <= 0 {
+		limit = 5
+	}
+	ordered := make([]*scheduledAuth, 0, len(m.entries))
+	for _, entry := range m.entries {
+		if entry == nil || entry.auth == nil {
+			continue
+		}
+		ordered = append(ordered, entry)
+	}
+	sort.SliceStable(ordered, func(i, j int) bool {
+		return authPreferredBefore(ordered[i].auth, ordered[j].auth)
+	})
+	if len(ordered) > limit {
+		ordered = ordered[:limit]
+	}
+	now := time.Now()
+	parts := make([]string, 0, len(ordered))
+	for _, entry := range ordered {
+		snapshot := scheduledAuthSnapshot(entry, modelKey, now)
+		if snapshot == "" {
+			continue
+		}
+		parts = append(parts, snapshot)
+	}
+	return strings.Join(parts, " | ")
+}
+
+func scheduledAuthSnapshot(entry *scheduledAuth, modelKey string, now time.Time) string {
+	if entry == nil || entry.auth == nil {
+		return ""
+	}
+	auth := entry.auth
+	modelState := selectedModelState(auth, modelKey)
+	planType := ""
+	if auth.Attributes != nil {
+		planType = strings.TrimSpace(auth.Attributes["plan_type"])
+	}
+	quotaBackoff := auth.Quota.BackoffLevel
+	if modelState != nil {
+		quotaBackoff = modelState.Quota.BackoffLevel
+	}
+	blocked, _, nextRetryAfter := isAuthBlockedForModel(auth, modelKey, now)
+	createdAt := ""
+	if !auth.CreatedAt.IsZero() {
+		createdAt = auth.CreatedAt.UTC().Format(time.RFC3339)
+	}
+	nextRetry := ""
+	if !nextRetryAfter.IsZero() {
+		nextRetry = nextRetryAfter.UTC().Format(time.RFC3339)
+	}
+	return fmt.Sprintf(
+		"auth_id=%s priority=%d plan_type=%s quota_backoff=%d created_at=%s unavailable=%t next_retry_after=%s",
+		auth.ID,
+		authPriority(auth),
+		planType,
+		quotaBackoff,
+		createdAt,
+		blocked,
+		nextRetry,
+	)
+}
+
+func selectedModelState(auth *Auth, modelKey string) *ModelState {
+	if auth == nil || len(auth.ModelStates) == 0 {
+		return nil
+	}
+	if state := auth.ModelStates[modelKey]; state != nil {
+		return state
+	}
+	baseModelKey := canonicalModelKey(modelKey)
+	if baseModelKey == "" || baseModelKey == modelKey {
+		return nil
+	}
+	return auth.ModelStates[baseModelKey]
 }
 
 // unavailableErrorLocked returns the correct unavailable or cooldown error for the shard.

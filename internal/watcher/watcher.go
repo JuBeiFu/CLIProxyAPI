@@ -56,6 +56,9 @@ type Watcher struct {
 	pendingUpdates    map[string]AuthUpdate
 	pendingOrder      []string
 	dispatchCancel    context.CancelFunc
+	authEventMu       sync.Mutex
+	authEventTimers   map[string]*time.Timer
+	pendingAuthEvents map[string]fsnotify.Event
 	storePersister    storePersister
 	mirroredAuthDir   string
 	oldConfigYaml     []byte
@@ -81,6 +84,7 @@ const (
 	// replaceCheckDelay is a short delay to allow atomic replace (rename) to settle
 	// before deciding whether a Remove event indicates a real deletion.
 	replaceCheckDelay        = 50 * time.Millisecond
+	authEventDebounceWindow  = 100 * time.Millisecond
 	configReloadDebounce     = 150 * time.Millisecond
 	authRemoveDebounceWindow = 1 * time.Second
 	serverUpdateDebounce     = 1 * time.Second
