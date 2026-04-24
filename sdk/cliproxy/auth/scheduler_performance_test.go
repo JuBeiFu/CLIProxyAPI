@@ -89,6 +89,105 @@ func TestSchedulerPerformanceShadowKeepsRoundRobinSelection(t *testing.T) {
 	}
 }
 
+func TestSchedulerPerformanceEnabledSelectsFasterSamePriorityAuth(t *testing.T) {
+	model := "gpt-5.4"
+	registerSchedulerModels(t, "codex", model, "auth-a", "auth-b")
+	scorer := &fakePerformanceScorer{
+		candidates: map[string]performance.ScoreCandidate{
+			"auth-a": {OutputTPSEWMA: 10, LatencyMsEWMA: 100, SampleReady: true},
+			"auth-b": {OutputTPSEWMA: 40, LatencyMsEWMA: 40, SampleReady: true},
+		},
+	}
+	scheduler := newSchedulerForTest(
+		&RoundRobinSelector{},
+		&Auth{ID: "auth-a", Provider: "codex"},
+		&Auth{ID: "auth-b", Provider: "codex"},
+	)
+	cfg := performance.DefaultConfig()
+	cfg.Enabled = true
+	cfg.ShadowLog = true
+	scheduler.setPerformanceRoutingConfig(cfg)
+	scheduler.setPerformanceScorer(scorer)
+
+	got, errPick := scheduler.pickSingle(context.Background(), "codex", model, cliproxyexecutor.Options{}, nil)
+	if errPick != nil {
+		t.Fatalf("pickSingle() error = %v", errPick)
+	}
+	if got == nil {
+		t.Fatal("pickSingle() auth = nil")
+	}
+	if got.ID != "auth-b" {
+		t.Fatalf("pickSingle() auth.ID = %q, want %q", got.ID, "auth-b")
+	}
+}
+
+func TestSchedulerPerformanceRespectsTriedAuthExclusion(t *testing.T) {
+	model := "gpt-5.4"
+	registerSchedulerModels(t, "codex", model, "auth-a", "auth-b")
+	scorer := &fakePerformanceScorer{
+		candidates: map[string]performance.ScoreCandidate{
+			"auth-a": {OutputTPSEWMA: 100, LatencyMsEWMA: 40, SampleReady: true},
+			"auth-b": {OutputTPSEWMA: 10, LatencyMsEWMA: 100, SampleReady: true},
+		},
+	}
+	scheduler := newSchedulerForTest(
+		&RoundRobinSelector{},
+		&Auth{ID: "auth-a", Provider: "codex"},
+		&Auth{ID: "auth-b", Provider: "codex"},
+	)
+	cfg := performance.DefaultConfig()
+	cfg.Enabled = true
+	scheduler.setPerformanceRoutingConfig(cfg)
+	scheduler.setPerformanceScorer(scorer)
+
+	got, errPick := scheduler.pickSingle(context.Background(), "codex", model, cliproxyexecutor.Options{}, map[string]struct{}{"auth-a": {}})
+	if errPick != nil {
+		t.Fatalf("pickSingle() error = %v", errPick)
+	}
+	if got == nil {
+		t.Fatal("pickSingle() auth = nil")
+	}
+	if got.ID != "auth-b" {
+		t.Fatalf("pickSingle() auth.ID = %q, want %q", got.ID, "auth-b")
+	}
+}
+
+func TestSchedulerPerformanceAllColdUsesRoundRobin(t *testing.T) {
+	model := "gpt-5.4"
+	registerSchedulerModels(t, "codex", model, "auth-a", "auth-b")
+	scorer := &fakePerformanceScorer{
+		candidates: map[string]performance.ScoreCandidate{
+			"auth-a": {},
+			"auth-b": {},
+		},
+	}
+	scheduler := newSchedulerForTest(
+		&RoundRobinSelector{},
+		&Auth{ID: "auth-a", Provider: "codex"},
+		&Auth{ID: "auth-b", Provider: "codex"},
+	)
+	cfg := performance.DefaultConfig()
+	cfg.Enabled = true
+	cfg.MinSamples = 5
+	scheduler.setPerformanceRoutingConfig(cfg)
+	scheduler.setPerformanceScorer(scorer)
+
+	first, errPick := scheduler.pickSingle(context.Background(), "codex", model, cliproxyexecutor.Options{}, nil)
+	if errPick != nil {
+		t.Fatalf("first pickSingle() error = %v", errPick)
+	}
+	second, errPick := scheduler.pickSingle(context.Background(), "codex", model, cliproxyexecutor.Options{}, nil)
+	if errPick != nil {
+		t.Fatalf("second pickSingle() error = %v", errPick)
+	}
+	if first == nil || second == nil {
+		t.Fatalf("picks = %v, %v; want auth-a, auth-b", first, second)
+	}
+	if first.ID != "auth-a" || second.ID != "auth-b" {
+		t.Fatalf("pick IDs = %s, %s; want auth-a, auth-b", first.ID, second.ID)
+	}
+}
+
 func TestManagerPerformanceRoutingConfigPropagatesToScheduler(t *testing.T) {
 	manager := NewManager(nil, &RoundRobinSelector{}, nil)
 	cfg := performance.DefaultConfig()

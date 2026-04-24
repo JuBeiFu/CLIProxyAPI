@@ -997,7 +997,11 @@ func (m *modelScheduler) pickReadyAtPriorityLocked(providerKey, modelKey string,
 	if picked == nil || picked.auth == nil {
 		return nil
 	}
-	view.logPerformanceShadowSelection(providerKey, modelKey, picked, predicate, load, performanceCfg, performanceScorer)
+	performancePicked, scores := view.performanceRankedLocked(providerKey, modelKey, predicate, load, performanceCfg, performanceScorer)
+	view.logPerformanceShadowSelection(providerKey, modelKey, picked, performancePicked, scores, performanceCfg)
+	if performance.NormalizeConfig(performanceCfg).Enabled && performancePicked != nil && performancePicked.auth != nil && readyScoreCount(scores) > 0 {
+		return performancePicked.auth
+	}
 	return picked.auth
 }
 
@@ -1042,15 +1046,14 @@ func (v *readyView) performanceRankedLocked(providerKey, modelKey string, predic
 	return best, scores
 }
 
-func (v *readyView) logPerformanceShadowSelection(providerKey, modelKey string, picked *scheduledAuth, predicate func(*scheduledAuth) bool, load func(*scheduledAuth) int, cfg performance.Config, scorer PerformanceScorer) {
-	if picked == nil || picked.auth == nil || scorer == nil {
+func (v *readyView) logPerformanceShadowSelection(providerKey, modelKey string, picked *scheduledAuth, shadowPicked *scheduledAuth, scores []performance.Score, cfg performance.Config) {
+	if picked == nil || picked.auth == nil {
 		return
 	}
 	cfg = performance.NormalizeConfig(cfg)
 	if !cfg.ShadowLog {
 		return
 	}
-	shadowPicked, scores := v.performanceRankedLocked(providerKey, modelKey, predicate, load, cfg, scorer)
 	if shadowPicked == nil || shadowPicked.auth == nil || shadowPicked.auth.ID == picked.auth.ID {
 		return
 	}
