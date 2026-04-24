@@ -382,6 +382,10 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 
 		eventData := bytes.TrimSpace(line[5:])
 		eventType := gjson.GetBytes(eventData, "type").String()
+		if bodyCyber, ok := codexResponsesEventCyberPolicyErrorBody(eventData); ok {
+			err = newCodexStatusErr(http.StatusBadRequest, bodyCyber)
+			return resp, err
+		}
 
 		if eventType == "response.output_item.done" {
 			itemResult := gjson.GetBytes(eventData, "item")
@@ -713,6 +717,14 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 
 			if bytes.HasPrefix(line, dataTag) {
 				data := bytes.TrimSpace(line[5:])
+				if bodyCyber, ok := codexResponsesEventCyberPolicyErrorBody(data); ok {
+					cyberErr := newCodexStatusErr(http.StatusBadRequest, bodyCyber)
+					helps.RecordAPIResponseError(ctx, e.cfg, cyberErr)
+					reporter.PublishFailureWithError(ctx, cyberErr)
+					timing.streamErrText = cyberErr.Error()
+					out <- cliproxyexecutor.StreamChunk{Err: cyberErr}
+					return
+				}
 				if gjson.GetBytes(data, "type").String() == "response.completed" {
 					if detail, ok := helps.ParseCodexUsage(data); ok {
 						reporter.Publish(ctx, detail)
@@ -1147,6 +1159,38 @@ func newCodexStatusErr(statusCode int, body []byte) statusErr {
 		err.retryAfter = &fallback
 	}
 	return err
+}
+
+func codexResponsesEventCyberPolicyErrorBody(eventData []byte) ([]byte, bool) {
+	if len(eventData) == 0 {
+		return nil, false
+	}
+	eventType := strings.TrimSpace(gjson.GetBytes(eventData, "type").String())
+	if eventType != "response.failed" && eventType != "response.error" {
+		return nil, false
+	}
+	errNode := gjson.GetBytes(eventData, "response.error")
+	if !errNode.Exists() {
+		errNode = gjson.GetBytes(eventData, "error")
+	}
+	if !errNode.Exists() || errNode.Type != gjson.JSON {
+		return nil, false
+	}
+	if !codexErrorNodeIsCyberPolicy(errNode) {
+		return nil, false
+	}
+	body := []byte(`{}`)
+	body, _ = sjson.SetRawBytes(body, "error", []byte(errNode.Raw))
+	return body, true
+}
+
+func codexErrorNodeIsCyberPolicy(errNode gjson.Result) bool {
+	code := strings.TrimSpace(errNode.Get("code").String())
+	if strings.EqualFold(code, "cyber_policy") {
+		return true
+	}
+	message := strings.ToLower(strings.TrimSpace(errNode.Get("message").String()))
+	return strings.Contains(message, "cyber_policy")
 }
 
 func normalizeCodexInstructions(body []byte) []byte {

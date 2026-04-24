@@ -8,6 +8,7 @@ import (
 
 	codexauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/codex"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
+	"github.com/tidwall/gjson"
 )
 
 func TestParseCodexRetryAfter(t *testing.T) {
@@ -114,6 +115,21 @@ func TestNewCodexStatusErrTreatsCurrentModelUnavailableAsRetryableRateLimit(t *t
 	}
 	if *err.RetryAfter() != 5*time.Minute {
 		t.Fatalf("expected 5m default, got %v", *err.RetryAfter())
+	}
+}
+
+func TestCodexResponsesEventCyberPolicyErrorBody(t *testing.T) {
+	event := []byte(`{"type":"response.failed","response":{"error":{"code":"cyber_policy","message":"This chat was flagged for possible cybersecurity risk"}}}`)
+
+	body, ok := codexResponsesEventCyberPolicyErrorBody(event)
+	if !ok {
+		t.Fatal("expected cyber policy event to be detected")
+	}
+	if got := gjson.GetBytes(body, "error.code").String(); got != "cyber_policy" {
+		t.Fatalf("error code = %q, want cyber_policy", got)
+	}
+	if got := gjson.GetBytes(body, "error.message").String(); got == "" {
+		t.Fatalf("expected error message, got empty")
 	}
 }
 

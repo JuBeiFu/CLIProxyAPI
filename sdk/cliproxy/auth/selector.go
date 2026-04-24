@@ -178,6 +178,9 @@ func authPreferredBefore(left, right *Auth) bool {
 	if leftPlan, rightPlan := authPlanTierScore(left), authPlanTierScore(right); leftPlan != rightPlan {
 		return leftPlan > rightPlan
 	}
+	if leftCyber, rightCyber := authCyberPolicyTriggerCount(left), authCyberPolicyTriggerCount(right); leftCyber != rightCyber {
+		return leftCyber < rightCyber
+	}
 	if leftQuota, rightQuota := authQuotaHealthScore(left), authQuotaHealthScore(right); leftQuota != rightQuota {
 		return leftQuota > rightQuota
 	}

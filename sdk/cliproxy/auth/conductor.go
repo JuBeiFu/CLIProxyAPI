@@ -111,6 +111,8 @@ type Result struct {
 	RetryAfter *time.Duration
 	// Error describes the failure when Success is false.
 	Error *Error
+	// RequestPayload captures the downstream request body for failure auditing.
+	RequestPayload []byte
 }
 
 type inflightLease struct {
@@ -852,7 +854,7 @@ func readStreamBootstrap(ctx context.Context, ch <-chan cliproxyexecutor.StreamC
 	}
 }
 
-func (m *Manager) wrapStreamResult(ctx context.Context, auth *Auth, provider, resultModel string, headers http.Header, buffered []cliproxyexecutor.StreamChunk, remaining <-chan cliproxyexecutor.StreamChunk, lease *inflightLease) *cliproxyexecutor.StreamResult {
+func (m *Manager) wrapStreamResult(ctx context.Context, auth *Auth, provider, resultModel string, requestPayload []byte, headers http.Header, buffered []cliproxyexecutor.StreamChunk, remaining <-chan cliproxyexecutor.StreamChunk, lease *inflightLease) *cliproxyexecutor.StreamResult {
 	out := make(chan cliproxyexecutor.StreamChunk)
 	go func() {
 		defer lease.Release()
@@ -868,7 +870,7 @@ func (m *Manager) wrapStreamResult(ctx context.Context, auth *Auth, provider, re
 					rerr.HTTPStatus = se.StatusCode()
 				}
 				retryAfter = retryAfterFromError(chunk.Err)
-				m.MarkResult(ctx, Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, RetryAfter: retryAfter, Error: rerr})
+				m.MarkResult(ctx, Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, RetryAfter: retryAfter, Error: rerr, RequestPayload: bytes.Clone(requestPayload)})
 			}
 			if !forward {
 				return false
@@ -924,7 +926,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			if se, ok := errors.AsType[cliproxyexecutor.StatusError](errStream); ok && se != nil {
 				rerr.HTTPStatus = se.StatusCode()
 			}
-			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr}
+			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr, RequestPayload: bytes.Clone(execReq.Payload)}
 			result.RetryAfter = retryAfterFromError(errStream)
 			m.MarkResult(ctx, result)
 			if isRequestInvalidError(errStream) {
@@ -947,7 +949,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 				if se, ok := errors.AsType[cliproxyexecutor.StatusError](bootstrapErr); ok && se != nil {
 					rerr.HTTPStatus = se.StatusCode()
 				}
-				result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr}
+				result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr, RequestPayload: bytes.Clone(execReq.Payload)}
 				result.RetryAfter = retryAfterFromError(bootstrapErr)
 				m.MarkResult(ctx, result)
 				discardStreamChunks(streamResult.Chunks)
@@ -959,7 +961,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 				if se, ok := errors.AsType[cliproxyexecutor.StatusError](bootstrapErr); ok && se != nil {
 					rerr.HTTPStatus = se.StatusCode()
 				}
-				result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr}
+				result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr, RequestPayload: bytes.Clone(execReq.Payload)}
 				result.RetryAfter = retryAfterFromError(bootstrapErr)
 				m.MarkResult(ctx, result)
 				discardStreamChunks(streamResult.Chunks)
@@ -970,7 +972,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			if se, ok := errors.AsType[cliproxyexecutor.StatusError](bootstrapErr); ok && se != nil {
 				rerr.HTTPStatus = se.StatusCode()
 			}
-			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr}
+			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr, RequestPayload: bytes.Clone(execReq.Payload)}
 			result.RetryAfter = retryAfterFromError(bootstrapErr)
 			m.MarkResult(ctx, result)
 			discardStreamChunks(streamResult.Chunks)
@@ -980,7 +982,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 
 		if closed && len(buffered) == 0 {
 			emptyErr := &Error{Code: "empty_stream", Message: "upstream stream closed before first payload", Retryable: true}
-			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: emptyErr}
+			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: emptyErr, RequestPayload: bytes.Clone(execReq.Payload)}
 			m.MarkResult(ctx, result)
 			if idx < len(execModels)-1 {
 				lastErr = emptyErr
@@ -996,7 +998,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			close(closedCh)
 			remaining = closedCh
 		}
-		return m.wrapStreamResult(ctx, auth.Clone(), provider, resultModel, streamResult.Headers, buffered, remaining, lease), nil
+		return m.wrapStreamResult(ctx, auth.Clone(), provider, resultModel, bytes.Clone(execReq.Payload), streamResult.Headers, buffered, remaining, lease), nil
 	}
 	if lastErr == nil {
 		lastErr = &Error{Code: "auth_not_found", Message: "no upstream model available"}
@@ -1429,7 +1431,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			execReq.Model = upstreamModel
 			execReq = m.expandCompactPreviousResponseRequest(execReq, opts)
 			resp, errExec := executor.Execute(execCtx, auth, execReq, opts)
-			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: errExec == nil}
+			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: errExec == nil, RequestPayload: bytes.Clone(execReq.Payload)}
 			if errExec != nil {
 				if errCtx := execCtx.Err(); errCtx != nil {
 					lease.Release()
@@ -1517,7 +1519,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 			execReq := req
 			execReq.Model = upstreamModel
 			resp, errExec := executor.CountTokens(execCtx, auth, execReq, opts)
-			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: errExec == nil}
+			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: errExec == nil, RequestPayload: bytes.Clone(execReq.Payload)}
 			if errExec != nil {
 				if errCtx := execCtx.Err(); errCtx != nil {
 					lease.Release()
@@ -2489,6 +2491,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	terminalAuthSnapshot := (*Auth)(nil)
 	terminalWarning := ""
 	terminallyDisabled := false
+	var cyberAudit *cyberPolicyAuditRecord
 
 	m.mu.Lock()
 	if auth, ok := m.auths[result.AuthID]; ok && auth != nil {
@@ -2546,7 +2549,24 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 					if isTransientCooldownStatus(statusCode) {
 						unbindResponseAuthID = result.AuthID
 					}
-					if isModelSupportResultError(result.Error) {
+					if isCyberPolicyResultError(result.Error) {
+						audit := recordCyberPolicyTriggerLocked(auth, result, now)
+						cyberAudit = &audit
+						count := authCyberPolicyTriggerCount(auth)
+						next := now.Add(cyberPolicyCooldown(count))
+						state.NextRetryAfter = next
+						state.Quota = QuotaState{
+							Exceeded:      true,
+							Reason:        "cyber_policy",
+							NextRecoverAt: next,
+							BackoffLevel:  count,
+							UpdatedAt:     now,
+						}
+						applyAggregatedQuotaCooldown(auth, next, count, "cyber_policy")
+						suspendReason = "cyber_policy"
+						shouldSuspendModel = true
+						setModelQuota = true
+					} else if isModelSupportResultError(result.Error) {
 						next := now.Add(12 * time.Hour)
 						state.NextRetryAfter = next
 						suspendReason = "model_not_supported"
@@ -2654,6 +2674,13 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 		m.markRevokedAuthDisabled(terminalAuthSnapshot, terminalWarning, "request")
 		m.hook.OnResult(ctx, result)
 		return
+	}
+
+	if cyberAudit != nil {
+		cfg, _ := m.runtimeConfig.Load().(*internalconfig.Config)
+		if errAudit := appendCyberPolicyAudit(cfg, *cyberAudit); errAudit != nil {
+			log.Warnf("failed to append cyber policy audit for auth %s: %v", result.AuthID, errAudit)
+		}
 	}
 
 	if m.scheduler != nil && authSnapshot != nil {

@@ -682,6 +682,15 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 			helps.RecordAPIWebsocketError(ctx, e.cfg, "upstream_error", wsErr)
 			return resp, wsErr
 		}
+		if bodyCyber, ok := codexResponsesEventCyberPolicyErrorBody(payload); ok {
+			cyberErr := newCodexStatusErr(http.StatusBadRequest, bodyCyber)
+			if sess != nil {
+				e.invalidateUpstreamConn(sess, conn, "cyber_policy", cyberErr)
+			}
+			helps.RecordAPIWebsocketError(ctx, e.cfg, "cyber_policy", cyberErr)
+			reporter.PublishFailureWithError(ctx, cyberErr)
+			return resp, cyberErr
+		}
 
 		payload = normalizeCodexWebsocketCompletion(payload)
 		aggregator.ingest(payload)
@@ -962,6 +971,18 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 					e.invalidateUpstreamConn(sess, conn, "upstream_error", wsErr)
 				}
 				_ = send(cliproxyexecutor.StreamChunk{Err: wsErr})
+				return
+			}
+			if bodyCyber, ok := codexResponsesEventCyberPolicyErrorBody(payload); ok {
+				cyberErr := newCodexStatusErr(http.StatusBadRequest, bodyCyber)
+				terminateReason = "cyber_policy"
+				terminateErr = cyberErr
+				helps.RecordAPIWebsocketError(ctx, e.cfg, "cyber_policy", cyberErr)
+				reporter.PublishFailureWithError(ctx, cyberErr)
+				if sess != nil {
+					e.invalidateUpstreamConn(sess, conn, "cyber_policy", cyberErr)
+				}
+				_ = send(cliproxyexecutor.StreamChunk{Err: cyberErr})
 				return
 			}
 

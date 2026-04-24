@@ -2,8 +2,14 @@ package auth
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -816,6 +822,151 @@ func TestManager_Execute_Plain429RateLimitSuspendsAuthFor60SecondsAndSwitchesAut
 	}
 	if !updated.NextRetryAfter.After(time.Now().Add(55 * time.Second)) {
 		t.Fatalf("auth NextRetryAfter = %v, want about 60s in future", updated.NextRetryAfter)
+	}
+}
+
+func TestManager_Execute_CyberPolicyRecordsCountCoolsAuthAndSwitchesAuth(t *testing.T) {
+	prev := quotaCooldownDisabled.Load()
+	quotaCooldownDisabled.Store(false)
+	t.Cleanup(func() { quotaCooldownDisabled.Store(prev) })
+	writablePath := t.TempDir()
+	t.Setenv("WRITABLE_PATH", writablePath)
+
+	m := NewManager(nil, nil, nil)
+	m.SetRetryConfig(1, 100*time.Millisecond, 2)
+
+	executor := &authFallbackExecutor{
+		id: "codex",
+		executeErrors: map[string]error{
+			"auth-001-cyber": &retryAfterStatusError{
+				status:  http.StatusBadRequest,
+				message: `{"error":{"code":"cyber_policy","message":"This chat was flagged for possible cybersecurity risk"}}`,
+			},
+		},
+	}
+	m.RegisterExecutor(executor)
+
+	suffix := uuid.NewString()
+	flagged := &Auth{ID: "auth-001-cyber-" + suffix, Provider: "codex"}
+	healthy := &Auth{ID: "auth-999-healthy-cyber-" + suffix, Provider: "codex"}
+	executor.executeErrors[flagged.ID] = executor.executeErrors["auth-001-cyber"]
+	delete(executor.executeErrors, "auth-001-cyber")
+
+	if _, errRegister := m.Register(context.Background(), flagged); errRegister != nil {
+		t.Fatalf("register flagged auth: %v", errRegister)
+	}
+	if _, errRegister := m.Register(context.Background(), healthy); errRegister != nil {
+		t.Fatalf("register healthy auth: %v", errRegister)
+	}
+
+	model := "cyber-policy-test-model-" + suffix
+	reg := registry.GetGlobalRegistry()
+	reg.RegisterClient(flagged.ID, "codex", []*registry.ModelInfo{{ID: model}})
+	reg.RegisterClient(healthy.ID, "codex", []*registry.ModelInfo{{ID: model}})
+	t.Cleanup(func() {
+		reg.UnregisterClient(flagged.ID)
+		reg.UnregisterClient(healthy.ID)
+	})
+
+	longInput := strings.Repeat("inspect sandbox target for CTF flow ", 180)
+	payload := []byte(`{"model":"` + model + `","input":"` + longInput + `"}`)
+	resp, errExecute := m.Execute(context.Background(), []string{"codex"}, cliproxyexecutor.Request{Model: model, Payload: payload}, cliproxyexecutor.Options{})
+	if errExecute != nil {
+		t.Fatalf("execute error = %v, want nil", errExecute)
+	}
+	if string(resp.Payload) != healthy.ID {
+		t.Fatalf("response payload = %q, want %q", string(resp.Payload), healthy.ID)
+	}
+
+	calls := executor.ExecuteCalls()
+	wantCalls := []string{flagged.ID, healthy.ID}
+	if len(calls) != len(wantCalls) {
+		t.Fatalf("execute calls = %v, want %v", calls, wantCalls)
+	}
+	for i := range wantCalls {
+		if calls[i] != wantCalls[i] {
+			t.Fatalf("execute call %d auth = %q, want %q", i, calls[i], wantCalls[i])
+		}
+	}
+
+	updated, ok := m.GetByID(flagged.ID)
+	if !ok || updated == nil {
+		t.Fatalf("expected flagged auth to remain present")
+	}
+	if got := authCyberPolicyTriggerCount(updated); got != 1 {
+		t.Fatalf("cyber trigger count = %d, want 1", got)
+	}
+	if got, _ := updated.Metadata["cyber_policy_last_model"].(string); got != model {
+		t.Fatalf("last model = %q, want %q", got, model)
+	}
+	wantPreview := string(payload[:cyberPolicyRequestPreviewMaxBytes])
+	if got, _ := updated.Metadata["cyber_policy_last_request_preview"].(string); got != wantPreview {
+		t.Fatalf("request preview length = %d, want preview length %d", len(got), len(wantPreview))
+	}
+	sum := sha256.Sum256(payload)
+	wantHash := hex.EncodeToString(sum[:])
+	if got, _ := updated.Metadata["cyber_policy_last_request_sha256"].(string); got != wantHash {
+		t.Fatalf("request sha256 = %q, want %q", got, wantHash)
+	}
+	state := updated.ModelStates[model]
+	if state == nil {
+		t.Fatalf("expected model state to exist")
+	}
+	if !state.NextRetryAfter.After(time.Now().Add(4 * time.Minute)) {
+		t.Fatalf("model NextRetryAfter = %v, want cyber cooldown", state.NextRetryAfter)
+	}
+	if state.Quota.Reason != "cyber_policy" {
+		t.Fatalf("quota reason = %q, want cyber_policy", state.Quota.Reason)
+	}
+	if updated.Quota.Reason != "cyber_policy" {
+		t.Fatalf("auth quota reason = %q, want cyber_policy", updated.Quota.Reason)
+	}
+
+	auditPath := filepath.Join(writablePath, "logs", cyberPolicyAuditFilename)
+	auditData, errRead := os.ReadFile(auditPath)
+	if errRead != nil {
+		t.Fatalf("read cyber policy audit: %v", errRead)
+	}
+	lines := strings.Split(strings.TrimSpace(string(auditData)), "\n")
+	if len(lines) != 1 {
+		t.Fatalf("audit line count = %d, want 1", len(lines))
+	}
+	var audit map[string]any
+	if errUnmarshal := json.Unmarshal([]byte(lines[0]), &audit); errUnmarshal != nil {
+		t.Fatalf("unmarshal cyber policy audit: %v", errUnmarshal)
+	}
+	if got, _ := audit["auth_id"].(string); got != flagged.ID {
+		t.Fatalf("audit auth_id = %q, want %q", got, flagged.ID)
+	}
+	if got, _ := audit["model"].(string); got != model {
+		t.Fatalf("audit model = %q, want %q", got, model)
+	}
+	if got, _ := audit["request_sha256"].(string); got != wantHash {
+		t.Fatalf("audit request_sha256 = %q, want %q", got, wantHash)
+	}
+	if got, _ := audit["request_preview"].(string); got != wantPreview {
+		t.Fatalf("audit request_preview length = %d, want %d", len(got), cyberPolicyRequestPreviewMaxBytes)
+	}
+	if got, _ := audit["request_payload"].(string); got != string(payload) {
+		t.Fatalf("audit request_payload length = %d, want %d", len(got), len(payload))
+	}
+}
+
+func TestAuthPreferredBeforeUsesCyberPolicyTriggerCount(t *testing.T) {
+	flagged := &Auth{
+		ID:       "auth-flagged",
+		Provider: "codex",
+		Metadata: map[string]any{
+			"cyber_policy_trigger_count": 3,
+		},
+	}
+	clean := &Auth{ID: "auth-clean", Provider: "codex"}
+
+	if authPreferredBefore(flagged, clean) {
+		t.Fatalf("flagged auth ranked ahead of clean auth")
+	}
+	if !authPreferredBefore(clean, flagged) {
+		t.Fatalf("clean auth should rank ahead of flagged auth")
 	}
 }
 
