@@ -15,6 +15,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/buildinfo"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/performance"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/proxypool"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/usage"
 	sdkAuth "github.com/router-for-me/CLIProxyAPI/v6/sdk/auth"
@@ -36,21 +37,22 @@ const attemptMaxIdleTime = 2 * time.Hour
 
 // Handler aggregates config reference, persistence path and helpers.
 type Handler struct {
-	cfg                 *config.Config
-	configFilePath      string
-	mu                  sync.Mutex
-	attemptsMu          sync.Mutex
-	failedAttempts      map[string]*attemptInfo // keyed by client IP
-	authManager         *coreauth.Manager
-	usageStats          *usage.RequestStatistics
-	tokenStore          coreauth.Store
-	localPassword       string
-	allowRemoteOverride bool
-	envSecret           string
-	logDir              string
-	postAuthHook        coreauth.PostAuthHook
-	proxyHealth         *proxypool.HealthManager
-	listAuthFilesCache  authFilesCacheEntry
+	cfg                   *config.Config
+	configFilePath        string
+	mu                    sync.Mutex
+	attemptsMu            sync.Mutex
+	failedAttempts        map[string]*attemptInfo // keyed by client IP
+	authManager           *coreauth.Manager
+	usageStats            *usage.RequestStatistics
+	tokenStore            coreauth.Store
+	localPassword         string
+	allowRemoteOverride   bool
+	envSecret             string
+	logDir                string
+	postAuthHook          coreauth.PostAuthHook
+	proxyHealth           *proxypool.HealthManager
+	performanceTracker    *performance.Tracker
+	listAuthFilesCache    authFilesCacheEntry
 	listAuthFilesCacheTTL time.Duration
 }
 
@@ -66,15 +68,16 @@ func NewHandler(cfg *config.Config, configFilePath string, manager *coreauth.Man
 	envSecret = strings.TrimSpace(envSecret)
 
 	h := &Handler{
-		cfg:                 cfg,
-		configFilePath:      configFilePath,
-		failedAttempts:      make(map[string]*attemptInfo),
-		authManager:         manager,
-		usageStats:          usage.GetRequestStatistics(),
-		tokenStore:          sdkAuth.GetTokenStore(),
-		allowRemoteOverride: envSecret != "",
-		envSecret:           envSecret,
-		proxyHealth:         proxypool.DefaultHealthManager(),
+		cfg:                   cfg,
+		configFilePath:        configFilePath,
+		failedAttempts:        make(map[string]*attemptInfo),
+		authManager:           manager,
+		usageStats:            usage.GetRequestStatistics(),
+		tokenStore:            sdkAuth.GetTokenStore(),
+		allowRemoteOverride:   envSecret != "",
+		envSecret:             envSecret,
+		proxyHealth:           proxypool.DefaultHealthManager(),
+		performanceTracker:    performance.DefaultTracker(),
 		listAuthFilesCacheTTL: 3 * time.Second,
 	}
 	h.startAttemptCleanup()
@@ -124,6 +127,10 @@ func (h *Handler) SetAuthManager(manager *coreauth.Manager) { h.authManager = ma
 
 // SetUsageStatistics allows replacing the usage statistics reference.
 func (h *Handler) SetUsageStatistics(stats *usage.RequestStatistics) { h.usageStats = stats }
+
+func (h *Handler) SetPerformanceTracker(tracker *performance.Tracker) {
+	h.performanceTracker = tracker
+}
 
 // SetLocalPassword configures the runtime-local password accepted for localhost requests.
 func (h *Handler) SetLocalPassword(password string) { h.localPassword = password }
