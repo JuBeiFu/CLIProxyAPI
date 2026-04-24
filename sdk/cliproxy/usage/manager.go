@@ -10,17 +10,18 @@ import (
 
 // Record contains the usage statistics captured for a single provider request.
 type Record struct {
-	Provider    string
-	Model       string
-	APIKey      string
-	AuthID      string
-	AuthIndex   string
-	Source      string
-	RequestID   string
-	RequestedAt time.Time
-	Latency     time.Duration
-	Failed      bool
-	Detail      Detail
+	Provider         string
+	Model            string
+	APIKey           string
+	AuthID           string
+	AuthIndex        string
+	Source           string
+	RequestID        string
+	RequestedAt      time.Time
+	Latency          time.Duration
+	FirstByteLatency time.Duration
+	Failed           bool
+	Detail           Detail
 }
 
 // Detail holds the token usage breakdown.
@@ -95,8 +96,20 @@ func (m *Manager) Start(ctx context.Context) {
 		}
 		var workerCtx context.Context
 		workerCtx, m.cancel = context.WithCancel(ctx)
+		go m.closeOnContextDone(workerCtx)
 		go m.run(workerCtx)
 	})
+}
+
+func (m *Manager) closeOnContextDone(ctx context.Context) {
+	if m == nil || ctx == nil {
+		return
+	}
+	<-ctx.Done()
+	m.mu.Lock()
+	m.closed = true
+	m.mu.Unlock()
+	m.cond.Broadcast()
 }
 
 // Stop stops the dispatcher and drains the queue.

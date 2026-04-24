@@ -21,19 +21,20 @@ import (
 )
 
 type UsageReporter struct {
-	provider    string
-	model       string
-	authID      string
-	authIndex   string
-	apiKey      string
-	requestID   string
-	source      string
-	requestedAt time.Time
-	cfg         *config.Config
-	auth        *cliproxyauth.Auth
-	mu          sync.Mutex
-	lastFailure usage.Detail
-	once        sync.Once
+	provider         string
+	model            string
+	authID           string
+	authIndex        string
+	apiKey           string
+	requestID        string
+	source           string
+	requestedAt      time.Time
+	firstByteLatency time.Duration
+	cfg              *config.Config
+	auth             *cliproxyauth.Auth
+	mu               sync.Mutex
+	lastFailure      usage.Detail
+	once             sync.Once
 }
 
 func NewUsageReporter(ctx context.Context, provider, model string, args ...any) *UsageReporter {
@@ -96,6 +97,17 @@ func (r *UsageReporter) PublishFailureWithError(ctx context.Context, err error) 
 	r.publishWithOutcome(ctx, detail, true)
 }
 
+func (r *UsageReporter) SetFirstByteLatency(latency time.Duration) {
+	if r == nil || latency <= 0 {
+		return
+	}
+	r.mu.Lock()
+	if r.firstByteLatency == 0 || latency < r.firstByteLatency {
+		r.firstByteLatency = latency
+	}
+	r.mu.Unlock()
+}
+
 func (r *UsageReporter) TrackFailure(ctx context.Context, errPtr *error) {
 	if r == nil || errPtr == nil {
 		return
@@ -141,18 +153,31 @@ func (r *UsageReporter) buildRecord(detail usage.Detail, failed bool) usage.Reco
 		detail = mergeFailureDiagnostics(detail, r.rememberedFailure())
 	}
 	return usage.Record{
-		Provider:    r.provider,
-		Model:       r.model,
-		Source:      r.source,
-		APIKey:      r.apiKey,
-		AuthID:      r.authID,
-		AuthIndex:   r.authIndex,
-		RequestID:   r.requestID,
-		RequestedAt: r.requestedAt,
-		Latency:     r.latency(),
-		Failed:      failed,
-		Detail:      detail,
+		Provider:         r.provider,
+		Model:            r.model,
+		Source:           r.source,
+		APIKey:           r.apiKey,
+		AuthID:           r.authID,
+		AuthIndex:        r.authIndex,
+		RequestID:        r.requestID,
+		RequestedAt:      r.requestedAt,
+		Latency:          r.latency(),
+		FirstByteLatency: r.firstByte(),
+		Failed:           failed,
+		Detail:           detail,
 	}
+}
+
+func (r *UsageReporter) firstByte() time.Duration {
+	if r == nil {
+		return 0
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.firstByteLatency < 0 {
+		return 0
+	}
+	return r.firstByteLatency
 }
 
 func (r *UsageReporter) latency() time.Duration {

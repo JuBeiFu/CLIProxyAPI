@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/api"
+	_ "github.com/router-for-me/CLIProxyAPI/v6/internal/performance"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/proxypool"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/executor"
@@ -721,7 +722,7 @@ func (s *Service) Run(ctx context.Context) error {
 // is no longer viable (disabled, removed from config, or marked unhealthy
 // by the HealthManager). Used by the forced-refresh loop to kick a
 // re-probe that picks a fresh binding. Returns false for auths that are
-// unbound or pinned to direct — those do not need re-binding.
+// unbound or pinned to direct; those do not need re-binding.
 func isBoundProxyUnusable(cfg *config.Config, auth *coreauth.Auth) bool {
 	if cfg == nil || auth == nil {
 		return false
@@ -936,21 +937,26 @@ func (s *Service) registerModelsForAuth(a *coreauth.Auth) {
 		}
 		models = applyExcludedModels(models, excluded)
 	case "codex":
+		if attrModels := codexSupportedModelsFromAuth(a); len(attrModels) > 0 {
+			models = attrModels
+		}
 		codexPlanType := ""
 		if a.Attributes != nil {
 			codexPlanType = strings.TrimSpace(a.Attributes["plan_type"])
 		}
-		switch strings.ToLower(codexPlanType) {
-		case "pro":
-			models = registry.GetCodexProModels()
-		case "plus":
-			models = registry.GetCodexPlusModels()
-		case "team", "business", "go":
-			models = registry.GetCodexTeamModels()
-		case "free":
-			models = registry.GetCodexFreeModels()
-		default:
-			models = registry.GetCodexProModels()
+		if len(models) == 0 {
+			switch strings.ToLower(codexPlanType) {
+			case "pro":
+				models = registry.GetCodexProModels()
+			case "plus":
+				models = registry.GetCodexPlusModels()
+			case "team", "business", "go":
+				models = registry.GetCodexTeamModels()
+			case "free":
+				models = registry.GetCodexFreeModels()
+			default:
+				models = registry.GetCodexProModels()
+			}
 		}
 		if entry := s.resolveConfigCodexKey(a); entry != nil {
 			if len(entry.Models) > 0 {
@@ -1257,6 +1263,40 @@ func (s *Service) oauthExcludedModels(provider, authKind string) []string {
 	return cfg.OAuthExcludedModels[providerKey]
 }
 
+func codexSupportedModelsFromAuth(a *coreauth.Auth) []*ModelInfo {
+	if a == nil || len(a.Attributes) == 0 {
+		return nil
+	}
+	raw := strings.TrimSpace(a.Attributes["supported_models"])
+	if raw == "" {
+		return nil
+	}
+	parts := strings.FieldsFunc(raw, func(r rune) bool {
+		return r == ',' || r == '\n' || r == '\r' || r == '\t' || r == ' '
+	})
+	if len(parts) == 0 {
+		return nil
+	}
+	now := time.Now().Unix()
+	models := make([]*ModelInfo, 0, len(parts))
+	seen := make(map[string]struct{}, len(parts))
+	for _, part := range parts {
+		id := strings.TrimSpace(part)
+		if id == "" {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		if info := registry.LookupModelInfo(id); info != nil {
+			models = append(models, info)
+			continue
+		}
+		models = append(models, &ModelInfo{ID: id, Object: "model", Created: now, OwnedBy: "openai", Type: "openai"})
+	}
+	return models
+}
 func applyExcludedModels(models []*ModelInfo, excluded []string) []*ModelInfo {
 	if len(models) == 0 || len(excluded) == 0 {
 		return models
