@@ -168,6 +168,38 @@ func TestTrackerWindowExpiresOutOfOrderEvents(t *testing.T) {
 	}
 }
 
+func TestTrackerWindowRequestCountIncludesLatencyOnlySamples(t *testing.T) {
+	now := time.Date(2026, 4, 25, 12, 0, 0, 0, time.UTC)
+	tracker := NewTracker(Config{Window: 10 * time.Second, MinSamples: 2, EWMAAlpha: 1})
+	tracker.Record(Sample{Provider: "codex", AuthID: "auth-a", Model: "gpt-5.4", RequestedAt: now, Latency: time.Second})
+	tracker.Record(Sample{Provider: "codex", AuthID: "auth-a", Model: "gpt-5.4", RequestedAt: now.Add(time.Second), Latency: time.Second, Failed: true, StatusCode: 502})
+
+	got := tracker.Snapshot(SnapshotFilter{}, now.Add(time.Second))[0]
+	if got.WindowRequestCount != 2 {
+		t.Fatalf("WindowRequestCount = %d, want 2", got.WindowRequestCount)
+	}
+	if got.WindowOutputTokens != 0 || got.WindowOutputTPS != 0 || got.OutputTPSEWMA != 0 {
+		t.Fatalf("unexpected speed values for latency-only samples: %+v", got)
+	}
+	if got.SampleReady {
+		t.Fatalf("SampleReady = true, want false without in-window speed samples")
+	}
+}
+
+func TestTrackerSampleReadyExpiresWithWindow(t *testing.T) {
+	now := time.Date(2026, 4, 25, 12, 0, 0, 0, time.UTC)
+	tracker := NewTracker(Config{Window: 10 * time.Second, MinSamples: 1, EWMAAlpha: 1})
+	tracker.Record(Sample{Provider: "codex", AuthID: "auth-a", Model: "gpt-5.4", RequestedAt: now.Add(-20 * time.Second), Latency: time.Second, OutputTokens: 10})
+
+	got := tracker.Snapshot(SnapshotFilter{}, now)[0]
+	if got.SampleReady {
+		t.Fatalf("SampleReady = true, want false after all speed samples expire from the window")
+	}
+	if got.WindowRequestCount != 0 || got.WindowOutputTokens != 0 || got.WindowOutputTPS != 0 {
+		t.Fatalf("unexpected window values: %+v", got)
+	}
+}
+
 func TestTrackerIgnoresSamplesMissingIdentity(t *testing.T) {
 	now := time.Date(2026, 4, 25, 12, 0, 0, 0, time.UTC)
 	tracker := NewTracker(Config{Window: time.Minute, MinSamples: 1, EWMAAlpha: 1})

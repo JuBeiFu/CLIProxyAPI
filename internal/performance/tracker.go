@@ -116,6 +116,7 @@ func (t *Tracker) Record(sample Sample) {
 		e.firstByteSamples++
 		e.firstByteMsEWMA = applyEWMA(e.firstByteMsEWMA, durationMillis(sample.FirstByteLatency), e.firstByteSamples, cfg.EWMAAlpha)
 	}
+	event := windowEvent{at: sample.RequestedAt}
 	if !sample.Failed && sample.OutputTokens > 0 {
 		duration := generationDuration(sample)
 		if duration > 0 {
@@ -123,9 +124,11 @@ func (t *Tracker) Record(sample Sample) {
 			e.speedSamples++
 			e.outputTokens += sample.OutputTokens
 			e.outputTPSEWMA = applyEWMA(e.outputTPSEWMA, tps, e.speedSamples, cfg.EWMAAlpha)
-			e.events = append(e.events, windowEvent{at: sample.RequestedAt, outputTokens: sample.OutputTokens, duration: duration})
+			event.outputTokens = sample.OutputTokens
+			event.duration = duration
 		}
 	}
+	e.events = append(e.events, event)
 	e.trimWindow(sample.RequestedAt, cfg.Window)
 }
 
@@ -187,14 +190,19 @@ func (s Sample) key() (Key, bool) {
 func (e *entry) snapshot(key Key, cfg Config) Snapshot {
 	var windowTokens int64
 	var windowDuration time.Duration
+	var windowSpeedSamples int64
 	for _, event := range e.events {
 		windowTokens += event.outputTokens
 		windowDuration += event.duration
+		if event.outputTokens > 0 && event.duration > 0 {
+			windowSpeedSamples++
+		}
 	}
 	windowTPS := 0.0
 	if windowTokens > 0 && windowDuration > 0 {
 		windowTPS = float64(windowTokens) / windowDuration.Seconds()
 	}
+	windowRequestCount := int64(len(e.events))
 	return Snapshot{
 		Provider:           key.Provider,
 		AuthID:             key.AuthID,
@@ -208,10 +216,10 @@ func (e *entry) snapshot(key Key, cfg Config) Snapshot {
 		LatencyMsEWMA:      e.latencyMsEWMA,
 		FirstByteMsEWMA:    e.firstByteMsEWMA,
 		FailureRateEWMA:    e.failureRateEWMA,
-		WindowRequestCount: int64(len(e.events)),
+		WindowRequestCount: windowRequestCount,
 		WindowOutputTokens: windowTokens,
 		WindowOutputTPS:    windowTPS,
-		SampleReady:        e.speedSamples >= cfg.MinSamples,
+		SampleReady:        windowSpeedSamples >= cfg.MinSamples,
 		LastSeen:           e.lastSeen,
 	}
 }
