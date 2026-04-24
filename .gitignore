@@ -12,6 +12,17 @@ logs/*
 conv/*
 temp/*
 refs/*
+analysis-logs/
+dist_tmp/
+tmp_*
+*.pprof
+checksums.txt
+
+# Local deployment artifacts
+CLIProxyAPI-linux-amd64
+CLIProxyAPI.linux.amd64*
+cli-proxy-api_linux_amd64.tar.gz
+cliproxyapi_linux_amd64*
 
 # Storage backends
 pgstore/*
