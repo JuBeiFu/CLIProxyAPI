@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/performance"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 	log "github.com/sirupsen/logrus"
@@ -34,13 +35,15 @@ const (
 
 // authScheduler keeps the incremental provider/model scheduling state used by Manager.
 type authScheduler struct {
-	mu            sync.Mutex
-	strategy      schedulerStrategy
-	providers     map[string]*providerScheduler
-	authProviders map[string]string
-	mixedCursors  map[string]int
-	inflight      map[string]int
-	lastSelections map[string]string
+	mu                       sync.Mutex
+	strategy                 schedulerStrategy
+	providers                map[string]*providerScheduler
+	authProviders            map[string]string
+	mixedCursors             map[string]int
+	inflight                 map[string]int
+	lastSelections           map[string]string
+	performanceRoutingConfig performance.Config
+	performanceScorer        PerformanceScorer
 }
 
 // providerScheduler stores auth metadata and model shards for a single provider.
@@ -170,12 +173,13 @@ func normalizeCursor(cursor, size int) int {
 // newAuthScheduler constructs an empty scheduler configured for the supplied selector strategy.
 func newAuthScheduler(selector Selector) *authScheduler {
 	return &authScheduler{
-		strategy:       selectorStrategy(selector),
-		providers:      make(map[string]*providerScheduler),
-		authProviders:  make(map[string]string),
-		mixedCursors:   make(map[string]int),
-		inflight:       make(map[string]int),
-		lastSelections: make(map[string]string),
+		strategy:                 selectorStrategy(selector),
+		providers:                make(map[string]*providerScheduler),
+		authProviders:            make(map[string]string),
+		mixedCursors:             make(map[string]int),
+		inflight:                 make(map[string]int),
+		lastSelections:           make(map[string]string),
+		performanceRoutingConfig: performance.DefaultConfig(),
 	}
 }
 
@@ -200,6 +204,24 @@ func (s *authScheduler) setSelector(selector Selector) {
 	defer s.mu.Unlock()
 	s.strategy = selectorStrategy(selector)
 	clear(s.mixedCursors)
+}
+
+func (s *authScheduler) setPerformanceRoutingConfig(cfg performance.Config) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.performanceRoutingConfig = performance.NormalizeConfig(cfg)
+}
+
+func (s *authScheduler) setPerformanceScorer(scorer PerformanceScorer) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.performanceScorer = scorer
 }
 
 func schedulerInflightKey(providerKey, modelKey, authID string) string {
@@ -372,19 +394,21 @@ func (s *authScheduler) pickSingle(ctx context.Context, provider, model string, 
 		}
 		return s.inflightCountLocked(providerKey, modelKey, entry.auth.ID)
 	}
+	performanceCfg := s.performanceRoutingConfig
+	performanceScorer := s.performanceScorer
 	selectionAttempt := len(tried) + 1
 	if strategy == schedulerStrategyFillFirst {
 		priorityReady, okPriority := shard.highestReadyPriorityLocked(preferWebsocket, predicate)
 		if !okPriority {
 			return nil, shard.unavailableErrorLocked(provider, model, predicate)
 		}
-		if picked := shard.pickReadyAtPriorityLocked(preferWebsocket, priorityReady, strategy, predicate, load); picked != nil {
+		if picked := shard.pickReadyAtPriorityLocked(providerKey, modelKey, preferWebsocket, priorityReady, strategy, predicate, load, performanceCfg, performanceScorer); picked != nil {
 			s.logFillFirstSelectionSwitchLocked(ctx, schedulerSelectionKeySingle(providerKey, modelKey), providerKey, modelKey, shard, picked, selectionAttempt)
 			return picked, nil
 		}
 		return nil, shard.unavailableErrorLocked(provider, model, predicate)
 	}
-	if picked := shard.pickReadyLocked(preferWebsocket, strategy, predicate, load); picked != nil {
+	if picked := shard.pickReadyLocked(providerKey, modelKey, preferWebsocket, strategy, predicate, load, performanceCfg, performanceScorer); picked != nil {
 		return picked, nil
 	}
 	return nil, shard.unavailableErrorLocked(provider, model, predicate)
@@ -421,6 +445,8 @@ func (s *authScheduler) pickMixed(ctx context.Context, providers []string, model
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	performanceCfg := s.performanceRoutingConfig
+	performanceScorer := s.performanceScorer
 	if pinnedAuthID != "" {
 		providerKey := s.authProviders[pinnedAuthID]
 		if providerKey == "" || !containsProvider(normalized, providerKey) {
@@ -447,7 +473,7 @@ func (s *authScheduler) pickMixed(ctx context.Context, providers []string, model
 			}
 			return s.inflightCountLocked(providerKey, modelKey, entry.auth.ID)
 		}
-		if picked := shard.pickReadyLocked(false, strategy, predicate, load); picked != nil {
+		if picked := shard.pickReadyLocked(providerKey, modelKey, false, strategy, predicate, load, performanceCfg, performanceScorer); picked != nil {
 			return picked, providerKey, nil
 		}
 		return nil, "", shard.unavailableErrorLocked("mixed", model, predicate)
@@ -493,7 +519,7 @@ func (s *authScheduler) pickMixed(ctx context.Context, providers []string, model
 				}
 				return s.inflightCountLocked(providerKey, modelKey, entry.auth.ID)
 			}
-			picked := shard.pickReadyAtPriorityLocked(false, bestPriority, strategy, predicate, load)
+			picked := shard.pickReadyAtPriorityLocked(providerKey, modelKey, false, bestPriority, strategy, predicate, load, performanceCfg, performanceScorer)
 			if picked != nil {
 				return picked, providerKey, nil
 			}
@@ -553,7 +579,7 @@ func (s *authScheduler) pickMixed(ctx context.Context, providers []string, model
 			}
 			return s.inflightCountLocked(providerKey, modelKey, entry.auth.ID)
 		}
-		picked := shard.pickReadyAtPriorityLocked(false, bestPriority, schedulerStrategyRoundRobin, predicate, load)
+		picked := shard.pickReadyAtPriorityLocked(providerKey, modelKey, false, bestPriority, schedulerStrategyRoundRobin, predicate, load, performanceCfg, performanceScorer)
 		if picked == nil {
 			continue
 		}
@@ -905,7 +931,7 @@ func (m *modelScheduler) promoteExpiredLocked(now time.Time) {
 }
 
 // pickReadyLocked selects the next ready auth from the highest available priority bucket.
-func (m *modelScheduler) pickReadyLocked(preferWebsocket bool, strategy schedulerStrategy, predicate func(*scheduledAuth) bool, load func(*scheduledAuth) int) *Auth {
+func (m *modelScheduler) pickReadyLocked(providerKey, modelKey string, preferWebsocket bool, strategy schedulerStrategy, predicate func(*scheduledAuth) bool, load func(*scheduledAuth) int, performanceCfg performance.Config, performanceScorer PerformanceScorer) *Auth {
 	if m == nil {
 		return nil
 	}
@@ -914,7 +940,7 @@ func (m *modelScheduler) pickReadyLocked(preferWebsocket bool, strategy schedule
 	if !okPriority {
 		return nil
 	}
-	return m.pickReadyAtPriorityLocked(preferWebsocket, priorityReady, strategy, predicate, load)
+	return m.pickReadyAtPriorityLocked(providerKey, modelKey, preferWebsocket, priorityReady, strategy, predicate, load, performanceCfg, performanceScorer)
 }
 
 // highestReadyPriorityLocked returns the highest priority bucket that still has a matching ready auth.
@@ -950,7 +976,7 @@ func (m *modelScheduler) highestReadyPriorityLocked(preferWebsocket bool, predic
 
 // pickReadyAtPriorityLocked selects the next ready auth from a specific priority bucket.
 // The caller must ensure expired entries are already promoted when needed.
-func (m *modelScheduler) pickReadyAtPriorityLocked(preferWebsocket bool, priority int, strategy schedulerStrategy, predicate func(*scheduledAuth) bool, load func(*scheduledAuth) int) *Auth {
+func (m *modelScheduler) pickReadyAtPriorityLocked(providerKey, modelKey string, preferWebsocket bool, priority int, strategy schedulerStrategy, predicate func(*scheduledAuth) bool, load func(*scheduledAuth) int, performanceCfg performance.Config, performanceScorer PerformanceScorer) *Auth {
 	if m == nil {
 		return nil
 	}
@@ -971,7 +997,95 @@ func (m *modelScheduler) pickReadyAtPriorityLocked(preferWebsocket bool, priorit
 	if picked == nil || picked.auth == nil {
 		return nil
 	}
+	view.logPerformanceShadowSelection(providerKey, modelKey, picked, predicate, load, performanceCfg, performanceScorer)
 	return picked.auth
+}
+
+func (v *readyView) performanceRankedLocked(providerKey, modelKey string, predicate func(*scheduledAuth) bool, load func(*scheduledAuth) int, cfg performance.Config, scorer PerformanceScorer) (*scheduledAuth, []performance.Score) {
+	if v == nil || scorer == nil {
+		return nil, nil
+	}
+	entriesByAuthID := make(map[string]*scheduledAuth, len(v.flat))
+	candidates := make([]performance.ScoreCandidate, 0, len(v.flat))
+	for _, entry := range v.flat {
+		if entry == nil || entry.auth == nil {
+			continue
+		}
+		if predicate != nil && !predicate(entry) {
+			continue
+		}
+		authID := entry.auth.ID
+		entriesByAuthID[authID] = entry
+		candidate := scorer.SnapshotCandidate(providerKey, authID, modelKey, inflightLoadValue(load, entry))
+		if strings.TrimSpace(candidate.Provider) == "" {
+			candidate.Provider = providerKey
+		}
+		if strings.TrimSpace(candidate.AuthID) == "" {
+			candidate.AuthID = authID
+		}
+		if strings.TrimSpace(candidate.Model) == "" {
+			candidate.Model = modelKey
+		}
+		candidates = append(candidates, candidate)
+	}
+	if len(candidates) == 0 {
+		return nil, nil
+	}
+	scores := scorer.ScoreCandidates(candidates, cfg)
+	if len(scores) == 0 {
+		return nil, nil
+	}
+	best := entriesByAuthID[scores[0].AuthID]
+	if best == nil || best.auth == nil {
+		return nil, scores
+	}
+	return best, scores
+}
+
+func (v *readyView) logPerformanceShadowSelection(providerKey, modelKey string, picked *scheduledAuth, predicate func(*scheduledAuth) bool, load func(*scheduledAuth) int, cfg performance.Config, scorer PerformanceScorer) {
+	if picked == nil || picked.auth == nil || scorer == nil {
+		return
+	}
+	cfg = performance.NormalizeConfig(cfg)
+	if !cfg.ShadowLog {
+		return
+	}
+	shadowPicked, scores := v.performanceRankedLocked(providerKey, modelKey, predicate, load, cfg, scorer)
+	if shadowPicked == nil || shadowPicked.auth == nil || shadowPicked.auth.ID == picked.auth.ID {
+		return
+	}
+	if !log.IsLevelEnabled(log.DebugLevel) {
+		return
+	}
+	log.WithFields(log.Fields{
+		"provider":           providerKey,
+		"model":              modelKey,
+		"selected_auth_id":   picked.auth.ID,
+		"shadow_auth_id":     shadowPicked.auth.ID,
+		"selected_score":     scoreForAuthID(scores, picked.auth.ID),
+		"shadow_score":       scoreForAuthID(scores, shadowPicked.auth.ID),
+		"candidate_count":    len(scores),
+		"sample_ready_count": readyScoreCount(scores),
+	}).Debug("auth performance shadow selection differs")
+}
+
+func scoreForAuthID(scores []performance.Score, authID string) float64 {
+	for _, score := range scores {
+		if score.AuthID == authID {
+			return score.Score
+		}
+	}
+	return 0
+}
+
+func readyScoreCount(scores []performance.Score) int {
+	count := 0
+	for _, score := range scores {
+		if score.SampleReady {
+			count++
+		}
+	}
+	return count
 }
 
 func (m *modelScheduler) readyCountAtPriorityLocked(preferWebsocket bool, priority int) int {

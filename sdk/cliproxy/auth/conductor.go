@@ -18,6 +18,7 @@ import (
 	"github.com/google/uuid"
 	internalconfig "github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/logging"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/performance"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
@@ -132,6 +133,16 @@ type Selector interface {
 	Pick(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) (*Auth, error)
 }
 
+// PerformanceScorer snapshots and ranks auth/model performance candidates.
+type PerformanceScorer interface {
+	SnapshotCandidate(provider, authID, model string, inflight int) performance.ScoreCandidate
+	ScoreCandidates(candidates []performance.ScoreCandidate, cfg performance.Config) []performance.Score
+}
+
+type performanceScorerHolder struct {
+	scorer PerformanceScorer
+}
+
 // Hook captures lifecycle callbacks for observing auth changes.
 type Hook interface {
 	// OnAuthRegistered fires when a new auth is registered.
@@ -185,6 +196,10 @@ type Manager struct {
 	// It is initialized in NewManager; never Load() before first Store().
 	runtimeConfig atomic.Value
 
+	// performanceRoutingConfig stores the latest auth performance routing controls.
+	performanceRoutingConfig atomic.Value
+	performanceScorer        atomic.Value
+
 	responseBindingsMu sync.Mutex
 	responseBindings   map[string]string
 	responseCompacts   map[string][]byte
@@ -222,8 +237,12 @@ func NewManager(store Store, selector Selector, hook Hook) *Manager {
 	}
 	// atomic.Value requires non-nil initial value.
 	manager.runtimeConfig.Store(&internalconfig.Config{})
+	performanceCfg := performance.DefaultConfig()
+	manager.performanceRoutingConfig.Store(performanceCfg)
+	manager.performanceScorer.Store(performanceScorerHolder{})
 	manager.apiKeyModelAlias.Store(apiKeyModelAliasTable(nil))
 	manager.scheduler = newAuthScheduler(selector)
+	manager.scheduler.setPerformanceRoutingConfig(performanceCfg)
 	return manager
 }
 
@@ -380,6 +399,29 @@ func (m *Manager) SetSelector(selector Selector) {
 	if m.scheduler != nil {
 		m.scheduler.setSelector(selector)
 		m.syncScheduler()
+	}
+}
+
+// SetPerformanceRoutingConfig updates auth performance routing controls.
+func (m *Manager) SetPerformanceRoutingConfig(cfg performance.Config) {
+	if m == nil {
+		return
+	}
+	cfg = performance.NormalizeConfig(cfg)
+	m.performanceRoutingConfig.Store(cfg)
+	if m.scheduler != nil {
+		m.scheduler.setPerformanceRoutingConfig(cfg)
+	}
+}
+
+// SetPerformanceScorer updates the scorer used by auth performance routing.
+func (m *Manager) SetPerformanceScorer(scorer PerformanceScorer) {
+	if m == nil {
+		return
+	}
+	m.performanceScorer.Store(performanceScorerHolder{scorer: scorer})
+	if m.scheduler != nil {
+		m.scheduler.setPerformanceScorer(scorer)
 	}
 }
 
