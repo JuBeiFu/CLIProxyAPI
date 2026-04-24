@@ -119,6 +119,10 @@ func (h *OpenAIAPIHandler) ChatCompletions(c *gin.Context) {
 		rawJSON = responsesconverter.ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName, rawJSON, stream)
 		stream = gjson.GetBytes(rawJSON, "stream").Bool()
 	}
+	if modelName := gjson.GetBytes(rawJSON, "model").String(); isOpenAIImageGenerationModel(modelName) {
+		writeImageGenerationEndpointError(c, modelName)
+		return
+	}
 
 	if stream {
 		h.handleStreamingResponse(c, rawJSON)

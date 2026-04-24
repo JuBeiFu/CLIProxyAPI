@@ -564,12 +564,27 @@ func appendAPIResponse(c *gin.Context, data []byte) {
 // ExecuteWithAuthManager executes a non-streaming request via the core auth manager.
 // This path is the only supported execution route.
 func (h *BaseAPIHandler) ExecuteWithAuthManager(ctx context.Context, handlerType, modelName string, rawJSON []byte, alt string) ([]byte, http.Header, *interfaces.ErrorMessage) {
+	return h.executeWithAuthManager(ctx, handlerType, modelName, modelName, rawJSON, alt)
+}
+
+// ExecuteWithAuthManagerRequestedModel executes a non-streaming request using
+// modelName for auth routing and requestedModel as the client-visible execution
+// hint consumed by provider executors.
+func (h *BaseAPIHandler) ExecuteWithAuthManagerRequestedModel(ctx context.Context, handlerType, modelName string, rawJSON []byte, alt string, requestedModel string) ([]byte, http.Header, *interfaces.ErrorMessage) {
+	return h.executeWithAuthManager(ctx, handlerType, modelName, requestedModel, rawJSON, alt)
+}
+
+func (h *BaseAPIHandler) executeWithAuthManager(ctx context.Context, handlerType, modelName string, requestedModel string, rawJSON []byte, alt string) ([]byte, http.Header, *interfaces.ErrorMessage) {
 	providers, normalizedModel, errMsg := h.getRequestDetails(modelName)
 	if errMsg != nil {
 		return nil, nil, errMsg
 	}
 	reqMeta := requestExecutionMetadata(ctx)
-	reqMeta[coreexecutor.RequestedModelMetadataKey] = normalizedModel
+	requestedModel = strings.TrimSpace(requestedModel)
+	if requestedModel == "" {
+		requestedModel = normalizedModel
+	}
+	reqMeta[coreexecutor.RequestedModelMetadataKey] = requestedModel
 	payload := rawJSON
 	if len(payload) == 0 {
 		payload = nil

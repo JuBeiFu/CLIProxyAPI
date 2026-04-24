@@ -255,6 +255,11 @@ func (h *OpenAIResponsesAPIHandler) Responses(c *gin.Context) {
 		return
 	}
 
+	if modelName := gjson.GetBytes(rawJSON, "model").String(); isOpenAIImageGenerationModel(modelName) {
+		writeImageGenerationEndpointError(c, modelName)
+		return
+	}
+
 	// Check if the client requested a streaming response.
 	streamResult := gjson.GetBytes(rawJSON, "stream")
 	if streamResult.Type == gjson.True {
