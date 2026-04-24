@@ -28,6 +28,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/managementasset"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/performance"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/proxypool"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/usage"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
@@ -261,6 +262,7 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 	s.applyAccessConfig(nil, cfg)
 	if authManager != nil {
 		authManager.SetRetryConfig(cfg.RequestRetry, time.Duration(cfg.MaxRetryInterval)*time.Second, cfg.MaxRetryCredentials)
+		applyPerformanceRoutingConfigToAuthManager(cfg, authManager)
 		// Start quota state persistence (flush to auth JSON files periodically)
 		if cfg.AuthDir != "" {
 			quotaStore := sdkAuth.GetTokenStore()
@@ -329,6 +331,33 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 	}
 
 	return s
+}
+
+func routingPerformanceConfigFromServerConfig(cfg *config.Config) performance.Config {
+	perfCfg := performance.DefaultConfig()
+	if cfg == nil {
+		return perfCfg
+	}
+	perfCfg.Enabled = cfg.Routing.PerformanceAware
+	perfCfg.ShadowLog = cfg.Routing.PerformanceShadowLog
+	perfCfg.Window = time.Duration(cfg.Routing.PerformanceWindowSeconds) * time.Second
+	perfCfg.MinSamples = int64(cfg.Routing.PerformanceMinSamples)
+	perfCfg.EWMAAlpha = cfg.Routing.PerformanceEWMAAlpha
+	perfCfg.WeightTPS = cfg.Routing.PerformanceWeightTPS
+	perfCfg.WeightLatency = cfg.Routing.PerformanceWeightLatency
+	perfCfg.WeightFailure = cfg.Routing.PerformanceWeightFailure
+	perfCfg.WeightInflight = cfg.Routing.PerformanceWeightInflight
+	return performance.NormalizeConfig(perfCfg)
+}
+
+func applyPerformanceRoutingConfigToAuthManager(cfg *config.Config, authManager *auth.Manager) {
+	perfCfg := routingPerformanceConfigFromServerConfig(cfg)
+	performance.ConfigureDefault(perfCfg)
+	if authManager == nil {
+		return
+	}
+	authManager.SetPerformanceScorer(performance.NewScorer(performance.DefaultTracker()))
+	authManager.SetPerformanceRoutingConfig(perfCfg)
 }
 
 // setupRoutes configures the API routes for the server.
@@ -958,6 +987,7 @@ func (s *Server) UpdateClients(cfg *config.Config) {
 
 	if s.handlers != nil && s.handlers.AuthManager != nil {
 		s.handlers.AuthManager.SetRetryConfig(cfg.RequestRetry, time.Duration(cfg.MaxRetryInterval)*time.Second, cfg.MaxRetryCredentials)
+		applyPerformanceRoutingConfigToAuthManager(cfg, s.handlers.AuthManager)
 	}
 
 	// Update log level dynamically when debug flag changes

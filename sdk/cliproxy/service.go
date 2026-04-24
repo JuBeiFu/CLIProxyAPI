@@ -13,7 +13,7 @@ import (
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/api"
-	_ "github.com/router-for-me/CLIProxyAPI/v6/internal/performance"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/performance"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/proxypool"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/executor"
@@ -352,6 +352,33 @@ func (s *Service) applyRetryConfig(cfg *config.Config) {
 	s.coreManager.SetRetryConfig(cfg.RequestRetry, maxInterval, cfg.MaxRetryCredentials)
 }
 
+func routingPerformanceConfigFromAppConfig(cfg *config.Config) performance.Config {
+	perfCfg := performance.DefaultConfig()
+	if cfg == nil {
+		return perfCfg
+	}
+	perfCfg.Enabled = cfg.Routing.PerformanceAware
+	perfCfg.ShadowLog = cfg.Routing.PerformanceShadowLog
+	perfCfg.Window = time.Duration(cfg.Routing.PerformanceWindowSeconds) * time.Second
+	perfCfg.MinSamples = int64(cfg.Routing.PerformanceMinSamples)
+	perfCfg.EWMAAlpha = cfg.Routing.PerformanceEWMAAlpha
+	perfCfg.WeightTPS = cfg.Routing.PerformanceWeightTPS
+	perfCfg.WeightLatency = cfg.Routing.PerformanceWeightLatency
+	perfCfg.WeightFailure = cfg.Routing.PerformanceWeightFailure
+	perfCfg.WeightInflight = cfg.Routing.PerformanceWeightInflight
+	return performance.NormalizeConfig(perfCfg)
+}
+
+func (s *Service) applyPerformanceRoutingConfig(cfg *config.Config) {
+	perfCfg := routingPerformanceConfigFromAppConfig(cfg)
+	performance.ConfigureDefault(perfCfg)
+	if s == nil || s.coreManager == nil {
+		return
+	}
+	s.coreManager.SetPerformanceScorer(performance.NewScorer(performance.DefaultTracker()))
+	s.coreManager.SetPerformanceRoutingConfig(perfCfg)
+}
+
 func openAICompatInfoFromAuth(a *coreauth.Auth) (providerKey string, compatName string, ok bool) {
 	if a == nil {
 		return "", "", false
@@ -501,6 +528,7 @@ func (s *Service) Run(ctx context.Context) error {
 	}
 
 	s.applyRetryConfig(s.cfg)
+	s.applyPerformanceRoutingConfig(s.cfg)
 
 	if s.coreManager != nil {
 		if errLoad := s.coreManager.Load(ctx); errLoad != nil {
@@ -655,6 +683,7 @@ func (s *Service) Run(ctx context.Context) error {
 		}
 
 		s.applyRetryConfig(newCfg)
+		s.applyPerformanceRoutingConfig(newCfg)
 		s.applyPprofConfig(newCfg)
 		if s.server != nil {
 			s.server.UpdateClients(newCfg)
