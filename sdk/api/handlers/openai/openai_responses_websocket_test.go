@@ -126,6 +126,17 @@ func TestWriteResponsesWebsocketError_MapsCurrentModelUnavailable429ToServiceUna
 	}
 }
 
+func TestShouldRetryResponsesWebsocketWithTranscriptResetForPreviousResponseNotFound(t *testing.T) {
+	errMsg := &interfaces.ErrorMessage{
+		StatusCode: http.StatusBadRequest,
+		Error:      errors.New(`{"error":{"code":"previous_response_not_found","message":"Previous response with id 'resp_1' not found.","type":"invalid_request_error","param":"previous_response_id"}}`),
+	}
+
+	if !shouldRetryResponsesWebsocketWithTranscriptReset(errMsg) {
+		t.Fatal("expected previous_response_not_found to trigger transcript reset retry")
+	}
+}
+
 type websocketCaptureExecutor struct {
 	streamCalls int
 	payloads    [][]byte

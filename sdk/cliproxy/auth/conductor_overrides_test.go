@@ -743,6 +743,10 @@ func TestManager_Execute_DisableCooling_RetriesAfter429RetryAfter(t *testing.T) 
 }
 
 func TestManager_Execute_Plain429RateLimitSuspendsAuthFor60SecondsAndSwitchesAuth(t *testing.T) {
+	prev := quotaCooldownDisabled.Load()
+	quotaCooldownDisabled.Store(false)
+	t.Cleanup(func() { quotaCooldownDisabled.Store(prev) })
+
 	m := NewManager(nil, nil, nil)
 	m.SetRetryConfig(1, 100*time.Millisecond, 2)
 

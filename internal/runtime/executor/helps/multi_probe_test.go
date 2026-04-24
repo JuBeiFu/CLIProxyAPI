@@ -5,26 +5,27 @@ import (
 	"fmt"
 	"testing"
 
+	codexauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/codex"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 )
 
 func TestProbeCodexPlanAcrossPoolPrefersExistingBoundEntryWhenStillPaid(t *testing.T) {
-	orig := fetchPlanTypeWithProxy
-	defer func() { fetchPlanTypeWithProxy = orig }()
+	orig := fetchUsageInfoWithProxy
+	defer func() { fetchUsageInfoWithProxy = orig }()
 
 	var requests []string
-	fetchPlanTypeWithProxy = func(ctx context.Context, proxyURL, accessToken string) (string, error) {
+	fetchUsageInfoWithProxy = func(ctx context.Context, proxyURL, accessToken string) (codexauth.WhamUsageInfo, error) {
 		requests = append(requests, proxyURL)
 		switch proxyURL {
 		case "http://bound-node":
-			return "plus", nil
+			return codexauth.WhamUsageInfo{PlanType: "plus"}, nil
 		case "http://other-node":
-			return "free", nil
+			return codexauth.WhamUsageInfo{PlanType: "free"}, nil
 		case "":
-			return "free", nil
+			return codexauth.WhamUsageInfo{PlanType: "free"}, nil
 		default:
-			return "", fmt.Errorf("unexpected proxyURL %q", proxyURL)
+			return codexauth.WhamUsageInfo{}, fmt.Errorf("unexpected proxyURL %q", proxyURL)
 		}
 	}
 
@@ -50,7 +51,7 @@ func TestProbeCodexPlanAcrossPoolPrefersExistingBoundEntryWhenStillPaid(t *testi
 	}
 	cliproxyauth.SetBoundProxyEntry(auth, "bound-node")
 
-	plan, bound, ok := ProbeCodexPlanAcrossPool(context.Background(), cfg, auth, "token")
+	plan, bound, _, ok := ProbeCodexPlanAcrossPool(context.Background(), cfg, auth, "token")
 	if !ok {
 		t.Fatal("probeOK = false, want true")
 	}
@@ -66,21 +67,21 @@ func TestProbeCodexPlanAcrossPoolPrefersExistingBoundEntryWhenStillPaid(t *testi
 }
 
 func TestProbeCodexPlanAcrossPoolFallsBackWhenExistingBoundEntryIsFree(t *testing.T) {
-	orig := fetchPlanTypeWithProxy
-	defer func() { fetchPlanTypeWithProxy = orig }()
+	orig := fetchUsageInfoWithProxy
+	defer func() { fetchUsageInfoWithProxy = orig }()
 
 	var requests []string
-	fetchPlanTypeWithProxy = func(ctx context.Context, proxyURL, accessToken string) (string, error) {
+	fetchUsageInfoWithProxy = func(ctx context.Context, proxyURL, accessToken string) (codexauth.WhamUsageInfo, error) {
 		requests = append(requests, proxyURL)
 		switch proxyURL {
 		case "http://bound-node":
-			return "free", nil
+			return codexauth.WhamUsageInfo{PlanType: "free"}, nil
 		case "http://other-node":
-			return "plus", nil
+			return codexauth.WhamUsageInfo{PlanType: "plus"}, nil
 		case "":
-			return "free", nil
+			return codexauth.WhamUsageInfo{PlanType: "free"}, nil
 		default:
-			return "", fmt.Errorf("unexpected proxyURL %q", proxyURL)
+			return codexauth.WhamUsageInfo{}, fmt.Errorf("unexpected proxyURL %q", proxyURL)
 		}
 	}
 
@@ -106,7 +107,7 @@ func TestProbeCodexPlanAcrossPoolFallsBackWhenExistingBoundEntryIsFree(t *testin
 	}
 	cliproxyauth.SetBoundProxyEntry(auth, "bound-node")
 
-	plan, bound, ok := ProbeCodexPlanAcrossPool(context.Background(), cfg, auth, "token")
+	plan, bound, _, ok := ProbeCodexPlanAcrossPool(context.Background(), cfg, auth, "token")
 	if !ok {
 		t.Fatal("probeOK = false, want true")
 	}
@@ -121,5 +122,28 @@ func TestProbeCodexPlanAcrossPoolFallsBackWhenExistingBoundEntryIsFree(t *testin
 	}
 	if requests[0] != "http://bound-node" {
 		t.Fatalf("first request = %q, want %q", requests[0], "http://bound-node")
+	}
+}
+
+func TestProbeCodexPlanAcrossPoolReturnsSupportedModelsFromPaidPath(t *testing.T) {
+	orig := fetchUsageInfoWithProxy
+	defer func() { fetchUsageInfoWithProxy = orig }()
+
+	fetchUsageInfoWithProxy = func(ctx context.Context, proxyURL, accessToken string) (codexauth.WhamUsageInfo, error) {
+		return codexauth.WhamUsageInfo{
+			PlanType:        "plus",
+			SupportedModels: []string{"gpt-5.4", "gpt-5.5"},
+		}, nil
+	}
+
+	plan, _, models, ok := ProbeCodexPlanAcrossPool(context.Background(), &config.Config{}, &cliproxyauth.Auth{Provider: "codex"}, "token")
+	if !ok {
+		t.Fatal("probeOK = false, want true")
+	}
+	if plan != "plus" {
+		t.Fatalf("plan = %q, want plus", plan)
+	}
+	if len(models) != 2 || models[0] != "gpt-5.4" || models[1] != "gpt-5.5" {
+		t.Fatalf("models = %v, want [gpt-5.4 gpt-5.5]", models)
 	}
 }

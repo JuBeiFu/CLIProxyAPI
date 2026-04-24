@@ -5,8 +5,10 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"reflect"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
@@ -17,10 +19,12 @@ import (
 type responseStickyExecutor struct {
 	id string
 
-	mu           sync.Mutex
-	executeCalls []string
-	streamCalls  []string
-	payloads     [][]byte
+	mu            sync.Mutex
+	executeCalls  []string
+	streamCalls   []string
+	payloads      [][]byte
+	executeErrors map[string]error
+	streamErrors  map[string]error
 }
 
 func (e *responseStickyExecutor) Identifier() string {
@@ -35,7 +39,11 @@ func (e *responseStickyExecutor) Execute(ctx context.Context, auth *Auth, req cl
 	callIndex := len(e.executeCalls)
 	e.executeCalls = append(e.executeCalls, auth.ID)
 	e.payloads = append(e.payloads, bytes.Clone(req.Payload))
+	err := e.executeErrors[auth.ID]
 	e.mu.Unlock()
+	if err != nil {
+		return cliproxyexecutor.Response{}, err
+	}
 
 	payload := []byte(fmt.Sprintf(`{"id":"resp-exec-%d","auth_id":"%s","output":[{"id":"msg-exec-%d","type":"message","status":"completed","role":"assistant","content":[{"type":"output_text","text":"assistant-%d"}]}]}`, callIndex+1, auth.ID, callIndex+1, callIndex+1))
 	return cliproxyexecutor.Response{
@@ -52,9 +60,18 @@ func (e *responseStickyExecutor) ExecuteStream(ctx context.Context, auth *Auth, 
 	e.mu.Lock()
 	callIndex := len(e.streamCalls)
 	e.streamCalls = append(e.streamCalls, auth.ID)
+	err := e.streamErrors[auth.ID]
 	e.mu.Unlock()
 
 	chunks := make(chan cliproxyexecutor.StreamChunk, 2)
+	if err != nil {
+		chunks <- cliproxyexecutor.StreamChunk{Err: err}
+		close(chunks)
+		return &cliproxyexecutor.StreamResult{
+			Headers: http.Header{"X-Auth": {auth.ID}},
+			Chunks:  chunks,
+		}, nil
+	}
 	chunks <- cliproxyexecutor.StreamChunk{Payload: []byte(`data: {"type":"response.output_text.delta","delta":"hi"}`)}
 	chunks <- cliproxyexecutor.StreamChunk{
 		Payload: []byte(fmt.Sprintf(`data: {"type":"response.completed","response":{"id":"resp-stream-%d","auth_id":"%s"}}`, callIndex+1, auth.ID)),
@@ -84,6 +101,22 @@ func (e *responseStickyExecutor) HttpRequest(ctx context.Context, auth *Auth, re
 	_ = auth
 	_ = req
 	return nil, nil
+}
+
+func (e *responseStickyExecutor) ExecuteCalls() []string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	out := make([]string, len(e.executeCalls))
+	copy(out, e.executeCalls)
+	return out
+}
+
+func (e *responseStickyExecutor) StreamCalls() []string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	out := make([]string, len(e.streamCalls))
+	copy(out, e.streamCalls)
+	return out
 }
 
 func parseStickyResponseAuthID(payload []byte) string {
@@ -292,7 +325,182 @@ func TestManagerExecuteStream_OpenAIResponsesPreviousResponseIDPinsAuth(t *testi
 	}
 }
 
-func TestManagerExecute_OpenAIResponsesCompactIgnoresPreviousResponseIDBindingAndPrefersBestAuth(t *testing.T) {
+func TestManagerExecute_OpenAIResponsesPreviousResponseIDRetriesOnAnotherAuthAfterTransientPinnedFailure(t *testing.T) {
+	t.Parallel()
+
+	const (
+		authAID = "response-bind-exec-transient-auth-a"
+		authBID = "response-bind-exec-transient-auth-b"
+		model   = "gpt-5.4"
+	)
+
+	manager := NewManager(nil, &RoundRobinSelector{}, nil)
+	manager.SetRetryConfig(1, 100*time.Millisecond, 2)
+	executor := &responseStickyExecutor{id: "codex"}
+	manager.RegisterExecutor(executor)
+	reg := registry.GetGlobalRegistry()
+	reg.RegisterClient(authAID, "codex", []*registry.ModelInfo{{ID: model}})
+	reg.RegisterClient(authBID, "codex", []*registry.ModelInfo{{ID: model}})
+	t.Cleanup(func() {
+		reg.UnregisterClient(authAID)
+		reg.UnregisterClient(authBID)
+	})
+
+	if _, errRegister := manager.Register(context.Background(), &Auth{
+		ID:       authAID,
+		Provider: "codex",
+	}); errRegister != nil {
+		t.Fatalf("Register(auth-a) error = %v", errRegister)
+	}
+	if _, errRegister := manager.Register(context.Background(), &Auth{
+		ID:       authBID,
+		Provider: "codex",
+	}); errRegister != nil {
+		t.Fatalf("Register(auth-b) error = %v", errRegister)
+	}
+
+	firstPayload := []byte(`{"input":"hello"}`)
+	firstResp, errExecute := manager.Execute(context.Background(), []string{"codex"}, cliproxyexecutor.Request{
+		Model:   model,
+		Payload: firstPayload,
+	}, cliproxyexecutor.Options{
+		OriginalRequest: firstPayload,
+		SourceFormat:    sdktranslator.FromString("openai-response"),
+		Metadata: map[string]any{
+			cliproxyexecutor.PinnedAuthMetadataKey: authAID,
+		},
+	})
+	if errExecute != nil {
+		t.Fatalf("first Execute() error = %v", errExecute)
+	}
+	firstResponseID := parseStickyResponseID(firstResp.Payload)
+	if firstResponseID == "" {
+		t.Fatalf("first response id = empty, payload = %s", string(firstResp.Payload))
+	}
+	if boundAuthID := manager.lookupBoundAuthID(firstResponseID); boundAuthID != authAID {
+		t.Fatalf("lookupBoundAuthID(%q) = %q, want %q", firstResponseID, boundAuthID, authAID)
+	}
+
+	executor.mu.Lock()
+	executor.executeErrors = map[string]error{
+		authAID: &retryAfterStatusError{status: http.StatusBadGateway, message: "upstream zero-usage completion without output events"},
+	}
+	executor.mu.Unlock()
+
+	secondPayload := []byte(fmt.Sprintf(`{"input":"follow up","previous_response_id":"%s"}`, firstResponseID))
+	secondResp, errExecute := manager.Execute(context.Background(), []string{"codex"}, cliproxyexecutor.Request{
+		Model:   model,
+		Payload: secondPayload,
+	}, cliproxyexecutor.Options{
+		OriginalRequest: secondPayload,
+		SourceFormat:    sdktranslator.FromString("openai-response"),
+	})
+	if errExecute != nil {
+		t.Fatalf("second Execute() error = %v", errExecute)
+	}
+	if secondAuthID := parseStickyResponseAuthID(secondResp.Payload); secondAuthID != authBID {
+		t.Fatalf("second Execute() auth = %q, want %q", secondAuthID, authBID)
+	}
+
+	wantCalls := []string{authAID, authAID, authBID}
+	if gotCalls := executor.ExecuteCalls(); !reflect.DeepEqual(gotCalls, wantCalls) {
+		t.Fatalf("execute calls = %#v, want %#v", gotCalls, wantCalls)
+	}
+	if boundAuthID := manager.lookupBoundAuthID(firstResponseID); boundAuthID != "" {
+		t.Fatalf("lookupBoundAuthID(%q) = %q, want empty after transient failure", firstResponseID, boundAuthID)
+	}
+}
+
+func TestManagerExecuteStream_OpenAIResponsesPreviousResponseIDRetriesOnAnotherAuthAfterTransientPinnedFailure(t *testing.T) {
+	t.Parallel()
+
+	const (
+		authAID = "response-bind-stream-transient-auth-a"
+		authBID = "response-bind-stream-transient-auth-b"
+		model   = "gpt-5.4"
+	)
+
+	manager := NewManager(nil, &RoundRobinSelector{}, nil)
+	manager.SetRetryConfig(1, 100*time.Millisecond, 2)
+	executor := &responseStickyExecutor{id: "codex"}
+	manager.RegisterExecutor(executor)
+	reg := registry.GetGlobalRegistry()
+	reg.RegisterClient(authAID, "codex", []*registry.ModelInfo{{ID: model}})
+	reg.RegisterClient(authBID, "codex", []*registry.ModelInfo{{ID: model}})
+	t.Cleanup(func() {
+		reg.UnregisterClient(authAID)
+		reg.UnregisterClient(authBID)
+	})
+
+	if _, errRegister := manager.Register(context.Background(), &Auth{
+		ID:       authAID,
+		Provider: "codex",
+	}); errRegister != nil {
+		t.Fatalf("Register(auth-a) error = %v", errRegister)
+	}
+	if _, errRegister := manager.Register(context.Background(), &Auth{
+		ID:       authBID,
+		Provider: "codex",
+	}); errRegister != nil {
+		t.Fatalf("Register(auth-b) error = %v", errRegister)
+	}
+
+	firstPayload := []byte(`{"input":"hello"}`)
+	firstResult, errExecute := manager.ExecuteStream(context.Background(), []string{"codex"}, cliproxyexecutor.Request{
+		Model:   model,
+		Payload: firstPayload,
+	}, cliproxyexecutor.Options{
+		Stream:          true,
+		OriginalRequest: firstPayload,
+		SourceFormat:    sdktranslator.FromString("openai-response"),
+		Metadata: map[string]any{
+			cliproxyexecutor.PinnedAuthMetadataKey: authAID,
+		},
+	})
+	if errExecute != nil {
+		t.Fatalf("first ExecuteStream() error = %v", errExecute)
+	}
+	firstResponseID, firstAuthID := readStickyCompletedChunk(t, firstResult)
+	if firstResponseID == "" {
+		t.Fatal("first stream response id = empty")
+	}
+	if firstAuthID != authAID {
+		t.Fatalf("first stream auth = %q, want %q", firstAuthID, authAID)
+	}
+
+	executor.mu.Lock()
+	executor.streamErrors = map[string]error{
+		authAID: &retryAfterStatusError{status: http.StatusBadGateway, message: "upstream zero-usage completion without output events"},
+	}
+	executor.mu.Unlock()
+
+	secondPayload := []byte(fmt.Sprintf(`{"input":"follow up","previous_response_id":"%s"}`, firstResponseID))
+	secondResult, errExecute := manager.ExecuteStream(context.Background(), []string{"codex"}, cliproxyexecutor.Request{
+		Model:   model,
+		Payload: secondPayload,
+	}, cliproxyexecutor.Options{
+		Stream:          true,
+		OriginalRequest: secondPayload,
+		SourceFormat:    sdktranslator.FromString("openai-response"),
+	})
+	if errExecute != nil {
+		t.Fatalf("second ExecuteStream() error = %v", errExecute)
+	}
+	_, secondAuthID := readStickyCompletedChunk(t, secondResult)
+	if secondAuthID != authBID {
+		t.Fatalf("second ExecuteStream() auth = %q, want %q", secondAuthID, authBID)
+	}
+
+	wantCalls := []string{authAID, authAID, authBID}
+	if gotCalls := executor.StreamCalls(); !reflect.DeepEqual(gotCalls, wantCalls) {
+		t.Fatalf("stream calls = %#v, want %#v", gotCalls, wantCalls)
+	}
+	if boundAuthID := manager.lookupBoundAuthID(firstResponseID); boundAuthID != "" {
+		t.Fatalf("lookupBoundAuthID(%q) = %q, want empty after transient failure", firstResponseID, boundAuthID)
+	}
+}
+
+func TestManagerExecute_OpenAIResponsesCompactIgnoresPreviousResponseIDBindingAndUsesRoundRobin(t *testing.T) {
 	t.Parallel()
 
 	const (
@@ -365,6 +573,88 @@ func TestManagerExecute_OpenAIResponsesCompactIgnoresPreviousResponseIDBindingAn
 		OriginalRequest: secondPayload,
 		SourceFormat:    sdktranslator.FromString("openai-response"),
 		Metadata: map[string]any{
+			cliproxyexecutor.SelectedAuthCallbackMetadataKey: func(authID string) {
+				secondSelectedAuth = authID
+			},
+		},
+	})
+	if errExecute != nil {
+		t.Fatalf("second Execute() error = %v, selected = %q", errExecute, secondSelectedAuth)
+	}
+	secondAuthID := parseStickyResponseAuthID(secondResp.Payload)
+	if secondAuthID != authAID {
+		t.Fatalf("compact Execute() auth = %q, selected = %q, want %q", secondAuthID, secondSelectedAuth, authAID)
+	}
+}
+
+func TestManagerExecute_OpenAIResponsesCompactHonorsExplicitPreferBestAuth(t *testing.T) {
+	t.Parallel()
+
+	const (
+		authAID = "response-bind-compact-explicit-best-auth-a"
+		authBID = "response-bind-compact-explicit-best-auth-b"
+	)
+
+	manager := NewManager(nil, &RoundRobinSelector{}, nil)
+	executor := &responseStickyExecutor{id: "codex"}
+	manager.RegisterExecutor(executor)
+	reg := registry.GetGlobalRegistry()
+	reg.RegisterClient(authAID, "codex", []*registry.ModelInfo{{ID: "gpt-5.4"}})
+	reg.RegisterClient(authBID, "codex", []*registry.ModelInfo{{ID: "gpt-5.4"}})
+	t.Cleanup(func() {
+		reg.UnregisterClient(authAID)
+		reg.UnregisterClient(authBID)
+	})
+
+	if _, errRegister := manager.Register(context.Background(), &Auth{
+		ID:       authAID,
+		Provider: "codex",
+		Attributes: map[string]string{
+			"plan_type": "free",
+		},
+	}); errRegister != nil {
+		t.Fatalf("Register(auth-a) error = %v", errRegister)
+	}
+	if _, errRegister := manager.Register(context.Background(), &Auth{
+		ID:       authBID,
+		Provider: "codex",
+		Attributes: map[string]string{
+			"plan_type": "pro",
+		},
+	}); errRegister != nil {
+		t.Fatalf("Register(auth-b) error = %v", errRegister)
+	}
+
+	firstPayload := []byte(`{"input":"hello"}`)
+	firstResp, errExecute := manager.Execute(context.Background(), []string{"codex"}, cliproxyexecutor.Request{
+		Model:   "gpt-5.4",
+		Payload: firstPayload,
+	}, cliproxyexecutor.Options{
+		OriginalRequest: firstPayload,
+		SourceFormat:    sdktranslator.FromString("openai-response"),
+		Metadata: map[string]any{
+			cliproxyexecutor.PinnedAuthMetadataKey: authAID,
+		},
+	})
+	if errExecute != nil {
+		t.Fatalf("first Execute() error = %v", errExecute)
+	}
+	firstResponseID := parseStickyResponseID(firstResp.Payload)
+	if firstResponseID == "" {
+		t.Fatalf("first response id = empty, payload = %s", string(firstResp.Payload))
+	}
+
+	secondPayload := []byte(fmt.Sprintf(`{"input":"compact this","previous_response_id":"%s"}`, firstResponseID))
+	var secondSelectedAuth string
+	secondResp, errExecute := manager.Execute(context.Background(), []string{"codex"}, cliproxyexecutor.Request{
+		Model:   "gpt-5.4",
+		Payload: secondPayload,
+	}, cliproxyexecutor.Options{
+		Alt:             "responses/compact",
+		OriginalRequest: secondPayload,
+		SourceFormat:    sdktranslator.FromString("openai-response"),
+		Metadata: map[string]any{
+			cliproxyexecutor.PreferBestAuthMetadataKey: true,
 			cliproxyexecutor.SelectedAuthCallbackMetadataKey: func(authID string) {
 				secondSelectedAuth = authID
 			},

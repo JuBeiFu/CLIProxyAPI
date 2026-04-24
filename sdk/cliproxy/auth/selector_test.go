@@ -619,6 +619,29 @@ func TestIsAuthBlockedForModel_UsageLimitAlwaysBlocked(t *testing.T) {
 	}
 }
 
+func TestIsAuthBlockedForModel_UsageLimitQuotaRecoverBlocksWithoutUnavailable(t *testing.T) {
+	now := time.Now()
+	auth := &Auth{
+		ID: "auth-block-quota-only",
+		Quota: QuotaState{
+			Exceeded:      true,
+			Reason:        "usage_limit",
+			NextRecoverAt: now.Add(2 * time.Hour),
+		},
+	}
+
+	blocked, reason, next := isAuthBlockedForModel(auth, "gpt-4", now)
+	if !blocked {
+		t.Fatal("expected auth to be blocked for usage_limit quota recovery")
+	}
+	if reason != blockReasonCooldown {
+		t.Fatalf("block reason = %v, want %v", reason, blockReasonCooldown)
+	}
+	if !next.After(now) {
+		t.Fatalf("next retry = %v, want future time", next)
+	}
+}
+
 func TestIsAuthBlockedForModel_RateLimitBlockedNormally(t *testing.T) {
 	now := time.Now()
 	auth := &Auth{

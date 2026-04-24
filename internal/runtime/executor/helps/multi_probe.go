@@ -1,4 +1,4 @@
-// Package helps — multi-path codex plan_type probe.
+// Package helps provides multi-path Codex plan_type probing.
 package helps
 
 import (
@@ -21,13 +21,13 @@ import (
 // healthy slow path (warp/socks) still succeeds.
 const multiProbeTimeout = 20 * time.Second
 
-var fetchPlanTypeWithProxy = func(ctx context.Context, proxyURL, accessToken string) (string, error) {
+var fetchUsageInfoWithProxy = func(ctx context.Context, proxyURL, accessToken string) (codexauth.WhamUsageInfo, error) {
 	client, err := buildProbeClient(proxyURL)
 	if err != nil {
-		return "", err
+		return codexauth.WhamUsageInfo{}, err
 	}
 	svc := codexauth.NewCodexAuthWithClient(client)
-	return svc.FetchWhamUsagePlanType(ctx, accessToken)
+	return svc.FetchWhamUsageInfo(ctx, accessToken)
 }
 
 // ProbeCodexPlanAcrossPool tries /wham/usage through every entry of the
@@ -42,9 +42,8 @@ var fetchPlanTypeWithProxy = func(ctx context.Context, proxyURL, accessToken str
 //     caller should pin the auth to. Empty string when no
 //     paid path was found (caller should clear the binding).
 //   - probeOK:     true iff at least one path returned a usable plan_type
-//     (paid OR free). False means every candidate errored —
-//     caller must NOT mutate the auth's plan_type / bound
-//     entry on that outcome (preserves last-known state).
+//     (paid OR free). False means every candidate errored, so the caller
+//     keeps the auth's plan_type and bound entry unchanged.
 //
 // The shuffle randomizes the start order so probes spread across pool
 // entries rather than hammering whichever entry the FNV hash happens to
@@ -54,7 +53,7 @@ func ProbeCodexPlanAcrossPool(
 	cfg *config.Config,
 	auth *cliproxyauth.Auth,
 	accessToken string,
-) (plan string, boundEntry string, probeOK bool) {
+) (plan string, boundEntry string, supportedModels []string, probeOK bool) {
 	pool := resolveCodexProbePool(cfg, auth)
 	candidates := shuffledHealthyEntries(pool)
 	boundPreferredName := strings.TrimSpace(cliproxyauth.BoundProxyEntry(auth))
@@ -90,20 +89,21 @@ func ProbeCodexPlanAcrossPool(
 			break
 		}
 		probeCtx, cancel := context.WithTimeout(ctx, multiProbeTimeout)
-		got, probeErr := fetchPlanTypeWithProxy(probeCtx, c.proxyURL, accessToken)
+		info, probeErr := fetchUsageInfoWithProxy(probeCtx, c.proxyURL, accessToken)
+		got := info.PlanType
 		cancel()
 		if probeErr != nil {
 			continue
 		}
 		got = strings.ToLower(strings.TrimSpace(got))
 		if got == "" {
-			// Endpoint answered without a plan_type. Treat like a failed
-			// probe rather than a trusted "free" — don't poison lastFreePlan.
+			// Endpoint answered without a plan_type. Treat it as a failed
+			// probe so lastFreePlan keeps its previous trusted value.
 			continue
 		}
 		anySucceeded = true
 		if isPaidPlanName(got) {
-			return got, c.entryName, true
+			return got, c.entryName, info.SupportedModels, true
 		}
 		// Successful probe but reports free. Keep searching for a paid
 		// path through other nodes: OpenAI edge caches sometimes disagree
@@ -114,11 +114,11 @@ func ProbeCodexPlanAcrossPool(
 	if anySucceeded {
 		// All paths reported free. Clear any previous binding: the auth
 		// has no egress that will serve it as paid right now.
-		return lastFreePlan, "", true
+		return lastFreePlan, "", nil, true
 	}
 
 	// Every candidate errored. Caller keeps existing state.
-	return "", "", false
+	return "", "", nil, false
 }
 
 // resolveCodexProbePool returns the proxy pool to enumerate for the auth.

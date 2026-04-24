@@ -79,6 +79,8 @@ const (
 	defaultMaxRetryInterval    = 120 * time.Second
 )
 
+const responseBindingPinnedAuthMetadataKey = "__cliproxy_response_binding_pinned_auth"
+
 var quotaCooldownDisabled atomic.Bool
 
 // SetQuotaCooldownDisabled toggles quota cooldown scheduling globally.
@@ -1203,7 +1205,7 @@ func (m *Manager) Register(ctx context.Context, auth *Auth) (*Auth, error) {
 	m.hook.OnAuthRegistered(ctx, auth.Clone())
 	// Codex auths get a fire-and-forget immediate refresh so the real plan_type
 	// (via /wham/usage) is known within seconds of import, not 5 minutes later.
-	// Only codex needs this — other providers don't have the JWT/usage mismatch
+	// Only codex needs this; other providers do not have the JWT/usage mismatch
 	// problem this solves.
 	if strings.EqualFold(strings.TrimSpace(auth.Provider), "codex") {
 		if m.executorFor(auth.Provider) != nil {
@@ -1441,6 +1443,9 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 					result.RetryAfter = ra
 				}
 				m.MarkResult(execCtx, result)
+				if isTransientCooldownError(errExec) {
+					opts = clearResponseBindingPinnedAuthMetadata(opts, auth.ID)
+				}
 				if isRequestInvalidError(errExec) {
 					lease.Release()
 					return cliproxyexecutor.Response{}, errExec
@@ -1526,6 +1531,9 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 					result.RetryAfter = ra
 				}
 				m.MarkResult(execCtx, result)
+				if isTransientCooldownError(errExec) {
+					opts = clearResponseBindingPinnedAuthMetadata(opts, auth.ID)
+				}
 				if isRequestInvalidError(errExec) {
 					lease.Release()
 					return cliproxyexecutor.Response{}, errExec
@@ -1585,7 +1593,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 		debugLogAuthSelection(entry, auth, provider, req.Model)
 		publishSelectedAuthMetadata(opts.Metadata, auth.ID)
 
-		// Opportunistic async re-probe — mirrors the Execute path.
+		// Opportunistic async re-probe mirrors the Execute path.
 		m.KickAsyncBindingProbe(auth.ID)
 
 		tried[auth.ID] = struct{}{}
@@ -1606,6 +1614,9 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			if errCtx := execCtx.Err(); errCtx != nil {
 				lease.Release()
 				return nil, errCtx
+			}
+			if isTransientCooldownError(errStream) {
+				opts = clearResponseBindingPinnedAuthMetadata(opts, auth.ID)
 			}
 			if isRequestInvalidError(errStream) {
 				lease.Release()
@@ -1644,8 +1655,10 @@ func ensureResponseBindingMetadata(req cliproxyexecutor.Request, opts cliproxyex
 	if len(opts.Metadata) > 0 && pinnedAuthIDFromMetadata(opts.Metadata) != "" {
 		return opts
 	}
-	if strings.EqualFold(strings.TrimSpace(opts.Alt), "responses/compact") && compactRequestPrefersBestAuth(req, opts) {
-		return ensureCompactSelectionMetadata(opts)
+	if strings.EqualFold(strings.TrimSpace(opts.Alt), "responses/compact") &&
+		compactRequestHasInput(req, opts) &&
+		preferBestAuthFromMetadata(opts.Metadata) {
+		return opts
 	}
 	if lookup == nil {
 		return opts
@@ -1659,7 +1672,10 @@ func ensureResponseBindingMetadata(req cliproxyexecutor.Request, opts cliproxyex
 		return opts
 	}
 	if len(opts.Metadata) == 0 {
-		opts.Metadata = map[string]any{cliproxyexecutor.PinnedAuthMetadataKey: authID}
+		opts.Metadata = map[string]any{
+			cliproxyexecutor.PinnedAuthMetadataKey: authID,
+			responseBindingPinnedAuthMetadataKey:   true,
+		}
 		return opts
 	}
 	meta := make(map[string]any, len(opts.Metadata)+1)
@@ -1667,53 +1683,49 @@ func ensureResponseBindingMetadata(req cliproxyexecutor.Request, opts cliproxyex
 		meta[k] = v
 	}
 	meta[cliproxyexecutor.PinnedAuthMetadataKey] = authID
+	meta[responseBindingPinnedAuthMetadataKey] = true
 	opts.Metadata = meta
 	return opts
 }
 
-func ensureCompactSelectionMetadata(opts cliproxyexecutor.Options) cliproxyexecutor.Options {
-	if len(opts.Metadata) == 0 {
-		opts.Metadata = map[string]any{cliproxyexecutor.PreferBestAuthMetadataKey: true}
+func clearResponseBindingPinnedAuthMetadata(opts cliproxyexecutor.Options, authID string) cliproxyexecutor.Options {
+	authID = strings.TrimSpace(authID)
+	if authID == "" || len(opts.Metadata) == 0 {
 		return opts
 	}
-	if raw, ok := opts.Metadata[cliproxyexecutor.PreferBestAuthMetadataKey]; ok {
-		if prefer, okBool := raw.(bool); okBool && prefer {
-			return opts
-		}
+	if !responseBindingPinnedAuthFromMetadata(opts.Metadata) {
+		return opts
 	}
-	meta := make(map[string]any, len(opts.Metadata)+1)
+	if pinnedAuthIDFromMetadata(opts.Metadata) != authID {
+		return opts
+	}
+	meta := make(map[string]any, len(opts.Metadata))
 	for k, v := range opts.Metadata {
+		if k == cliproxyexecutor.PinnedAuthMetadataKey || k == responseBindingPinnedAuthMetadataKey {
+			continue
+		}
 		meta[k] = v
 	}
-	meta[cliproxyexecutor.PreferBestAuthMetadataKey] = true
 	opts.Metadata = meta
 	return opts
 }
 
-func compactRequestPrefersBestAuth(req cliproxyexecutor.Request, opts cliproxyexecutor.Options) bool {
-	for _, payload := range [][]byte{req.Payload, opts.OriginalRequest} {
-		if len(payload) == 0 || !gjson.ValidBytes(payload) {
-			continue
-		}
-		input := gjson.GetBytes(payload, "input")
-		if input.Exists() {
-			switch input.Type {
-			case gjson.String:
-				if strings.TrimSpace(input.String()) != "" {
-					return true
-				}
-			case gjson.JSON:
-				if input.IsArray() && len(input.Array()) > 0 {
-					return true
-				}
-			default:
-				if strings.TrimSpace(input.Raw) != "" && input.Raw != "null" {
-					return true
-				}
-			}
-		}
+func responseBindingPinnedAuthFromMetadata(meta map[string]any) bool {
+	if len(meta) == 0 {
+		return false
 	}
-	return false
+	raw, ok := meta[responseBindingPinnedAuthMetadataKey]
+	if !ok || raw == nil {
+		return false
+	}
+	switch val := raw.(type) {
+	case bool:
+		return val
+	case string:
+		return strings.EqualFold(strings.TrimSpace(val), "true")
+	default:
+		return false
+	}
 }
 
 func previousResponseIDFromRequest(req cliproxyexecutor.Request, opts cliproxyexecutor.Options) string {
@@ -1760,10 +1772,36 @@ func compactRequestNeedsTranscriptRewrite(req cliproxyexecutor.Request, opts cli
 	if !strings.EqualFold(strings.TrimSpace(opts.Alt), "responses/compact") {
 		return false
 	}
-	if compactRequestPrefersBestAuth(req, opts) {
+	if compactRequestHasInput(req, opts) {
 		return false
 	}
 	return previousResponseIDFromRequest(req, opts) != ""
+}
+
+func compactRequestHasInput(req cliproxyexecutor.Request, opts cliproxyexecutor.Options) bool {
+	for _, payload := range [][]byte{req.Payload, opts.OriginalRequest} {
+		if len(payload) == 0 || !gjson.ValidBytes(payload) {
+			continue
+		}
+		input := gjson.GetBytes(payload, "input")
+		if input.Exists() {
+			switch input.Type {
+			case gjson.String:
+				if strings.TrimSpace(input.String()) != "" {
+					return true
+				}
+			case gjson.JSON:
+				if input.IsArray() && len(input.Array()) > 0 {
+					return true
+				}
+			default:
+				if strings.TrimSpace(input.Raw) != "" && input.Raw != "null" {
+					return true
+				}
+			}
+		}
+	}
+	return false
 }
 
 func compactTranscriptFromPayload(reqPayload, respPayload []byte) []byte {
@@ -1909,6 +1947,27 @@ func (m *Manager) bindResponseToAuth(responseID, authID string) {
 	}
 	m.responseBindings[responseID] = authID
 	m.responseBindingsMu.Unlock()
+}
+
+func (m *Manager) unbindResponsesForAuth(authID string) int {
+	if m == nil {
+		return 0
+	}
+	authID = strings.TrimSpace(authID)
+	if authID == "" {
+		return 0
+	}
+	m.responseBindingsMu.Lock()
+	defer m.responseBindingsMu.Unlock()
+	removed := 0
+	for responseID, boundAuthID := range m.responseBindings {
+		if strings.TrimSpace(boundAuthID) != authID {
+			continue
+		}
+		delete(m.responseBindings, responseID)
+		removed++
+	}
+	return removed
 }
 
 func (m *Manager) bindResponseFromPayload(authID string, reqPayload []byte, respPayload []byte) {
@@ -2424,9 +2483,11 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	suspendReason := ""
 	clearModelQuota := false
 	setModelQuota := false
+	modelSupportFailure := false
+	unbindResponseAuthID := ""
 	var authSnapshot *Auth
-	removedAuth := (*Auth)(nil)
-	deleteWarning := ""
+	terminalAuthSnapshot := (*Auth)(nil)
+	terminalWarning := ""
 	terminallyDisabled := false
 
 	m.mu.Lock()
@@ -2435,18 +2496,19 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 
 		if !result.Success {
 			if deleteAuth, reason := shouldDeleteRevokedAuth(auth, result.Error); deleteAuth {
-				removedAuth = auth.Clone()
-				deleteWarning = reason
-				delete(m.auths, result.AuthID)
+				applyTerminalAuthDisabledState(auth, result.Error, reason, now)
+				terminalAuthSnapshot = auth.Clone()
+				terminalWarning = reason
+				terminallyDisabled = true
 			} else if disableAuth, reason := shouldDisableRevokedAuth(auth, result.Error); disableAuth {
 				applyTerminalAuthDisabledState(auth, result.Error, reason, now)
+				terminalAuthSnapshot = auth.Clone()
+				terminalWarning = reason
 				terminallyDisabled = true
 			}
 		}
 
-		if removedAuth != nil {
-			// Auth already removed from runtime state.
-		} else if terminallyDisabled {
+		if terminallyDisabled {
 			// Auth already disabled from runtime state.
 		} else if result.Success {
 			if result.Model != "" {
@@ -2481,11 +2543,15 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 					}
 
 					statusCode := statusCodeFromResult(result.Error)
+					if isTransientCooldownStatus(statusCode) {
+						unbindResponseAuthID = result.AuthID
+					}
 					if isModelSupportResultError(result.Error) {
 						next := now.Add(12 * time.Hour)
 						state.NextRetryAfter = next
 						suspendReason = "model_not_supported"
 						shouldSuspendModel = true
+						modelSupportFailure = true
 					} else {
 						switch statusCode {
 						case 401:
@@ -2562,30 +2628,39 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 						}
 					}
 
-					auth.Status = StatusError
+					if modelSupportFailure {
+						clearAggregatedAvailability(auth)
+					} else {
+						updateAggregatedAvailability(auth, now)
+					}
+					if modelSupportFailure {
+						auth.Status = StatusActive
+					} else {
+						auth.Status = StatusError
+					}
 					auth.UpdatedAt = now
-					updateAggregatedAvailability(auth, now)
 				}
 			} else {
 				applyAuthFailureState(auth, result.Error, result.RetryAfter, now)
 			}
 		}
 
-		if removedAuth == nil {
-			_ = m.persist(ctx, auth)
-			authSnapshot = auth.Clone()
-		}
+		_ = m.persist(ctx, auth)
+		authSnapshot = auth.Clone()
 	}
 	m.mu.Unlock()
 
-	if removedAuth != nil {
-		m.deleteRevokedAuth(removedAuth, deleteWarning, "request")
+	if terminalAuthSnapshot != nil {
+		m.markRevokedAuthDisabled(terminalAuthSnapshot, terminalWarning, "request")
 		m.hook.OnResult(ctx, result)
 		return
 	}
 
 	if m.scheduler != nil && authSnapshot != nil {
 		m.scheduler.upsertAuth(authSnapshot)
+	}
+	if unbindResponseAuthID != "" {
+		m.unbindResponsesForAuth(unbindResponseAuthID)
 	}
 
 	if clearModelQuota && result.Model != "" {
@@ -2973,6 +3048,19 @@ func statusCodeFromResult(err *Error) int {
 	return err.StatusCode()
 }
 
+func isTransientCooldownError(err error) bool {
+	return isTransientCooldownStatus(statusCodeFromError(err))
+}
+
+func isTransientCooldownStatus(status int) bool {
+	switch status {
+	case http.StatusRequestTimeout, http.StatusInternalServerError, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+		return true
+	default:
+		return false
+	}
+}
+
 func resultErrorFromError(err error) *Error {
 	if err == nil {
 		return nil
@@ -2993,6 +3081,8 @@ func isModelSupportErrorMessage(message string) bool {
 	}
 	patterns := [...]string{
 		"model_not_supported",
+		"missing scopes: api.model.read",
+		"insufficient permissions for this operation",
 		"requested model is not supported",
 		"requested model is unsupported",
 		"requested model is unavailable",
@@ -3016,7 +3106,7 @@ func isModelSupportError(err error) bool {
 		return false
 	}
 	status := statusCodeFromError(err)
-	if status != http.StatusBadRequest && status != http.StatusUnprocessableEntity {
+	if status != http.StatusBadRequest && status != http.StatusForbidden && status != http.StatusUnprocessableEntity {
 		return false
 	}
 	return isModelSupportErrorMessage(err.Error())
@@ -3027,7 +3117,7 @@ func isModelSupportResultError(err *Error) bool {
 		return false
 	}
 	status := statusCodeFromResult(err)
-	if status != http.StatusBadRequest && status != http.StatusUnprocessableEntity {
+	if status != http.StatusBadRequest && status != http.StatusForbidden && status != http.StatusUnprocessableEntity {
 		return false
 	}
 	return isModelSupportErrorMessage(err.Message)
@@ -3078,6 +3168,9 @@ func isRequestInvalidError(err error) bool {
 
 func terminalAuthFailureReason(resultErr *Error) string {
 	if resultErr == nil {
+		return ""
+	}
+	if isModelSupportResultError(resultErr) {
 		return ""
 	}
 	message := strings.TrimSpace(resultErr.Message)
@@ -3242,6 +3335,29 @@ func (m *Manager) deleteRevokedAuth(auth *Auth, warning string, source string) {
 		log.Warnf("deleted revoked auth %s%s after terminal auth failure during %s, but failed to append ban record: %v", authID, authPathSuffix(auth), source, err)
 	}
 	log.Warnf("deleted revoked auth %s%s after terminal auth failure during %s: %s", authID, authPathSuffix(auth), source, warning)
+}
+
+func (m *Manager) markRevokedAuthDisabled(auth *Auth, warning string, source string) {
+	if m == nil || auth == nil {
+		return
+	}
+	authID := strings.TrimSpace(auth.ID)
+	if authID == "" {
+		return
+	}
+	if source == "" {
+		source = "request"
+	}
+	RegisterRevokedAuthTombstone(auth, warning, time.Now())
+	if m.scheduler != nil {
+		m.scheduler.removeAuth(authID)
+	}
+	m.rebuildAPIKeyModelAliasFromRuntimeConfig()
+	registry.GetGlobalRegistry().UnregisterClient(authID)
+	if err := appendBanRecord(auth, warning, source, time.Now()); err != nil {
+		log.Warnf("disabled revoked auth %s%s after terminal auth failure during %s, but failed to append ban record: %v", authID, authPathSuffix(auth), source, err)
+	}
+	log.Warnf("disabled revoked auth %s%s after terminal auth failure during %s: %s", authID, authPathSuffix(auth), source, warning)
 }
 
 func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Duration, now time.Time) {
@@ -4142,7 +4258,7 @@ func (m *Manager) KickAsyncBindingProbe(authID string) {
 	// refreshAuthWithLimit acquires m.refreshSemaphore, so the full pool
 	// of async probes shares the existing 16-slot pipeline with forced
 	// refreshes and the 15min auto-refresh loop. If the pool is
-	// saturated, this goroutine parks until a slot opens — still
+	// saturated, this goroutine parks until a slot opens while remaining
 	// non-blocking for the caller thanks to the `go` prefix.
 	go m.refreshAuthWithLimit(context.Background(), authID)
 }
@@ -4172,15 +4288,26 @@ func (m *Manager) refreshAuth(ctx context.Context, id string) {
 	if err != nil {
 		resultErr := resultErrorFromError(err)
 		if deleteAuth, reason := shouldDeleteRevokedAuth(auth, resultErr); deleteAuth {
-			var removedAuth *Auth
+			var authSnapshot *Auth
+			var persistErr error
 			m.mu.Lock()
 			if current := m.auths[id]; current != nil {
-				removedAuth = current.Clone()
-				delete(m.auths, id)
+				applyTerminalAuthDisabledState(current, resultErr, reason, now)
+				current.NextRefreshAfter = time.Time{}
+				m.auths[id] = current
+				authSnapshot = current.Clone()
+				persistErr = m.persist(ctx, current)
 			}
 			m.mu.Unlock()
-			if removedAuth != nil {
-				m.deleteRevokedAuth(removedAuth, reason, "refresh")
+			if authSnapshot != nil {
+				if m.scheduler != nil {
+					m.scheduler.upsertAuth(authSnapshot)
+				}
+				if persistErr != nil {
+					log.Warnf("disabled revoked auth %s%s after terminal auth failure during refresh, but failed to persist disabled state: %v", authSnapshot.ID, authPathSuffix(authSnapshot), persistErr)
+					return
+				}
+				log.Warnf("disabled revoked auth %s%s after terminal auth failure during refresh: %s", authSnapshot.ID, authPathSuffix(authSnapshot), reason)
 			}
 			return
 		}

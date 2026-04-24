@@ -619,6 +619,9 @@ func shouldRetryResponsesWebsocketWithTranscriptReset(errMsg *interfaces.ErrorMe
 			return true
 		}
 	}
+	if errMsg.StatusCode == http.StatusBadRequest && responsesWebsocketPreviousResponseNotFound(errMsg.Error) {
+		return true
+	}
 	switch errMsg.StatusCode {
 	case http.StatusUnauthorized, http.StatusForbidden, http.StatusRequestTimeout, http.StatusTooManyRequests,
 		http.StatusInternalServerError, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
@@ -626,6 +629,15 @@ func shouldRetryResponsesWebsocketWithTranscriptReset(errMsg *interfaces.ErrorMe
 	default:
 		return false
 	}
+}
+
+func responsesWebsocketPreviousResponseNotFound(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "previous_response_not_found") ||
+		(strings.Contains(message, "previous response") && strings.Contains(message, "not found"))
 }
 
 func (h *OpenAIResponsesAPIHandler) websocketUpstreamSupportsIncrementalInputForModel(modelName string) bool {

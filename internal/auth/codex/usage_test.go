@@ -133,7 +133,7 @@ func TestFetchWhamUsagePlanType_MalformedJSON(t *testing.T) {
 	}
 	got, err := auth.FetchWhamUsagePlanType(context.Background(), "tok")
 	// Malformed JSON: either returns empty string with no error (gjson treats as empty),
-	// or returns an error. Either is acceptable — but got MUST be empty.
+	// or returns an error. Either is acceptable 鈥?but got MUST be empty.
 	if got != "" {
 		t.Fatalf("plan_type should be empty for malformed JSON, got %q (err=%v)", got, err)
 	}
@@ -163,5 +163,38 @@ func TestFetchWhamUsagePlanType_NetworkError(t *testing.T) {
 	}
 	if got != "" {
 		t.Fatalf("plan_type should be empty on network error, got %q", got)
+	}
+}
+
+func TestFetchWhamUsageInfoExtractsSupportedModels(t *testing.T) {
+	t.Parallel()
+	auth := &CodexAuth{
+		httpClient: &http.Client{
+			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Body: io.NopCloser(strings.NewReader(
+						`{"plan_type":"plus","entitlements":{"models":["gpt-5.4",{"id":"gpt-5.5"}]}}`)),
+					Header:  make(http.Header),
+					Request: req,
+				}, nil
+			}),
+		},
+	}
+	got, err := auth.FetchWhamUsageInfo(context.Background(), "tok")
+	if err != nil {
+		t.Fatalf("FetchWhamUsageInfo error = %v", err)
+	}
+	if got.PlanType != "plus" {
+		t.Fatalf("PlanType = %q, want plus", got.PlanType)
+	}
+	want := []string{"gpt-5.4", "gpt-5.5"}
+	if len(got.SupportedModels) != len(want) {
+		t.Fatalf("SupportedModels = %v, want %v", got.SupportedModels, want)
+	}
+	for index, wantModel := range want {
+		if got.SupportedModels[index] != wantModel {
+			t.Fatalf("SupportedModels[%d] = %q, want %q", index, got.SupportedModels[index], wantModel)
+		}
 	}
 }

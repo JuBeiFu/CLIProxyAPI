@@ -263,7 +263,7 @@ func TestAPICallMarksQuotaExceededCooldown(t *testing.T) {
 	}
 }
 
-func TestAPICallDeletesRevokedCodexAuthOn401(t *testing.T) {
+func TestAPICallDisablesRevokedCodexAuthOn401(t *testing.T) {
 	t.Parallel()
 
 	gin.SetMode(gin.TestMode)
@@ -308,12 +308,16 @@ func TestAPICallDeletesRevokedCodexAuthOn401(t *testing.T) {
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusOK)
 	}
-	if _, ok := manager.GetByID(auth.ID); ok {
-		t.Fatal("expected revoked auth to be deleted from manager")
+	got, ok := manager.GetByID(auth.ID)
+	if !ok {
+		t.Fatal("expected revoked auth to remain in manager")
+	}
+	if !got.Disabled || got.Status != coreauth.StatusDisabled {
+		t.Fatalf("expected revoked auth to be disabled, got disabled=%v status=%q", got.Disabled, got.Status)
 	}
 }
 
-func TestAPICallDeletesRevokedCodexAuthDisappearsFromList(t *testing.T) {
+func TestAPICallDisabledRevokedCodexAuthDisappearsFromList(t *testing.T) {
 	t.Parallel()
 
 	gin.SetMode(gin.TestMode)

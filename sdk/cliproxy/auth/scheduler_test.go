@@ -183,6 +183,96 @@ func TestSchedulerPick_FillFirstSticksToFirstReady(t *testing.T) {
 	}
 }
 
+func TestSchedulerPick_GPT55RequiresRegisteredModelSupport(t *testing.T) {
+	t.Parallel()
+
+	reg := registry.GetGlobalRegistry()
+	reg.RegisterClient("registered-gpt54-only", "codex", []*registry.ModelInfo{{ID: "gpt-5.4"}})
+	reg.RegisterClient("registered-gpt55-ready", "codex", []*registry.ModelInfo{{ID: "gpt-5.4"}, {ID: "gpt-5.5"}})
+	t.Cleanup(func() {
+		reg.UnregisterClient("registered-gpt54-only")
+		reg.UnregisterClient("registered-gpt55-ready")
+	})
+
+	scheduler := newSchedulerForTest(
+		&FillFirstSelector{},
+		&Auth{ID: "unregistered", Provider: "codex"},
+		&Auth{ID: "registered-gpt54-only", Provider: "codex"},
+		&Auth{ID: "registered-gpt55-ready", Provider: "codex"},
+	)
+
+	got, errPick := scheduler.pickSingle(context.Background(), "codex", "gpt-5.5", cliproxyexecutor.Options{}, nil)
+	if errPick != nil {
+		t.Fatalf("pickSingle(gpt-5.5) error = %v", errPick)
+	}
+	if got == nil || got.ID != "registered-gpt55-ready" {
+		t.Fatalf("pickSingle(gpt-5.5) auth = %v, want registered-gpt55-ready", got)
+	}
+
+	got, errPick = scheduler.pickSingle(context.Background(), "codex", "gpt-5.4", cliproxyexecutor.Options{}, nil)
+	if errPick != nil {
+		t.Fatalf("pickSingle(gpt-5.4) error = %v", errPick)
+	}
+	if got == nil || got.ID != "registered-gpt54-only" {
+		t.Fatalf("pickSingle(gpt-5.4) auth = %v, want registered-gpt54-only", got)
+	}
+}
+
+func TestSchedulerPick_GPT55PermissionFailureRemovesOnlyThatModel(t *testing.T) {
+	t.Parallel()
+
+	manager := NewManager(nil, &FillFirstSelector{}, nil)
+	reg := registry.GetGlobalRegistry()
+	reg.RegisterClient("permission-gpt55-blocked", "codex", []*registry.ModelInfo{{ID: "gpt-5.4"}, {ID: "gpt-5.5"}})
+	reg.RegisterClient("permission-gpt55-ready", "codex", []*registry.ModelInfo{{ID: "gpt-5.4"}, {ID: "gpt-5.5"}})
+	t.Cleanup(func() {
+		reg.UnregisterClient("permission-gpt55-blocked")
+		reg.UnregisterClient("permission-gpt55-ready")
+	})
+
+	if _, errRegister := manager.Register(context.Background(), &Auth{ID: "permission-gpt55-blocked", Provider: "codex"}); errRegister != nil {
+		t.Fatalf("Register(permission-gpt55-blocked) error = %v", errRegister)
+	}
+	if _, errRegister := manager.Register(context.Background(), &Auth{ID: "permission-gpt55-ready", Provider: "codex"}); errRegister != nil {
+		t.Fatalf("Register(permission-gpt55-ready) error = %v", errRegister)
+	}
+	manager.RefreshSchedulerEntry("permission-gpt55-blocked")
+	manager.RefreshSchedulerEntry("permission-gpt55-ready")
+
+	manager.MarkResult(context.Background(), Result{
+		AuthID:   "permission-gpt55-blocked",
+		Provider: "codex",
+		Model:    "gpt-5.5",
+		Success:  false,
+		Error: &Error{
+			HTTPStatus: http.StatusForbidden,
+			Message:    "You have insufficient permissions for this operation. Missing scopes: api.model.read.",
+		},
+	})
+
+	got, errPick := manager.scheduler.pickSingle(context.Background(), "codex", "gpt-5.5", cliproxyexecutor.Options{}, nil)
+	if errPick != nil {
+		t.Fatalf("pickSingle(gpt-5.5) error = %v", errPick)
+	}
+	if got == nil || got.ID != "permission-gpt55-ready" {
+		t.Fatalf("pickSingle(gpt-5.5) auth = %v, want permission-gpt55-ready", got)
+	}
+
+	got, errPick = manager.scheduler.pickSingle(
+		context.Background(),
+		"codex",
+		"gpt-5.4",
+		cliproxyexecutor.Options{},
+		map[string]struct{}{"permission-gpt55-ready": {}},
+	)
+	if errPick != nil {
+		t.Fatalf("pickSingle(gpt-5.4) error = %v", errPick)
+	}
+	if got == nil || got.ID != "permission-gpt55-blocked" {
+		t.Fatalf("pickSingle(gpt-5.4) auth = %v, want permission-gpt55-blocked", got)
+	}
+}
+
 func TestSchedulerPick_FillFirstStableSelectionSkipsSwitchLog(t *testing.T) {
 	var buffer bytes.Buffer
 	previousOutput := log.StandardLogger().Out

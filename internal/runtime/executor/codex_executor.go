@@ -926,7 +926,7 @@ func (e *CodexExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*
 	// Resolve the authoritative plan_type by probing /wham/usage with the
 	// freshly-refreshed access token. The JWT's chatgpt_plan_type is a cached
 	// snapshot (can lag by hours); /wham/usage is live. On probe failure we
-	// leave existing plan_type untouched — ApplyPlanTypeRefreshDecision won't
+	// leave existing plan_type untouched; ApplyPlanTypeRefreshDecision will not
 	// mutate Disabled or Attributes without an authoritative reading.
 	jwtPlan := ""
 	if claims, jwtErr := codexauth.ParseJWTToken(td.IDToken); jwtErr == nil {
@@ -943,11 +943,12 @@ func (e *CodexExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*
 	// sees the same node and OpenAI's cache decision is self-consistent.
 	// Header note: Chatgpt-Account-Id has no observable effect on the
 	// response (verified 2026-04-20 across 5 egress paths); we omit it.
-	realPlan, boundEntry, probeOK := helps.ProbeCodexPlanAcrossPool(ctx, e.cfg, auth, td.AccessToken)
+	realPlan, boundEntry, supportedModels, probeOK := helps.ProbeCodexPlanAcrossPool(ctx, e.cfg, auth, td.AccessToken)
 	if !probeOK {
 		log.Warnf("codex executor: /wham/usage multi-path probe for auth %s failed on every candidate", auth.ID)
 	}
 	cliproxyauth.ApplyPlanTypeRefreshDecision(auth, jwtPlan, realPlan, probeOK, now)
+	applyCodexSupportedModels(auth, supportedModels, now)
 	if probeOK {
 		if boundEntry != "" {
 			// Found a path reporting paid plan; pin the auth so later
@@ -966,6 +967,34 @@ func (e *CodexExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*
 	return auth, nil
 }
 
+func applyCodexSupportedModels(auth *cliproxyauth.Auth, models []string, now time.Time) {
+	if auth == nil || len(models) == 0 {
+		return
+	}
+	if auth.Attributes == nil {
+		auth.Attributes = make(map[string]string)
+	}
+	seen := make(map[string]struct{}, len(models))
+	clean := make([]string, 0, len(models))
+	for _, model := range models {
+		model = strings.TrimSpace(model)
+		if model == "" {
+			continue
+		}
+		if _, ok := seen[model]; ok {
+			continue
+		}
+		seen[model] = struct{}{}
+		clean = append(clean, model)
+	}
+	if len(clean) == 0 {
+		return
+	}
+	sort.Strings(clean)
+	auth.Attributes["supported_models"] = strings.Join(clean, ",")
+	auth.Attributes["supported_models_source"] = "codex_entitlements"
+	auth.Attributes["supported_models_updated"] = now.Format(time.RFC3339)
+}
 func applyRefreshedCodexTokenState(auth *cliproxyauth.Auth, storage *codexauth.CodexTokenStorage, td *codexauth.CodexTokenData, now time.Time) {
 	if auth == nil || td == nil {
 		return

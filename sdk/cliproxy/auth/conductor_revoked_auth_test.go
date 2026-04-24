@@ -17,11 +17,18 @@ import (
 
 type deletingStore struct {
 	deleted []string
+	saved   []*Auth
 }
 
 func (s *deletingStore) List(context.Context) ([]*Auth, error) { return nil, nil }
 
-func (s *deletingStore) Save(context.Context, *Auth) (string, error) { return "", nil }
+func (s *deletingStore) Save(_ context.Context, auth *Auth) (string, error) {
+	if auth != nil {
+		s.saved = append(s.saved, auth.Clone())
+		return auth.ID, nil
+	}
+	return "", nil
+}
 
 func (s *deletingStore) Delete(_ context.Context, id string) error {
 	s.deleted = append(s.deleted, id)
@@ -92,7 +99,24 @@ func newPersistedCodexAuth(id string) *Auth {
 	}
 }
 
-func TestManager_MarkResult_DeletesPersistedAuthOnRevoked401(t *testing.T) {
+func assertPersistedAuthDisabled(t *testing.T, mgr *Manager, store *deletingStore, auth *Auth) {
+	t.Helper()
+	stored, ok := mgr.GetByID(auth.ID)
+	if !ok {
+		t.Fatalf("expected auth %s to remain registered", auth.ID)
+	}
+	if !stored.Disabled || stored.Status != StatusDisabled {
+		t.Fatalf("expected auth %s to be disabled, got disabled=%v status=%q", auth.ID, stored.Disabled, stored.Status)
+	}
+	if len(store.deleted) != 0 {
+		t.Fatalf("expected auth %s to remain in store, got deletes %v", auth.ID, store.deleted)
+	}
+	if len(store.saved) == 0 || !store.saved[len(store.saved)-1].Disabled {
+		t.Fatalf("expected disabled auth %s to be persisted, got saves=%d", auth.ID, len(store.saved))
+	}
+}
+
+func TestManager_MarkResult_DisablesPersistedAuthOnRevoked401(t *testing.T) {
 	store := &deletingStore{}
 	mgr := NewManager(store, nil, nil)
 	auth := newPersistedCodexAuth("auths/revoked.json")
@@ -115,16 +139,16 @@ func TestManager_MarkResult_DeletesPersistedAuthOnRevoked401(t *testing.T) {
 		},
 	})
 
-	if _, ok := mgr.GetByID(auth.ID); ok {
-		t.Fatal("expected revoked auth to be removed from manager")
-	}
-	waitForDeletedIDs(t, store, []string{auth.ID})
+	assertPersistedAuthDisabled(t, mgr, store, auth)
 	if models := reg.GetModelsForClient(auth.ID); len(models) != 0 {
-		t.Fatalf("expected revoked auth models to be unregistered, got %d", len(models))
+		t.Fatalf("expected disabled auth models to be unregistered, got %d", len(models))
+	}
+	if !HasRevokedAuthTombstone(auth, time.Now()) {
+		t.Fatal("expected revoked auth to leave a tombstone")
 	}
 }
 
-func TestManager_MarkResult_DeletesPersistedAuthOnForbiddenMessage(t *testing.T) {
+func TestManager_MarkResult_DisablesPersistedAuthOnForbiddenMessage(t *testing.T) {
 	store := &deletingStore{}
 	mgr := NewManager(store, nil, nil)
 	auth := newPersistedCodexAuth("auths/forbidden.json")
@@ -147,13 +171,10 @@ func TestManager_MarkResult_DeletesPersistedAuthOnForbiddenMessage(t *testing.T)
 		},
 	})
 
-	if _, ok := mgr.GetByID(auth.ID); ok {
-		t.Fatal("expected forbidden auth to be removed from manager")
-	}
-	waitForDeletedIDs(t, store, []string{auth.ID})
+	assertPersistedAuthDisabled(t, mgr, store, auth)
 }
 
-func TestManager_MarkResult_DeletesPersistedAuthOnMessageOnlyInvalidatedToken(t *testing.T) {
+func TestManager_MarkResult_DisablesPersistedAuthOnMessageOnlyInvalidatedToken(t *testing.T) {
 	store := &deletingStore{}
 	mgr := NewManager(store, nil, nil)
 	auth := newPersistedCodexAuth("auths/message-only.json")
@@ -176,10 +197,7 @@ func TestManager_MarkResult_DeletesPersistedAuthOnMessageOnlyInvalidatedToken(t 
 		},
 	})
 
-	if _, ok := mgr.GetByID(auth.ID); ok {
-		t.Fatal("expected invalidated-token auth to be removed from manager")
-	}
-	waitForDeletedIDs(t, store, []string{auth.ID})
+	assertPersistedAuthDisabled(t, mgr, store, auth)
 }
 
 func TestManager_MarkResult_DisablesRuntimeOnlyAuthOnUnauthorized(t *testing.T) {
@@ -217,7 +235,7 @@ func TestManager_MarkResult_DisablesRuntimeOnlyAuthOnUnauthorized(t *testing.T) 
 	}
 }
 
-func TestManager_RefreshAuth_DeletesPersistedAuthOnOrgRequired(t *testing.T) {
+func TestManager_RefreshAuth_DisablesPersistedAuthOnOrgRequired(t *testing.T) {
 	store := &deletingStore{}
 	mgr := NewManager(store, nil, nil)
 	mgr.RegisterExecutor(&revokedRefreshExecutor{
@@ -239,16 +257,22 @@ func TestManager_RefreshAuth_DeletesPersistedAuthOnOrgRequired(t *testing.T) {
 
 	mgr.refreshAuth(context.Background(), auth.ID)
 
-	if _, ok := mgr.GetByID(auth.ID); ok {
-		t.Fatal("expected org-required auth to be removed after refresh failure")
+	stored, ok := mgr.GetByID(auth.ID)
+	if !ok {
+		t.Fatal("expected org-required auth to remain registered after refresh failure")
 	}
-	waitForDeletedIDs(t, store, []string{auth.ID})
-	if models := reg.GetModelsForClient(auth.ID); len(models) != 0 {
-		t.Fatalf("expected revoked auth models to be unregistered after refresh, got %d", len(models))
+	if !stored.Disabled || stored.Status != StatusDisabled {
+		t.Fatalf("expected org-required auth to be disabled, got disabled=%v status=%q", stored.Disabled, stored.Status)
+	}
+	if len(store.deleted) != 0 {
+		t.Fatalf("expected org-required auth to remain in store, got deletes %v", store.deleted)
+	}
+	if len(store.saved) == 0 || !store.saved[len(store.saved)-1].Disabled {
+		t.Fatalf("expected disabled org-required auth to be persisted, got saves=%d", len(store.saved))
 	}
 }
 
-func TestManager_RefreshAuth_DeletesPersistedAuthOnRefreshTokenReused(t *testing.T) {
+func TestManager_RefreshAuth_DisablesPersistedAuthOnRefreshTokenReused(t *testing.T) {
 	store := &deletingStore{}
 	mgr := NewManager(store, nil, nil)
 	mgr.RegisterExecutor(&revokedRefreshExecutor{
@@ -266,13 +290,22 @@ func TestManager_RefreshAuth_DeletesPersistedAuthOnRefreshTokenReused(t *testing
 
 	mgr.refreshAuth(context.Background(), auth.ID)
 
-	if _, ok := mgr.GetByID(auth.ID); ok {
-		t.Fatal("expected reused-token auth to be removed after refresh failure")
+	stored, ok := mgr.GetByID(auth.ID)
+	if !ok {
+		t.Fatal("expected reused-token auth to remain registered after refresh failure")
 	}
-	waitForDeletedIDs(t, store, []string{auth.ID})
+	if !stored.Disabled || stored.Status != StatusDisabled {
+		t.Fatalf("expected reused-token auth to be disabled, got disabled=%v status=%q", stored.Disabled, stored.Status)
+	}
+	if len(store.deleted) != 0 {
+		t.Fatalf("expected reused-token auth to remain in store, got deletes %v", store.deleted)
+	}
+	if len(store.saved) == 0 || !store.saved[len(store.saved)-1].Disabled {
+		t.Fatalf("expected disabled reused-token auth to be persisted, got saves=%d", len(store.saved))
+	}
 }
 
-func TestManager_MarkResult_DeletesPersistedAuthOnRefreshTokenReused(t *testing.T) {
+func TestManager_MarkResult_DisablesPersistedAuthOnRefreshTokenReused(t *testing.T) {
 	store := &deletingStore{}
 	mgr := NewManager(store, nil, nil)
 	auth := newPersistedCodexAuth("auths/request-reused.json")
@@ -291,10 +324,7 @@ func TestManager_MarkResult_DeletesPersistedAuthOnRefreshTokenReused(t *testing.
 		},
 	})
 
-	if _, ok := mgr.GetByID(auth.ID); ok {
-		t.Fatal("expected reused-token auth to be removed from manager")
-	}
-	waitForDeletedIDs(t, store, []string{auth.ID})
+	assertPersistedAuthDisabled(t, mgr, store, auth)
 	if !HasRevokedAuthTombstone(auth, time.Now()) {
 		t.Fatal("expected refresh_token_reused auth to leave a tombstone")
 	}
@@ -333,7 +363,7 @@ func TestManager_RefreshAuth_KeepsNonTerminalFailures(t *testing.T) {
 	}
 }
 
-func TestManager_MarkResult_WritesBanRecordOnRevokedDelete(t *testing.T) {
+func TestManager_MarkResult_WritesBanRecordOnRevokedDisable(t *testing.T) {
 	store := &deletingStore{}
 	mgr := NewManager(store, nil, nil)
 
@@ -372,7 +402,7 @@ func TestManager_MarkResult_WritesBanRecordOnRevokedDelete(t *testing.T) {
 		},
 	})
 
-	waitForDeletedIDs(t, store, []string{auth.ID})
+	assertPersistedAuthDisabled(t, mgr, store, auth)
 
 	recordPath := filepath.Join(authDir, ".system", "ban-records", "banned-auth-records-"+time.Now().Format("2006-01-02")+".jsonl")
 	recordBytes, err := os.ReadFile(recordPath)

@@ -632,6 +632,74 @@ func TestCodexWebsocketExecuteStreamZeroUsageCompletionReturnsError(t *testing.T
 	}
 }
 
+func TestCodexWebsocketExecuteNonStreamZeroUsageCompletionReturnsError(t *testing.T) {
+	upgrader := websocket.Upgrader{
+		CheckOrigin: func(r *http.Request) bool { return true },
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !websocket.IsWebSocketUpgrade(r) {
+			http.Error(w, "upgrade required", http.StatusUpgradeRequired)
+			return
+		}
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Errorf("Upgrade() error = %v", err)
+			return
+		}
+		defer conn.Close()
+
+		if _, _, err := conn.ReadMessage(); err != nil {
+			t.Errorf("ReadMessage() error = %v", err)
+			return
+		}
+
+		frames := [][]byte{
+			[]byte(`{"type":"response.created","response":{"id":"resp-empty"}}`),
+			[]byte(`{"type":"response.reasoning_summary_text.delta","delta":"thinking..."}`),
+			[]byte(`{"type":"response.completed","response":{"id":"resp-empty","model":"gpt-5.4","status":"completed","output":[],"usage":{"input_tokens":0,"output_tokens":0,"total_tokens":0}}}`),
+		}
+		for _, frame := range frames {
+			if err := conn.WriteMessage(websocket.TextMessage, frame); err != nil {
+				t.Errorf("WriteMessage() error = %v", err)
+				return
+			}
+		}
+	}))
+	defer server.Close()
+
+	exec := NewCodexWebsocketsExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{
+		ID:       "auth-zero-nonstream",
+		Provider: "codex",
+		Attributes: map[string]string{
+			"api_key":    "sk-test",
+			"base_url":   server.URL,
+			"websockets": "true",
+		},
+	}
+	req := cliproxyexecutor.Request{
+		Model:   "gpt-5.4",
+		Payload: []byte(`{"model":"gpt-5.4","input":[{"role":"user","content":"hi"}]}`),
+	}
+	opts := cliproxyexecutor.Options{
+		Stream:       false,
+		SourceFormat: sdktranslator.FromString("openai-response"),
+	}
+
+	resp, err := exec.Execute(context.Background(), auth, req, opts)
+
+	if err == nil {
+		t.Fatalf("Execute() error = nil, payload=%s", resp.Payload)
+	}
+	statusCoder, ok := err.(interface{ StatusCode() int })
+	if !ok {
+		t.Fatalf("expected status coder error, got %T: %v", err, err)
+	}
+	if got := statusCoder.StatusCode(); got != http.StatusBadGateway {
+		t.Fatalf("StatusCode = %d, want %d", got, http.StatusBadGateway)
+	}
+}
+
 func TestCodexWebsocketExecuteNonStreamSynthesizesResponsesFunctionCallOutput(t *testing.T) {
 	upgrader := websocket.Upgrader{
 		CheckOrigin: func(r *http.Request) bool { return true },
