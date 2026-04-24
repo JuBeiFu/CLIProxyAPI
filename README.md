@@ -76,6 +76,30 @@ CLIProxyAPI Guides: [https://help.router-for.me/](https://help.router-for.me/)
 
 see [MANAGEMENT_API.md](https://help.router-for.me/management/api)
 
+### Auth Performance Routing
+
+CLIProxyAPI tracks per-auth per-model output throughput and exposes it through the management API:
+
+```bash
+curl -H "Authorization: Bearer $MANAGEMENT_SECRET" \
+  "http://127.0.0.1:8080/v0/management/auth-performance?provider=codex&model=gpt-5.4&ready_only=true"
+```
+
+The primary speed signal is `output_tps_ewma`, computed from generated output tokens divided by request generation duration. Start with `routing.performance-aware: false` and `routing.performance-shadow-log: true`, review shadow choices and `failure_rate_ewma`, then enable `routing.performance-aware: true` on a canary instance after each auth/model reaches `performance-min-samples`.
+
+```yaml
+routing:
+  performance-aware: false
+  performance-shadow-log: true
+  performance-window-seconds: 300
+  performance-min-samples: 5
+  performance-ewma-alpha: 0.25
+  performance-weight-tps: 1.0
+  performance-weight-latency: 0.25
+  performance-weight-failure: 2.0
+  performance-weight-inflight: 0.5
+```
+
 ## Amp CLI Support
 
 CLIProxyAPI includes integrated support for [Amp CLI](https://ampcode.com) and Amp IDE extensions, enabling you to use your Google/ChatGPT/Claude OAuth subscriptions with Amp's coding tools:
