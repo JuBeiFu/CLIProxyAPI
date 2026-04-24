@@ -948,8 +948,8 @@ func (e *CodexExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*
 		log.Warnf("codex executor: /wham/usage multi-path probe for auth %s failed on every candidate", auth.ID)
 	}
 	cliproxyauth.ApplyPlanTypeRefreshDecision(auth, jwtPlan, realPlan, probeOK, now)
-	applyCodexSupportedModels(auth, supportedModels, now)
 	if probeOK {
+		applyCodexSupportedModels(auth, supportedModels, now)
 		if boundEntry != "" {
 			// Found a path reporting paid plan; pin the auth so later
 			// dispatches go through the same node.
@@ -968,11 +968,20 @@ func (e *CodexExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*
 }
 
 func applyCodexSupportedModels(auth *cliproxyauth.Auth, models []string, now time.Time) {
-	if auth == nil || len(models) == 0 {
+	if auth == nil {
 		return
 	}
 	if auth.Attributes == nil {
 		auth.Attributes = make(map[string]string)
+	}
+	clearSupportedModels := func() {
+		delete(auth.Attributes, "supported_models")
+		auth.Attributes["supported_models_source"] = "codex_entitlements"
+		auth.Attributes["supported_models_updated"] = now.Format(time.RFC3339)
+	}
+	if len(models) == 0 {
+		clearSupportedModels()
+		return
 	}
 	seen := make(map[string]struct{}, len(models))
 	clean := make([]string, 0, len(models))
@@ -988,6 +997,7 @@ func applyCodexSupportedModels(auth *cliproxyauth.Auth, models []string, now tim
 		clean = append(clean, model)
 	}
 	if len(clean) == 0 {
+		clearSupportedModels()
 		return
 	}
 	sort.Strings(clean)

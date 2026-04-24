@@ -102,3 +102,34 @@ func TestRegisterModelsForAuth_CodexSupportedModelsOverridePlanModels(t *testing
 		t.Fatalf("registered model count = %d, want 2: %+v", len(ids), ids)
 	}
 }
+
+func TestRegisterModelsForAuth_CodexEmptySupportedModelsDoesNotFallbackToPlanModels(t *testing.T) {
+	service := &Service{
+		cfg:         &config.Config{},
+		coreManager: coreauth.NewManager(nil, nil, nil),
+	}
+	auth := &coreauth.Auth{
+		ID:       "codex-empty-supported-models-auth",
+		Provider: "codex",
+		Status:   coreauth.StatusActive,
+		Attributes: map[string]string{
+			"plan_type":                "pro",
+			"supported_models_source":  "codex_entitlements",
+			"supported_models_updated": "2026-04-25T00:00:00Z",
+		},
+	}
+	t.Cleanup(func() {
+		registry.GetGlobalRegistry().UnregisterClient(auth.ID)
+	})
+
+	service.registerModelsForAuth(auth)
+	models := registry.GetGlobalRegistry().GetModelsForClient(auth.ID)
+	for _, model := range models {
+		if model != nil && model.ID == "gpt-5.5" {
+			t.Fatalf("registered stale gpt-5.5 model from plan fallback: %+v", models)
+		}
+	}
+	if len(models) != 0 {
+		t.Fatalf("registered models = %+v, want none for empty entitlements", models)
+	}
+}

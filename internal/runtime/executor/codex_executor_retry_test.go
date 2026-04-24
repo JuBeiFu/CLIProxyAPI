@@ -202,6 +202,30 @@ func TestNewCodexStatusErr_UsageLimitPreservesUpstreamRetryAfter(t *testing.T) {
 	}
 }
 
+func TestApplyCodexSupportedModelsClearsStaleModelsOnEmptyProbe(t *testing.T) {
+	auth := &cliproxyauth.Auth{
+		ID:       "auth-stale-supported-models",
+		Provider: "codex",
+		Attributes: map[string]string{
+			"supported_models":         "gpt-5.4,gpt-5.5",
+			"supported_models_source":  "codex_entitlements",
+			"supported_models_updated": "2026-04-24T00:00:00Z",
+		},
+	}
+
+	applyCodexSupportedModels(auth, nil, time.Date(2026, 4, 25, 0, 0, 0, 0, time.UTC))
+
+	if got := auth.Attributes["supported_models"]; got != "" {
+		t.Fatalf("supported_models = %q, want empty", got)
+	}
+	if got := auth.Attributes["supported_models_source"]; got != "codex_entitlements" {
+		t.Fatalf("supported_models_source = %q, want codex_entitlements", got)
+	}
+	if got := auth.Attributes["supported_models_updated"]; got != "2026-04-25T00:00:00Z" {
+		t.Fatalf("supported_models_updated = %q, want 2026-04-25T00:00:00Z", got)
+	}
+}
+
 func TestApplyRefreshedCodexTokenState_UpdatesMetadataAndStorage(t *testing.T) {
 	storage := &codexauth.CodexTokenStorage{
 		IDToken:      "old-id",

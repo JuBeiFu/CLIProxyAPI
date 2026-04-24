@@ -966,6 +966,7 @@ func (s *Service) registerModelsForAuth(a *coreauth.Auth) {
 		}
 		models = applyExcludedModels(models, excluded)
 	case "codex":
+		entitlementsModelsKnown := codexSupportedModelsKnownFromAuth(a)
 		if attrModels := codexSupportedModelsFromAuth(a); len(attrModels) > 0 {
 			models = attrModels
 		}
@@ -973,7 +974,7 @@ func (s *Service) registerModelsForAuth(a *coreauth.Auth) {
 		if a.Attributes != nil {
 			codexPlanType = strings.TrimSpace(a.Attributes["plan_type"])
 		}
-		if len(models) == 0 {
+		if len(models) == 0 && !entitlementsModelsKnown {
 			switch strings.ToLower(codexPlanType) {
 			case "pro":
 				models = registry.GetCodexProModels()
@@ -1326,6 +1327,15 @@ func codexSupportedModelsFromAuth(a *coreauth.Auth) []*ModelInfo {
 	}
 	return models
 }
+
+func codexSupportedModelsKnownFromAuth(a *coreauth.Auth) bool {
+	if a == nil || len(a.Attributes) == 0 {
+		return false
+	}
+	return strings.EqualFold(strings.TrimSpace(a.Attributes["supported_models_source"]), "codex_entitlements") &&
+		strings.TrimSpace(a.Attributes["supported_models_updated"]) != ""
+}
+
 func applyExcludedModels(models []*ModelInfo, excluded []string) []*ModelInfo {
 	if len(models) == 0 || len(excluded) == 0 {
 		return models
