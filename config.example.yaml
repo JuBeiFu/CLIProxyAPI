@@ -119,6 +119,17 @@ quota-exceeded:
 # Routing strategy for selecting credentials when multiple match.
 routing:
   strategy: "round-robin" # round-robin (default), fill-first
+  # Enable per-auth performance routing inside the selected provider/model/priority bucket.
+  performance-aware: false
+  # Log the performance-preferred auth for comparison while static routing still selects the request auth.
+  performance-shadow-log: true
+  performance-window-seconds: 300
+  performance-min-samples: 5
+  performance-ewma-alpha: 0.25
+  performance-weight-tps: 1.0
+  performance-weight-latency: 0.25
+  performance-weight-failure: 2.0
+  performance-weight-inflight: 0.5
 
 # When true, enable authentication for the WebSocket API (/v1/ws).
 ws-auth: false

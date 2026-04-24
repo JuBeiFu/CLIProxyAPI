@@ -24,6 +24,16 @@ const (
 	DefaultPprofAddr             = "127.0.0.1:8316"
 )
 
+const (
+	DefaultRoutingPerformanceWindowSeconds  = 300
+	DefaultRoutingPerformanceMinSamples     = 5
+	DefaultRoutingPerformanceEWMAAlpha      = 0.25
+	DefaultRoutingPerformanceWeightTPS      = 1.0
+	DefaultRoutingPerformanceWeightLatency  = 0.25
+	DefaultRoutingPerformanceWeightFailure  = 2.0
+	DefaultRoutingPerformanceWeightInflight = 0.5
+)
+
 // Config represents the application's configuration, loaded from a YAML file.
 type Config struct {
 	SDKConfig `yaml:",inline"`
@@ -133,7 +143,8 @@ type Config struct {
 	// Payload defines default and override rules for provider payload parameters.
 	Payload PayloadConfig `yaml:"payload" json:"payload"`
 
-	legacyMigrationPending bool `yaml:"-" json:"-"`
+	legacyMigrationPending         bool `yaml:"-" json:"-"`
+	routingPerformanceShadowLogSet bool `yaml:"-" json:"-"`
 }
 
 // ClaudeHeaderDefaults configures default header values injected into Claude API requests.
@@ -212,6 +223,80 @@ type RoutingConfig struct {
 	// Strategy selects the credential selection strategy.
 	// Supported values: "round-robin" (default), "fill-first".
 	Strategy string `yaml:"strategy,omitempty" json:"strategy,omitempty"`
+
+	PerformanceAware          bool    `yaml:"performance-aware,omitempty" json:"performance-aware,omitempty"`
+	PerformanceShadowLog      bool    `yaml:"performance-shadow-log,omitempty" json:"performance-shadow-log,omitempty"`
+	PerformanceWindowSeconds  int     `yaml:"performance-window-seconds,omitempty" json:"performance-window-seconds,omitempty"`
+	PerformanceMinSamples     int     `yaml:"performance-min-samples,omitempty" json:"performance-min-samples,omitempty"`
+	PerformanceEWMAAlpha      float64 `yaml:"performance-ewma-alpha,omitempty" json:"performance-ewma-alpha,omitempty"`
+	PerformanceWeightTPS      float64 `yaml:"performance-weight-tps,omitempty" json:"performance-weight-tps,omitempty"`
+	PerformanceWeightLatency  float64 `yaml:"performance-weight-latency,omitempty" json:"performance-weight-latency,omitempty"`
+	PerformanceWeightFailure  float64 `yaml:"performance-weight-failure,omitempty" json:"performance-weight-failure,omitempty"`
+	PerformanceWeightInflight float64 `yaml:"performance-weight-inflight,omitempty" json:"performance-weight-inflight,omitempty"`
+}
+
+func (c *Config) UnmarshalYAML(value *yaml.Node) error {
+	if value == nil {
+		return nil
+	}
+	type rawConfig Config
+	raw := rawConfig(*c)
+	if err := value.Decode(&raw); err != nil {
+		return err
+	}
+	*c = Config(raw)
+	c.routingPerformanceShadowLogSet = yamlMappingHasPath(value, []string{"routing", "performance-shadow-log"})
+	return nil
+}
+
+func yamlMappingHasPath(node *yaml.Node, path []string) bool {
+	if node == nil || len(path) == 0 || node.Kind != yaml.MappingNode {
+		return false
+	}
+	for i := 0; i+1 < len(node.Content); i += 2 {
+		key := node.Content[i]
+		value := node.Content[i+1]
+		if key != nil && key.Value == path[0] {
+			if len(path) == 1 {
+				return true
+			}
+			return yamlMappingHasPath(value, path[1:])
+		}
+	}
+	return false
+}
+
+func (c *Config) ApplyRoutingPerformanceDefaults() {
+	if c == nil {
+		return
+	}
+	if c.Routing.PerformanceWindowSeconds <= 0 {
+		c.Routing.PerformanceWindowSeconds = DefaultRoutingPerformanceWindowSeconds
+	}
+	if c.Routing.PerformanceMinSamples <= 0 {
+		c.Routing.PerformanceMinSamples = DefaultRoutingPerformanceMinSamples
+	}
+	if c.Routing.PerformanceEWMAAlpha <= 0 {
+		c.Routing.PerformanceEWMAAlpha = DefaultRoutingPerformanceEWMAAlpha
+	}
+	if c.Routing.PerformanceEWMAAlpha > 1 {
+		c.Routing.PerformanceEWMAAlpha = 1
+	}
+	if c.Routing.PerformanceWeightTPS <= 0 {
+		c.Routing.PerformanceWeightTPS = DefaultRoutingPerformanceWeightTPS
+	}
+	if c.Routing.PerformanceWeightLatency <= 0 {
+		c.Routing.PerformanceWeightLatency = DefaultRoutingPerformanceWeightLatency
+	}
+	if c.Routing.PerformanceWeightFailure <= 0 {
+		c.Routing.PerformanceWeightFailure = DefaultRoutingPerformanceWeightFailure
+	}
+	if c.Routing.PerformanceWeightInflight <= 0 {
+		c.Routing.PerformanceWeightInflight = DefaultRoutingPerformanceWeightInflight
+	}
+	if !c.routingPerformanceShadowLogSet {
+		c.Routing.PerformanceShadowLog = true
+	}
 }
 
 // OAuthModelAlias defines a model ID alias for a specific channel.
@@ -576,7 +661,9 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 		if optional {
 			if os.IsNotExist(err) || errors.Is(err, syscall.EISDIR) {
 				// Missing and optional: return empty config (cloud deploy standby).
-				return &Config{}, nil
+				empty := &Config{}
+				empty.ApplyRoutingPerformanceDefaults()
+				return empty, nil
 			}
 		}
 		return nil, fmt.Errorf("failed to read config file: %w", err)
@@ -584,7 +671,9 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 
 	// In cloud deploy mode (optional=true), if file is empty or contains only whitespace, return empty config.
 	if optional && len(data) == 0 {
-		return &Config{}, nil
+		empty := &Config{}
+		empty.ApplyRoutingPerformanceDefaults()
+		return empty, nil
 	}
 
 	// Unmarshal the YAML data into the Config struct.
@@ -603,10 +692,13 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	if err = yaml.Unmarshal(data, &cfg); err != nil {
 		if optional {
 			// In cloud deploy mode, if YAML parsing fails, return empty config instead of error.
-			return &Config{}, nil
+			empty := &Config{}
+			empty.ApplyRoutingPerformanceDefaults()
+			return empty, nil
 		}
 		return nil, fmt.Errorf("failed to parse config file: %w", err)
 	}
+	cfg.ApplyRoutingPerformanceDefaults()
 
 	// NOTE: Startup legacy key migration is intentionally disabled.
 	// Reason: avoid mutating config.yaml during server startup.
@@ -1441,6 +1533,32 @@ func isKnownDefaultValue(path []string, node *yaml.Node) bool {
 		switch fullPath {
 		case "error-logs-max-files":
 			return node.Value == "10"
+		case "routing.performance-window-seconds":
+			return node.Value == fmt.Sprintf("%d", DefaultRoutingPerformanceWindowSeconds)
+		case "routing.performance-min-samples":
+			return node.Value == fmt.Sprintf("%d", DefaultRoutingPerformanceMinSamples)
+		}
+	}
+
+	if node.Kind == yaml.ScalarNode && node.Tag == "!!bool" {
+		switch fullPath {
+		case "routing.performance-shadow-log":
+			return node.Value == "true"
+		}
+	}
+
+	if node.Kind == yaml.ScalarNode && node.Tag == "!!float" {
+		switch fullPath {
+		case "routing.performance-ewma-alpha":
+			return node.Value == fmt.Sprintf("%g", DefaultRoutingPerformanceEWMAAlpha)
+		case "routing.performance-weight-tps":
+			return node.Value == fmt.Sprintf("%g", DefaultRoutingPerformanceWeightTPS)
+		case "routing.performance-weight-latency":
+			return node.Value == fmt.Sprintf("%g", DefaultRoutingPerformanceWeightLatency)
+		case "routing.performance-weight-failure":
+			return node.Value == fmt.Sprintf("%g", DefaultRoutingPerformanceWeightFailure)
+		case "routing.performance-weight-inflight":
+			return node.Value == fmt.Sprintf("%g", DefaultRoutingPerformanceWeightInflight)
 		}
 	}
 
