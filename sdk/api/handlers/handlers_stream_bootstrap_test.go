@@ -132,9 +132,10 @@ func (e *payloadThenErrorStreamExecutor) Calls() int {
 }
 
 type authAwareStreamExecutor struct {
-	mu      sync.Mutex
-	calls   int
-	authIDs []string
+	mu         sync.Mutex
+	calls      int
+	authIDs    []string
+	failAuthID string
 }
 
 type invalidJSONStreamExecutor struct{}
@@ -222,7 +223,7 @@ func (e *authAwareStreamExecutor) ExecuteStream(ctx context.Context, auth *corea
 	e.authIDs = append(e.authIDs, authID)
 	e.mu.Unlock()
 
-	if authID == "auth1" {
+	if authID == e.failAuthID {
 		ch <- coreexecutor.StreamChunk{
 			Err: &coreauth.Error{
 				Code:       "unauthorized",
@@ -271,12 +272,14 @@ func (e *authAwareStreamExecutor) AuthIDs() []string {
 }
 
 func TestExecuteStreamWithAuthManager_RetriesBeforeFirstByte(t *testing.T) {
+	authID1 := "auth-retry-before-first-byte-1"
+	authID2 := "auth-retry-before-first-byte-2"
 	executor := &failOnceStreamExecutor{}
 	manager := coreauth.NewManager(nil, nil, nil)
 	manager.RegisterExecutor(executor)
 
 	auth1 := &coreauth.Auth{
-		ID:       "auth1",
+		ID:       authID1,
 		Provider: "codex",
 		Status:   coreauth.StatusActive,
 		Metadata: map[string]any{"email": "test1@example.com"},
@@ -286,7 +289,7 @@ func TestExecuteStreamWithAuthManager_RetriesBeforeFirstByte(t *testing.T) {
 	}
 
 	auth2 := &coreauth.Auth{
-		ID:       "auth2",
+		ID:       authID2,
 		Provider: "codex",
 		Status:   coreauth.StatusActive,
 		Metadata: map[string]any{"email": "test2@example.com"},
@@ -337,12 +340,14 @@ func TestExecuteStreamWithAuthManager_RetriesBeforeFirstByte(t *testing.T) {
 }
 
 func TestExecuteStreamWithAuthManager_HeaderPassthroughDisabledByDefault(t *testing.T) {
+	authID1 := "auth-header-passthrough-disabled-1"
+	authID2 := "auth-header-passthrough-disabled-2"
 	executor := &failOnceStreamExecutor{}
 	manager := coreauth.NewManager(nil, nil, nil)
 	manager.RegisterExecutor(executor)
 
 	auth1 := &coreauth.Auth{
-		ID:       "auth1",
+		ID:       authID1,
 		Provider: "codex",
 		Status:   coreauth.StatusActive,
 		Metadata: map[string]any{"email": "test1@example.com"},
@@ -352,7 +357,7 @@ func TestExecuteStreamWithAuthManager_HeaderPassthroughDisabledByDefault(t *test
 	}
 
 	auth2 := &coreauth.Auth{
-		ID:       "auth2",
+		ID:       authID2,
 		Provider: "codex",
 		Status:   coreauth.StatusActive,
 		Metadata: map[string]any{"email": "test2@example.com"},
@@ -397,12 +402,14 @@ func TestExecuteStreamWithAuthManager_HeaderPassthroughDisabledByDefault(t *test
 }
 
 func TestExecuteStreamWithAuthManager_DoesNotRetryAfterFirstByte(t *testing.T) {
+	authID1 := "auth-no-retry-after-first-byte-1"
+	authID2 := "auth-no-retry-after-first-byte-2"
 	executor := &payloadThenErrorStreamExecutor{}
 	manager := coreauth.NewManager(nil, nil, nil)
 	manager.RegisterExecutor(executor)
 
 	auth1 := &coreauth.Auth{
-		ID:       "auth1",
+		ID:       authID1,
 		Provider: "codex",
 		Status:   coreauth.StatusActive,
 		Metadata: map[string]any{"email": "test1@example.com"},
@@ -412,7 +419,7 @@ func TestExecuteStreamWithAuthManager_DoesNotRetryAfterFirstByte(t *testing.T) {
 	}
 
 	auth2 := &coreauth.Auth{
-		ID:       "auth2",
+		ID:       authID2,
 		Provider: "codex",
 		Status:   coreauth.StatusActive,
 		Metadata: map[string]any{"email": "test2@example.com"},
@@ -467,12 +474,13 @@ func TestExecuteStreamWithAuthManager_DoesNotRetryAfterFirstByte(t *testing.T) {
 }
 
 func TestExecuteStreamWithAuthManager_EnrichesBootstrapRetryAuthUnavailableError(t *testing.T) {
+	authID1 := "auth-bootstrap-retry-unavailable-1"
 	executor := &failOnceStreamExecutor{}
 	manager := coreauth.NewManager(nil, nil, nil)
 	manager.RegisterExecutor(executor)
 
 	auth1 := &coreauth.Auth{
-		ID:       "auth1",
+		ID:       authID1,
 		Provider: "codex",
 		Status:   coreauth.StatusActive,
 		Metadata: map[string]any{"email": "test1@example.com"},
@@ -537,12 +545,14 @@ func TestExecuteStreamWithAuthManager_EnrichesBootstrapRetryAuthUnavailableError
 }
 
 func TestExecuteStreamWithAuthManager_PinnedAuthKeepsSameUpstream(t *testing.T) {
-	executor := &authAwareStreamExecutor{}
+	authID1 := "auth-pinned-same-upstream-1"
+	authID2 := "auth-pinned-same-upstream-2"
+	executor := &authAwareStreamExecutor{failAuthID: authID1}
 	manager := coreauth.NewManager(nil, nil, nil)
 	manager.RegisterExecutor(executor)
 
 	auth1 := &coreauth.Auth{
-		ID:       "auth1",
+		ID:       authID1,
 		Provider: "codex",
 		Status:   coreauth.StatusActive,
 		Metadata: map[string]any{"email": "test1@example.com"},
@@ -552,7 +562,7 @@ func TestExecuteStreamWithAuthManager_PinnedAuthKeepsSameUpstream(t *testing.T) 
 	}
 
 	auth2 := &coreauth.Auth{
-		ID:       "auth2",
+		ID:       authID2,
 		Provider: "codex",
 		Status:   coreauth.StatusActive,
 		Metadata: map[string]any{"email": "test2@example.com"},
@@ -573,7 +583,7 @@ func TestExecuteStreamWithAuthManager_PinnedAuthKeepsSameUpstream(t *testing.T) 
 			BootstrapRetries: 1,
 		},
 	}, manager)
-	ctx := WithPinnedAuthID(context.Background(), "auth1")
+	ctx := WithPinnedAuthID(context.Background(), authID1)
 	dataChan, _, errChan := handler.ExecuteStreamWithAuthManager(ctx, "openai", "test-model", []byte(`{"model":"test-model"}`), "")
 	if dataChan == nil || errChan == nil {
 		t.Fatalf("expected non-nil channels")
@@ -602,19 +612,20 @@ func TestExecuteStreamWithAuthManager_PinnedAuthKeepsSameUpstream(t *testing.T) 
 		t.Fatalf("expected at least one upstream attempt")
 	}
 	for _, authID := range authIDs {
-		if authID != "auth1" {
+		if authID != authID1 {
 			t.Fatalf("expected all attempts on auth1, got sequence %v", authIDs)
 		}
 	}
 }
 
 func TestExecuteStreamWithAuthManager_SelectedAuthCallbackReceivesAuthID(t *testing.T) {
+	authID2 := "auth-selected-callback-2"
 	executor := &authAwareStreamExecutor{}
 	manager := coreauth.NewManager(nil, nil, nil)
 	manager.RegisterExecutor(executor)
 
 	auth2 := &coreauth.Auth{
-		ID:       "auth2",
+		ID:       authID2,
 		Provider: "codex",
 		Status:   coreauth.StatusActive,
 		Metadata: map[string]any{"email": "test2@example.com"},
@@ -656,18 +667,19 @@ func TestExecuteStreamWithAuthManager_SelectedAuthCallbackReceivesAuthID(t *test
 	if string(got) != "ok" {
 		t.Fatalf("expected payload ok, got %q", string(got))
 	}
-	if selectedAuthID != "auth2" {
-		t.Fatalf("selectedAuthID = %q, want %q", selectedAuthID, "auth2")
+	if selectedAuthID != authID2 {
+		t.Fatalf("selectedAuthID = %q, want %q", selectedAuthID, authID2)
 	}
 }
 
 func TestExecuteStreamWithAuthManager_ValidatesOpenAIResponsesStreamDataJSON(t *testing.T) {
+	authID1 := "auth-validate-responses-sse-json-1"
 	executor := &invalidJSONStreamExecutor{}
 	manager := coreauth.NewManager(nil, nil, nil)
 	manager.RegisterExecutor(executor)
 
 	auth1 := &coreauth.Auth{
-		ID:       "auth1",
+		ID:       authID1,
 		Provider: "codex",
 		Status:   coreauth.StatusActive,
 		Metadata: map[string]any{"email": "test1@example.com"},
@@ -714,12 +726,13 @@ func TestExecuteStreamWithAuthManager_ValidatesOpenAIResponsesStreamDataJSON(t *
 }
 
 func TestExecuteStreamWithAuthManager_AllowsSplitOpenAIResponsesSSEEventLines(t *testing.T) {
+	authID1 := "auth-split-responses-sse-lines-1"
 	executor := &splitResponsesEventStreamExecutor{}
 	manager := coreauth.NewManager(nil, nil, nil)
 	manager.RegisterExecutor(executor)
 
 	auth1 := &coreauth.Auth{
-		ID:       "auth1",
+		ID:       authID1,
 		Provider: "split-sse",
 		Status:   coreauth.StatusActive,
 		Metadata: map[string]any{"email": "test1@example.com"},

@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -212,5 +213,15 @@ func TestEnrichAuthSelectionError_IgnoresOtherErrors(t *testing.T) {
 	out := enrichAuthSelectionError(in, []string{"claude"}, "claude-sonnet-4-6")
 	if out != in {
 		t.Fatalf("expected original error to be returned unchanged")
+	}
+}
+
+func TestStatusFromError_MapsContextErrors(t *testing.T) {
+	const clientClosedRequestStatus = 499
+	if got := statusFromError(context.Canceled); got != clientClosedRequestStatus {
+		t.Fatalf("context.Canceled status = %d, want %d", got, clientClosedRequestStatus)
+	}
+	if got := statusFromError(context.DeadlineExceeded); got != http.StatusGatewayTimeout {
+		t.Fatalf("context.DeadlineExceeded status = %d, want %d", got, http.StatusGatewayTimeout)
 	}
 }

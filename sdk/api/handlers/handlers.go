@@ -50,6 +50,7 @@ type ErrorDetail struct {
 
 const idempotencyKeyMetadataKey = "idempotency_key"
 const newAPIDownstreamTransportHeader = "X-NewAPI-Downstream-Transport"
+const statusClientClosedRequest = 499
 
 const (
 	defaultStreamingKeepAliveSeconds = 0
@@ -655,11 +656,9 @@ func (h *BaseAPIHandler) executeWithAuthManager(ctx context.Context, handlerType
 	resp, err := h.AuthManager.Execute(ctx, providers, req, opts)
 	if err != nil {
 		err = enrichAuthSelectionError(err, providers, normalizedModel)
-		status := http.StatusInternalServerError
-		if se, ok := err.(interface{ StatusCode() int }); ok && se != nil {
-			if code := se.StatusCode(); code > 0 {
-				status = code
-			}
+		status := statusFromError(err)
+		if status <= 0 {
+			status = http.StatusInternalServerError
 		}
 		var addon http.Header
 		if he, ok := err.(interface{ Headers() http.Header }); ok && he != nil {
@@ -702,11 +701,9 @@ func (h *BaseAPIHandler) ExecuteCountWithAuthManager(ctx context.Context, handle
 	resp, err := h.AuthManager.ExecuteCount(ctx, providers, req, opts)
 	if err != nil {
 		err = enrichAuthSelectionError(err, providers, normalizedModel)
-		status := http.StatusInternalServerError
-		if se, ok := err.(interface{ StatusCode() int }); ok && se != nil {
-			if code := se.StatusCode(); code > 0 {
-				status = code
-			}
+		status := statusFromError(err)
+		if status <= 0 {
+			status = http.StatusInternalServerError
 		}
 		var addon http.Header
 		if he, ok := err.(interface{ Headers() http.Header }); ok && he != nil {
@@ -754,11 +751,9 @@ func (h *BaseAPIHandler) ExecuteStreamWithAuthManager(ctx context.Context, handl
 	if err != nil {
 		err = enrichAuthSelectionError(err, providers, normalizedModel)
 		errChan := make(chan *interfaces.ErrorMessage, 1)
-		status := http.StatusInternalServerError
-		if se, ok := err.(interface{ StatusCode() int }); ok && se != nil {
-			if code := se.StatusCode(); code > 0 {
-				status = code
-			}
+		status := statusFromError(err)
+		if status <= 0 {
+			status = http.StatusInternalServerError
 		}
 		var addon http.Header
 		if he, ok := err.(interface{ Headers() http.Header }); ok && he != nil {
@@ -866,11 +861,9 @@ func (h *BaseAPIHandler) ExecuteStreamWithAuthManager(ctx context.Context, handl
 						}
 					}
 
-					status := http.StatusInternalServerError
-					if se, ok := streamErr.(interface{ StatusCode() int }); ok && se != nil {
-						if code := se.StatusCode(); code > 0 {
-							status = code
-						}
+					status := statusFromError(streamErr)
+					if status <= 0 {
+						status = http.StatusInternalServerError
 					}
 					var addon http.Header
 					if he, ok := streamErr.(interface{ Headers() http.Header }); ok && he != nil {
@@ -931,6 +924,12 @@ func validateSSEDataJSON(chunk []byte) error {
 func statusFromError(err error) int {
 	if err == nil {
 		return 0
+	}
+	if errors.Is(err, context.Canceled) {
+		return statusClientClosedRequest
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return http.StatusGatewayTimeout
 	}
 	if se, ok := err.(interface{ StatusCode() int }); ok && se != nil {
 		if code := se.StatusCode(); code > 0 {
