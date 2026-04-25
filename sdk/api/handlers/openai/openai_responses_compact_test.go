@@ -83,6 +83,42 @@ func TestOpenAIResponsesCompactRejectsStream(t *testing.T) {
 	}
 }
 
+func TestOpenAIResponsesRejectsMissingPayloadBeforeUpstream(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	executor := &compactCaptureExecutor{}
+	manager := coreauth.NewManager(nil, nil, nil)
+	manager.RegisterExecutor(executor)
+
+	auth := &coreauth.Auth{ID: "auth-responses-missing-payload", Provider: executor.Identifier(), Status: coreauth.StatusActive}
+	if _, err := manager.Register(context.Background(), auth); err != nil {
+		t.Fatalf("Register auth: %v", err)
+	}
+	registry.GetGlobalRegistry().RegisterClient(auth.ID, auth.Provider, []*registry.ModelInfo{{ID: "test-model"}})
+	t.Cleanup(func() {
+		registry.GetGlobalRegistry().UnregisterClient(auth.ID)
+	})
+
+	base := handlers.NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, manager)
+	h := NewOpenAIResponsesAPIHandler(base)
+	router := gin.New()
+	router.POST("/v1/responses", h.Responses)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"test-model"}`))
+	req.Header.Set("Content-Type", "application/json")
+	resp := httptest.NewRecorder()
+	router.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d; body=%s", resp.Code, http.StatusBadRequest, resp.Body.String())
+	}
+	if executor.calls != 0 {
+		t.Fatalf("executor calls = %d, want 0", executor.calls)
+	}
+	if !strings.Contains(resp.Body.String(), "missing_required_parameter") {
+		t.Fatalf("expected missing_required_parameter error, got: %s", resp.Body.String())
+	}
+}
+
 func TestOpenAIResponsesCompactExecute(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	executor := &compactCaptureExecutor{}

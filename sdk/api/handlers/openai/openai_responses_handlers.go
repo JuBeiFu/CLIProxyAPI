@@ -259,6 +259,16 @@ func (h *OpenAIResponsesAPIHandler) Responses(c *gin.Context) {
 		writeImageGenerationEndpointError(c, modelName)
 		return
 	}
+	if !hasResponsesPayload(rawJSON) {
+		c.JSON(http.StatusBadRequest, handlers.ErrorResponse{
+			Error: handlers.ErrorDetail{
+				Message: `One of "input", "previous_response_id", "prompt", or "conversation_id" must be provided.`,
+				Type:    "invalid_request_error",
+				Code:    "missing_required_parameter",
+			},
+		})
+		return
+	}
 
 	// Check if the client requested a streaming response.
 	streamResult := gjson.GetBytes(rawJSON, "stream")
@@ -268,6 +278,15 @@ func (h *OpenAIResponsesAPIHandler) Responses(c *gin.Context) {
 		h.handleNonStreamingResponse(c, rawJSON)
 	}
 
+}
+
+func hasResponsesPayload(rawJSON []byte) bool {
+	for _, path := range []string{"input", "previous_response_id", "prompt", "conversation_id"} {
+		if gjson.GetBytes(rawJSON, path).Exists() {
+			return true
+		}
+	}
+	return false
 }
 
 func (h *OpenAIResponsesAPIHandler) Compact(c *gin.Context) {
