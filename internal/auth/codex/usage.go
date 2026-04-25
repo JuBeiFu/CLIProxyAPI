@@ -2,11 +2,15 @@ package codex
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/tidwall/gjson"
 )
@@ -21,6 +25,15 @@ const codexUsageURL = "https://chatgpt.com/backend-api/wham/usage"
 type WhamUsageInfo struct {
 	PlanType        string
 	SupportedModels []string
+	FiveHourQuota   *WhamQuotaWindow
+}
+
+type WhamQuotaWindow struct {
+	Limit          float64
+	Remaining      float64
+	Used           float64
+	RemainingRatio float64
+	ResetAt        time.Time
 }
 
 // NewCodexAuthWithClient builds a CodexAuth that uses the supplied
@@ -98,6 +111,7 @@ func (o *CodexAuth) FetchWhamUsageInfo(ctx context.Context, accessToken string) 
 	return WhamUsageInfo{
 		PlanType:        strings.TrimSpace(gjson.GetBytes(body, "plan_type").String()),
 		SupportedModels: extractWhamUsageSupportedModels(body),
+		FiveHourQuota:   extractWhamUsageFiveHourQuota(body),
 	}, nil
 }
 
@@ -146,4 +160,303 @@ func extractWhamUsageSupportedModels(body []byte) []string {
 		})
 	}
 	return out
+}
+
+func extractWhamUsageFiveHourQuota(body []byte) *WhamQuotaWindow {
+	var root any
+	if err := json.Unmarshal(body, &root); err != nil {
+		return nil
+	}
+	var best *WhamQuotaWindow
+	walkWhamUsageObjects(root, "", func(path string, obj map[string]any) {
+		if best != nil {
+			return
+		}
+		if !looksLikeFiveHourWindow(path, obj) {
+			return
+		}
+		if quota := quotaWindowFromObject(obj); quota != nil {
+			best = quota
+		}
+	})
+	return best
+}
+
+func walkWhamUsageObjects(value any, path string, visit func(string, map[string]any)) {
+	switch typed := value.(type) {
+	case map[string]any:
+		visit(path, typed)
+		for key, child := range typed {
+			nextPath := strings.TrimSpace(key)
+			if path != "" {
+				nextPath = path + "." + nextPath
+			}
+			walkWhamUsageObjects(child, nextPath, visit)
+		}
+	case []any:
+		for _, child := range typed {
+			walkWhamUsageObjects(child, path, visit)
+		}
+	}
+}
+
+func looksLikeFiveHourWindow(path string, obj map[string]any) bool {
+	if containsFiveHourMarker(path) {
+		return true
+	}
+	for key, value := range obj {
+		if containsFiveHourMarker(key) {
+			return true
+		}
+		if s, ok := value.(string); ok && containsFiveHourMarker(s) {
+			return true
+		}
+		n, ok := numericValue(value)
+		if !ok {
+			continue
+		}
+		keyNorm := normalizeWhamKey(key)
+		switch {
+		case strings.Contains(keyNorm, "windowseconds") || strings.Contains(keyNorm, "periodseconds") || strings.Contains(keyNorm, "durationseconds"):
+			if math.Abs(n-18000) < 0.001 {
+				return true
+			}
+		case strings.Contains(keyNorm, "windowminutes") || strings.Contains(keyNorm, "periodminutes") || strings.Contains(keyNorm, "durationminutes"):
+			if math.Abs(n-300) < 0.001 {
+				return true
+			}
+		case strings.Contains(keyNorm, "windowhours") || strings.Contains(keyNorm, "periodhours") || strings.Contains(keyNorm, "durationhours"):
+			if math.Abs(n-5) < 0.001 {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func containsFiveHourMarker(value string) bool {
+	norm := normalizeWhamKey(value)
+	return strings.Contains(norm, "5h") ||
+		strings.Contains(norm, "5hour") ||
+		strings.Contains(norm, "fivehour")
+}
+
+func quotaWindowFromObject(obj map[string]any) *WhamQuotaWindow {
+	numbers := make(map[string]float64)
+	stringsByPath := make(map[string]string)
+	collectWhamFields(obj, "", numbers, stringsByPath)
+
+	ratio, hasRatio := firstWhamNumber(numbers,
+		"remaining_ratio",
+		"remainingRatio",
+		"remaining_percent",
+		"remainingPercent",
+		"remaining_percentage",
+		"percent_remaining",
+		"ratio_remaining",
+	)
+	if hasRatio && ratio > 1 && ratio <= 100 {
+		ratio /= 100
+	}
+
+	limit, hasLimit := firstWhamNumber(numbers,
+		"limit",
+		"max",
+		"maximum",
+		"capacity",
+		"total_limit",
+		"message_limit",
+		"request_limit",
+	)
+	remaining, hasRemaining := firstWhamNumber(numbers,
+		"remaining",
+		"available",
+		"balance",
+		"remaining_quota",
+		"remaining_messages",
+		"requests_remaining",
+		"remaining_count",
+	)
+	used, hasUsed := firstWhamNumber(numbers,
+		"used",
+		"usage",
+		"consumed",
+		"current",
+		"count",
+		"used_count",
+		"messages_used",
+	)
+
+	if !hasRatio {
+		switch {
+		case hasLimit && limit > 0 && hasRemaining:
+			ratio = remaining / limit
+			hasRatio = true
+		case hasLimit && limit > 0 && hasUsed:
+			remaining = limit - used
+			if remaining < 0 {
+				remaining = 0
+			}
+			hasRemaining = true
+			ratio = remaining / limit
+			hasRatio = true
+		}
+	}
+	if !hasRatio || math.IsNaN(ratio) || math.IsInf(ratio, 0) {
+		return nil
+	}
+	if ratio < 0 {
+		ratio = 0
+	}
+	if ratio > 1 {
+		ratio = 1
+	}
+
+	return &WhamQuotaWindow{
+		Limit:          valueOrZero(limit, hasLimit),
+		Remaining:      valueOrZero(remaining, hasRemaining),
+		Used:           valueOrZero(used, hasUsed),
+		RemainingRatio: ratio,
+		ResetAt:        whamResetTime(numbers, stringsByPath, time.Now().UTC()),
+	}
+}
+
+func collectWhamFields(value any, path string, numbers map[string]float64, stringsByPath map[string]string) {
+	switch typed := value.(type) {
+	case map[string]any:
+		for key, child := range typed {
+			nextPath := strings.TrimSpace(key)
+			if path != "" {
+				nextPath = path + "." + nextPath
+			}
+			collectWhamFields(child, nextPath, numbers, stringsByPath)
+		}
+	case []any:
+		for _, child := range typed {
+			collectWhamFields(child, path, numbers, stringsByPath)
+		}
+	case string:
+		trimmed := strings.TrimSpace(typed)
+		if trimmed == "" || path == "" {
+			return
+		}
+		stringsByPath[path] = trimmed
+		if parsed, err := strconv.ParseFloat(trimmed, 64); err == nil {
+			numbers[path] = parsed
+		}
+	default:
+		if n, ok := numericValue(typed); ok && path != "" {
+			numbers[path] = n
+		}
+	}
+}
+
+func firstWhamNumber(fields map[string]float64, names ...string) (float64, bool) {
+	for _, name := range names {
+		want := normalizeWhamKey(name)
+		for key, value := range fields {
+			got := normalizeWhamKey(key)
+			if got == want || strings.HasSuffix(got, want) {
+				return value, true
+			}
+		}
+	}
+	return 0, false
+}
+
+func whamResetTime(numbers map[string]float64, stringsByPath map[string]string, now time.Time) time.Time {
+	if raw, ok := firstWhamNumber(numbers,
+		"resets_at",
+		"reset_at",
+		"resetsAt",
+		"resetAt",
+		"next_reset_at",
+		"nextResetAt",
+	); ok {
+		return normaliseWhamUnix(raw)
+	}
+	for key, value := range stringsByPath {
+		got := normalizeWhamKey(key)
+		if got == "resetsat" || got == "resetat" || got == "nextresetat" || strings.HasSuffix(got, "resetsat") || strings.HasSuffix(got, "resetat") || strings.HasSuffix(got, "nextresetat") {
+			if ts, ok := parseWhamTime(value); ok {
+				return ts
+			}
+		}
+	}
+	if raw, ok := firstWhamNumber(numbers,
+		"resets_in_seconds",
+		"reset_in_seconds",
+		"resets_in",
+		"reset_in",
+		"reset_after_seconds",
+	); ok && raw > 0 {
+		return now.Add(time.Duration(raw) * time.Second)
+	}
+	return time.Time{}
+}
+
+func parseWhamTime(value string) (time.Time, bool) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return time.Time{}, false
+	}
+	if parsed, err := time.Parse(time.RFC3339Nano, value); err == nil {
+		return parsed.UTC(), true
+	}
+	if parsed, err := time.Parse(time.RFC3339, value); err == nil {
+		return parsed.UTC(), true
+	}
+	if raw, err := strconv.ParseFloat(value, 64); err == nil {
+		return normaliseWhamUnix(raw), true
+	}
+	return time.Time{}, false
+}
+
+func normaliseWhamUnix(raw float64) time.Time {
+	if raw <= 0 {
+		return time.Time{}
+	}
+	if raw > 1_000_000_000_000 {
+		return time.UnixMilli(int64(raw)).UTC()
+	}
+	return time.Unix(int64(raw), 0).UTC()
+}
+
+func numericValue(value any) (float64, bool) {
+	switch typed := value.(type) {
+	case int:
+		return float64(typed), true
+	case int32:
+		return float64(typed), true
+	case int64:
+		return float64(typed), true
+	case uint:
+		return float64(typed), true
+	case uint32:
+		return float64(typed), true
+	case uint64:
+		return float64(typed), true
+	case float32:
+		return float64(typed), true
+	case float64:
+		return typed, true
+	case json.Number:
+		if parsed, err := typed.Float64(); err == nil {
+			return parsed, true
+		}
+	}
+	return 0, false
+}
+
+func valueOrZero(value float64, ok bool) float64 {
+	if !ok {
+		return 0
+	}
+	return value
+}
+
+func normalizeWhamKey(value string) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+	replacer := strings.NewReplacer("_", "", "-", "", " ", "", ".", "", "/", "", ":", "")
+	return replacer.Replace(value)
 }

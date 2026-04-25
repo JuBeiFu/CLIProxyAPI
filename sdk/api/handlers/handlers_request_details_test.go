@@ -1,7 +1,9 @@
 package handlers
 
 import (
+	"net/http"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -114,5 +116,26 @@ func TestGetRequestDetails_PreservesSuffix(t *testing.T) {
 				t.Fatalf("getRequestDetails() model = %v, want %v", model, tt.wantModel)
 			}
 		})
+	}
+}
+
+func TestGetRequestDetails_GPTImage2OnlySupportedOnImagesEndpoints(t *testing.T) {
+	handler := NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, coreauth.NewManager(nil, nil, nil))
+
+	providers, model, errMsg := handler.getRequestDetails("gpt-image-2")
+	if errMsg == nil {
+		t.Fatalf("getRequestDetails() error = nil, want image endpoint error")
+	}
+	if len(providers) != 0 {
+		t.Fatalf("getRequestDetails() providers = %v, want none", providers)
+	}
+	if model != "" {
+		t.Fatalf("getRequestDetails() model = %q, want empty", model)
+	}
+	if errMsg.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want %d", errMsg.StatusCode, http.StatusServiceUnavailable)
+	}
+	if errMsg.Error == nil || !strings.Contains(errMsg.Error.Error(), "/v1/images/edits") {
+		t.Fatalf("error = %v, want images endpoint hint", errMsg.Error)
 	}
 }

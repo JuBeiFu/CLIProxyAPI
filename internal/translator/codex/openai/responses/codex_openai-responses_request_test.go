@@ -521,3 +521,14 @@ func TestConvertOpenAIResponsesRequestToCodex_FlattensNestedFunctionToolSpec(t *
 		t.Fatalf("tools.0.function should be flattened away: %s", string(output))
 	}
 }
+
+func TestConvertOpenAIResponsesRequestToCodex_LargeTranscriptAllocationBudget(t *testing.T) {
+	raw := buildBenchmarkResponsesRequest(240, true, true, true)
+	allocs := testing.AllocsPerRun(20, func() {
+		benchmarkResponsesRequestSink = ConvertOpenAIResponsesRequestToCodex("gpt-5.4", raw, false)
+	})
+
+	if allocs > 500 {
+		t.Fatalf("large transcript conversion allocs = %.0f, want <= 500", allocs)
+	}
+}

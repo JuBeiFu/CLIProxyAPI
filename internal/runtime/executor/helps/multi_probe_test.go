@@ -51,7 +51,7 @@ func TestProbeCodexPlanAcrossPoolPrefersExistingBoundEntryWhenStillPaid(t *testi
 	}
 	cliproxyauth.SetBoundProxyEntry(auth, "bound-node")
 
-	plan, bound, _, ok := ProbeCodexPlanAcrossPool(context.Background(), cfg, auth, "token")
+	plan, bound, _, _, ok := ProbeCodexPlanAcrossPool(context.Background(), cfg, auth, "token")
 	if !ok {
 		t.Fatal("probeOK = false, want true")
 	}
@@ -107,7 +107,7 @@ func TestProbeCodexPlanAcrossPoolFallsBackWhenExistingBoundEntryIsFree(t *testin
 	}
 	cliproxyauth.SetBoundProxyEntry(auth, "bound-node")
 
-	plan, bound, _, ok := ProbeCodexPlanAcrossPool(context.Background(), cfg, auth, "token")
+	plan, bound, _, _, ok := ProbeCodexPlanAcrossPool(context.Background(), cfg, auth, "token")
 	if !ok {
 		t.Fatal("probeOK = false, want true")
 	}
@@ -136,7 +136,7 @@ func TestProbeCodexPlanAcrossPoolReturnsSupportedModelsFromPaidPath(t *testing.T
 		}, nil
 	}
 
-	plan, _, models, ok := ProbeCodexPlanAcrossPool(context.Background(), &config.Config{}, &cliproxyauth.Auth{Provider: "codex"}, "token")
+	plan, _, models, _, ok := ProbeCodexPlanAcrossPool(context.Background(), &config.Config{}, &cliproxyauth.Auth{Provider: "codex"}, "token")
 	if !ok {
 		t.Fatal("probeOK = false, want true")
 	}

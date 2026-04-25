@@ -74,6 +74,16 @@ const (
 )
 
 const (
+	codexColdRefreshInterval        = 2 * time.Hour
+	codexHotRefreshInterval         = 5 * time.Minute
+	codexFrequentRefreshInterval    = 45 * time.Second
+	codexFrequentActivityWindow     = time.Minute
+	codexFrequentActivityThreshold  = 3
+	codexFiveHourQuotaRestThreshold = 0.20
+	codexFiveHourQuotaLowReason     = "codex_5h_quota_low"
+)
+
+const (
 	defaultRequestRetry        = 2
 	defaultMaxRetryCredentials = 5
 	defaultMaxRetryInterval    = 120 * time.Second
@@ -135,6 +145,21 @@ func (l *inflightLease) Release() {
 	}
 	l.once.Do(func() {
 		l.manager.scheduler.releaseInflight(l.provider, l.model, l.authID)
+	})
+}
+
+type imageAuthLease struct {
+	manager *Manager
+	authID  string
+	once    sync.Once
+}
+
+func (l *imageAuthLease) Release() {
+	if l == nil || l.manager == nil {
+		return
+	}
+	l.once.Do(func() {
+		l.manager.releaseImageAuthLease(l.authID)
 	})
 }
 
@@ -221,6 +246,12 @@ type Manager struct {
 	responseCompactMaxEntries   int
 	responseCompactNextSeq      uint64
 
+	imageInflightMu sync.Mutex
+	imageInflight   map[string]int
+
+	authActivityMu sync.Mutex
+	authActivity   map[string][]time.Time
+
 	// Optional HTTP RoundTripper provider injected by host.
 	rtProvider RoundTripperProvider
 
@@ -254,6 +285,8 @@ func NewManager(store Store, selector Selector, hook Hook) *Manager {
 		responseCompactMaxBytes:     defaultResponseCompactMaxBytes,
 		responseCompactMaxEntrySize: defaultResponseCompactMaxEntrySize,
 		responseCompactMaxEntries:   defaultResponseCompactMaxEntries,
+		imageInflight:               make(map[string]int),
+		authActivity:                make(map[string][]time.Time),
 		refreshSemaphore:            make(chan struct{}, refreshMaxConcurrency),
 	}
 	// atomic.Value requires non-nil initial value.
@@ -307,6 +340,207 @@ func (m *Manager) acquireInflightLease(provider, model, authID string) *inflight
 		model:    model,
 		authID:   authID,
 	}
+}
+
+func imageGenerationRequestFromMetadata(meta map[string]any) bool {
+	if len(meta) == 0 {
+		return false
+	}
+	raw, ok := meta[cliproxyexecutor.ImageGenerationRequestMetadataKey]
+	if !ok {
+		return false
+	}
+	value, ok := raw.(bool)
+	return ok && value
+}
+
+func imageGenerationModelFromMetadata(meta map[string]any) string {
+	if len(meta) == 0 {
+		return ""
+	}
+	raw, ok := meta[cliproxyexecutor.ImageGenerationModelMetadataKey]
+	if !ok || raw == nil {
+		return ""
+	}
+	switch v := raw.(type) {
+	case string:
+		return strings.TrimSpace(v)
+	case []byte:
+		return strings.TrimSpace(string(v))
+	default:
+		return ""
+	}
+}
+
+func resultModelForOptions(opts cliproxyexecutor.Options, fallback string) string {
+	if imageGenerationRequestFromMetadata(opts.Metadata) {
+		if imageModel := imageGenerationModelFromMetadata(opts.Metadata); imageModel != "" {
+			return imageModel
+		}
+	}
+	return fallback
+}
+
+const imageAuthBusyRetryAfter = 10 * time.Second
+
+type imageAuthBusyStatusError struct {
+	inner      *Error
+	retryAfter time.Duration
+}
+
+func newImageAuthBusyError() error {
+	return &imageAuthBusyStatusError{
+		inner: &Error{
+			Code:       "image_auth_busy",
+			Message:    "all eligible image generation auths are busy",
+			Retryable:  true,
+			HTTPStatus: http.StatusServiceUnavailable,
+		},
+		retryAfter: imageAuthBusyRetryAfter,
+	}
+}
+
+func (e *imageAuthBusyStatusError) Error() string {
+	if e == nil || e.inner == nil {
+		return ""
+	}
+	payload, err := json.Marshal(map[string]any{
+		"error": map[string]any{
+			"message": e.inner.Message,
+			"type":    "server_error",
+			"code":    e.inner.Code,
+		},
+	})
+	if err != nil {
+		return e.inner.Error()
+	}
+	return string(payload)
+}
+
+func (e *imageAuthBusyStatusError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.inner
+}
+
+func (e *imageAuthBusyStatusError) StatusCode() int {
+	if e == nil || e.inner == nil {
+		return 0
+	}
+	return e.inner.StatusCode()
+}
+
+func (e *imageAuthBusyStatusError) Headers() http.Header {
+	if e == nil || e.retryAfter <= 0 {
+		return nil
+	}
+	headers := make(http.Header)
+	headers.Set("Retry-After", strconv.Itoa(int(e.retryAfter/time.Second)))
+	return headers
+}
+
+func (e *imageAuthBusyStatusError) RetryAfter() *time.Duration {
+	if e == nil || e.retryAfter <= 0 {
+		return nil
+	}
+	d := e.retryAfter
+	return &d
+}
+
+func (m *Manager) tryAcquireImageAuthLease(authID string) (*imageAuthLease, bool) {
+	if m == nil {
+		return nil, true
+	}
+	authID = strings.TrimSpace(authID)
+	if authID == "" {
+		return nil, true
+	}
+	m.imageInflightMu.Lock()
+	defer m.imageInflightMu.Unlock()
+	if m.imageInflight == nil {
+		m.imageInflight = make(map[string]int)
+	}
+	if m.imageInflight[authID] > 0 {
+		return nil, false
+	}
+	m.imageInflight[authID] = 1
+	return &imageAuthLease{manager: m, authID: authID}, true
+}
+
+func (m *Manager) releaseImageAuthLease(authID string) {
+	if m == nil {
+		return
+	}
+	authID = strings.TrimSpace(authID)
+	if authID == "" {
+		return
+	}
+	m.imageInflightMu.Lock()
+	defer m.imageInflightMu.Unlock()
+	current := m.imageInflight[authID]
+	if current <= 1 {
+		delete(m.imageInflight, authID)
+		return
+	}
+	m.imageInflight[authID] = current - 1
+}
+
+func (m *Manager) recordAuthDispatch(authID string, now time.Time) {
+	if m == nil {
+		return
+	}
+	authID = strings.TrimSpace(authID)
+	if authID == "" {
+		return
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	cutoff := now.Add(-codexFrequentActivityWindow)
+	m.authActivityMu.Lock()
+	defer m.authActivityMu.Unlock()
+	if m.authActivity == nil {
+		m.authActivity = make(map[string][]time.Time)
+	}
+	events := m.authActivity[authID]
+	kept := events[:0]
+	for _, ts := range events {
+		if ts.After(cutoff) {
+			kept = append(kept, ts)
+		}
+	}
+	kept = append(kept, now)
+	m.authActivity[authID] = kept
+}
+
+func (m *Manager) authDispatchCount(authID string, now time.Time) int {
+	if m == nil {
+		return 0
+	}
+	authID = strings.TrimSpace(authID)
+	if authID == "" {
+		return 0
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	cutoff := now.Add(-codexFrequentActivityWindow)
+	m.authActivityMu.Lock()
+	defer m.authActivityMu.Unlock()
+	events := m.authActivity[authID]
+	kept := events[:0]
+	for _, ts := range events {
+		if ts.After(cutoff) {
+			kept = append(kept, ts)
+		}
+	}
+	if len(kept) == 0 {
+		delete(m.authActivity, authID)
+		return 0
+	}
+	m.authActivity[authID] = kept
+	return len(kept)
 }
 
 // RefreshSchedulerEntry re-upserts a single auth into the scheduler so that its
@@ -930,7 +1164,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 	}
 	var lastErr error
 	for idx, execModel := range execModels {
-		resultModel := m.stateModelForExecution(auth, routeModel, execModel, pooled)
+		resultModel := resultModelForOptions(opts, m.stateModelForExecution(auth, routeModel, execModel, pooled))
 		execReq := req
 		execReq.Model = execModel
 		streamResult, errStream := executor.ExecuteStream(ctx, auth, execReq, opts)
@@ -1252,6 +1486,7 @@ func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 			if len(auth.ModelStates) == 0 && len(existing.ModelStates) > 0 {
 				auth.ModelStates = existing.ModelStates
 			}
+			preserveRuntimeAvailabilityState(auth, existing, time.Now())
 		}
 	}
 	auth.EnsureIndex()
@@ -1265,6 +1500,51 @@ func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 	_ = m.persist(ctx, auth)
 	m.hook.OnAuthUpdated(ctx, auth.Clone())
 	return auth.Clone(), nil
+}
+
+func preserveRuntimeAvailabilityState(auth, existing *Auth, now time.Time) {
+	if auth == nil || existing == nil {
+		return
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	if existing.UpdatedAt.After(auth.UpdatedAt) {
+		if len(existing.ModelStates) > 0 {
+			auth.ModelStates = cloneModelStates(existing.ModelStates)
+		}
+		if existing.Unavailable {
+			auth.Unavailable = existing.Unavailable
+			auth.NextRetryAfter = existing.NextRetryAfter
+			auth.Quota = existing.Quota
+		}
+		if existing.LastError != nil {
+			auth.LastError = cloneError(existing.LastError)
+		}
+		if existing.Status == StatusError || strings.TrimSpace(existing.StatusMessage) != "" {
+			auth.Status = existing.Status
+			auth.StatusMessage = existing.StatusMessage
+		}
+	}
+	if len(auth.ModelStates) > 0 {
+		updateAggregatedAvailability(auth, now)
+		if hasModelError(auth, now) && auth.Status != StatusDisabled {
+			auth.Status = StatusError
+		}
+	}
+}
+
+func cloneModelStates(states map[string]*ModelState) map[string]*ModelState {
+	if len(states) == 0 {
+		return nil
+	}
+	cloned := make(map[string]*ModelState, len(states))
+	for key, state := range states {
+		if state != nil {
+			cloned[key] = state.Clone()
+		}
+	}
+	return cloned
 }
 
 // Load resets manager state from the backing store.
@@ -1402,6 +1682,8 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 	opts = ensureResponseBindingMetadata(req, opts, m.lookupBoundAuthID)
 	tried := make(map[string]struct{})
 	attempted := make(map[string]struct{})
+	imageRequest := imageGenerationRequestFromMetadata(opts.Metadata)
+	skippedBusyImageAuth := false
 	var lastErr error
 	for {
 		if maxRetryCredentials > 0 && len(attempted) >= maxRetryCredentials {
@@ -1415,12 +1697,27 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			if lastErr != nil {
 				return cliproxyexecutor.Response{}, lastErr
 			}
+			if imageRequest && skippedBusyImageAuth {
+				return cliproxyexecutor.Response{}, newImageAuthBusyError()
+			}
 			return cliproxyexecutor.Response{}, errPick
+		}
+
+		var imageLease *imageAuthLease
+		if imageRequest {
+			var ok bool
+			imageLease, ok = m.tryAcquireImageAuthLease(auth.ID)
+			if !ok {
+				skippedBusyImageAuth = true
+				tried[auth.ID] = struct{}{}
+				continue
+			}
 		}
 
 		entry := logEntryWithRequestID(ctx)
 		debugLogAuthSelection(entry, auth, provider, req.Model)
 		publishSelectedAuthMetadata(opts.Metadata, auth.ID)
+		m.recordAuthDispatch(auth.ID, time.Now())
 
 		// Opportunistic async re-probe for codex bound paid auths whose
 		// binding is older than AsyncBindingProbeTTL. Fires in a goroutine
@@ -1437,13 +1734,18 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 
 		models, pooled := m.preparedExecutionModels(auth, routeModel)
 		if len(models) == 0 {
+			imageLease.Release()
 			continue
 		}
 		attempted[auth.ID] = struct{}{}
 		lease := m.acquireInflightLease(provider, routeModel, auth.ID)
+		releaseLeases := func() {
+			lease.Release()
+			imageLease.Release()
+		}
 		var authErr error
 		for _, upstreamModel := range models {
-			resultModel := m.stateModelForExecution(auth, routeModel, upstreamModel, pooled)
+			resultModel := resultModelForOptions(opts, m.stateModelForExecution(auth, routeModel, upstreamModel, pooled))
 			execReq := req
 			execReq.Model = upstreamModel
 			execReq = m.expandCompactPreviousResponseRequest(execReq, opts)
@@ -1451,22 +1753,35 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: errExec == nil, RequestPayload: bytes.Clone(execReq.Payload)}
 			if errExec != nil {
 				if errCtx := execCtx.Err(); errCtx != nil {
-					lease.Release()
+					releaseLeases()
 					return cliproxyexecutor.Response{}, errCtx
 				}
-				result.Error = &Error{Message: errExec.Error()}
-				if se, ok := errors.AsType[cliproxyexecutor.StatusError](errExec); ok && se != nil {
-					result.Error.HTTPStatus = se.StatusCode()
+				setExecutionResultError(&result, errExec)
+				if shouldAttemptAccessTokenRefresh(auth, result.Error) {
+					if refreshedAuth, ok := m.refreshAuthAfterAccessTokenFailure(execCtx, auth, result.Error); ok {
+						resp, errExec = executor.Execute(execCtx, refreshedAuth, execReq, opts)
+						result = Result{AuthID: refreshedAuth.ID, Provider: provider, Model: resultModel, Success: errExec == nil, RequestPayload: bytes.Clone(execReq.Payload)}
+						if errExec != nil {
+							if errCtx := execCtx.Err(); errCtx != nil {
+								releaseLeases()
+								return cliproxyexecutor.Response{}, errCtx
+							}
+							setExecutionResultError(&result, errExec)
+						}
+					}
 				}
-				if ra := retryAfterFromError(errExec); ra != nil {
-					result.RetryAfter = ra
+				if errExec == nil {
+					m.MarkResult(execCtx, result)
+					m.bindResponseFromPayload(auth.ID, execReq.Payload, resp.Payload)
+					releaseLeases()
+					return resp, nil
 				}
 				m.MarkResult(execCtx, result)
 				if isTransientCooldownError(errExec) {
 					opts = clearResponseBindingPinnedAuthMetadata(opts, auth.ID)
 				}
 				if isRequestInvalidError(errExec) {
-					lease.Release()
+					releaseLeases()
 					return cliproxyexecutor.Response{}, errExec
 				}
 				authErr = errExec
@@ -1474,10 +1789,10 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			}
 			m.MarkResult(execCtx, result)
 			m.bindResponseFromPayload(auth.ID, execReq.Payload, resp.Payload)
-			lease.Release()
+			releaseLeases()
 			return resp, nil
 		}
-		lease.Release()
+		releaseLeases()
 		if authErr != nil {
 			if isRequestInvalidError(authErr) {
 				return cliproxyexecutor.Response{}, authErr
@@ -1516,6 +1831,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 		entry := logEntryWithRequestID(ctx)
 		debugLogAuthSelection(entry, auth, provider, req.Model)
 		publishSelectedAuthMetadata(opts.Metadata, auth.ID)
+		m.recordAuthDispatch(auth.ID, time.Now())
 
 		tried[auth.ID] = struct{}{}
 		execCtx := ctx
@@ -1532,7 +1848,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 		lease := m.acquireInflightLease(provider, routeModel, auth.ID)
 		var authErr error
 		for _, upstreamModel := range models {
-			resultModel := m.stateModelForExecution(auth, routeModel, upstreamModel, pooled)
+			resultModel := resultModelForOptions(opts, m.stateModelForExecution(auth, routeModel, upstreamModel, pooled))
 			execReq := req
 			execReq.Model = upstreamModel
 			resp, errExec := executor.CountTokens(execCtx, auth, execReq, opts)
@@ -1542,12 +1858,24 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 					lease.Release()
 					return cliproxyexecutor.Response{}, errCtx
 				}
-				result.Error = &Error{Message: errExec.Error()}
-				if se, ok := errors.AsType[cliproxyexecutor.StatusError](errExec); ok && se != nil {
-					result.Error.HTTPStatus = se.StatusCode()
+				setExecutionResultError(&result, errExec)
+				if shouldAttemptAccessTokenRefresh(auth, result.Error) {
+					if refreshedAuth, ok := m.refreshAuthAfterAccessTokenFailure(execCtx, auth, result.Error); ok {
+						resp, errExec = executor.CountTokens(execCtx, refreshedAuth, execReq, opts)
+						result = Result{AuthID: refreshedAuth.ID, Provider: provider, Model: resultModel, Success: errExec == nil, RequestPayload: bytes.Clone(execReq.Payload)}
+						if errExec != nil {
+							if errCtx := execCtx.Err(); errCtx != nil {
+								lease.Release()
+								return cliproxyexecutor.Response{}, errCtx
+							}
+							setExecutionResultError(&result, errExec)
+						}
+					}
 				}
-				if ra := retryAfterFromError(errExec); ra != nil {
-					result.RetryAfter = ra
+				if errExec == nil {
+					m.MarkResult(execCtx, result)
+					lease.Release()
+					return resp, nil
 				}
 				m.MarkResult(execCtx, result)
 				if isTransientCooldownError(errExec) {
@@ -1611,6 +1939,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 		entry := logEntryWithRequestID(ctx)
 		debugLogAuthSelection(entry, auth, provider, req.Model)
 		publishSelectedAuthMetadata(opts.Metadata, auth.ID)
+		m.recordAuthDispatch(auth.ID, time.Now())
 
 		// Opportunistic async re-probe mirrors the Execute path.
 		m.KickAsyncBindingProbe(auth.ID)
@@ -2982,6 +3311,9 @@ func clearAggregatedAvailability(auth *Auth) {
 	if auth == nil {
 		return
 	}
+	if auth.Quota.Exceeded && auth.Quota.Reason == codexFiveHourQuotaLowReason {
+		return
+	}
 	auth.Unavailable = false
 	auth.NextRetryAfter = time.Time{}
 	auth.Quota = QuotaState{}
@@ -3009,6 +3341,10 @@ func hasModelError(auth *Auth, now time.Time) bool {
 
 func clearAuthStateOnSuccess(auth *Auth, now time.Time) {
 	if auth == nil {
+		return
+	}
+	if auth.Quota.Exceeded && auth.Quota.Reason == codexFiveHourQuotaLowReason {
+		auth.UpdatedAt = now
 		return
 	}
 	auth.Unavailable = false
@@ -3172,6 +3508,46 @@ func statusCodeFromResult(err *Error) int {
 	return err.StatusCode()
 }
 
+func setExecutionResultError(result *Result, err error) {
+	if result == nil || err == nil {
+		return
+	}
+	result.Error = &Error{Message: err.Error()}
+	if se, ok := errors.AsType[cliproxyexecutor.StatusError](err); ok && se != nil {
+		result.Error.HTTPStatus = se.StatusCode()
+	}
+	if ra := retryAfterFromError(err); ra != nil {
+		result.RetryAfter = ra
+	}
+}
+
+func (m *Manager) refreshAuthAfterAccessTokenFailure(ctx context.Context, auth *Auth, resultErr *Error) (*Auth, bool) {
+	if m == nil || !shouldAttemptAccessTokenRefresh(auth, resultErr) {
+		return nil, false
+	}
+	authID := strings.TrimSpace(auth.ID)
+	if authID == "" {
+		return nil, false
+	}
+	m.mu.Lock()
+	if current := m.auths[authID]; current != nil {
+		current.NextRefreshAfter = time.Time{}
+		if current.Metadata == nil {
+			current.Metadata = make(map[string]any)
+		}
+		current.Metadata[MetadataCodexForceTokenRefreshKey] = true
+		m.auths[authID] = current
+	}
+	m.mu.Unlock()
+
+	m.refreshAuthWithLimit(ctx, authID)
+	refreshed, ok := m.GetByID(authID)
+	if !ok || refreshed == nil || refreshed.Disabled || refreshed.Status == StatusDisabled {
+		return nil, false
+	}
+	return refreshed, true
+}
+
 func isTransientCooldownError(err error) bool {
 	return isTransientCooldownStatus(statusCodeFromError(err))
 }
@@ -3306,8 +3682,6 @@ func terminalAuthFailureReason(resultErr *Error) string {
 		"unauthorized",
 		"refresh_token_reused",
 		"refresh token has already been used",
-		"token_revoked",
-		"token_invalidated",
 		"account_deactivated",
 		"must be a member of an organization to use the api",
 		"encountered invalidated oauth token for user",
@@ -3347,6 +3721,21 @@ func isRefreshTokenReusedResultError(resultErr *Error) bool {
 	return strings.Contains(lower, "refresh_token_reused") || strings.Contains(lower, "refresh token has already been used")
 }
 
+func isAccessTokenRefreshableResultError(resultErr *Error) bool {
+	if resultErr == nil {
+		return false
+	}
+	lower := strings.ToLower(strings.TrimSpace(resultErr.Message))
+	return strings.Contains(lower, "token_revoked") || strings.Contains(lower, "token_invalidated")
+}
+
+func shouldAttemptAccessTokenRefresh(auth *Auth, resultErr *Error) bool {
+	if !isCodexAuth(auth) || isRefreshTokenReusedResultError(resultErr) {
+		return false
+	}
+	return isAccessTokenRefreshableResultError(resultErr)
+}
+
 func shouldDeleteRevokedAuth(auth *Auth, resultErr *Error) (bool, string) {
 	if !isCodexAuth(auth) || !hasPersistedAuthRecord(auth) {
 		return false, ""
@@ -3366,6 +3755,12 @@ func shouldDeleteRevokedAuth(auth *Auth, resultErr *Error) (bool, string) {
 
 func shouldDisableRevokedAuth(auth *Auth, resultErr *Error) (bool, string) {
 	if !isCodexAuth(auth) || auth == nil {
+		return false, ""
+	}
+	if shouldAttemptAccessTokenRefresh(auth, resultErr) {
+		return false, ""
+	}
+	if isRefreshTokenReusedResultError(resultErr) && hasPersistedAuthRecord(auth) {
 		return false, ""
 	}
 	reason := terminalAuthFailureReason(resultErr)
@@ -3582,6 +3977,117 @@ func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Durati
 		if auth.StatusMessage == "" {
 			auth.StatusMessage = "request failed"
 		}
+	}
+}
+
+func applyCodexFiveHourQuotaRest(auth *Auth, now time.Time) {
+	if auth == nil || !isCodexAuth(auth) {
+		return
+	}
+	ratio, ok := codexFiveHourRemainingRatio(auth)
+	if !ok {
+		return
+	}
+	if ratio < codexFiveHourQuotaRestThreshold {
+		next := codexFiveHourResetAt(auth)
+		if next.IsZero() || !next.After(now) {
+			next = now.Add(codexColdRefreshInterval)
+		}
+		auth.Unavailable = true
+		auth.Status = StatusError
+		auth.StatusMessage = "codex_5h_quota_low: remaining_ratio=" + strconv.FormatFloat(ratio, 'f', 2, 64)
+		auth.NextRetryAfter = next
+		auth.Quota = QuotaState{
+			Exceeded:      true,
+			Reason:        codexFiveHourQuotaLowReason,
+			NextRecoverAt: next,
+			UpdatedAt:     now,
+		}
+		return
+	}
+	if auth.Quota.Exceeded && auth.Quota.Reason == codexFiveHourQuotaLowReason {
+		auth.Unavailable = false
+		auth.Status = StatusActive
+		auth.StatusMessage = ""
+		auth.NextRetryAfter = time.Time{}
+		auth.Quota = QuotaState{}
+	}
+}
+
+func codexFiveHourRemainingRatio(auth *Auth) (float64, bool) {
+	if auth == nil || len(auth.Metadata) == 0 {
+		return 0, false
+	}
+	return floatFromMetadata(auth.Metadata,
+		MetadataCodexFiveHourQuotaRemainingRatioKey,
+		"codex_5h_remaining_ratio",
+		"five_hour_remaining_ratio",
+		"5h_remaining_ratio",
+	)
+}
+
+func codexFiveHourResetAt(auth *Auth) time.Time {
+	if auth == nil || len(auth.Metadata) == 0 {
+		return time.Time{}
+	}
+	if ts, ok := lookupMetadataTime(auth.Metadata,
+		MetadataCodexFiveHourQuotaResetAtKey,
+		"codex_5h_reset_at",
+		"five_hour_reset_at",
+		"5h_reset_at",
+	); ok {
+		return ts
+	}
+	return time.Time{}
+}
+
+func floatFromMetadata(meta map[string]any, keys ...string) (float64, bool) {
+	for _, key := range keys {
+		if val, ok := meta[key]; ok {
+			if parsed, okParse := parseFloatAny(val); okParse {
+				return parsed, true
+			}
+		}
+	}
+	return 0, false
+}
+
+func parseFloatAny(val any) (float64, bool) {
+	switch typed := val.(type) {
+	case float64:
+		return typed, true
+	case float32:
+		return float64(typed), true
+	case int:
+		return float64(typed), true
+	case int32:
+		return float64(typed), true
+	case int64:
+		return float64(typed), true
+	case uint:
+		return float64(typed), true
+	case uint32:
+		return float64(typed), true
+	case uint64:
+		return float64(typed), true
+	case json.Number:
+		parsed, err := typed.Float64()
+		if err != nil {
+			return 0, false
+		}
+		return parsed, true
+	case string:
+		trimmed := strings.TrimSpace(typed)
+		if trimmed == "" {
+			return 0, false
+		}
+		parsed, err := strconv.ParseFloat(trimmed, 64)
+		if err != nil {
+			return 0, false
+		}
+		return parsed, true
+	default:
+		return 0, false
 	}
 }
 
@@ -4110,13 +4616,21 @@ func (m *Manager) snapshotAuths() []*Auth {
 }
 
 func (m *Manager) shouldRefresh(a *Auth, now time.Time) bool {
-	if a == nil || a.Disabled {
+	if a == nil {
 		return false
 	}
 	if hasRevokedAuthTombstoneMemory(a, now) {
 		return false
 	}
 	if !a.NextRefreshAfter.IsZero() && now.Before(a.NextRefreshAfter) {
+		return false
+	}
+	if isCodexAuth(a) {
+		if m.shouldRefreshCodexQuotaProbe(a, now) {
+			return true
+		}
+	}
+	if a.Disabled {
 		return false
 	}
 	if evaluator, ok := a.Runtime.(RefreshEvaluator); ok && evaluator != nil {
@@ -4165,6 +4679,52 @@ func (m *Manager) shouldRefresh(a *Auth, now time.Time) bool {
 		return now.Sub(lastRefresh) >= *lead
 	}
 	return true
+}
+
+func (m *Manager) shouldRefreshCodexQuotaProbe(a *Auth, now time.Time) bool {
+	if a == nil || !isCodexAuth(a) {
+		return false
+	}
+	lastRefresh := effectiveLastRefresh(a)
+	interval := codexHotRefreshInterval
+	if codexAuthNeedsColdRefresh(a, now) {
+		interval = codexColdRefreshInterval
+	} else if m.authDispatchCount(a.ID, now) >= codexFrequentActivityThreshold {
+		interval = codexFrequentRefreshInterval
+	}
+	if lastRefresh.IsZero() {
+		return true
+	}
+	return now.Sub(lastRefresh) >= interval
+}
+
+func codexAuthNeedsColdRefresh(a *Auth, now time.Time) bool {
+	if a == nil {
+		return false
+	}
+	if a.Disabled || a.Status == StatusDisabled {
+		return true
+	}
+	if a.Quota.Exceeded {
+		return true
+	}
+	if a.Unavailable && (!a.NextRetryAfter.IsZero() || a.Status == StatusError) {
+		return true
+	}
+	return false
+}
+
+func effectiveLastRefresh(a *Auth) time.Time {
+	if a == nil {
+		return time.Time{}
+	}
+	lastRefresh := a.LastRefreshedAt
+	if lastRefresh.IsZero() {
+		if ts, ok := authLastRefreshTimestamp(a); ok {
+			lastRefresh = ts
+		}
+	}
+	return lastRefresh
 }
 
 func authPreferredInterval(a *Auth) time.Duration {
@@ -4321,7 +4881,13 @@ func (m *Manager) markRefreshPending(id string, now time.Time) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	auth, ok := m.auths[id]
-	if !ok || auth == nil || auth.Disabled {
+	if !ok || auth == nil {
+		return false
+	}
+	if hasRevokedAuthTombstoneMemory(auth, now) {
+		return false
+	}
+	if auth.Disabled && !(isCodexAuth(auth) && codexAuthNeedsColdRefresh(auth, now)) {
 		return false
 	}
 	if !auth.NextRefreshAfter.IsZero() && now.Before(auth.NextRefreshAfter) {
@@ -4503,6 +5069,7 @@ func (m *Manager) refreshAuth(ctx context.Context, id string) {
 	if updated.Runtime == nil {
 		updated.Runtime = auth.Runtime
 	}
+	applyCodexFiveHourQuotaRest(updated, now)
 	updated.LastRefreshedAt = now
 	updated.NextRefreshAfter = time.Time{}
 	updated.LastError = nil

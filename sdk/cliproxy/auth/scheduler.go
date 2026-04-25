@@ -6,6 +6,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/performance"
@@ -38,16 +39,48 @@ type authScheduler struct {
 	mu                       sync.Mutex
 	strategy                 schedulerStrategy
 	providers                map[string]*providerScheduler
+	providerIndexValue       atomic.Value
 	authProviders            map[string]string
-	mixedCursors             map[string]int
-	inflight                 map[string]int
+	mixedCursorsMu           sync.Mutex
+	mixedCursors             map[string]*schedulerMixedCursor
+	inflight                 schedulerInflightMap
+	lastSelectionsMu         sync.Mutex
 	lastSelections           map[string]string
 	performanceRoutingConfig performance.Config
+	performanceRoutingValue  atomic.Value
 	performanceScorer        PerformanceScorer
+	performanceScorerValue   atomic.Value
+	strategyValue            atomic.Int32
+}
+
+type schedulerInflightCounter struct {
+	value atomic.Int64
+}
+
+type schedulerProviderIndex struct {
+	providers     map[string]*providerScheduler
+	authProviders map[string]string
+}
+
+type schedulerMixedCursor struct {
+	mu    sync.Mutex
+	value int
+}
+
+const schedulerInflightShardCount = 64
+
+type schedulerInflightMap struct {
+	shards [schedulerInflightShardCount]schedulerInflightShard
+}
+
+type schedulerInflightShard struct {
+	mu       sync.RWMutex
+	counters map[string]*schedulerInflightCounter
 }
 
 // providerScheduler stores auth metadata and model shards for a single provider.
 type providerScheduler struct {
+	mu          sync.Mutex
 	providerKey string
 	auths       map[string]*scheduledAuthMeta
 	modelShards map[string]*modelScheduler
@@ -172,15 +205,22 @@ func normalizeCursor(cursor, size int) int {
 
 // newAuthScheduler constructs an empty scheduler configured for the supplied selector strategy.
 func newAuthScheduler(selector Selector) *authScheduler {
-	return &authScheduler{
+	scheduler := &authScheduler{
 		strategy:                 selectorStrategy(selector),
 		providers:                make(map[string]*providerScheduler),
 		authProviders:            make(map[string]string),
-		mixedCursors:             make(map[string]int),
-		inflight:                 make(map[string]int),
+		mixedCursors:             make(map[string]*schedulerMixedCursor),
 		lastSelections:           make(map[string]string),
 		performanceRoutingConfig: performance.DefaultConfig(),
 	}
+	scheduler.strategyValue.Store(int32(scheduler.strategy))
+	scheduler.performanceRoutingValue.Store(performance.DefaultConfig())
+	scheduler.performanceScorerValue.Store(performanceScorerHolder{})
+	scheduler.providerIndexValue.Store(schedulerProviderIndex{
+		providers:     map[string]*providerScheduler{},
+		authProviders: map[string]string{},
+	})
+	return scheduler
 }
 
 // selectorStrategy maps a selector implementation to the scheduler semantics it should emulate.
@@ -203,7 +243,8 @@ func (s *authScheduler) setSelector(selector Selector) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.strategy = selectorStrategy(selector)
-	clear(s.mixedCursors)
+	s.strategyValue.Store(int32(s.strategy))
+	s.clearMixedCursors()
 }
 
 func (s *authScheduler) setPerformanceRoutingConfig(cfg performance.Config) {
@@ -213,6 +254,7 @@ func (s *authScheduler) setPerformanceRoutingConfig(cfg performance.Config) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.performanceRoutingConfig = performance.NormalizeConfig(cfg)
+	s.performanceRoutingValue.Store(s.performanceRoutingConfig)
 }
 
 func (s *authScheduler) setPerformanceScorer(scorer PerformanceScorer) {
@@ -222,6 +264,141 @@ func (s *authScheduler) setPerformanceScorer(scorer PerformanceScorer) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.performanceScorer = scorer
+	s.performanceScorerValue.Store(performanceScorerHolder{scorer: scorer})
+}
+
+func (s *authScheduler) currentStrategy() schedulerStrategy {
+	if s == nil {
+		return schedulerStrategyRoundRobin
+	}
+	return schedulerStrategy(s.strategyValue.Load())
+}
+
+func (s *authScheduler) currentPerformanceRoutingConfig() performance.Config {
+	if s == nil {
+		return performance.DefaultConfig()
+	}
+	if value := s.performanceRoutingValue.Load(); value != nil {
+		if cfg, ok := value.(performance.Config); ok {
+			return cfg
+		}
+	}
+	return performance.DefaultConfig()
+}
+
+func (s *authScheduler) currentPerformanceScorer() PerformanceScorer {
+	if s == nil {
+		return nil
+	}
+	if value := s.performanceScorerValue.Load(); value != nil {
+		if holder, ok := value.(performanceScorerHolder); ok {
+			return holder.scorer
+		}
+	}
+	return nil
+}
+
+func (s *authScheduler) publishProviderIndexLocked() {
+	if s == nil {
+		return
+	}
+	next := make(map[string]*providerScheduler, len(s.providers))
+	for providerKey, providerState := range s.providers {
+		if providerKey != "" && providerState != nil {
+			next[providerKey] = providerState
+		}
+	}
+	nextAuthProviders := make(map[string]string, len(s.authProviders))
+	for authID, providerKey := range s.authProviders {
+		if authID != "" && providerKey != "" {
+			nextAuthProviders[authID] = providerKey
+		}
+	}
+	s.providerIndexValue.Store(schedulerProviderIndex{
+		providers:     next,
+		authProviders: nextAuthProviders,
+	})
+}
+
+func (s *authScheduler) loadProvider(providerKey string) *providerScheduler {
+	if s == nil || providerKey == "" {
+		return nil
+	}
+	value := s.providerIndexValue.Load()
+	index, ok := value.(schedulerProviderIndex)
+	if !ok || len(index.providers) == 0 {
+		return nil
+	}
+	return index.providers[providerKey]
+}
+
+func (s *authScheduler) loadAuthProvider(authID string) string {
+	if s == nil || authID == "" {
+		return ""
+	}
+	value := s.providerIndexValue.Load()
+	index, ok := value.(schedulerProviderIndex)
+	if !ok || len(index.authProviders) == 0 {
+		return ""
+	}
+	return index.authProviders[authID]
+}
+
+func (s *authScheduler) mixedCursor(cursorKey string) *schedulerMixedCursor {
+	if s == nil || cursorKey == "" {
+		return nil
+	}
+	s.mixedCursorsMu.Lock()
+	defer s.mixedCursorsMu.Unlock()
+	if s.mixedCursors == nil {
+		s.mixedCursors = make(map[string]*schedulerMixedCursor)
+	}
+	cursor := s.mixedCursors[cursorKey]
+	if cursor == nil {
+		cursor = &schedulerMixedCursor{}
+		s.mixedCursors[cursorKey] = cursor
+	}
+	return cursor
+}
+
+func (s *authScheduler) clearMixedCursors() {
+	if s == nil {
+		return
+	}
+	s.mixedCursorsMu.Lock()
+	s.mixedCursors = make(map[string]*schedulerMixedCursor)
+	s.mixedCursorsMu.Unlock()
+}
+
+func lockProviderStates(providerStates []*providerScheduler) []*providerScheduler {
+	if len(providerStates) == 0 {
+		return nil
+	}
+	seen := make(map[*providerScheduler]struct{}, len(providerStates))
+	locked := make([]*providerScheduler, 0, len(providerStates))
+	for _, providerState := range providerStates {
+		if providerState == nil {
+			continue
+		}
+		if _, ok := seen[providerState]; ok {
+			continue
+		}
+		seen[providerState] = struct{}{}
+		locked = append(locked, providerState)
+	}
+	sort.Slice(locked, func(i, j int) bool {
+		return locked[i].providerKey < locked[j].providerKey
+	})
+	for _, providerState := range locked {
+		providerState.mu.Lock()
+	}
+	return locked
+}
+
+func unlockProviderStates(providerStates []*providerScheduler) {
+	for i := len(providerStates) - 1; i >= 0; i-- {
+		providerStates[i].mu.Unlock()
+	}
 }
 
 func schedulerInflightKey(providerKey, modelKey, authID string) string {
@@ -238,6 +415,81 @@ func schedulerSelectionKeySingle(providerKey, modelKey string) string {
 	return "single:" + providerKey + ":" + modelKey
 }
 
+func schedulerInflightShardIndex(key string) uint32 {
+	const prime32 = 16777619
+	hash := uint32(2166136261)
+	for i := 0; i < len(key); i++ {
+		hash ^= uint32(key[i])
+		hash *= prime32
+	}
+	return hash % schedulerInflightShardCount
+}
+
+func (m *schedulerInflightMap) acquire(key string) {
+	if key == "" {
+		return
+	}
+	shard := &m.shards[schedulerInflightShardIndex(key)]
+	shard.mu.RLock()
+	counter := shard.counters[key]
+	if counter != nil {
+		counter.value.Add(1)
+		shard.mu.RUnlock()
+		return
+	}
+	shard.mu.RUnlock()
+	shard.mu.Lock()
+	if shard.counters == nil {
+		shard.counters = make(map[string]*schedulerInflightCounter)
+	}
+	counter = shard.counters[key]
+	if counter == nil {
+		counter = &schedulerInflightCounter{}
+		shard.counters[key] = counter
+	}
+	counter.value.Add(1)
+	shard.mu.Unlock()
+}
+
+func (m *schedulerInflightMap) release(key string) {
+	if key == "" {
+		return
+	}
+	shard := &m.shards[schedulerInflightShardIndex(key)]
+	shard.mu.RLock()
+	counter := shard.counters[key]
+	shard.mu.RUnlock()
+	if counter == nil {
+		return
+	}
+	if counter.value.Add(-1) > 0 {
+		return
+	}
+	shard.mu.Lock()
+	if current := shard.counters[key]; current == counter && counter.value.Load() <= 0 {
+		delete(shard.counters, key)
+	}
+	shard.mu.Unlock()
+}
+
+func (m *schedulerInflightMap) count(key string) int {
+	if key == "" {
+		return 0
+	}
+	shard := &m.shards[schedulerInflightShardIndex(key)]
+	shard.mu.RLock()
+	counter := shard.counters[key]
+	shard.mu.RUnlock()
+	if counter == nil {
+		return 0
+	}
+	current := counter.value.Load()
+	if current <= 0 {
+		return 0
+	}
+	return int(current)
+}
+
 func (s *authScheduler) acquireInflight(provider, model, authID string) {
 	if s == nil {
 		return
@@ -246,12 +498,7 @@ func (s *authScheduler) acquireInflight(provider, model, authID string) {
 	if key == "" {
 		return
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.inflight == nil {
-		s.inflight = make(map[string]int)
-	}
-	s.inflight[key]++
+	s.inflight.acquire(key)
 }
 
 func (s *authScheduler) releaseInflight(provider, model, authID string) {
@@ -262,31 +509,26 @@ func (s *authScheduler) releaseInflight(provider, model, authID string) {
 	if key == "" {
 		return
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	current := s.inflight[key]
-	if current <= 1 {
-		delete(s.inflight, key)
-		return
-	}
-	s.inflight[key] = current - 1
+	s.inflight.release(key)
 }
 
 func (s *authScheduler) inflightCountLocked(providerKey, modelKey, authID string) int {
-	if s == nil || len(s.inflight) == 0 {
+	if s == nil {
 		return 0
 	}
 	key := schedulerInflightKey(providerKey, modelKey, authID)
 	if key == "" {
 		return 0
 	}
-	return s.inflight[key]
+	return s.inflight.count(key)
 }
 
 func (s *authScheduler) logFillFirstSelectionSwitchLocked(ctx context.Context, routeKey string, providerKey string, modelKey string, shard *modelScheduler, picked *Auth, selectionAttempt int) {
 	if s == nil || picked == nil || routeKey == "" {
 		return
 	}
+	s.lastSelectionsMu.Lock()
+	defer s.lastSelectionsMu.Unlock()
 	previousAuthID := strings.TrimSpace(s.lastSelections[routeKey])
 	s.lastSelections[routeKey] = picked.ID
 	if previousAuthID == "" || previousAuthID == picked.ID {
@@ -319,11 +561,12 @@ func (s *authScheduler) rebuild(auths []*Auth) {
 	defer s.mu.Unlock()
 	s.providers = make(map[string]*providerScheduler)
 	s.authProviders = make(map[string]string)
-	s.mixedCursors = make(map[string]int)
+	s.clearMixedCursors()
 	now := time.Now()
 	for _, auth := range auths {
 		s.upsertAuthLocked(auth, now)
 	}
+	s.publishProviderIndexLocked()
 }
 
 // upsertAuth incrementally synchronizes one auth into the scheduler.
@@ -333,7 +576,9 @@ func (s *authScheduler) upsertAuth(auth *Auth) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.upsertAuthLocked(auth, time.Now())
+	if s.upsertAuthLocked(auth, time.Now()) {
+		s.publishProviderIndexLocked()
+	}
 }
 
 // removeAuth deletes one auth from every scheduler shard that references it.
@@ -347,7 +592,9 @@ func (s *authScheduler) removeAuth(authID string) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.removeAuthLocked(authID)
+	if s.removeAuthLocked(authID) {
+		s.publishProviderIndexLocked()
+	}
 }
 
 // pickSingle returns the next auth for a single provider/model request using scheduler state.
@@ -359,17 +606,17 @@ func (s *authScheduler) pickSingle(ctx context.Context, provider, model string, 
 	modelKey := canonicalModelKey(model)
 	pinnedAuthID := pinnedAuthIDFromMetadata(opts.Metadata)
 	preferWebsocket := cliproxyexecutor.DownstreamWebsocket(ctx) && providerKey == "codex" && pinnedAuthID == ""
-	strategy := s.strategy
+	strategy := s.currentStrategy()
 	if preferBestAuthFromMetadata(opts.Metadata) {
 		strategy = schedulerStrategyFillFirst
 	}
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	providerState := s.providers[providerKey]
+	providerState := s.loadProvider(providerKey)
 	if providerState == nil {
 		return nil, &Error{Code: "auth_not_found", Message: "no auth available"}
 	}
+	providerState.mu.Lock()
+	defer providerState.mu.Unlock()
 	shard := providerState.ensureModelLocked(modelKey, time.Now())
 	if shard == nil {
 		return nil, &Error{Code: "auth_not_found", Message: "no auth available"}
@@ -394,8 +641,8 @@ func (s *authScheduler) pickSingle(ctx context.Context, provider, model string, 
 		}
 		return s.inflightCountLocked(providerKey, modelKey, entry.auth.ID)
 	}
-	performanceCfg := s.performanceRoutingConfig
-	performanceScorer := s.performanceScorer
+	performanceCfg := s.currentPerformanceRoutingConfig()
+	performanceScorer := s.currentPerformanceScorer()
 	selectionAttempt := len(tried) + 1
 	if strategy == schedulerStrategyFillFirst {
 		priorityReady, okPriority := shard.highestReadyPriorityLocked(preferWebsocket, predicate)
@@ -437,25 +684,25 @@ func (s *authScheduler) pickMixed(ctx context.Context, providers []string, model
 		return picked, providerKey, nil
 	}
 	pinnedAuthID := pinnedAuthIDFromMetadata(opts.Metadata)
-	strategy := s.strategy
+	strategy := s.currentStrategy()
 	if preferBestAuthFromMetadata(opts.Metadata) {
 		strategy = schedulerStrategyFillFirst
 	}
 	modelKey := canonicalModelKey(model)
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	performanceCfg := s.performanceRoutingConfig
-	performanceScorer := s.performanceScorer
+	performanceCfg := s.currentPerformanceRoutingConfig()
+	performanceScorer := s.currentPerformanceScorer()
 	if pinnedAuthID != "" {
-		providerKey := s.authProviders[pinnedAuthID]
+		providerKey := s.loadAuthProvider(pinnedAuthID)
 		if providerKey == "" || !containsProvider(normalized, providerKey) {
 			return nil, "", &Error{Code: "auth_not_found", Message: "no auth available"}
 		}
-		providerState := s.providers[providerKey]
+		providerState := s.loadProvider(providerKey)
 		if providerState == nil {
 			return nil, "", &Error{Code: "auth_not_found", Message: "no auth available"}
 		}
+		providerState.mu.Lock()
+		defer providerState.mu.Unlock()
 		shard := providerState.ensureModelLocked(modelKey, time.Now())
 		predicate := func(entry *scheduledAuth) bool {
 			if entry == nil || entry.auth == nil || entry.auth.ID != pinnedAuthID {
@@ -484,8 +731,14 @@ func (s *authScheduler) pickMixed(ctx context.Context, providers []string, model
 	bestPriority := 0
 	hasCandidate := false
 	now := time.Now()
+	providerStates := make([]*providerScheduler, len(normalized))
 	for providerIndex, providerKey := range normalized {
-		providerState := s.providers[providerKey]
+		providerStates[providerIndex] = s.loadProvider(providerKey)
+	}
+	lockedProviders := lockProviderStates(providerStates)
+	defer unlockProviderStates(lockedProviders)
+	for providerIndex := range normalized {
+		providerState := providerStates[providerIndex]
 		if providerState == nil {
 			continue
 		}
@@ -504,7 +757,7 @@ func (s *authScheduler) pickMixed(ctx context.Context, providers []string, model
 		}
 	}
 	if !hasCandidate {
-		return nil, "", s.mixedUnavailableErrorLocked(normalized, model, tried)
+		return nil, "", s.mixedUnavailableErrorLocked(providerStates, normalized, model, tried)
 	}
 
 	if strategy == schedulerStrategyFillFirst {
@@ -524,7 +777,7 @@ func (s *authScheduler) pickMixed(ctx context.Context, providers []string, model
 				return picked, providerKey, nil
 			}
 		}
-		return nil, "", s.mixedUnavailableErrorLocked(normalized, model, tried)
+		return nil, "", s.mixedUnavailableErrorLocked(providerStates, normalized, model, tried)
 	}
 
 	cursorKey := strings.Join(normalized, ",") + ":" + modelKey
@@ -541,10 +794,16 @@ func (s *authScheduler) pickMixed(ctx context.Context, providers []string, model
 		segmentEnds[providerIndex] = totalWeight
 	}
 	if totalWeight == 0 {
-		return nil, "", s.mixedUnavailableErrorLocked(normalized, model, tried)
+		return nil, "", s.mixedUnavailableErrorLocked(providerStates, normalized, model, tried)
 	}
 
-	startSlot := s.mixedCursors[cursorKey] % totalWeight
+	cursor := s.mixedCursor(cursorKey)
+	if cursor == nil {
+		return nil, "", &Error{Code: "auth_unavailable", Message: "no auth available"}
+	}
+	cursor.mu.Lock()
+	defer cursor.mu.Unlock()
+	startSlot := cursor.value % totalWeight
 	startProviderIndex := -1
 	for providerIndex := range normalized {
 		if weights[providerIndex] == 0 {
@@ -556,7 +815,7 @@ func (s *authScheduler) pickMixed(ctx context.Context, providers []string, model
 		}
 	}
 	if startProviderIndex < 0 {
-		return nil, "", s.mixedUnavailableErrorLocked(normalized, model, tried)
+		return nil, "", s.mixedUnavailableErrorLocked(providerStates, normalized, model, tried)
 	}
 
 	slot := startSlot
@@ -583,20 +842,23 @@ func (s *authScheduler) pickMixed(ctx context.Context, providers []string, model
 		if picked == nil {
 			continue
 		}
-		s.mixedCursors[cursorKey] = slot + 1
+		cursor.value = slot + 1
 		return picked, providerKey, nil
 	}
-	return nil, "", s.mixedUnavailableErrorLocked(normalized, model, tried)
+	return nil, "", s.mixedUnavailableErrorLocked(providerStates, normalized, model, tried)
 }
 
 // mixedUnavailableErrorLocked synthesizes the mixed-provider cooldown or unavailable error.
-func (s *authScheduler) mixedUnavailableErrorLocked(providers []string, model string, tried map[string]struct{}) error {
+func (s *authScheduler) mixedUnavailableErrorLocked(providerStates []*providerScheduler, providers []string, model string, tried map[string]struct{}) error {
 	now := time.Now()
 	total := 0
 	cooldownCount := 0
 	earliest := time.Time{}
-	for _, providerKey := range providers {
-		providerState := s.providers[providerKey]
+	for providerIndex := range providers {
+		if providerIndex >= len(providerStates) {
+			continue
+		}
+		providerState := providerStates[providerIndex]
 		if providerState == nil {
 			continue
 		}
@@ -679,41 +941,57 @@ func preferBestAuthFromMetadata(meta map[string]any) bool {
 }
 
 // upsertAuthLocked updates one auth in-place while the scheduler mutex is held.
-func (s *authScheduler) upsertAuthLocked(auth *Auth, now time.Time) {
+func (s *authScheduler) upsertAuthLocked(auth *Auth, now time.Time) bool {
 	if auth == nil {
-		return
+		return false
 	}
 	authID := strings.TrimSpace(auth.ID)
 	providerKey := strings.ToLower(strings.TrimSpace(auth.Provider))
 	if authID == "" || providerKey == "" || auth.Disabled {
-		s.removeAuthLocked(authID)
-		return
+		return s.removeAuthLocked(authID)
 	}
+	changedIndex := false
 	if previousProvider := s.authProviders[authID]; previousProvider != "" && previousProvider != providerKey {
 		if previousState := s.providers[previousProvider]; previousState != nil {
+			previousState.mu.Lock()
 			previousState.removeAuthLocked(authID)
+			previousState.mu.Unlock()
 		}
+		changedIndex = true
+	} else if previousProvider == "" {
+		changedIndex = true
 	}
 	meta := buildScheduledAuthMeta(auth)
 	s.authProviders[authID] = providerKey
-	s.ensureProviderLocked(providerKey).upsertAuthLocked(meta, now)
+	providerState, createdProvider := s.ensureProviderLocked(providerKey)
+	if createdProvider {
+		changedIndex = true
+	}
+	providerState.mu.Lock()
+	defer providerState.mu.Unlock()
+	providerState.upsertAuthLocked(meta, now)
+	return changedIndex
 }
 
 // removeAuthLocked removes one auth from the scheduler while the scheduler mutex is held.
-func (s *authScheduler) removeAuthLocked(authID string) {
+func (s *authScheduler) removeAuthLocked(authID string) bool {
 	if authID == "" {
-		return
+		return false
 	}
 	if providerKey := s.authProviders[authID]; providerKey != "" {
 		if providerState := s.providers[providerKey]; providerState != nil {
+			providerState.mu.Lock()
 			providerState.removeAuthLocked(authID)
+			providerState.mu.Unlock()
 		}
 		delete(s.authProviders, authID)
+		return true
 	}
+	return false
 }
 
 // ensureProviderLocked returns the provider scheduler for providerKey, creating it when needed.
-func (s *authScheduler) ensureProviderLocked(providerKey string) *providerScheduler {
+func (s *authScheduler) ensureProviderLocked(providerKey string) (*providerScheduler, bool) {
 	if s.providers == nil {
 		s.providers = make(map[string]*providerScheduler)
 	}
@@ -725,8 +1003,9 @@ func (s *authScheduler) ensureProviderLocked(providerKey string) *providerSchedu
 			modelShards: make(map[string]*modelScheduler),
 		}
 		s.providers[providerKey] = providerState
+		return providerState, true
 	}
-	return providerState
+	return providerState, false
 }
 
 // buildScheduledAuthMeta extracts the scheduling metadata needed for shard bookkeeping.
@@ -811,6 +1090,7 @@ func (p *providerScheduler) ensureModelLocked(modelKey string, now time.Time) *m
 		shard.promoteExpiredLocked(now)
 		return shard
 	}
+	p.refreshSupportedModelsLocked()
 	shard := &modelScheduler{
 		modelKey:        modelKey,
 		entries:         make(map[string]*scheduledAuth),
@@ -824,6 +1104,18 @@ func (p *providerScheduler) ensureModelLocked(modelKey string, now time.Time) *m
 	}
 	p.modelShards[modelKey] = shard
 	return shard
+}
+
+func (p *providerScheduler) refreshSupportedModelsLocked() {
+	if p == nil || len(p.auths) == 0 {
+		return
+	}
+	for authID, meta := range p.auths {
+		if meta == nil || strings.TrimSpace(authID) == "" {
+			continue
+		}
+		meta.supportedModelSet = supportedModelSetForAuth(authID)
+	}
 }
 
 // supportsModel reports whether the auth metadata currently supports modelKey.

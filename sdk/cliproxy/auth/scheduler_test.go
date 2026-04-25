@@ -3,6 +3,7 @@ package auth
 import (
 	"bytes"
 	"context"
+	"errors"
 	"net/http"
 	"strings"
 	"sync"
@@ -39,15 +40,17 @@ func (schedulerTestExecutor) HttpRequest(ctx context.Context, auth *Auth, req *h
 }
 
 type blockingSelectionExecutor struct {
-	mu        sync.Mutex
-	started   map[string]chan struct{}
-	blockExec map[string]chan struct{}
+	mu             sync.Mutex
+	started        map[string]chan struct{}
+	blockExec      map[string]chan struct{}
+	blockImageOnly map[string]bool
 }
 
 func newBlockingSelectionExecutor() *blockingSelectionExecutor {
 	return &blockingSelectionExecutor{
-		started:   make(map[string]chan struct{}),
-		blockExec: make(map[string]chan struct{}),
+		started:        make(map[string]chan struct{}),
+		blockExec:      make(map[string]chan struct{}),
+		blockImageOnly: make(map[string]bool),
 	}
 }
 
@@ -62,6 +65,7 @@ func (e *blockingSelectionExecutor) Execute(ctx context.Context, auth *Auth, req
 	e.mu.Lock()
 	started := e.started[authID]
 	block := e.blockExec[authID]
+	imageOnly := e.blockImageOnly[authID]
 	e.mu.Unlock()
 
 	if started != nil {
@@ -71,7 +75,7 @@ func (e *blockingSelectionExecutor) Execute(ctx context.Context, auth *Auth, req
 			close(started)
 		}
 	}
-	if block != nil {
+	if block != nil && (!imageOnly || imageGenerationRequestFromMetadata(opts.Metadata)) {
 		select {
 		case <-block:
 		case <-ctx.Done():
@@ -96,6 +100,33 @@ func (e *blockingSelectionExecutor) CountTokens(ctx context.Context, auth *Auth,
 
 func (e *blockingSelectionExecutor) HttpRequest(ctx context.Context, auth *Auth, req *http.Request) (*http.Response, error) {
 	return nil, nil
+}
+
+type imageQuotaErrorExecutor struct{}
+
+func (e *imageQuotaErrorExecutor) Identifier() string { return "codex" }
+
+func (e *imageQuotaErrorExecutor) Execute(context.Context, *Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	return cliproxyexecutor.Response{}, &Error{
+		HTTPStatus: http.StatusTooManyRequests,
+		Message:    `{"error":{"type":"usage_limit_reached","message":"Image generation usage limit reached","resets_in_seconds":3600}}`,
+	}
+}
+
+func (e *imageQuotaErrorExecutor) ExecuteStream(context.Context, *Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (e *imageQuotaErrorExecutor) Refresh(_ context.Context, auth *Auth) (*Auth, error) {
+	return auth, nil
+}
+
+func (e *imageQuotaErrorExecutor) CountTokens(context.Context, *Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	return cliproxyexecutor.Response{}, errors.New("not implemented")
+}
+
+func (e *imageQuotaErrorExecutor) HttpRequest(context.Context, *Auth, *http.Request) (*http.Response, error) {
+	return nil, errors.New("not implemented")
 }
 
 type trackingSelector struct {
@@ -598,6 +629,177 @@ func TestSchedulerPick_RoundRobinPrefersLowerInflightBeforeStaticOrder(t *testin
 	}
 }
 
+func TestSchedulerInflightTrackingDoesNotWaitForSchedulerLock(t *testing.T) {
+	t.Parallel()
+
+	scheduler := newAuthScheduler(&RoundRobinSelector{})
+	scheduler.mu.Lock()
+	defer scheduler.mu.Unlock()
+
+	acquired := make(chan struct{})
+	go func() {
+		scheduler.acquireInflight("codex", "gpt-5.4", "auth-a")
+		close(acquired)
+	}()
+
+	select {
+	case <-acquired:
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("acquireInflight waited on scheduler.mu")
+	}
+
+	released := make(chan struct{})
+	go func() {
+		scheduler.releaseInflight("codex", "gpt-5.4", "auth-a")
+		close(released)
+	}()
+
+	select {
+	case <-released:
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("releaseInflight waited on scheduler.mu")
+	}
+}
+
+func TestSchedulerPickSingleExistingShardDoesNotWaitForGlobalLock(t *testing.T) {
+	t.Parallel()
+
+	scheduler := newSchedulerForTest(
+		&RoundRobinSelector{},
+		&Auth{ID: "auth-a", Provider: "codex"},
+		&Auth{ID: "auth-b", Provider: "codex"},
+	)
+
+	if got, errPick := scheduler.pickSingle(context.Background(), "codex", "", cliproxyexecutor.Options{}, nil); errPick != nil || got == nil {
+		t.Fatalf("warmup pickSingle() auth=%v err=%v", got, errPick)
+	}
+
+	scheduler.mu.Lock()
+	defer scheduler.mu.Unlock()
+
+	picked := make(chan *Auth, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		got, errPick := scheduler.pickSingle(context.Background(), "codex", "", cliproxyexecutor.Options{}, nil)
+		if errPick != nil {
+			errCh <- errPick
+			return
+		}
+		picked <- got
+	}()
+
+	select {
+	case errPick := <-errCh:
+		t.Fatalf("pickSingle() error = %v", errPick)
+	case got := <-picked:
+		if got == nil {
+			t.Fatal("pickSingle() auth = nil")
+		}
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("pickSingle() waited on scheduler.mu for an existing shard")
+	}
+}
+
+func TestSchedulerPickMixedExistingShardDoesNotWaitForGlobalLock(t *testing.T) {
+	t.Parallel()
+
+	scheduler := newSchedulerForTest(
+		&RoundRobinSelector{},
+		&Auth{ID: "gemini-a", Provider: "gemini"},
+		&Auth{ID: "claude-a", Provider: "claude"},
+	)
+
+	if got, provider, errPick := scheduler.pickMixed(context.Background(), []string{"gemini", "claude"}, "", cliproxyexecutor.Options{}, nil); errPick != nil || got == nil || provider == "" {
+		t.Fatalf("warmup pickMixed() auth=%v provider=%q err=%v", got, provider, errPick)
+	}
+
+	scheduler.mu.Lock()
+	defer scheduler.mu.Unlock()
+
+	picked := make(chan *Auth, 1)
+	providerCh := make(chan string, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		got, provider, errPick := scheduler.pickMixed(context.Background(), []string{"gemini", "claude"}, "", cliproxyexecutor.Options{}, nil)
+		if errPick != nil {
+			errCh <- errPick
+			return
+		}
+		providerCh <- provider
+		picked <- got
+	}()
+
+	select {
+	case errPick := <-errCh:
+		t.Fatalf("pickMixed() error = %v", errPick)
+	case got := <-picked:
+		provider := <-providerCh
+		if got == nil {
+			t.Fatal("pickMixed() auth = nil")
+		}
+		if provider == "" {
+			t.Fatal("pickMixed() provider = empty")
+		}
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("pickMixed() waited on scheduler.mu for existing shards")
+	}
+}
+
+func TestSchedulerProviderIndexPublishesIndependentSnapshots(t *testing.T) {
+	t.Parallel()
+
+	scheduler := newAuthScheduler(&RoundRobinSelector{})
+	initial := scheduler.providerIndexValue.Load().(schedulerProviderIndex).providers
+	if len(initial) != 0 {
+		t.Fatalf("initial provider index length = %d, want 0", len(initial))
+	}
+
+	scheduler.upsertAuth(&Auth{ID: "auth-a", Provider: "codex"})
+
+	if len(initial) != 0 {
+		t.Fatalf("initial provider index changed length = %d, want 0", len(initial))
+	}
+	next := scheduler.providerIndexValue.Load().(schedulerProviderIndex).providers
+	if len(next) != 1 {
+		t.Fatalf("published provider index length = %d, want 1", len(next))
+	}
+	if next["codex"] == nil {
+		t.Fatal("published provider index missing codex provider")
+	}
+	if _, errPick := scheduler.pickSingle(context.Background(), "codex", "", cliproxyexecutor.Options{}, nil); errPick != nil {
+		t.Fatalf("pickSingle() after upsertAuth error = %v", errPick)
+	}
+}
+
+func TestSchedulerRefreshesModelSupportWhenRegistryUpdatesAfterRegister(t *testing.T) {
+	t.Parallel()
+
+	manager := NewManager(nil, &RoundRobinSelector{}, nil)
+	if _, errRegister := manager.Register(context.Background(), &Auth{ID: "late-registry-auth-a", Provider: "gemini"}); errRegister != nil {
+		t.Fatalf("Register(auth-a) error = %v", errRegister)
+	}
+	if _, errRegister := manager.Register(context.Background(), &Auth{ID: "late-registry-auth-b", Provider: "gemini"}); errRegister != nil {
+		t.Fatalf("Register(auth-b) error = %v", errRegister)
+	}
+
+	reg := registry.GetGlobalRegistry()
+	model := "late-registry-model"
+	reg.RegisterClient("late-registry-auth-a", "gemini", []*registry.ModelInfo{{ID: model}})
+	reg.RegisterClient("late-registry-auth-b", "gemini", []*registry.ModelInfo{{ID: model}})
+	t.Cleanup(func() {
+		reg.UnregisterClient("late-registry-auth-a")
+		reg.UnregisterClient("late-registry-auth-b")
+	})
+
+	got, errPick := manager.scheduler.pickSingle(context.Background(), "gemini", model, cliproxyexecutor.Options{}, nil)
+	if errPick != nil {
+		t.Fatalf("scheduler.pickSingle() error = %v", errPick)
+	}
+	if got == nil || got.ID != "late-registry-auth-a" {
+		t.Fatalf("scheduler.pickSingle() auth = %v, want late-registry-auth-a", got)
+	}
+}
+
 func TestSchedulerPick_SkipsTriedAuthAndFallsThroughOrderedCandidates(t *testing.T) {
 	t.Parallel()
 
@@ -1008,5 +1210,229 @@ func TestManagerExecute_PrefersIdleAuthWhileAnotherAuthIsStillInflight(t *testin
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for first Execute() completion")
+	}
+}
+
+func TestManagerExecute_ImageGenerationUsesDifferentAuthWhileFirstAuthIsBusy(t *testing.T) {
+	t.Parallel()
+
+	manager := NewManager(nil, &RoundRobinSelector{}, nil)
+	executor := newBlockingSelectionExecutor()
+	executor.started["auth-a"] = make(chan struct{})
+	executor.blockExec["auth-a"] = make(chan struct{})
+	manager.RegisterExecutor(executor)
+
+	if _, errRegister := manager.Register(context.Background(), &Auth{ID: "auth-a", Provider: "gemini"}); errRegister != nil {
+		t.Fatalf("Register(auth-a) error = %v", errRegister)
+	}
+	if _, errRegister := manager.Register(context.Background(), &Auth{ID: "auth-b", Provider: "gemini"}); errRegister != nil {
+		t.Fatalf("Register(auth-b) error = %v", errRegister)
+	}
+
+	imageOpts := cliproxyexecutor.Options{
+		Metadata: map[string]any{
+			cliproxyexecutor.ImageGenerationRequestMetadataKey: true,
+		},
+	}
+
+	firstRespCh := make(chan cliproxyexecutor.Response, 1)
+	firstErrCh := make(chan error, 1)
+	go func() {
+		resp, errExecute := manager.Execute(context.Background(), []string{"gemini"}, cliproxyexecutor.Request{}, imageOpts)
+		if errExecute != nil {
+			firstErrCh <- errExecute
+			return
+		}
+		firstRespCh <- resp
+	}()
+
+	select {
+	case <-executor.started["auth-a"]:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for auth-a image generation to start")
+	}
+
+	secondResp, errExecute := manager.Execute(context.Background(), []string{"gemini"}, cliproxyexecutor.Request{}, imageOpts)
+	if errExecute != nil {
+		t.Fatalf("second image Execute() error = %v", errExecute)
+	}
+	if got := string(secondResp.Payload); got != "auth-b" {
+		t.Fatalf("second image Execute() payload = %q, want %q", got, "auth-b")
+	}
+
+	close(executor.blockExec["auth-a"])
+
+	select {
+	case errExecute := <-firstErrCh:
+		t.Fatalf("first image Execute() error = %v", errExecute)
+	case firstResp := <-firstRespCh:
+		if got := string(firstResp.Payload); got != "auth-a" {
+			t.Fatalf("first image Execute() payload = %q, want %q", got, "auth-a")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for first image Execute() completion")
+	}
+}
+
+func TestManagerExecute_ImageGenerationReturnsBusyWhenOnlyAuthIsBusy(t *testing.T) {
+	t.Parallel()
+
+	manager := NewManager(nil, &RoundRobinSelector{}, nil)
+	manager.SetRetryConfig(0, 5*time.Second, 5)
+	executor := newBlockingSelectionExecutor()
+	executor.started["auth-a"] = make(chan struct{})
+	executor.blockExec["auth-a"] = make(chan struct{})
+	manager.RegisterExecutor(executor)
+
+	if _, errRegister := manager.Register(context.Background(), &Auth{ID: "auth-a", Provider: "gemini"}); errRegister != nil {
+		t.Fatalf("Register(auth-a) error = %v", errRegister)
+	}
+
+	imageOpts := cliproxyexecutor.Options{
+		Metadata: map[string]any{
+			cliproxyexecutor.ImageGenerationRequestMetadataKey: true,
+		},
+	}
+
+	firstErrCh := make(chan error, 1)
+	go func() {
+		_, errExecute := manager.Execute(context.Background(), []string{"gemini"}, cliproxyexecutor.Request{}, imageOpts)
+		firstErrCh <- errExecute
+	}()
+
+	select {
+	case <-executor.started["auth-a"]:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for auth-a image generation to start")
+	}
+
+	_, errExecute := manager.Execute(context.Background(), []string{"gemini"}, cliproxyexecutor.Request{}, imageOpts)
+	if errExecute == nil {
+		t.Fatal("second image Execute() error = nil, want image auth busy")
+	}
+	var authErr *Error
+	if !errors.As(errExecute, &authErr) {
+		t.Fatalf("second image Execute() error type = %T, want *Error", errExecute)
+	}
+	if authErr.Code != "image_auth_busy" {
+		t.Fatalf("second image Execute() code = %q, want image_auth_busy", authErr.Code)
+	}
+	if authErr.StatusCode() != http.StatusServiceUnavailable {
+		t.Fatalf("second image Execute() status = %d, want %d", authErr.StatusCode(), http.StatusServiceUnavailable)
+	}
+	var headerErr interface{ Headers() http.Header }
+	if !errors.As(errExecute, &headerErr) {
+		t.Fatalf("second image Execute() error lacks Headers()")
+	}
+	if got := headerErr.Headers().Get("Retry-After"); got != "10" {
+		t.Fatalf("second image Execute() Retry-After = %q, want 10", got)
+	}
+
+	close(executor.blockExec["auth-a"])
+
+	select {
+	case errFirst := <-firstErrCh:
+		if errFirst != nil {
+			t.Fatalf("first image Execute() error = %v", errFirst)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for first image Execute() completion")
+	}
+}
+
+func TestManagerExecute_ImageGenerationUsageLimitTracksToolModel(t *testing.T) {
+	t.Parallel()
+
+	manager := NewManager(nil, &RoundRobinSelector{}, nil)
+	manager.SetRetryConfig(0, 5*time.Second, 5)
+	executor := &imageQuotaErrorExecutor{}
+	manager.RegisterExecutor(executor)
+
+	auth := &Auth{ID: "auth-image-quota", Provider: executor.Identifier()}
+	if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
+		t.Fatalf("Register auth: %v", errRegister)
+	}
+	registerSchedulerModels(t, executor.Identifier(), "gpt-5.4-mini", auth.ID)
+
+	opts := cliproxyexecutor.Options{
+		Metadata: map[string]any{
+			cliproxyexecutor.ImageGenerationRequestMetadataKey: true,
+			cliproxyexecutor.ImageGenerationModelMetadataKey:   "gpt-image-2",
+		},
+	}
+	req := cliproxyexecutor.Request{Model: "gpt-5.4-mini", Payload: []byte(`{"tools":[{"type":"image_generation","model":"gpt-image-2"}]}`)}
+	_, errExecute := manager.Execute(context.Background(), []string{executor.Identifier()}, req, opts)
+	if errExecute == nil {
+		t.Fatal("Execute() error = nil, want usage limit")
+	}
+
+	updated, ok := manager.GetByID(auth.ID)
+	if !ok {
+		t.Fatal("auth missing after Execute")
+	}
+	imageState := updated.ModelStates["gpt-image-2"]
+	if imageState == nil {
+		t.Fatalf("gpt-image-2 model state missing; states=%v", updated.ModelStates)
+	}
+	if !imageState.Quota.Exceeded {
+		t.Fatalf("gpt-image-2 quota exceeded = false; state=%+v", imageState)
+	}
+	if imageState.Quota.Reason != "usage_limit" {
+		t.Fatalf("gpt-image-2 quota reason = %q, want usage_limit", imageState.Quota.Reason)
+	}
+	if _, exists := updated.ModelStates["gpt-5.4-mini"]; exists {
+		t.Fatalf("route model state should not own image quota; states=%v", updated.ModelStates)
+	}
+}
+
+func TestManagerExecute_ImageGenerationBusyAuthStillAllowsNonImageRequest(t *testing.T) {
+	t.Parallel()
+
+	manager := NewManager(nil, &RoundRobinSelector{}, nil)
+	executor := newBlockingSelectionExecutor()
+	executor.started["auth-a"] = make(chan struct{})
+	executor.blockExec["auth-a"] = make(chan struct{})
+	executor.blockImageOnly["auth-a"] = true
+	manager.RegisterExecutor(executor)
+
+	if _, errRegister := manager.Register(context.Background(), &Auth{ID: "auth-a", Provider: "gemini"}); errRegister != nil {
+		t.Fatalf("Register(auth-a) error = %v", errRegister)
+	}
+
+	imageOpts := cliproxyexecutor.Options{
+		Metadata: map[string]any{
+			cliproxyexecutor.ImageGenerationRequestMetadataKey: true,
+		},
+	}
+
+	firstErrCh := make(chan error, 1)
+	go func() {
+		_, errExecute := manager.Execute(context.Background(), []string{"gemini"}, cliproxyexecutor.Request{}, imageOpts)
+		firstErrCh <- errExecute
+	}()
+
+	select {
+	case <-executor.started["auth-a"]:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for auth-a image generation to start")
+	}
+
+	normalResp, errExecute := manager.Execute(context.Background(), []string{"gemini"}, cliproxyexecutor.Request{}, cliproxyexecutor.Options{})
+	if errExecute != nil {
+		t.Fatalf("normal Execute() error = %v", errExecute)
+	}
+	if got := string(normalResp.Payload); got != "auth-a" {
+		t.Fatalf("normal Execute() payload = %q, want %q", got, "auth-a")
+	}
+
+	close(executor.blockExec["auth-a"])
+
+	select {
+	case errFirst := <-firstErrCh:
+		if errFirst != nil {
+			t.Fatalf("first image Execute() error = %v", errFirst)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for first image Execute() completion")
 	}
 }

@@ -2,7 +2,6 @@ package auth
 
 import (
 	"context"
-	"errors"
 	"net/http"
 	"testing"
 
@@ -36,7 +35,7 @@ func (e schedulerProviderTestExecutor) HttpRequest(ctx context.Context, auth *Au
 	return nil, nil
 }
 
-func TestManager_RefreshSchedulerEntry_RebuildsSupportedModelSetAfterModelRegistration(t *testing.T) {
+func TestManager_SchedulerRefreshesSupportedModelSetAfterModelRegistration(t *testing.T) {
 	ctx := context.Background()
 
 	testCases := []struct {
@@ -80,25 +79,21 @@ func TestManager_RefreshSchedulerEntry_RebuildsSupportedModelSetAfterModelRegist
 			registerSchedulerModels(t, "gemini", "scheduler-refresh-model", auth.ID)
 
 			got, errPick := manager.scheduler.pickSingle(ctx, "gemini", "scheduler-refresh-model", cliproxyexecutor.Options{}, nil)
-			var authErr *Error
-			if !errors.As(errPick, &authErr) || authErr == nil {
-				t.Fatalf("pickSingle() before refresh error = %v, want auth_not_found", errPick)
+			if errPick != nil {
+				t.Fatalf("pickSingle() after model registration error = %v", errPick)
 			}
-			if authErr.Code != "auth_not_found" {
-				t.Fatalf("pickSingle() before refresh code = %q, want %q", authErr.Code, "auth_not_found")
-			}
-			if got != nil {
-				t.Fatalf("pickSingle() before refresh auth = %v, want nil", got)
+			if got == nil || got.ID != auth.ID {
+				t.Fatalf("pickSingle() after model registration auth = %v, want %q", got, auth.ID)
 			}
 
 			manager.RefreshSchedulerEntry(auth.ID)
 
 			got, errPick = manager.scheduler.pickSingle(ctx, "gemini", "scheduler-refresh-model", cliproxyexecutor.Options{}, nil)
 			if errPick != nil {
-				t.Fatalf("pickSingle() after refresh error = %v", errPick)
+				t.Fatalf("pickSingle() after explicit refresh error = %v", errPick)
 			}
 			if got == nil || got.ID != auth.ID {
-				t.Fatalf("pickSingle() after refresh auth = %v, want %q", got, auth.ID)
+				t.Fatalf("pickSingle() after explicit refresh auth = %v, want %q", got, auth.ID)
 			}
 		})
 	}
@@ -142,12 +137,11 @@ func TestManager_PickNext_RebuildsSchedulerAfterModelCooldownError(t *testing.T)
 	})
 
 	got, errPick := manager.scheduler.pickSingle(ctx, "gemini", "scheduler-cooldown-rebuild-model", cliproxyexecutor.Options{}, nil)
-	var cooldownErr *modelCooldownError
-	if !errors.As(errPick, &cooldownErr) {
-		t.Fatalf("pickSingle() before sync error = %v, want modelCooldownError", errPick)
+	if errPick != nil {
+		t.Fatalf("pickSingle() after model registration error = %v", errPick)
 	}
-	if got != nil {
-		t.Fatalf("pickSingle() before sync auth = %v, want nil", got)
+	if got == nil || got.ID != newAuth.ID {
+		t.Fatalf("pickSingle() after model registration auth = %v, want %q", got, newAuth.ID)
 	}
 
 	got, executor, errPick := manager.pickNext(ctx, "gemini", "scheduler-cooldown-rebuild-model", cliproxyexecutor.Options{}, nil)

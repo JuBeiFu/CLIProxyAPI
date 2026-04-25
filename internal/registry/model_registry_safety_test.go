@@ -147,3 +147,27 @@ func TestLookupModelInfoReturnsCloneForStaticDefinitions(t *testing.T) {
 		t.Fatalf("expected static lookup clone, got %+v", second)
 	}
 }
+
+func TestCodexModelsIncludeBuiltinGPTImage2(t *testing.T) {
+	models := GetCodexProModels()
+	for _, model := range models {
+		if model != nil && model.ID == codexBuiltinImageModelID {
+			return
+		}
+	}
+	t.Fatalf("expected Codex model list to include %s", codexBuiltinImageModelID)
+}
+
+func TestWithCodexBuiltinsReplacesExistingGPTImage2(t *testing.T) {
+	models := WithCodexBuiltins([]*ModelInfo{{
+		ID:          codexBuiltinImageModelID,
+		DisplayName: "stale image model",
+	}})
+
+	if len(models) != 1 {
+		t.Fatalf("model count = %d, want 1", len(models))
+	}
+	if models[0].DisplayName != "GPT Image 2" {
+		t.Fatalf("display_name = %q, want GPT Image 2", models[0].DisplayName)
+	}
+}

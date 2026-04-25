@@ -2,7 +2,9 @@ package auth
 
 import (
 	"context"
+	"net/http"
 	"testing"
+	"time"
 )
 
 func TestManager_Update_PreservesModelStates(t *testing.T) {
@@ -200,5 +202,53 @@ func TestManager_Update_ActiveInheritsModelStates(t *testing.T) {
 	}
 	if state.Quota.BackoffLevel != backoffLevel {
 		t.Fatalf("expected BackoffLevel to be %d, got %d", backoffLevel, state.Quota.BackoffLevel)
+	}
+}
+
+func TestManager_Update_PreservesNewerRuntimeAvailabilityState(t *testing.T) {
+	m := NewManager(nil, nil, nil)
+
+	model := "newer-runtime-state-model"
+	if _, err := m.Register(context.Background(), &Auth{
+		ID:        "auth-newer-runtime",
+		Provider:  "codex",
+		Status:    StatusActive,
+		UpdatedAt: time.Now().Add(-time.Minute),
+	}); err != nil {
+		t.Fatalf("register auth: %v", err)
+	}
+
+	m.MarkResult(context.Background(), Result{
+		AuthID:   "auth-newer-runtime",
+		Provider: "codex",
+		Model:    model,
+		Success:  false,
+		Error:    &Error{HTTPStatus: http.StatusTooManyRequests, Message: "quota"},
+	})
+
+	staleRefresh := &Auth{
+		ID:              "auth-newer-runtime",
+		Provider:        "codex",
+		Status:          StatusActive,
+		LastRefreshedAt: time.Now(),
+		UpdatedAt:       time.Now().Add(-time.Hour),
+	}
+	if _, err := m.Update(context.Background(), staleRefresh); err != nil {
+		t.Fatalf("update auth: %v", err)
+	}
+
+	updated, ok := m.GetByID("auth-newer-runtime")
+	if !ok || updated == nil {
+		t.Fatalf("expected auth to be present")
+	}
+	state := updated.ModelStates[model]
+	if state == nil {
+		t.Fatalf("expected newer model state to be preserved")
+	}
+	if state.NextRetryAfter.IsZero() {
+		t.Fatalf("expected newer model cooldown to be preserved")
+	}
+	if updated.NextRetryAfter.IsZero() {
+		t.Fatalf("expected newer auth cooldown to be preserved")
 	}
 }

@@ -69,6 +69,12 @@ func TestBuildHTTPTransportDirectBypassesProxy(t *testing.T) {
 	if transport.Proxy != nil {
 		t.Fatal("expected direct transport to disable proxy function")
 	}
+	if transport.MaxIdleConns < 4096 {
+		t.Fatalf("MaxIdleConns = %d, want at least 4096", transport.MaxIdleConns)
+	}
+	if transport.MaxIdleConnsPerHost < 1024 {
+		t.Fatalf("MaxIdleConnsPerHost = %d, want at least 1024", transport.MaxIdleConnsPerHost)
+	}
 }
 
 func TestBuildHTTPTransportHTTPProxy(t *testing.T) {
@@ -108,6 +114,12 @@ func TestBuildHTTPTransportHTTPProxy(t *testing.T) {
 	if transport.TLSHandshakeTimeout != defaultTransport.TLSHandshakeTimeout {
 		t.Fatalf("TLSHandshakeTimeout = %v, want %v", transport.TLSHandshakeTimeout, defaultTransport.TLSHandshakeTimeout)
 	}
+	if transport.MaxIdleConns < 4096 {
+		t.Fatalf("MaxIdleConns = %d, want at least 4096", transport.MaxIdleConns)
+	}
+	if transport.MaxIdleConnsPerHost < 1024 {
+		t.Fatalf("MaxIdleConnsPerHost = %d, want at least 1024", transport.MaxIdleConnsPerHost)
+	}
 }
 
 func TestBuildHTTPTransportSOCKS5ProxyInheritsDefaultTransportSettings(t *testing.T) {
@@ -136,6 +148,12 @@ func TestBuildHTTPTransportSOCKS5ProxyInheritsDefaultTransportSettings(t *testin
 	}
 	if transport.TLSHandshakeTimeout != defaultTransport.TLSHandshakeTimeout {
 		t.Fatalf("TLSHandshakeTimeout = %v, want %v", transport.TLSHandshakeTimeout, defaultTransport.TLSHandshakeTimeout)
+	}
+	if transport.MaxIdleConns < 4096 {
+		t.Fatalf("MaxIdleConns = %d, want at least 4096", transport.MaxIdleConns)
+	}
+	if transport.MaxIdleConnsPerHost < 1024 {
+		t.Fatalf("MaxIdleConnsPerHost = %d, want at least 1024", transport.MaxIdleConnsPerHost)
 	}
 }
 

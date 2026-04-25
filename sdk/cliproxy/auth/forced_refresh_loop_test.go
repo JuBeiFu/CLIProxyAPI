@@ -79,7 +79,7 @@ func TestRunForcedRefreshOnce_RefreshesScopeAuthsOnly(t *testing.T) {
 	// Confirmed-paid WITH binding (C) and settled free+free (E) stay OUT.
 	want := map[string]bool{
 		"A_paid_unprobed":          true,
-		"B_paid_free":               true,
+		"B_paid_free":              true,
 		"D_free_unprobed":          true,
 		"F_paid_confirmed_unbound": true,
 	}
@@ -131,6 +131,7 @@ func TestRunForcedRefreshOnce_DeletesAfterGrace(t *testing.T) {
 	a := mustAuthKeyed("stale_downgrade", "codex", "plus", "free", true)
 	a.StatusMessage = downgradeDetectedPrefix + "submitted=plus upstream=free"
 	setDowngradeDetectedAt(a, time.Now().Add(-3*time.Hour)) // 3h ago > 2h grace
+	clearRevokedAuthTombstoneForTest(t, a)
 	m.auths = map[string]*Auth{"stale_downgrade": a}
 
 	m.runForcedRefreshOnce(context.Background(), grace)

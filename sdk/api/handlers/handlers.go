@@ -59,6 +59,8 @@ const (
 type pinnedAuthContextKey struct{}
 type selectedAuthCallbackContextKey struct{}
 type executionSessionContextKey struct{}
+type imageGenerationRequestContextKey struct{}
+type imageGenerationModelContextKey struct{}
 
 // DownstreamWebsocketBridge reports whether this request should be treated as a
 // logical downstream websocket bridge, even if the immediate transport into
@@ -110,6 +112,27 @@ func WithExecutionSessionID(ctx context.Context, sessionID string) context.Conte
 		ctx = context.Background()
 	}
 	return context.WithValue(ctx, executionSessionContextKey{}, sessionID)
+}
+
+// WithImageGenerationRequest tags a context as an image generation request.
+func WithImageGenerationRequest(ctx context.Context) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(ctx, imageGenerationRequestContextKey{}, true)
+}
+
+// WithImageGenerationModel tags a context with the image_generation tool model
+// for quota and cooldown accounting.
+func WithImageGenerationModel(ctx context.Context, model string) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	model = strings.TrimSpace(model)
+	if model == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, imageGenerationModelContextKey{}, model)
 }
 
 // BuildErrorResponseBody builds an OpenAI-compatible JSON error response body.
@@ -290,6 +313,12 @@ func requestExecutionMetadata(ctx context.Context) map[string]any {
 	if executionSessionID != "" {
 		meta[coreexecutor.ExecutionSessionMetadataKey] = executionSessionID
 	}
+	if imageGenerationRequestFromContext(ctx) {
+		meta[coreexecutor.ImageGenerationRequestMetadataKey] = true
+	}
+	if imageModel := imageGenerationModelFromContext(ctx); imageModel != "" {
+		meta[coreexecutor.ImageGenerationModelMetadataKey] = imageModel
+	}
 	return meta
 }
 
@@ -335,6 +364,29 @@ func executionSessionIDFromContext(ctx context.Context) string {
 	}
 	raw := ctx.Value(executionSessionContextKey{})
 	switch v := raw.(type) {
+	case string:
+		return strings.TrimSpace(v)
+	case []byte:
+		return strings.TrimSpace(string(v))
+	default:
+		return ""
+	}
+}
+
+func imageGenerationRequestFromContext(ctx context.Context) bool {
+	if ctx == nil {
+		return false
+	}
+	raw := ctx.Value(imageGenerationRequestContextKey{})
+	value, ok := raw.(bool)
+	return ok && value
+}
+
+func imageGenerationModelFromContext(ctx context.Context) string {
+	if ctx == nil {
+		return ""
+	}
+	switch v := ctx.Value(imageGenerationModelContextKey{}).(type) {
 	case string:
 		return strings.TrimSpace(v)
 	case []byte:
@@ -904,6 +956,13 @@ func (h *BaseAPIHandler) getRequestDetails(modelName string) (providers []string
 
 	parsed := thinking.ParseSuffix(resolvedModelName)
 	baseModel := strings.TrimSpace(parsed.ModelName)
+
+	if strings.EqualFold(baseModel, "gpt-image-2") {
+		return nil, "", &interfaces.ErrorMessage{
+			StatusCode: http.StatusServiceUnavailable,
+			Error:      fmt.Errorf("model %s is only supported on /v1/images/generations and /v1/images/edits", baseModel),
+		}
+	}
 
 	providers = util.GetProviderName(baseModel)
 	// Fallback: if baseModel has no provider but differs from resolvedModelName,

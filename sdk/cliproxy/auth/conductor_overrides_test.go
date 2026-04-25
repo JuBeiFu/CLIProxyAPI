@@ -749,17 +749,16 @@ func TestManager_Execute_DisableCooling_RetriesAfter429RetryAfter(t *testing.T) 
 }
 
 func TestManager_Execute_Plain429RateLimitSuspendsAuthFor60SecondsAndSwitchesAuth(t *testing.T) {
-	prev := quotaCooldownDisabled.Load()
-	quotaCooldownDisabled.Store(false)
-	t.Cleanup(func() { quotaCooldownDisabled.Store(prev) })
-
 	m := NewManager(nil, nil, nil)
 	m.SetRetryConfig(1, 100*time.Millisecond, 2)
 
+	testKey := strings.ReplaceAll(t.Name(), "/", "-") + "-" + uuid.NewString()
+	rateLimitedID := testKey + "-auth-001-rate-limited"
+	healthyID := testKey + "-auth-999-healthy"
 	executor := &authFallbackExecutor{
 		id: "codex",
 		executeErrors: map[string]error{
-			"auth-001-rate-limited": &retryAfterStatusError{
+			rateLimitedID: &retryAfterStatusError{
 				status:  http.StatusTooManyRequests,
 				message: `{"detail":"Rate limit exceeded"}`,
 			},
@@ -767,8 +766,16 @@ func TestManager_Execute_Plain429RateLimitSuspendsAuthFor60SecondsAndSwitchesAut
 	}
 	m.RegisterExecutor(executor)
 
-	rateLimited := &Auth{ID: "auth-001-rate-limited", Provider: "codex"}
-	healthy := &Auth{ID: "auth-999-healthy", Provider: "codex"}
+	baseCreatedAt := time.Date(2026, 4, 1, 0, 0, 0, 0, time.UTC)
+	rateLimited := &Auth{
+		ID:        rateLimitedID,
+		Provider:  "codex",
+		CreatedAt: baseCreatedAt.Add(time.Second),
+		Metadata: map[string]any{
+			"disable_cooling": false,
+		},
+	}
+	healthy := &Auth{ID: healthyID, Provider: "codex", CreatedAt: baseCreatedAt}
 
 	if _, errRegister := m.Register(context.Background(), rateLimited); errRegister != nil {
 		t.Fatalf("register rate limited auth: %v", errRegister)
@@ -777,7 +784,7 @@ func TestManager_Execute_Plain429RateLimitSuspendsAuthFor60SecondsAndSwitchesAut
 		t.Fatalf("register healthy auth: %v", errRegister)
 	}
 
-	model := "gpt-5.4"
+	model := testKey + "-model"
 	reg := registry.GetGlobalRegistry()
 	reg.RegisterClient(rateLimited.ID, "codex", []*registry.ModelInfo{{ID: model}})
 	reg.RegisterClient(healthy.ID, "codex", []*registry.ModelInfo{{ID: model}})
@@ -1044,13 +1051,16 @@ func TestManager_Execute_UsageLimitReachedBlocksAuthAcrossModelsWithExistingHeal
 	executor := &authFallbackExecutor{id: "codex"}
 	m.RegisterExecutor(executor)
 
-	modelLimited := "gpt-5.4"
-	modelHealthy := "gpt-5.4-mini"
-	modelFollowup := "gpt-5.3-codex"
+	testKey := strings.ReplaceAll(t.Name(), "/", "-") + "-" + uuid.NewString()
+	modelLimited := testKey + "-limited"
+	modelHealthy := testKey + "-healthy"
+	modelFollowup := testKey + "-followup"
 	resetAt := time.Now().Add(90 * time.Second).Unix()
+	limitedID := testKey + "-auth-001-usage-limit-cross-model"
+	healthyID := testKey + "-auth-999-healthy-cross-model"
 
 	limited := &Auth{
-		ID:       "auth-001-usage-limit-cross-model",
+		ID:       limitedID,
 		Provider: "codex",
 		ModelStates: map[string]*ModelState{
 			modelHealthy: {
@@ -1059,7 +1069,7 @@ func TestManager_Execute_UsageLimitReachedBlocksAuthAcrossModelsWithExistingHeal
 			},
 		},
 	}
-	healthy := &Auth{ID: "auth-999-healthy-cross-model", Provider: "codex"}
+	healthy := &Auth{ID: healthyID, Provider: "codex"}
 
 	if _, errRegister := m.Register(context.Background(), limited); errRegister != nil {
 		t.Fatalf("register limited auth: %v", errRegister)
@@ -1113,10 +1123,13 @@ func TestManager_Execute_SelectedModelAtCapacitySwitchesAuth(t *testing.T) {
 	m := NewManager(nil, nil, nil)
 	m.SetRetryConfig(1, 100*time.Millisecond, 2)
 
+	testKey := strings.ReplaceAll(t.Name(), "/", "-")
+	capacityAuthID := testKey + "-auth-001-capacity"
+	healthyAuthID := testKey + "-auth-999-healthy-capacity"
 	executor := &authFallbackExecutor{
 		id: "codex",
 		executeErrors: map[string]error{
-			"auth-001-capacity": &Error{
+			capacityAuthID: &Error{
 				HTTPStatus: http.StatusTooManyRequests,
 				Message:    "Selected model is at capacity. Please try a different model.",
 			},
@@ -1124,8 +1137,8 @@ func TestManager_Execute_SelectedModelAtCapacitySwitchesAuth(t *testing.T) {
 	}
 	m.RegisterExecutor(executor)
 
-	capacityAuth := &Auth{ID: "auth-001-capacity", Provider: "codex"}
-	healthy := &Auth{ID: "auth-999-healthy-capacity", Provider: "codex"}
+	capacityAuth := &Auth{ID: capacityAuthID, Provider: "codex"}
+	healthy := &Auth{ID: healthyAuthID, Provider: "codex"}
 
 	if _, errRegister := m.Register(context.Background(), capacityAuth); errRegister != nil {
 		t.Fatalf("register capacity auth: %v", errRegister)
@@ -1134,7 +1147,7 @@ func TestManager_Execute_SelectedModelAtCapacitySwitchesAuth(t *testing.T) {
 		t.Fatalf("register healthy auth: %v", errRegister)
 	}
 
-	model := "gpt-5.4"
+	model := testKey + "-model"
 	reg := registry.GetGlobalRegistry()
 	reg.RegisterClient(capacityAuth.ID, "codex", []*registry.ModelInfo{{ID: model}})
 	reg.RegisterClient(healthy.ID, "codex", []*registry.ModelInfo{{ID: model}})

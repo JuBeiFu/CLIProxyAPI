@@ -32,7 +32,6 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/misc"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/executor"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	sdkAuth "github.com/router-for-me/CLIProxyAPI/v6/sdk/auth"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
@@ -310,27 +309,6 @@ func (h *Handler) ListAvailableAuthFiles(c *gin.Context) {
 	})
 }
 
-// GptDrawQuota returns the per-auth daily gpt-draw usage counters plus the
-// configured limit. Entries with stale dates are surfaced as count=0 for today.
-func (h *Handler) GptDrawQuota(c *gin.Context) {
-	entries, limit := executor.GptDrawQuotaSnapshot()
-	type row struct {
-		AuthID string `json:"auth_id"`
-		Date   string `json:"date"`
-		Used   int    `json:"used"`
-		Limit  int    `json:"limit"`
-	}
-	out := make([]row, 0, len(entries))
-	for id, e := range entries {
-		out = append(out, row{AuthID: id, Date: e.Date, Used: e.Count, Limit: limit})
-	}
-	sort.Slice(out, func(i, j int) bool { return out[i].AuthID < out[j].AuthID })
-	c.JSON(http.StatusOK, gin.H{
-		"limit":   limit,
-		"entries": out,
-	})
-}
-
 // BatchQuotaCheck probes up to 50 codex auths against the upstream API to check
 // their current quota status. Auths that return 429 usage_limit_reached are
 // automatically suspended until their reset time.
@@ -386,18 +364,18 @@ func (h *Handler) BatchQuotaCheck(c *gin.Context) {
 	}
 
 	type quotaResult struct {
-		AuthID       string `json:"auth_id"`
-		AuthIndex    string `json:"auth_index"`
-		Email        string `json:"email,omitempty"`
-		PlanType     string `json:"plan_type,omitempty"`
-		Available    bool   `json:"available"`
-		StatusCode   int    `json:"status_code"`
-		ErrorType    string `json:"error_type,omitempty"`
-		Message      string `json:"message,omitempty"`
-		ResetsAt     string `json:"resets_at,omitempty"`
-		ResetsIn     int64  `json:"resets_in_seconds,omitempty"`
-		Suspended    bool   `json:"suspended"`
-		Error        string `json:"error,omitempty"`
+		AuthID     string `json:"auth_id"`
+		AuthIndex  string `json:"auth_index"`
+		Email      string `json:"email,omitempty"`
+		PlanType   string `json:"plan_type,omitempty"`
+		Available  bool   `json:"available"`
+		StatusCode int    `json:"status_code"`
+		ErrorType  string `json:"error_type,omitempty"`
+		Message    string `json:"message,omitempty"`
+		ResetsAt   string `json:"resets_at,omitempty"`
+		ResetsIn   int64  `json:"resets_in_seconds,omitempty"`
+		Suspended  bool   `json:"suspended"`
+		Error      string `json:"error,omitempty"`
 	}
 
 	results := make([]quotaResult, len(candidates))

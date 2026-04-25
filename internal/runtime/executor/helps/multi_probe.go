@@ -53,7 +53,7 @@ func ProbeCodexPlanAcrossPool(
 	cfg *config.Config,
 	auth *cliproxyauth.Auth,
 	accessToken string,
-) (plan string, boundEntry string, supportedModels []string, probeOK bool) {
+) (plan string, boundEntry string, supportedModels []string, fiveHourQuota *codexauth.WhamQuotaWindow, probeOK bool) {
 	pool := resolveCodexProbePool(cfg, auth)
 	candidates := shuffledHealthyEntries(pool)
 	boundPreferredName := strings.TrimSpace(cliproxyauth.BoundProxyEntry(auth))
@@ -103,7 +103,7 @@ func ProbeCodexPlanAcrossPool(
 		}
 		anySucceeded = true
 		if isPaidPlanName(got) {
-			return got, c.entryName, info.SupportedModels, true
+			return got, c.entryName, info.SupportedModels, info.FiveHourQuota, true
 		}
 		// Successful probe but reports free. Keep searching for a paid
 		// path through other nodes: OpenAI edge caches sometimes disagree
@@ -114,11 +114,11 @@ func ProbeCodexPlanAcrossPool(
 	if anySucceeded {
 		// All paths reported free. Clear any previous binding: the auth
 		// has no egress that will serve it as paid right now.
-		return lastFreePlan, "", nil, true
+		return lastFreePlan, "", nil, nil, true
 	}
 
 	// Every candidate errored. Caller keeps existing state.
-	return "", "", nil, false
+	return "", "", nil, nil, false
 }
 
 // resolveCodexProbePool returns the proxy pool to enumerate for the auth.

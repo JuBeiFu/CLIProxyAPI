@@ -40,6 +40,20 @@ const (
 	// free and eligible for the 5min forced-refresh retry cycle.
 	MetadataBoundProxyEntryKey = "cliproxy_bound_proxy_entry"
 
+	// MetadataCodexFiveHourQuotaRemainingRatioKey stores the remaining quota
+	// ratio for Codex's rolling 5-hour window as returned by /wham/usage.
+	MetadataCodexFiveHourQuotaRemainingRatioKey = "cliproxy_codex_5h_remaining_ratio"
+
+	// MetadataCodexFiveHourQuotaResetAtKey stores the reset time for the same
+	// rolling 5-hour window when /wham/usage returns it.
+	MetadataCodexFiveHourQuotaResetAtKey = "cliproxy_codex_5h_reset_at"
+
+	MetadataCodexFiveHourQuotaLimitKey     = "cliproxy_codex_5h_limit"
+	MetadataCodexFiveHourQuotaRemainingKey = "cliproxy_codex_5h_remaining"
+	MetadataCodexFiveHourQuotaUpdatedAtKey = "cliproxy_codex_5h_updated_at"
+
+	MetadataCodexForceTokenRefreshKey = "cliproxy_codex_force_token_refresh"
+
 	// BoundProxyEntryDirect is the sentinel value stored in
 	// MetadataBoundProxyEntryKey when the auth should use direct egress
 	// (no proxy) because every pool entry reported a free plan but direct
@@ -199,11 +213,11 @@ func clearDowngradeDetectedAt(auth *Auth) {
 //  3. Write probed_plan_type and Attributes[plan_type] = realPlan.
 //  4. 4-state decision on (submitted, real):
 //     - paid + free:  take ownership of disable iff not already disabled for
-//       another reason; record downgrade timestamp if first detection.
+//     another reason; record downgrade timestamp if first detection.
 //     - paid + paid:  clear downgrade timestamp; re-enable only if WE own the
-//       disable (our StatusMessage prefix matches).
+//     disable (our StatusMessage prefix matches).
 //     - free + *:     no Disabled mutation (free-submitted accounts are out
-//       of the downgrade-protection scope).
+//     of the downgrade-protection scope).
 //     - paid + <something unrecognized>: treat like free (conservative).
 //
 // The function mutates auth in place and is a pure function of its inputs

@@ -288,24 +288,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	body = stripCodexUnsupportedResponseFields(body, shouldPreserveCodexPreviousResponseID(ctx, auth, from, body))
 	body, _ = sjson.DeleteBytes(body, "stream_options")
 	body = normalizeCodexInstructions(body)
-	gptDrawRequested := IsGptDrawModel(requestedModel) || IsGptDrawModel(baseModel)
-	if gptDrawRequested {
-		name := requestedModel
-		if !IsGptDrawModel(name) {
-			name = baseModel
-		}
-		if auth != nil {
-			allowed, used, limit := globalGptDrawQuota.CheckAndIncrement(auth.ID)
-			if !allowed {
-				return resp, statusErr{code: 429, msg: gptDrawQuotaErrMsg(auth.ID, used, limit)}
-			}
-		}
-		if upstream, patched := transformGptDrawPayload(name, body); upstream != "" {
-			body = patched
-		}
-	} else {
-		body = maybeAttachImageGenerationTool(baseModel, body)
-	}
+	body = maybeAttachImageGenerationTool(baseModel, body)
 
 	url := strings.TrimSuffix(baseURL, "/") + "/responses"
 	httpReq, err := e.cacheHelper(ctx, from, url, req, body)
@@ -618,24 +601,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 	body, _ = sjson.DeleteBytes(body, "stream_options")
 	body, _ = sjson.SetBytes(body, "model", baseModel)
 	body = normalizeCodexInstructions(body)
-	gptDrawRequestedStream := IsGptDrawModel(requestedModel) || IsGptDrawModel(baseModel)
-	if gptDrawRequestedStream {
-		name := requestedModel
-		if !IsGptDrawModel(name) {
-			name = baseModel
-		}
-		if auth != nil {
-			allowed, used, limit := globalGptDrawQuota.CheckAndIncrement(auth.ID)
-			if !allowed {
-				return nil, statusErr{code: 429, msg: gptDrawQuotaErrMsg(auth.ID, used, limit)}
-			}
-		}
-		if upstream, patched := transformGptDrawPayload(name, body); upstream != "" {
-			body = patched
-		}
-	} else {
-		body = maybeAttachImageGenerationTool(baseModel, body)
-	}
+	body = maybeAttachImageGenerationTool(baseModel, body)
 
 	url := strings.TrimSuffix(baseURL, "/") + "/responses"
 	httpReq, err := e.cacheHelper(ctx, from, url, req, body)
@@ -923,28 +889,22 @@ func (e *CodexExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*
 	if refreshToken == "" {
 		return auth, nil
 	}
-	svc := codexauth.NewCodexAuth(e.cfg)
-	td, err := svc.RefreshTokensWithRetry(ctx, refreshToken, 3)
-	if err != nil {
-		return nil, err
-	}
 	if auth.Metadata == nil {
 		auth.Metadata = make(map[string]any)
 	}
 	now := time.Now()
-	storage, _ := auth.Storage.(*codexauth.CodexTokenStorage)
-	applyRefreshedCodexTokenState(auth, storage, td, now)
+	accessToken, jwtPlan, refreshed, err := e.codexAccessTokenForProbe(ctx, auth, refreshToken, now)
+	if err != nil {
+		return nil, err
+	}
 
 	// Resolve the authoritative plan_type by probing /wham/usage with the
-	// freshly-refreshed access token. The JWT's chatgpt_plan_type is a cached
+	// current access token. The JWT's chatgpt_plan_type is a cached
 	// snapshot (can lag by hours); /wham/usage is live. On probe failure we
 	// leave existing plan_type untouched; ApplyPlanTypeRefreshDecision will not
 	// mutate Disabled or Attributes without an authoritative reading.
-	jwtPlan := ""
-	if claims, jwtErr := codexauth.ParseJWTToken(td.IDToken); jwtErr == nil {
-		jwtPlan = strings.ToLower(strings.TrimSpace(claims.CodexAuthInfo.ChatgptPlanType))
-	} else {
-		log.Warnf("codex executor: parse id_token JWT for auth %s failed: %v", auth.ID, jwtErr)
+	if refreshed {
+		log.Debugf("codex executor: refreshed access token for auth %s before usage probe", auth.ID)
 	}
 	// Multi-path probe: walk every pool entry (shuffled) and stop as soon
 	// as one reports a paid plan. Falls back to direct egress last. This
@@ -955,13 +915,14 @@ func (e *CodexExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*
 	// sees the same node and OpenAI's cache decision is self-consistent.
 	// Header note: Chatgpt-Account-Id has no observable effect on the
 	// response (verified 2026-04-20 across 5 egress paths); we omit it.
-	realPlan, boundEntry, supportedModels, probeOK := helps.ProbeCodexPlanAcrossPool(ctx, e.cfg, auth, td.AccessToken)
+	realPlan, boundEntry, supportedModels, fiveHourQuota, probeOK := helps.ProbeCodexPlanAcrossPool(ctx, e.cfg, auth, accessToken)
 	if !probeOK {
 		log.Warnf("codex executor: /wham/usage multi-path probe for auth %s failed on every candidate", auth.ID)
 	}
 	cliproxyauth.ApplyPlanTypeRefreshDecision(auth, jwtPlan, realPlan, probeOK, now)
 	if probeOK {
 		applyCodexSupportedModels(auth, supportedModels, now)
+		applyCodexFiveHourQuotaMetadata(auth, fiveHourQuota, now)
 		if boundEntry != "" {
 			// Found a path reporting paid plan; pin the auth so later
 			// dispatches go through the same node.
@@ -977,6 +938,39 @@ func (e *CodexExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*
 		log.Warnf("codex executor: auth %s disabled by downgrade detection: %s", auth.ID, auth.StatusMessage)
 	}
 	return auth, nil
+}
+
+func (e *CodexExecutor) codexAccessTokenForProbe(ctx context.Context, auth *cliproxyauth.Auth, refreshToken string, now time.Time) (accessToken string, jwtPlan string, refreshed bool, err error) {
+	if auth == nil {
+		return "", "", false, statusErr{code: 500, msg: "codex executor: auth is nil"}
+	}
+	accessToken = strings.TrimSpace(stringFromAny(auth.Metadata["access_token"]))
+	if idToken := strings.TrimSpace(stringFromAny(auth.Metadata["id_token"])); idToken != "" {
+		if claims, jwtErr := codexauth.ParseJWTToken(idToken); jwtErr == nil {
+			jwtPlan = strings.ToLower(strings.TrimSpace(claims.CodexAuthInfo.ChatgptPlanType))
+		}
+	}
+	forceTokenRefresh := boolFromAny(auth.Metadata[cliproxyauth.MetadataCodexForceTokenRefreshKey])
+	delete(auth.Metadata, cliproxyauth.MetadataCodexForceTokenRefreshKey)
+	if accessToken != "" && !forceTokenRefresh {
+		if expiry, ok := auth.ExpirationTime(); ok && expiry.After(now.Add(codexUsageProbeRefreshLead)) {
+			return accessToken, jwtPlan, false, nil
+		}
+	}
+
+	svc := codexauth.NewCodexAuth(e.cfg)
+	td, refreshErr := svc.RefreshTokensWithRetry(ctx, refreshToken, 3)
+	if refreshErr != nil {
+		return "", jwtPlan, false, refreshErr
+	}
+	storage, _ := auth.Storage.(*codexauth.CodexTokenStorage)
+	applyRefreshedCodexTokenState(auth, storage, td, now)
+	if claims, jwtErr := codexauth.ParseJWTToken(td.IDToken); jwtErr == nil {
+		jwtPlan = strings.ToLower(strings.TrimSpace(claims.CodexAuthInfo.ChatgptPlanType))
+	} else {
+		log.Warnf("codex executor: parse id_token JWT for auth %s failed: %v", auth.ID, jwtErr)
+	}
+	return td.AccessToken, jwtPlan, true, nil
 }
 
 func applyCodexSupportedModels(auth *cliproxyauth.Auth, models []string, now time.Time) {
@@ -1016,6 +1010,60 @@ func applyCodexSupportedModels(auth *cliproxyauth.Auth, models []string, now tim
 	auth.Attributes["supported_models"] = strings.Join(clean, ",")
 	auth.Attributes["supported_models_source"] = "codex_entitlements"
 	auth.Attributes["supported_models_updated"] = now.Format(time.RFC3339)
+}
+
+const codexUsageProbeRefreshLead = 2 * time.Minute
+
+func applyCodexFiveHourQuotaMetadata(auth *cliproxyauth.Auth, quota *codexauth.WhamQuotaWindow, now time.Time) {
+	if auth == nil {
+		return
+	}
+	if auth.Metadata == nil {
+		auth.Metadata = make(map[string]any)
+	}
+	if quota == nil {
+		delete(auth.Metadata, cliproxyauth.MetadataCodexFiveHourQuotaRemainingRatioKey)
+		delete(auth.Metadata, cliproxyauth.MetadataCodexFiveHourQuotaResetAtKey)
+		delete(auth.Metadata, cliproxyauth.MetadataCodexFiveHourQuotaLimitKey)
+		delete(auth.Metadata, cliproxyauth.MetadataCodexFiveHourQuotaRemainingKey)
+		auth.Metadata[cliproxyauth.MetadataCodexFiveHourQuotaUpdatedAtKey] = now.UTC().Format(time.RFC3339)
+		return
+	}
+	auth.Metadata[cliproxyauth.MetadataCodexFiveHourQuotaRemainingRatioKey] = quota.RemainingRatio
+	auth.Metadata[cliproxyauth.MetadataCodexFiveHourQuotaUpdatedAtKey] = now.UTC().Format(time.RFC3339)
+	if quota.Limit > 0 {
+		auth.Metadata[cliproxyauth.MetadataCodexFiveHourQuotaLimitKey] = quota.Limit
+	} else {
+		delete(auth.Metadata, cliproxyauth.MetadataCodexFiveHourQuotaLimitKey)
+	}
+	if quota.Remaining > 0 {
+		auth.Metadata[cliproxyauth.MetadataCodexFiveHourQuotaRemainingKey] = quota.Remaining
+	} else {
+		delete(auth.Metadata, cliproxyauth.MetadataCodexFiveHourQuotaRemainingKey)
+	}
+	if !quota.ResetAt.IsZero() {
+		auth.Metadata[cliproxyauth.MetadataCodexFiveHourQuotaResetAtKey] = quota.ResetAt.UTC().Format(time.RFC3339)
+	} else {
+		delete(auth.Metadata, cliproxyauth.MetadataCodexFiveHourQuotaResetAtKey)
+	}
+}
+
+func stringFromAny(value any) string {
+	if s, ok := value.(string); ok {
+		return s
+	}
+	return ""
+}
+
+func boolFromAny(value any) bool {
+	switch typed := value.(type) {
+	case bool:
+		return typed
+	case string:
+		return strings.EqualFold(strings.TrimSpace(typed), "true")
+	default:
+		return false
+	}
 }
 func applyRefreshedCodexTokenState(auth *cliproxyauth.Auth, storage *codexauth.CodexTokenStorage, td *codexauth.CodexTokenData, now time.Time) {
 	if auth == nil || td == nil {

@@ -4,8 +4,10 @@ import (
 	"context"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestFetchWhamUsagePlanType_Plus(t *testing.T) {
@@ -196,5 +198,36 @@ func TestFetchWhamUsageInfoExtractsSupportedModels(t *testing.T) {
 		if got.SupportedModels[index] != wantModel {
 			t.Fatalf("SupportedModels[%d] = %q, want %q", index, got.SupportedModels[index], wantModel)
 		}
+	}
+}
+
+func TestFetchWhamUsageInfoExtractsFiveHourQuota(t *testing.T) {
+	t.Parallel()
+	resetAt := time.Now().Add(2 * time.Hour).UTC().Unix()
+	auth := &CodexAuth{
+		httpClient: &http.Client{
+			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Body: io.NopCloser(strings.NewReader(
+						`{"plan_type":"plus","rate_limits":[{"window":"5h","limit":100,"remaining":19,"resets_at":` + strconv.FormatInt(resetAt, 10) + `}]}`)),
+					Header:  make(http.Header),
+					Request: req,
+				}, nil
+			}),
+		},
+	}
+	got, err := auth.FetchWhamUsageInfo(context.Background(), "tok")
+	if err != nil {
+		t.Fatalf("FetchWhamUsageInfo error = %v", err)
+	}
+	if got.FiveHourQuota == nil {
+		t.Fatal("FiveHourQuota = nil, want parsed quota")
+	}
+	if got.FiveHourQuota.RemainingRatio != 0.19 {
+		t.Fatalf("RemainingRatio = %v, want 0.19", got.FiveHourQuota.RemainingRatio)
+	}
+	if got.FiveHourQuota.ResetAt.IsZero() || got.FiveHourQuota.ResetAt.Unix() != resetAt {
+		t.Fatalf("ResetAt = %s, want unix %d", got.FiveHourQuota.ResetAt, resetAt)
 	}
 }

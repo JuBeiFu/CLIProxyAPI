@@ -13,6 +13,10 @@ const RequestedModelMetadataKey = "requested_model"
 const (
 	// PinnedAuthMetadataKey locks execution to a specific auth ID.
 	PinnedAuthMetadataKey = "pinned_auth_id"
+	// ImageGenerationRequestMetadataKey marks image generation requests for scheduling.
+	ImageGenerationRequestMetadataKey = "image_generation_request"
+	// ImageGenerationModelMetadataKey stores the image_generation tool model used for quota tracking.
+	ImageGenerationModelMetadataKey = "image_generation_model"
 	// PreferBestAuthMetadataKey requests deterministic best-auth selection over round-robin.
 	PreferBestAuthMetadataKey = "prefer_best_auth"
 	// SelectedAuthMetadataKey stores the auth ID selected by the scheduler.

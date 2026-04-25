@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -62,6 +63,67 @@ func (e *revokedRefreshExecutor) HttpRequest(context.Context, *Auth, *http.Reque
 	return nil, nil
 }
 
+type accessTokenRefreshRetryExecutor struct {
+	id   string
+	code string
+
+	mu           sync.Mutex
+	executeCalls int
+	refreshCalls int
+}
+
+func (e *accessTokenRefreshRetryExecutor) Identifier() string { return e.id }
+
+func (e *accessTokenRefreshRetryExecutor) Execute(_ context.Context, auth *Auth, _ cliproxyexecutor.Request, _ cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	e.mu.Lock()
+	e.executeCalls++
+	call := e.executeCalls
+	e.mu.Unlock()
+
+	if call == 1 {
+		return cliproxyexecutor.Response{}, &Error{
+			HTTPStatus: http.StatusUnauthorized,
+			Message:    `{"error":{"message":"Encountered invalidated oauth token for user, failing request","code":"` + e.code + `"},"status":401}`,
+		}
+	}
+	if got := auth.Metadata["access_token"]; got != "new-access-"+e.code {
+		return cliproxyexecutor.Response{}, &Error{Message: "retry used stale access token"}
+	}
+	return cliproxyexecutor.Response{Payload: []byte("ok-" + e.code)}, nil
+}
+
+func (e *accessTokenRefreshRetryExecutor) ExecuteStream(context.Context, *Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
+	return nil, nil
+}
+
+func (e *accessTokenRefreshRetryExecutor) Refresh(_ context.Context, auth *Auth) (*Auth, error) {
+	e.mu.Lock()
+	e.refreshCalls++
+	e.mu.Unlock()
+
+	updated := auth.Clone()
+	if updated.Metadata == nil {
+		updated.Metadata = map[string]any{}
+	}
+	updated.Metadata["access_token"] = "new-access-" + e.code
+	updated.Metadata["refresh_token"] = "rotated-refresh-" + e.code
+	return updated, nil
+}
+
+func (e *accessTokenRefreshRetryExecutor) CountTokens(context.Context, *Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	return cliproxyexecutor.Response{}, nil
+}
+
+func (e *accessTokenRefreshRetryExecutor) HttpRequest(context.Context, *Auth, *http.Request) (*http.Response, error) {
+	return nil, nil
+}
+
+func (e *accessTokenRefreshRetryExecutor) calls() (int, int) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.executeCalls, e.refreshCalls
+}
+
 func waitForDeletedIDs(t *testing.T, store *deletingStore, want []string) {
 	t.Helper()
 	deadline := time.Now().Add(2 * time.Second)
@@ -94,7 +156,9 @@ func newPersistedCodexAuth(id string) *Auth {
 			"path": "/tmp/" + id,
 		},
 		Metadata: map[string]any{
-			"type": "codex",
+			"type":          "codex",
+			"access_token":  "old-access",
+			"refresh_token": "refresh-token",
 		},
 	}
 }
@@ -116,35 +180,48 @@ func assertPersistedAuthDisabled(t *testing.T, mgr *Manager, store *deletingStor
 	}
 }
 
-func TestManager_MarkResult_DisablesPersistedAuthOnRevoked401(t *testing.T) {
-	store := &deletingStore{}
-	mgr := NewManager(store, nil, nil)
-	auth := newPersistedCodexAuth("auths/revoked.json")
-	if _, err := mgr.Register(WithSkipPersist(context.Background()), auth); err != nil {
-		t.Fatalf("Register returned error: %v", err)
-	}
+func TestManager_Execute_RefreshesAndRetriesCodexOnAccessTokenInvalidation(t *testing.T) {
+	for _, code := range []string{"token_revoked", "token_invalidated"} {
+		t.Run(code, func(t *testing.T) {
+			store := &deletingStore{}
+			mgr := NewManager(store, nil, nil)
+			auth := newPersistedCodexAuth("auths/" + code + ".json")
+			if _, err := mgr.Register(WithSkipPersist(context.Background()), auth); err != nil {
+				t.Fatalf("Register returned error: %v", err)
+			}
+			exec := &accessTokenRefreshRetryExecutor{id: "codex", code: code}
+			mgr.RegisterExecutor(exec)
 
-	reg := registry.GetGlobalRegistry()
-	reg.RegisterClient(auth.ID, "codex", []*registry.ModelInfo{{ID: "gpt-5"}})
-	t.Cleanup(func() { reg.UnregisterClient(auth.ID) })
+			model := "gpt-5-" + code
+			reg := registry.GetGlobalRegistry()
+			reg.RegisterClient(auth.ID, "codex", []*registry.ModelInfo{{ID: model}})
+			t.Cleanup(func() { reg.UnregisterClient(auth.ID) })
 
-	mgr.MarkResult(context.Background(), Result{
-		AuthID:   auth.ID,
-		Provider: "codex",
-		Model:    "gpt-5",
-		Success:  false,
-		Error: &Error{
-			HTTPStatus: http.StatusUnauthorized,
-			Message:    `{"error":{"message":"Encountered invalidated oauth token for user, failing request","code":"token_revoked"},"status":401}`,
-		},
-	})
-
-	assertPersistedAuthDisabled(t, mgr, store, auth)
-	if models := reg.GetModelsForClient(auth.ID); len(models) != 0 {
-		t.Fatalf("expected disabled auth models to be unregistered, got %d", len(models))
-	}
-	if !HasRevokedAuthTombstone(auth, time.Now()) {
-		t.Fatal("expected revoked auth to leave a tombstone")
+			resp, err := mgr.Execute(context.Background(), []string{"codex"}, cliproxyexecutor.Request{Model: model, Payload: []byte(`{}`)}, cliproxyexecutor.Options{})
+			if err != nil {
+				t.Fatalf("Execute returned error: %v", err)
+			}
+			if string(resp.Payload) != "ok-"+code {
+				t.Fatalf("expected retry response %q, got %q", "ok-"+code, string(resp.Payload))
+			}
+			executeCalls, refreshCalls := exec.calls()
+			if executeCalls != 2 || refreshCalls != 1 {
+				t.Fatalf("expected execute=2 refresh=1, got execute=%d refresh=%d", executeCalls, refreshCalls)
+			}
+			stored, ok := mgr.GetByID(auth.ID)
+			if !ok {
+				t.Fatalf("expected auth %s to remain registered", auth.ID)
+			}
+			if stored.Disabled || stored.Status == StatusDisabled {
+				t.Fatalf("expected auth %s to stay enabled, got disabled=%v status=%q", auth.ID, stored.Disabled, stored.Status)
+			}
+			if got := stored.Metadata["access_token"]; got != "new-access-"+code {
+				t.Fatalf("expected refreshed access token, got %#v", got)
+			}
+			if len(store.deleted) != 0 {
+				t.Fatalf("expected no delete, got %v", store.deleted)
+			}
+		})
 	}
 }
 
@@ -152,6 +229,7 @@ func TestManager_MarkResult_DisablesPersistedAuthOnForbiddenMessage(t *testing.T
 	store := &deletingStore{}
 	mgr := NewManager(store, nil, nil)
 	auth := newPersistedCodexAuth("auths/forbidden.json")
+	clearRevokedAuthTombstoneForTest(t, auth)
 	if _, err := mgr.Register(WithSkipPersist(context.Background()), auth); err != nil {
 		t.Fatalf("Register returned error: %v", err)
 	}
@@ -178,6 +256,7 @@ func TestManager_MarkResult_DisablesPersistedAuthOnMessageOnlyInvalidatedToken(t
 	store := &deletingStore{}
 	mgr := NewManager(store, nil, nil)
 	auth := newPersistedCodexAuth("auths/message-only.json")
+	clearRevokedAuthTombstoneForTest(t, auth)
 	if _, err := mgr.Register(WithSkipPersist(context.Background()), auth); err != nil {
 		t.Fatalf("Register returned error: %v", err)
 	}
@@ -208,6 +287,7 @@ func TestManager_MarkResult_DisablesRuntimeOnlyAuthOnUnauthorized(t *testing.T) 
 		Provider: "codex",
 		Metadata: map[string]any{"type": "codex"},
 	}
+	clearRevokedAuthTombstoneForTest(t, auth)
 	if _, err := mgr.Register(WithSkipPersist(context.Background()), auth); err != nil {
 		t.Fatalf("Register returned error: %v", err)
 	}
@@ -247,6 +327,7 @@ func TestManager_RefreshAuth_DisablesPersistedAuthOnOrgRequired(t *testing.T) {
 	})
 
 	auth := newPersistedCodexAuth("auths/refresh-org-required.json")
+	clearRevokedAuthTombstoneForTest(t, auth)
 	if _, err := mgr.Register(WithSkipPersist(context.Background()), auth); err != nil {
 		t.Fatalf("Register returned error: %v", err)
 	}
@@ -284,6 +365,7 @@ func TestManager_RefreshAuth_DeletesPersistedAuthOnRefreshTokenReused(t *testing
 	})
 
 	auth := newPersistedCodexAuth("auths/refresh-reused.json")
+	clearRevokedAuthTombstoneForTest(t, auth)
 	if _, err := mgr.Register(WithSkipPersist(context.Background()), auth); err != nil {
 		t.Fatalf("Register returned error: %v", err)
 	}
@@ -306,6 +388,7 @@ func TestManager_MarkResult_DeletesPersistedAuthOnRefreshTokenReused(t *testing.
 	store := &deletingStore{}
 	mgr := NewManager(store, nil, nil)
 	auth := newPersistedCodexAuth("auths/request-reused.json")
+	clearRevokedAuthTombstoneForTest(t, auth)
 	if _, err := mgr.Register(WithSkipPersist(context.Background()), auth); err != nil {
 		t.Fatalf("Register returned error: %v", err)
 	}
@@ -342,6 +425,7 @@ func TestManager_RefreshAuth_KeepsNonTerminalFailures(t *testing.T) {
 	})
 
 	auth := newPersistedCodexAuth("auths/refresh-error.json")
+	clearRevokedAuthTombstoneForTest(t, auth)
 	if _, err := mgr.Register(WithSkipPersist(context.Background()), auth); err != nil {
 		t.Fatalf("Register returned error: %v", err)
 	}
@@ -383,6 +467,7 @@ func TestManager_MarkResult_WritesBanRecordOnRevokedDisable(t *testing.T) {
 			"id_token": testJWTWithCodexClaims(t, map[string]any{"email": "ban-record@example.com", "https://api.openai.com/auth": map[string]any{"chatgpt_subscription_active_start": expectedCreatedAt.Format(time.RFC3339)}}),
 		},
 	}
+	clearRevokedAuthTombstoneForTest(t, auth)
 	if _, err := mgr.Register(WithSkipPersist(context.Background()), auth); err != nil {
 		t.Fatalf("Register returned error: %v", err)
 	}
@@ -398,7 +483,7 @@ func TestManager_MarkResult_WritesBanRecordOnRevokedDisable(t *testing.T) {
 		Success:  false,
 		Error: &Error{
 			HTTPStatus: http.StatusUnauthorized,
-			Message:    `{"error":{"message":"Encountered invalidated oauth token for user, failing request","code":"token_revoked"},"status":401}`,
+			Message:    `{"error":{"message":"You must be a member of an organization to use the API."},"status":401}`,
 		},
 	})
 
