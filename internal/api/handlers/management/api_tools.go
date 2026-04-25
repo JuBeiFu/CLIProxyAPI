@@ -323,11 +323,12 @@ func (h *Handler) markAPICallResponse(
 	}
 	retryAfter := retryAfterFromAPICall(statusCode, body)
 	h.authManager.MarkResult(ctx, coreauth.Result{
-		AuthID:     authID,
-		Provider:   provider,
-		Success:    false,
-		RetryAfter: retryAfter,
-		Error:      resultErr,
+		AuthID:                 authID,
+		Provider:               provider,
+		Success:                false,
+		RetryAfter:             retryAfter,
+		Error:                  resultErr,
+		SkipAccessTokenRefresh: true,
 	})
 }
 

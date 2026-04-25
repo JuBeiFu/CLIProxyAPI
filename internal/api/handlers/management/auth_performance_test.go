@@ -17,12 +17,13 @@ func TestGetAuthPerformanceReturnsSnapshotsAndConfig(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.ApplyRoutingPerformanceDefaults()
 	cfg.Routing.PerformanceAware = true
+	cfg.Routing.PerformanceMinSamples = 1
 	cfg.Routing.PerformanceWeightTPS = 1.5
 	cfg.Routing.PerformanceWeightLatency = 0.4
 	cfg.Routing.PerformanceWeightFailure = 3
 	cfg.Routing.PerformanceWeightInflight = 0.7
 	tracker := performance.NewTracker(performance.Config{Enabled: true, ShadowLog: true, Window: 5 * time.Minute, MinSamples: 1, EWMAAlpha: 1})
-	now := time.Date(2026, 4, 25, 12, 0, 0, 0, time.UTC)
+	now := time.Now()
 	tracker.Record(performance.Sample{Provider: "codex", AuthID: "auth-a", AuthIndex: "2", Model: "gpt-5.4", RequestedAt: now, Latency: time.Second, OutputTokens: 20})
 
 	h := NewHandler(cfg, "", nil)

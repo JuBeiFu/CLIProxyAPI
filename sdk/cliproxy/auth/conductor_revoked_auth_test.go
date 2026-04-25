@@ -163,20 +163,14 @@ func newPersistedCodexAuth(id string) *Auth {
 	}
 }
 
-func assertPersistedAuthDisabled(t *testing.T, mgr *Manager, store *deletingStore, auth *Auth) {
+func assertPersistedAuthDeleted(t *testing.T, mgr *Manager, store *deletingStore, auth *Auth) {
 	t.Helper()
-	stored, ok := mgr.GetByID(auth.ID)
-	if !ok {
-		t.Fatalf("expected auth %s to remain registered", auth.ID)
+	if _, ok := mgr.GetByID(auth.ID); ok {
+		t.Fatalf("expected auth %s to be removed from manager", auth.ID)
 	}
-	if !stored.Disabled || stored.Status != StatusDisabled {
-		t.Fatalf("expected auth %s to be disabled, got disabled=%v status=%q", auth.ID, stored.Disabled, stored.Status)
-	}
-	if len(store.deleted) != 0 {
-		t.Fatalf("expected auth %s to remain in store, got deletes %v", auth.ID, store.deleted)
-	}
-	if len(store.saved) == 0 || !store.saved[len(store.saved)-1].Disabled {
-		t.Fatalf("expected disabled auth %s to be persisted, got saves=%d", auth.ID, len(store.saved))
+	waitForDeletedIDs(t, store, []string{auth.ID})
+	if !HasRevokedAuthTombstone(auth, time.Now()) {
+		t.Fatalf("expected auth %s to leave a tombstone", auth.ID)
 	}
 }
 
@@ -249,7 +243,7 @@ func TestManager_MarkResult_DisablesPersistedAuthOnForbiddenMessage(t *testing.T
 		},
 	})
 
-	assertPersistedAuthDisabled(t, mgr, store, auth)
+	assertPersistedAuthDeleted(t, mgr, store, auth)
 }
 
 func TestManager_MarkResult_DisablesPersistedAuthOnMessageOnlyInvalidatedToken(t *testing.T) {
@@ -276,7 +270,7 @@ func TestManager_MarkResult_DisablesPersistedAuthOnMessageOnlyInvalidatedToken(t
 		},
 	})
 
-	assertPersistedAuthDisabled(t, mgr, store, auth)
+	assertPersistedAuthDeleted(t, mgr, store, auth)
 }
 
 func TestManager_MarkResult_DisablesRuntimeOnlyAuthOnUnauthorized(t *testing.T) {
@@ -338,19 +332,7 @@ func TestManager_RefreshAuth_DisablesPersistedAuthOnOrgRequired(t *testing.T) {
 
 	mgr.refreshAuth(context.Background(), auth.ID)
 
-	stored, ok := mgr.GetByID(auth.ID)
-	if !ok {
-		t.Fatal("expected org-required auth to remain registered after refresh failure")
-	}
-	if !stored.Disabled || stored.Status != StatusDisabled {
-		t.Fatalf("expected org-required auth to be disabled, got disabled=%v status=%q", stored.Disabled, stored.Status)
-	}
-	if len(store.deleted) != 0 {
-		t.Fatalf("expected org-required auth to remain in store, got deletes %v", store.deleted)
-	}
-	if len(store.saved) == 0 || !store.saved[len(store.saved)-1].Disabled {
-		t.Fatalf("expected disabled org-required auth to be persisted, got saves=%d", len(store.saved))
-	}
+	assertPersistedAuthDeleted(t, mgr, store, auth)
 }
 
 func TestManager_RefreshAuth_DeletesPersistedAuthOnRefreshTokenReused(t *testing.T) {
@@ -487,7 +469,7 @@ func TestManager_MarkResult_WritesBanRecordOnRevokedDisable(t *testing.T) {
 		},
 	})
 
-	assertPersistedAuthDisabled(t, mgr, store, auth)
+	assertPersistedAuthDeleted(t, mgr, store, auth)
 
 	recordPath := filepath.Join(authDir, ".system", "ban-records", "banned-auth-records-"+time.Now().Format("2006-01-02")+".jsonl")
 	recordBytes, err := os.ReadFile(recordPath)

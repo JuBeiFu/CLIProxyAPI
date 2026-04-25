@@ -129,6 +129,9 @@ type Result struct {
 	Error *Error
 	// RequestPayload captures the downstream request body for failure auditing.
 	RequestPayload []byte
+	// SkipAccessTokenRefresh marks call sites that already cannot refresh/retry
+	// access tokens and should treat token_revoked as terminal.
+	SkipAccessTokenRefresh bool
 }
 
 type inflightLease struct {
@@ -2958,14 +2961,14 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 		now := time.Now()
 
 		if !result.Success {
-			if deleteAuth, reason := shouldDeleteRevokedAuth(auth, result.Error); deleteAuth {
+			if deleteAuth, reason := shouldDeleteRevokedAuth(auth, result.Error, result.SkipAccessTokenRefresh); deleteAuth {
 				applyTerminalAuthDisabledState(auth, result.Error, reason, now)
 				terminalAuthSnapshot = auth.Clone()
 				terminalWarning = reason
 				terminallyDisabled = true
 				terminallyDeleted = true
 				delete(m.auths, result.AuthID)
-			} else if disableAuth, reason := shouldDisableRevokedAuth(auth, result.Error); disableAuth {
+			} else if disableAuth, reason := shouldDisableRevokedAuth(auth, result.Error, result.SkipAccessTokenRefresh); disableAuth {
 				applyTerminalAuthDisabledState(auth, result.Error, reason, now)
 				terminalAuthSnapshot = auth.Clone()
 				terminalWarning = reason
@@ -3778,28 +3781,22 @@ func shouldAttemptAccessTokenRefresh(auth *Auth, resultErr *Error) bool {
 	return isAccessTokenRefreshableResultError(resultErr)
 }
 
-func shouldDeleteRevokedAuth(auth *Auth, resultErr *Error) (bool, string) {
+func shouldDeleteRevokedAuth(auth *Auth, resultErr *Error, skipAccessTokenRefresh bool) (bool, string) {
 	if !isCodexAuth(auth) || !hasPersistedAuthRecord(auth) {
 		return false, ""
 	}
-	if !isRefreshTokenReusedResultError(resultErr) {
+	if !skipAccessTokenRefresh && shouldAttemptAccessTokenRefresh(auth, resultErr) {
 		return false, ""
 	}
 	reason := terminalAuthFailureReason(resultErr)
-	if reason == "" && resultErr != nil {
-		reason = strings.TrimSpace(resultErr.Message)
-	}
-	if reason == "" {
-		reason = "refresh_token_reused"
-	}
 	return reason != "", reason
 }
 
-func shouldDisableRevokedAuth(auth *Auth, resultErr *Error) (bool, string) {
+func shouldDisableRevokedAuth(auth *Auth, resultErr *Error, skipAccessTokenRefresh bool) (bool, string) {
 	if !isCodexAuth(auth) || auth == nil {
 		return false, ""
 	}
-	if shouldAttemptAccessTokenRefresh(auth, resultErr) {
+	if !skipAccessTokenRefresh && shouldAttemptAccessTokenRefresh(auth, resultErr) {
 		return false, ""
 	}
 	if isRefreshTokenReusedResultError(resultErr) && hasPersistedAuthRecord(auth) {
@@ -5036,7 +5033,7 @@ func (m *Manager) refreshAuth(ctx context.Context, id string) {
 	now := time.Now()
 	if err != nil {
 		resultErr := resultErrorFromError(err)
-		if deleteAuth, reason := shouldDeleteRevokedAuth(auth, resultErr); deleteAuth {
+		if deleteAuth, reason := shouldDeleteRevokedAuth(auth, resultErr, false); deleteAuth {
 			var authSnapshot *Auth
 			m.mu.Lock()
 			if current := m.auths[id]; current != nil {
@@ -5051,7 +5048,7 @@ func (m *Manager) refreshAuth(ctx context.Context, id string) {
 			}
 			return
 		}
-		if disableAuth, reason := shouldDisableRevokedAuth(auth, resultErr); disableAuth {
+		if disableAuth, reason := shouldDisableRevokedAuth(auth, resultErr, false); disableAuth {
 			var authSnapshot *Auth
 			var persistErr error
 			m.mu.Lock()

@@ -1,6 +1,8 @@
 package store
 
 import (
+	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -12,6 +14,7 @@ import (
 	gitconfig "github.com/go-git/go-git/v6/config"
 	"github.com/go-git/go-git/v6/plumbing"
 	"github.com/go-git/go-git/v6/plumbing/object"
+	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 )
 
 type testBranchSpec struct {
@@ -309,6 +312,68 @@ func TestEnsureRepositoryKeepsCurrentBranchWhenRemoteDefaultCannotBeResolved(t *
 		t.Fatalf("EnsureRepository default branch fallback: %v", err)
 	}
 	assertRepositoryHeadBranch(t, filepath.Join(root, "workspace"), "develop")
+}
+
+func TestGitTokenStore_SaveAndListPreservesDisabledState(t *testing.T) {
+	root := t.TempDir()
+	remoteDir := setupGitRemoteRepository(t, root, "master",
+		testBranchSpec{name: "master", contents: "remote master branch\n"},
+	)
+	baseDir := filepath.Join(root, "workspace", "auths")
+	store := NewGitTokenStore(remoteDir, "", "", "")
+	store.SetBaseDir(baseDir)
+	if err := store.EnsureRepository(); err != nil {
+		t.Fatalf("EnsureRepository: %v", err)
+	}
+	path := filepath.Join(baseDir, "codex-disabled.json")
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatalf("create auth dir: %v", err)
+	}
+	if err := os.WriteFile(path, []byte(`{"type":"codex","email":"disabled@example.com"}`), 0o600); err != nil {
+		t.Fatalf("write initial auth: %v", err)
+	}
+
+	auth := &cliproxyauth.Auth{
+		ID:       "codex-disabled.json",
+		FileName: "codex-disabled.json",
+		Provider: "codex",
+		Disabled: true,
+		Status:   cliproxyauth.StatusDisabled,
+		Attributes: map[string]string{
+			"path": path,
+		},
+		Metadata: map[string]any{
+			"type":  "codex",
+			"email": "disabled@example.com",
+		},
+	}
+
+	if _, err := store.Save(context.Background(), auth); err != nil {
+		t.Fatalf("Save returned error: %v", err)
+	}
+
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read saved auth: %v", err)
+	}
+	var saved map[string]any
+	if err := json.Unmarshal(raw, &saved); err != nil {
+		t.Fatalf("decode saved auth: %v", err)
+	}
+	if saved["disabled"] != true {
+		t.Fatalf("expected disabled=true in saved auth JSON, got %s", string(raw))
+	}
+
+	items, err := store.List(context.Background())
+	if err != nil {
+		t.Fatalf("List returned error: %v", err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("List returned %d items, want 1", len(items))
+	}
+	if !items[0].Disabled || items[0].Status != cliproxyauth.StatusDisabled {
+		t.Fatalf("expected disabled auth after reload, got disabled=%v status=%q", items[0].Disabled, items[0].Status)
+	}
 }
 
 func setupGitRemoteRepository(t *testing.T, root, defaultBranch string, branches ...testBranchSpec) string {
