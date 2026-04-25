@@ -1249,7 +1249,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			close(closedCh)
 			remaining = closedCh
 		}
-		return m.wrapStreamResult(ctx, auth.Clone(), provider, resultModel, bytes.Clone(execReq.Payload), streamResult.Headers, buffered, remaining, lease), nil
+		return m.wrapStreamResult(ctx, auth.Clone(), provider, resultModel, execReq.Payload, streamResult.Headers, buffered, remaining, lease), nil
 	}
 	if lastErr == nil {
 		lastErr = &Error{Code: "auth_not_found", Message: "no upstream model available"}
@@ -2418,7 +2418,6 @@ func (m *Manager) bindResponseFromStreamResult(authID string, reqPayload []byte,
 		return result
 	}
 	out := make(chan cliproxyexecutor.StreamChunk)
-	transcriptReq := bytes.Clone(reqPayload)
 	go func() {
 		defer close(out)
 		for chunk := range result.Chunks {
@@ -2430,7 +2429,7 @@ func (m *Manager) bindResponseFromStreamResult(authID string, reqPayload []byte,
 						payload = bytes.TrimSpace(payload[len("data:"):])
 					}
 					responsePayload := []byte(gjson.GetBytes(payload, "response").Raw)
-					if transcript := compactTranscriptFromPayload(transcriptReq, responsePayload); len(transcript) > 0 {
+					if transcript := compactTranscriptFromPayload(reqPayload, responsePayload); len(transcript) > 0 {
 						m.bindCompactTranscript(responseID, transcript)
 					}
 				}

@@ -888,6 +888,62 @@ func TestManager_BindCompactTranscriptEnforcesTotalByteLimit(t *testing.T) {
 	}
 }
 
+func TestManager_ExecuteStreamWithModelPoolDoesNotClonePayloadForActiveStream(t *testing.T) {
+	manager := NewManager(nil, &RoundRobinSelector{}, nil)
+	executor := &responseStickyExecutor{id: "codex"}
+	reqPayload := largeCompactRequestPayload(512, 16*1024)
+
+	runtime.GC()
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	streamResult, err := manager.executeStreamWithModelPool(context.Background(), executor, &Auth{
+		ID:       "stream-active-payload-auth",
+		Provider: "codex",
+	}, "codex", cliproxyexecutor.Request{
+		Model:   "gpt-5.4",
+		Payload: reqPayload,
+	}, cliproxyexecutor.Options{}, "gpt-5.4", []string{"gpt-5.4"}, false, &inflightLease{})
+	runtime.ReadMemStats(&after)
+	if err != nil {
+		t.Fatalf("executeStreamWithModelPool() error = %v", err)
+	}
+	for range streamResult.Chunks {
+	}
+	runtime.KeepAlive(reqPayload)
+
+	allocated := after.TotalAlloc - before.TotalAlloc
+	limit := uint64(len(reqPayload) / 8)
+	if allocated > limit {
+		t.Fatalf("allocated %d bytes while wrapping %d-byte streaming request, want <= %d", allocated, len(reqPayload), limit)
+	}
+}
+
+func TestManager_BindResponseFromStreamResultDoesNotClonePayloadBeforeCompletion(t *testing.T) {
+	manager := NewManager(nil, &RoundRobinSelector{}, nil)
+	reqPayload := largeCompactRequestPayload(512, 16*1024)
+	chunks := make(chan cliproxyexecutor.StreamChunk)
+	streamResult := &cliproxyexecutor.StreamResult{
+		Headers: http.Header{"X-Test": {"stream"}},
+		Chunks:  chunks,
+	}
+
+	runtime.GC()
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	wrapped := manager.bindResponseFromStreamResult("stream-bind-payload-auth", reqPayload, streamResult)
+	runtime.ReadMemStats(&after)
+	close(chunks)
+	for range wrapped.Chunks {
+	}
+	runtime.KeepAlive(reqPayload)
+
+	allocated := after.TotalAlloc - before.TotalAlloc
+	limit := uint64(len(reqPayload) / 8)
+	if allocated > limit {
+		t.Fatalf("allocated %d bytes while binding %d-byte streaming request, want <= %d", allocated, len(reqPayload), limit)
+	}
+}
+
 func TestCompactTranscriptFromPayloadLargeInputAllocationsStayBounded(t *testing.T) {
 	t.Parallel()
 
