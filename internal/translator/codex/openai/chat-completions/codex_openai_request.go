@@ -7,6 +7,7 @@
 package chat_completions
 
 import (
+	"bytes"
 	"strconv"
 	"strings"
 
@@ -109,132 +110,6 @@ func ConvertOpenAIRequestToCodex(modelName string, inputRawJSON []byte, stream b
 	// 	}
 	// }
 
-	// Build input from messages, handling all message types including tool calls
-	out, _ = sjson.SetRawBytes(out, "input", []byte(`[]`))
-	if messages.IsArray() {
-		arr := messages.Array()
-		for i := 0; i < len(arr); i++ {
-			m := arr[i]
-			role := m.Get("role").String()
-
-			switch role {
-			case "tool":
-				// Handle tool response messages as top-level function_call_output objects
-				toolCallID := m.Get("tool_call_id").String()
-				content := m.Get("content").String()
-
-				// Create function_call_output object
-				funcOutput := []byte(`{}`)
-				funcOutput, _ = sjson.SetBytes(funcOutput, "type", "function_call_output")
-				funcOutput, _ = sjson.SetBytes(funcOutput, "call_id", toolCallID)
-				funcOutput, _ = sjson.SetBytes(funcOutput, "output", content)
-				out, _ = sjson.SetRawBytes(out, "input.-1", funcOutput)
-
-			default:
-				// Handle regular messages
-				msg := []byte(`{}`)
-				msg, _ = sjson.SetBytes(msg, "type", "message")
-				if role == "system" {
-					msg, _ = sjson.SetBytes(msg, "role", "developer")
-				} else {
-					msg, _ = sjson.SetBytes(msg, "role", role)
-				}
-
-				msg, _ = sjson.SetRawBytes(msg, "content", []byte(`[]`))
-
-				// Handle regular content
-				c := m.Get("content")
-				if c.Exists() && c.Type == gjson.String && c.String() != "" {
-					// Single string content
-					partType := "input_text"
-					if role == "assistant" {
-						partType = "output_text"
-					}
-					part := []byte(`{}`)
-					part, _ = sjson.SetBytes(part, "type", partType)
-					part, _ = sjson.SetBytes(part, "text", c.String())
-					msg, _ = sjson.SetRawBytes(msg, "content.-1", part)
-				} else if c.Exists() && c.IsArray() {
-					items := c.Array()
-					for j := 0; j < len(items); j++ {
-						it := items[j]
-						t := it.Get("type").String()
-						switch t {
-						case "text":
-							partType := "input_text"
-							if role == "assistant" {
-								partType = "output_text"
-							}
-							part := []byte(`{}`)
-							part, _ = sjson.SetBytes(part, "type", partType)
-							part, _ = sjson.SetBytes(part, "text", it.Get("text").String())
-							msg, _ = sjson.SetRawBytes(msg, "content.-1", part)
-						case "image_url":
-							// Map image inputs to input_image for Responses API
-							if role == "user" {
-								part := []byte(`{}`)
-								part, _ = sjson.SetBytes(part, "type", "input_image")
-								if u := it.Get("image_url.url"); u.Exists() {
-									part, _ = sjson.SetBytes(part, "image_url", u.String())
-								}
-								msg, _ = sjson.SetRawBytes(msg, "content.-1", part)
-							}
-						case "file":
-							if role == "user" {
-								fileData := it.Get("file.file_data").String()
-								filename := it.Get("file.filename").String()
-								if fileData != "" {
-									part := []byte(`{}`)
-									part, _ = sjson.SetBytes(part, "type", "input_file")
-									part, _ = sjson.SetBytes(part, "file_data", fileData)
-									if filename != "" {
-										part, _ = sjson.SetBytes(part, "filename", filename)
-									}
-									msg, _ = sjson.SetRawBytes(msg, "content.-1", part)
-								}
-							}
-						}
-					}
-				}
-
-				// Don't emit empty assistant messages when only tool_calls
-				// are present — Responses API needs function_call items
-				// directly, otherwise call_id matching fails (#2132).
-				if role != "assistant" || len(gjson.GetBytes(msg, "content").Array()) > 0 {
-					out, _ = sjson.SetRawBytes(out, "input.-1", msg)
-				}
-
-				// Handle tool calls for assistant messages as separate top-level objects
-				if role == "assistant" {
-					toolCalls := m.Get("tool_calls")
-					if toolCalls.Exists() && toolCalls.IsArray() {
-						toolCallsArr := toolCalls.Array()
-						for j := 0; j < len(toolCallsArr); j++ {
-							tc := toolCallsArr[j]
-							if tc.Get("type").String() == "function" {
-								// Create function_call as top-level object
-								funcCall := []byte(`{}`)
-								funcCall, _ = sjson.SetBytes(funcCall, "type", "function_call")
-								funcCall, _ = sjson.SetBytes(funcCall, "call_id", tc.Get("id").String())
-								{
-									name := tc.Get("function.name").String()
-									if short, ok := originalToolNameMap[name]; ok {
-										name = short
-									} else {
-										name = shortenNameIfNeeded(name)
-									}
-									funcCall, _ = sjson.SetBytes(funcCall, "name", name)
-								}
-								funcCall, _ = sjson.SetBytes(funcCall, "arguments", tc.Get("function.arguments").String())
-								out, _ = sjson.SetRawBytes(out, "input.-1", funcCall)
-							}
-						}
-					}
-				}
-			}
-		}
-	}
-
 	// Map response_format and text settings to Responses API text.format
 	rf := gjson.GetBytes(rawJSON, "response_format")
 	text := gjson.GetBytes(rawJSON, "text")
@@ -280,50 +155,6 @@ func ConvertOpenAIRequestToCodex(modelName string, inputRawJSON []byte, stream b
 		}
 	}
 
-	// Map tools (flatten function fields)
-	tools := gjson.GetBytes(rawJSON, "tools")
-	if tools.IsArray() && len(tools.Array()) > 0 {
-		out, _ = sjson.SetRawBytes(out, "tools", []byte(`[]`))
-		arr := tools.Array()
-		for i := 0; i < len(arr); i++ {
-			t := arr[i]
-			toolType := t.Get("type").String()
-			// Pass through built-in tools (e.g. {"type":"web_search"}) directly for the Responses API.
-			// Only "function" needs structural conversion because Chat Completions nests details under "function".
-			if toolType != "" && toolType != "function" && t.IsObject() {
-				out, _ = sjson.SetRawBytes(out, "tools.-1", []byte(t.Raw))
-				continue
-			}
-
-			if toolType == "function" {
-				item := []byte(`{}`)
-				item, _ = sjson.SetBytes(item, "type", "function")
-				fn := t.Get("function")
-				if fn.Exists() {
-					if v := fn.Get("name"); v.Exists() {
-						name := v.String()
-						if short, ok := originalToolNameMap[name]; ok {
-							name = short
-						} else {
-							name = shortenNameIfNeeded(name)
-						}
-						item, _ = sjson.SetBytes(item, "name", name)
-					}
-					if v := fn.Get("description"); v.Exists() {
-						item, _ = sjson.SetBytes(item, "description", v.Value())
-					}
-					if v := fn.Get("parameters"); v.Exists() {
-						item, _ = sjson.SetRawBytes(item, "parameters", []byte(v.Raw))
-					}
-					if v := fn.Get("strict"); v.Exists() {
-						item, _ = sjson.SetBytes(item, "strict", v.Value())
-					}
-				}
-				out, _ = sjson.SetRawBytes(out, "tools.-1", item)
-			}
-		}
-	}
-
 	// Map tool_choice when present.
 	// Chat Completions: "tool_choice" can be a string ("auto"/"none") or an object (e.g. {"type":"function","function":{"name":"..."}}).
 	// Responses API: keep built-in tool choices as-is; flatten function choice to {"type":"function","name":"..."}.
@@ -356,7 +187,277 @@ func ConvertOpenAIRequestToCodex(modelName string, inputRawJSON []byte, stream b
 	}
 
 	out, _ = sjson.SetBytes(out, "store", false)
+
+	// Large fields are attached last so later small-field mutations do not copy
+	// the full transcript again.
+	tools := gjson.GetBytes(rawJSON, "tools")
+	if toolsJSON, ok := buildCodexTools(tools, originalToolNameMap); ok {
+		out, _ = sjson.SetRawBytes(out, "tools", toolsJSON)
+	}
+	out, _ = sjson.SetRawBytes(out, "input", buildCodexInputItems(messages, originalToolNameMap))
+
 	return out
+}
+
+func buildCodexInputItems(messages gjson.Result, originalToolNameMap map[string]string) []byte {
+	if !messages.IsArray() {
+		return []byte(`[]`)
+	}
+
+	var out bytes.Buffer
+	out.Grow(len(messages.Raw) + 32)
+	out.WriteByte('[')
+	firstItem := true
+	messages.ForEach(func(_, m gjson.Result) bool {
+		role := m.Get("role").String()
+		switch role {
+		case "tool":
+			appendArrayItem(&out, &firstItem)
+			writeFunctionCallOutput(&out, m.Get("tool_call_id").String(), m.Get("content").String())
+		default:
+			content := m.Get("content")
+			partCount := countMessageContentParts(role, content)
+			if role != "assistant" || partCount > 0 {
+				appendArrayItem(&out, &firstItem)
+				writeMessageItem(&out, role, content)
+			}
+			if role == "assistant" {
+				toolCalls := m.Get("tool_calls")
+				if toolCalls.Exists() && toolCalls.IsArray() {
+					toolCalls.ForEach(func(_, tc gjson.Result) bool {
+						if tc.Get("type").String() != "function" {
+							return true
+						}
+						appendArrayItem(&out, &firstItem)
+						name := tc.Get("function.name").String()
+						if short, ok := originalToolNameMap[name]; ok {
+							name = short
+						} else {
+							name = shortenNameIfNeeded(name)
+						}
+						writeFunctionCall(&out, tc.Get("id").String(), name, tc.Get("function.arguments").String())
+						return true
+					})
+				}
+			}
+		}
+		return true
+	})
+	out.WriteByte(']')
+	return out.Bytes()
+}
+
+func countMessageContentParts(role string, content gjson.Result) int {
+	if content.Exists() && content.Type == gjson.String && content.Raw != `""` {
+		return 1
+	}
+	if !content.Exists() || !content.IsArray() {
+		return 0
+	}
+
+	partCount := 0
+	content.ForEach(func(_, it gjson.Result) bool {
+		switch it.Get("type").String() {
+		case "text":
+			partCount++
+		case "image_url":
+			if role == "user" {
+				partCount++
+			}
+		case "file":
+			if role == "user" && it.Get("file.file_data").String() != "" {
+				partCount++
+			}
+		}
+		return true
+	})
+	return partCount
+}
+
+func writeMessageContentParts(out *bytes.Buffer, role string, content gjson.Result) {
+	out.WriteByte('[')
+	firstPart := true
+	partType := "input_text"
+	if role == "assistant" {
+		partType = "output_text"
+	}
+
+	if content.Exists() && content.Type == gjson.String && content.Raw != `""` {
+		appendArrayItem(out, &firstPart)
+		writeTextPart(out, partType, content.String())
+	} else if content.Exists() && content.IsArray() {
+		content.ForEach(func(_, it gjson.Result) bool {
+			switch it.Get("type").String() {
+			case "text":
+				appendArrayItem(out, &firstPart)
+				writeTextPart(out, partType, it.Get("text").String())
+			case "image_url":
+				if role == "user" {
+					appendArrayItem(out, &firstPart)
+					writeImagePart(out, it.Get("image_url.url"))
+				}
+			case "file":
+				if role == "user" {
+					fileData := it.Get("file.file_data").String()
+					if fileData != "" {
+						appendArrayItem(out, &firstPart)
+						writeFilePart(out, fileData, it.Get("file.filename").String())
+					}
+				}
+			}
+			return true
+		})
+	}
+
+	out.WriteByte(']')
+}
+
+func buildCodexTools(tools gjson.Result, originalToolNameMap map[string]string) ([]byte, bool) {
+	if !tools.IsArray() || len(tools.Array()) == 0 {
+		return nil, false
+	}
+
+	var out bytes.Buffer
+	out.Grow(len(tools.Raw) + 16)
+	out.WriteByte('[')
+	firstItem := true
+	tools.ForEach(func(_, t gjson.Result) bool {
+		toolType := t.Get("type").String()
+		if toolType != "" && toolType != "function" && t.IsObject() {
+			appendArrayItem(&out, &firstItem)
+			out.WriteString(t.Raw)
+			return true
+		}
+		if toolType != "function" {
+			return true
+		}
+
+		appendArrayItem(&out, &firstItem)
+		writeToolDefinition(&out, t.Get("function"), originalToolNameMap)
+		return true
+	})
+	out.WriteByte(']')
+	return out.Bytes(), true
+}
+
+func appendArrayItem(out *bytes.Buffer, first *bool) {
+	if !*first {
+		out.WriteByte(',')
+	}
+	*first = false
+}
+
+func appendFieldPrefix(out *bytes.Buffer, first *bool, name string) {
+	if !*first {
+		out.WriteByte(',')
+	}
+	*first = false
+	writeJSONString(out, name)
+	out.WriteByte(':')
+}
+
+func appendStringField(out *bytes.Buffer, first *bool, name, value string) {
+	appendFieldPrefix(out, first, name)
+	writeJSONString(out, value)
+}
+
+func appendRawField(out *bytes.Buffer, first *bool, name, raw string) {
+	appendFieldPrefix(out, first, name)
+	out.WriteString(raw)
+}
+
+func writeJSONString(out *bytes.Buffer, value string) {
+	buf := out.AvailableBuffer()
+	buf = strconv.AppendQuote(buf, value)
+	out.Write(buf)
+}
+
+func writeMessageItem(out *bytes.Buffer, role string, content gjson.Result) {
+	if role == "system" {
+		role = "developer"
+	}
+	first := true
+	out.WriteByte('{')
+	appendStringField(out, &first, "type", "message")
+	appendStringField(out, &first, "role", role)
+	appendFieldPrefix(out, &first, "content")
+	writeMessageContentParts(out, role, content)
+	out.WriteByte('}')
+}
+
+func writeTextPart(out *bytes.Buffer, partType, text string) {
+	first := true
+	out.WriteByte('{')
+	appendStringField(out, &first, "type", partType)
+	appendStringField(out, &first, "text", text)
+	out.WriteByte('}')
+}
+
+func writeImagePart(out *bytes.Buffer, imageURL gjson.Result) {
+	first := true
+	out.WriteByte('{')
+	appendStringField(out, &first, "type", "input_image")
+	if imageURL.Exists() {
+		appendStringField(out, &first, "image_url", imageURL.String())
+	}
+	out.WriteByte('}')
+}
+
+func writeFilePart(out *bytes.Buffer, fileData, filename string) {
+	first := true
+	out.WriteByte('{')
+	appendStringField(out, &first, "type", "input_file")
+	appendStringField(out, &first, "file_data", fileData)
+	if filename != "" {
+		appendStringField(out, &first, "filename", filename)
+	}
+	out.WriteByte('}')
+}
+
+func writeFunctionCallOutput(out *bytes.Buffer, callID, output string) {
+	first := true
+	out.WriteByte('{')
+	appendStringField(out, &first, "type", "function_call_output")
+	appendStringField(out, &first, "call_id", callID)
+	appendStringField(out, &first, "output", output)
+	out.WriteByte('}')
+}
+
+func writeFunctionCall(out *bytes.Buffer, callID, name, arguments string) {
+	first := true
+	out.WriteByte('{')
+	appendStringField(out, &first, "type", "function_call")
+	appendStringField(out, &first, "call_id", callID)
+	appendStringField(out, &first, "name", name)
+	appendStringField(out, &first, "arguments", arguments)
+	out.WriteByte('}')
+}
+
+func writeToolDefinition(out *bytes.Buffer, fn gjson.Result, originalToolNameMap map[string]string) {
+	first := true
+	out.WriteByte('{')
+	appendStringField(out, &first, "type", "function")
+	if fn.Exists() {
+		if v := fn.Get("name"); v.Exists() {
+			name := v.String()
+			if short, ok := originalToolNameMap[name]; ok {
+				name = short
+			} else {
+				name = shortenNameIfNeeded(name)
+			}
+			appendStringField(out, &first, "name", name)
+		}
+		if v := fn.Get("description"); v.Exists() {
+			appendRawField(out, &first, "description", v.Raw)
+		}
+		if v := fn.Get("parameters"); v.Exists() {
+			appendRawField(out, &first, "parameters", v.Raw)
+		}
+		if v := fn.Get("strict"); v.Exists() {
+			appendRawField(out, &first, "strict", v.Raw)
+		}
+	}
+	out.WriteByte('}')
 }
 
 // shortenNameIfNeeded applies the simple shortening rule for a single name.

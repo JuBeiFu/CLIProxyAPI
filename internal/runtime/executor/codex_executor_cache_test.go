@@ -2,8 +2,12 @@ package executor
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"net/http/httptest"
+	"runtime"
+	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/gin-gonic/gin"
@@ -62,6 +66,65 @@ func TestCodexExecutorCacheHelper_OpenAIChatCompletions_StablePromptCacheKeyFrom
 	if gotKey2 != expectedKey {
 		t.Fatalf("prompt_cache_key (second call) = %q, want %q", gotKey2, expectedKey)
 	}
+}
+
+func TestCodexExecutorCacheHelper_LargePayloadPromptCacheKeyAllocationsStayBounded(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	ginCtx, _ := gin.CreateTestContext(recorder)
+	ginCtx.Set("apiKey", "test-api-key")
+
+	ctx := context.WithValue(context.Background(), "gin", ginCtx)
+	executor := &CodexExecutor{}
+	rawJSON := buildLargeCacheHelperCodexBodyWithTools(64, 16*1024)
+	req := cliproxyexecutor.Request{
+		Model:   "gpt-5.4",
+		Payload: rawJSON,
+	}
+	url := "https://example.com/responses"
+	_, _ = executor.cacheHelper(ctx, sdktranslator.FromString("openai"), url, req, rawJSON)
+
+	runtime.GC()
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	httpReq, err := executor.cacheHelper(ctx, sdktranslator.FromString("openai"), url, req, rawJSON)
+	runtime.ReadMemStats(&after)
+	if err != nil {
+		t.Fatalf("cacheHelper error: %v", err)
+	}
+	body, errRead := io.ReadAll(httpReq.Body)
+	if errRead != nil {
+		t.Fatalf("read request body: %v", errRead)
+	}
+	runtime.KeepAlive(body)
+
+	if !json.Valid(body) {
+		t.Fatalf("request body JSON is invalid: %s", body)
+	}
+	if gotKey := gjson.GetBytes(body, "prompt_cache_key").String(); gotKey == "" {
+		t.Fatalf("prompt_cache_key is empty: %s", body)
+	}
+	allocated := after.TotalAlloc - before.TotalAlloc
+	limit := uint64(len(rawJSON) + 8192)
+	if allocated > limit {
+		t.Fatalf("allocated %d bytes for %d-byte body, want <= %d", allocated, len(rawJSON), limit)
+	}
+}
+
+func buildLargeCacheHelperCodexBodyWithTools(messageCount, messageSize int) []byte {
+	text := strings.Repeat("x", messageSize)
+	var b strings.Builder
+	b.Grow(messageCount*messageSize + 256)
+	b.WriteString(`{"model":"gpt-5.4","stream":true,"input":[`)
+	for i := 0; i < messageCount; i++ {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		b.WriteString(`{"type":"message","role":"user","content":[{"type":"input_text","text":`)
+		b.WriteString(strconv.Quote(text))
+		b.WriteString(`}]}`)
+	}
+	b.WriteString(`],"tools":[{"type":"function","name":"noop","parameters":{"type":"object","properties":{}}}]}`)
+	return []byte(b.String())
 }
 
 func TestShouldPreserveCodexPreviousResponseID_TrueForOpenAIResponsesFollowupOverHTTP(t *testing.T) {

@@ -1,6 +1,10 @@
 package chat_completions
 
 import (
+	"encoding/json"
+	"runtime"
+	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/tidwall/gjson"
@@ -95,6 +99,54 @@ func TestToolCallSimple(t *testing.T) {
 	if items[3].Get("output").String() != "sunny, 22C" {
 		t.Errorf("item 3: expected output 'sunny, 22C', got '%s'", items[3].Get("output").String())
 	}
+}
+
+func TestConvertOpenAIRequestToCodexLargeTranscriptAllocationsStayBounded(t *testing.T) {
+	input := buildLargeChatCompletionsRequest(48, 16*1024, 24)
+	_ = ConvertOpenAIRequestToCodex("gpt-5.4", input, true)
+
+	runtime.GC()
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	out := ConvertOpenAIRequestToCodex("gpt-5.4", input, true)
+	runtime.ReadMemStats(&after)
+	runtime.KeepAlive(out)
+
+	if !json.Valid(out) {
+		t.Fatalf("output JSON is invalid: %s", out)
+	}
+	allocated := after.TotalAlloc - before.TotalAlloc
+	limit := uint64(len(input) * 4)
+	if allocated > limit {
+		t.Fatalf("allocated %d bytes for %d-byte input, want <= %d", allocated, len(input), limit)
+	}
+}
+
+func buildLargeChatCompletionsRequest(messageCount, messageSize, toolCount int) []byte {
+	text := strings.Repeat("x", messageSize)
+	var b strings.Builder
+	b.Grow(messageCount*messageSize + toolCount*512)
+	b.WriteString(`{"model":"gpt-4o","messages":[`)
+	for i := 0; i < messageCount; i++ {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		b.WriteString(`{"role":"user","content":`)
+		b.WriteString(strconv.Quote(text))
+		b.WriteByte('}')
+	}
+	b.WriteString(`],"tools":[`)
+	for i := 0; i < toolCount; i++ {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		name := "tool_" + strconv.Itoa(i)
+		b.WriteString(`{"type":"function","function":{"name":`)
+		b.WriteString(strconv.Quote(name))
+		b.WriteString(`,"description":"large transcript allocation guard","parameters":{"type":"object","properties":{"value":{"type":"string"}}}}}`)
+	}
+	b.WriteString(`]}`)
+	return []byte(b.String())
 }
 
 // Assistant has both text content and tool_calls — the message should

@@ -2163,48 +2163,61 @@ func compactTranscriptFromPayload(reqPayload, respPayload []byte) []byte {
 		return nil
 	}
 
-	transcript := []byte(`[]`)
+	var transcript bytes.Buffer
+	transcript.Grow(len(reqInput.Raw) + len(respOutput.Raw) + 32)
+	transcript.WriteByte('[')
+	firstItem := true
 	switch {
 	case reqInput.IsArray():
-		for _, item := range reqInput.Array() {
+		reqInput.ForEach(func(_, item gjson.Result) bool {
 			if strings.TrimSpace(item.Raw) == "" {
-				continue
+				return true
 			}
-			var err error
-			transcript, err = sjson.SetRawBytes(transcript, "-1", []byte(item.Raw))
-			if err != nil {
-				return nil
-			}
-		}
+			appendCompactTranscriptItem(&transcript, &firstItem, item.Raw)
+			return true
+		})
 	case reqInput.Type == gjson.String && strings.TrimSpace(reqInput.String()) != "":
-		message := []byte(`{"type":"message","role":"user","content":[{"type":"input_text","text":""}]}`)
-		message, _ = sjson.SetBytes(message, "content.0.text", reqInput.String())
-		var err error
-		transcript, err = sjson.SetRawBytes(transcript, "-1", message)
-		if err != nil {
-			return nil
-		}
+		appendCompactTranscriptItemPrefix(&transcript, &firstItem)
+		writeCompactInputTextMessage(&transcript, reqInput.String())
 	default:
 		return nil
 	}
-	for _, item := range respOutput.Array() {
+	respOutput.ForEach(func(_, item gjson.Result) bool {
 		if strings.TrimSpace(item.Raw) == "" {
-			continue
+			return true
 		}
 		itemType := strings.TrimSpace(item.Get("type").String())
 		if itemType != "message" && itemType != "function_call" && itemType != "function_call_output" && itemType != "custom_tool_call" && itemType != "custom_tool_call_output" {
-			continue
+			return true
 		}
-		var err error
-		transcript, err = sjson.SetRawBytes(transcript, "-1", []byte(item.Raw))
-		if err != nil {
-			return nil
-		}
-	}
-	if len(gjson.ParseBytes(transcript).Array()) == 0 {
+		appendCompactTranscriptItem(&transcript, &firstItem, item.Raw)
+		return true
+	})
+	if firstItem {
 		return nil
 	}
-	return transcript
+	transcript.WriteByte(']')
+	return transcript.Bytes()
+}
+
+func appendCompactTranscriptItem(out *bytes.Buffer, first *bool, raw string) {
+	appendCompactTranscriptItemPrefix(out, first)
+	out.WriteString(raw)
+}
+
+func appendCompactTranscriptItemPrefix(out *bytes.Buffer, first *bool) {
+	if !*first {
+		out.WriteByte(',')
+	}
+	*first = false
+}
+
+func writeCompactInputTextMessage(out *bytes.Buffer, text string) {
+	out.WriteString(`{"type":"message","role":"user","content":[{"type":"input_text","text":`)
+	buf := out.AvailableBuffer()
+	buf = strconv.AppendQuote(buf, text)
+	out.Write(buf)
+	out.WriteString(`}]}`)
 }
 
 func (m *Manager) lookupCompactTranscript(responseID string) []byte {

@@ -6,6 +6,9 @@ import (
 	"fmt"
 	"net/http"
 	"reflect"
+	"runtime"
+	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -883,4 +886,48 @@ func TestManager_BindCompactTranscriptEnforcesTotalByteLimit(t *testing.T) {
 	if manager.responseCompactsTotalBytes > manager.responseCompactMaxBytes {
 		t.Fatalf("compact transcript bytes = %d, limit = %d", manager.responseCompactsTotalBytes, manager.responseCompactMaxBytes)
 	}
+}
+
+func TestCompactTranscriptFromPayloadLargeInputAllocationsStayBounded(t *testing.T) {
+	t.Parallel()
+
+	reqPayload := largeCompactRequestPayload(48, 16*1024)
+	respPayload := []byte(`{"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"ok"}]}]}`)
+	_ = compactTranscriptFromPayload(reqPayload, respPayload)
+
+	runtime.GC()
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	transcript := compactTranscriptFromPayload(reqPayload, respPayload)
+	runtime.ReadMemStats(&after)
+	runtime.KeepAlive(transcript)
+
+	if !gjson.ValidBytes(transcript) {
+		t.Fatalf("transcript is invalid JSON: %s", string(transcript))
+	}
+	if got := len(gjson.ParseBytes(transcript).Array()); got != 49 {
+		t.Fatalf("transcript items = %d, want 49", got)
+	}
+	allocated := after.TotalAlloc - before.TotalAlloc
+	limit := uint64(len(reqPayload) * 3)
+	if allocated > limit {
+		t.Fatalf("allocated %d bytes for %d-byte request, want <= %d", allocated, len(reqPayload), limit)
+	}
+}
+
+func largeCompactRequestPayload(messageCount, messageSize int) []byte {
+	text := strings.Repeat("x", messageSize)
+	var b strings.Builder
+	b.Grow(messageCount*messageSize + 256)
+	b.WriteString(`{"input":[`)
+	for i := 0; i < messageCount; i++ {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		b.WriteString(`{"type":"message","role":"user","content":[{"type":"input_text","text":`)
+		b.WriteString(strconv.Quote(text))
+		b.WriteString(`}]}`)
+	}
+	b.WriteString(`]}`)
+	return []byte(b.String())
 }
