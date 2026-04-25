@@ -130,7 +130,7 @@ type Result struct {
 	// RequestPayload captures the downstream request body for failure auditing.
 	RequestPayload []byte
 	// SkipAccessTokenRefresh marks call sites that already cannot refresh/retry
-	// access tokens and should treat token_revoked as terminal.
+	// access tokens and should treat terminal token errors immediately.
 	SkipAccessTokenRefresh bool
 }
 
@@ -3726,11 +3726,15 @@ func terminalAuthFailureReason(resultErr *Error) string {
 		"forbidden",
 		"unauthorized",
 		"refresh_token_reused",
+		"refresh_token_invalidated",
+		"refresh token has been invalidated",
 		"refresh token has already been used",
 		"account_deactivated",
 		"must be a member of an organization to use the api",
 		"encountered invalidated oauth token for user",
 		"your authentication token has been invalidated. please try signing in again.",
+		"token_revoked",
+		"token_invalidated",
 		"your openai account has been deactivated",
 		"account has been deactivated",
 		"account deactivated",
@@ -3766,19 +3770,8 @@ func isRefreshTokenReusedResultError(resultErr *Error) bool {
 	return strings.Contains(lower, "refresh_token_reused") || strings.Contains(lower, "refresh token has already been used")
 }
 
-func isAccessTokenRefreshableResultError(resultErr *Error) bool {
-	if resultErr == nil {
-		return false
-	}
-	lower := strings.ToLower(strings.TrimSpace(resultErr.Message))
-	return strings.Contains(lower, "token_revoked") || strings.Contains(lower, "token_invalidated")
-}
-
 func shouldAttemptAccessTokenRefresh(auth *Auth, resultErr *Error) bool {
-	if !isCodexAuth(auth) || isRefreshTokenReusedResultError(resultErr) {
-		return false
-	}
-	return isAccessTokenRefreshableResultError(resultErr)
+	return false
 }
 
 func shouldDeleteRevokedAuth(auth *Auth, resultErr *Error, skipAccessTokenRefresh bool) (bool, string) {

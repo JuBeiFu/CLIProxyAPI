@@ -63,7 +63,7 @@ func (e *revokedRefreshExecutor) HttpRequest(context.Context, *Auth, *http.Reque
 	return nil, nil
 }
 
-type accessTokenRefreshRetryExecutor struct {
+type revokedRequestExecutor struct {
 	id   string
 	code string
 
@@ -72,53 +72,38 @@ type accessTokenRefreshRetryExecutor struct {
 	refreshCalls int
 }
 
-func (e *accessTokenRefreshRetryExecutor) Identifier() string { return e.id }
+func (e *revokedRequestExecutor) Identifier() string { return e.id }
 
-func (e *accessTokenRefreshRetryExecutor) Execute(_ context.Context, auth *Auth, _ cliproxyexecutor.Request, _ cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+func (e *revokedRequestExecutor) Execute(context.Context, *Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
 	e.mu.Lock()
 	e.executeCalls++
-	call := e.executeCalls
 	e.mu.Unlock()
-
-	if call == 1 {
-		return cliproxyexecutor.Response{}, &Error{
-			HTTPStatus: http.StatusUnauthorized,
-			Message:    `{"error":{"message":"Encountered invalidated oauth token for user, failing request","code":"` + e.code + `"},"status":401}`,
-		}
+	return cliproxyexecutor.Response{}, &Error{
+		HTTPStatus: http.StatusUnauthorized,
+		Message:    `{"error":{"message":"Encountered invalidated oauth token for user, failing request","code":"` + e.code + `"},"status":401}`,
 	}
-	if got := auth.Metadata["access_token"]; got != "new-access-"+e.code {
-		return cliproxyexecutor.Response{}, &Error{Message: "retry used stale access token"}
-	}
-	return cliproxyexecutor.Response{Payload: []byte("ok-" + e.code)}, nil
 }
 
-func (e *accessTokenRefreshRetryExecutor) ExecuteStream(context.Context, *Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
+func (e *revokedRequestExecutor) ExecuteStream(context.Context, *Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
 	return nil, nil
 }
 
-func (e *accessTokenRefreshRetryExecutor) Refresh(_ context.Context, auth *Auth) (*Auth, error) {
+func (e *revokedRequestExecutor) Refresh(_ context.Context, auth *Auth) (*Auth, error) {
 	e.mu.Lock()
 	e.refreshCalls++
 	e.mu.Unlock()
-
-	updated := auth.Clone()
-	if updated.Metadata == nil {
-		updated.Metadata = map[string]any{}
-	}
-	updated.Metadata["access_token"] = "new-access-" + e.code
-	updated.Metadata["refresh_token"] = "rotated-refresh-" + e.code
-	return updated, nil
+	return auth, nil
 }
 
-func (e *accessTokenRefreshRetryExecutor) CountTokens(context.Context, *Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+func (e *revokedRequestExecutor) CountTokens(context.Context, *Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
 	return cliproxyexecutor.Response{}, nil
 }
 
-func (e *accessTokenRefreshRetryExecutor) HttpRequest(context.Context, *Auth, *http.Request) (*http.Response, error) {
+func (e *revokedRequestExecutor) HttpRequest(context.Context, *Auth, *http.Request) (*http.Response, error) {
 	return nil, nil
 }
 
-func (e *accessTokenRefreshRetryExecutor) calls() (int, int) {
+func (e *revokedRequestExecutor) calls() (int, int) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	return e.executeCalls, e.refreshCalls
@@ -174,7 +159,7 @@ func assertPersistedAuthDeleted(t *testing.T, mgr *Manager, store *deletingStore
 	}
 }
 
-func TestManager_Execute_RefreshesAndRetriesCodexOnAccessTokenInvalidation(t *testing.T) {
+func TestManager_Execute_DeletesPersistedCodexOnTokenRevokedOrInvalidated(t *testing.T) {
 	for _, code := range []string{"token_revoked", "token_invalidated"} {
 		t.Run(code, func(t *testing.T) {
 			store := &deletingStore{}
@@ -183,7 +168,7 @@ func TestManager_Execute_RefreshesAndRetriesCodexOnAccessTokenInvalidation(t *te
 			if _, err := mgr.Register(WithSkipPersist(context.Background()), auth); err != nil {
 				t.Fatalf("Register returned error: %v", err)
 			}
-			exec := &accessTokenRefreshRetryExecutor{id: "codex", code: code}
+			exec := &revokedRequestExecutor{id: "codex", code: code}
 			mgr.RegisterExecutor(exec)
 
 			model := "gpt-5-" + code
@@ -191,30 +176,15 @@ func TestManager_Execute_RefreshesAndRetriesCodexOnAccessTokenInvalidation(t *te
 			reg.RegisterClient(auth.ID, "codex", []*registry.ModelInfo{{ID: model}})
 			t.Cleanup(func() { reg.UnregisterClient(auth.ID) })
 
-			resp, err := mgr.Execute(context.Background(), []string{"codex"}, cliproxyexecutor.Request{Model: model, Payload: []byte(`{}`)}, cliproxyexecutor.Options{})
-			if err != nil {
-				t.Fatalf("Execute returned error: %v", err)
-			}
-			if string(resp.Payload) != "ok-"+code {
-				t.Fatalf("expected retry response %q, got %q", "ok-"+code, string(resp.Payload))
+			_, err := mgr.Execute(context.Background(), []string{"codex"}, cliproxyexecutor.Request{Model: model, Payload: []byte(`{}`)}, cliproxyexecutor.Options{})
+			if err == nil {
+				t.Fatal("expected Execute to return the terminal auth error")
 			}
 			executeCalls, refreshCalls := exec.calls()
-			if executeCalls != 2 || refreshCalls != 1 {
-				t.Fatalf("expected execute=2 refresh=1, got execute=%d refresh=%d", executeCalls, refreshCalls)
+			if executeCalls != 1 || refreshCalls != 0 {
+				t.Fatalf("expected execute=1 refresh=0, got execute=%d refresh=%d", executeCalls, refreshCalls)
 			}
-			stored, ok := mgr.GetByID(auth.ID)
-			if !ok {
-				t.Fatalf("expected auth %s to remain registered", auth.ID)
-			}
-			if stored.Disabled || stored.Status == StatusDisabled {
-				t.Fatalf("expected auth %s to stay enabled, got disabled=%v status=%q", auth.ID, stored.Disabled, stored.Status)
-			}
-			if got := stored.Metadata["access_token"]; got != "new-access-"+code {
-				t.Fatalf("expected refreshed access token, got %#v", got)
-			}
-			if len(store.deleted) != 0 {
-				t.Fatalf("expected no delete, got %v", store.deleted)
-			}
+			assertPersistedAuthDeleted(t, mgr, store, auth)
 		})
 	}
 }
@@ -363,6 +333,37 @@ func TestManager_RefreshAuth_DeletesPersistedAuthOnRefreshTokenReused(t *testing
 	}
 	if !HasRevokedAuthTombstone(auth, time.Now()) {
 		t.Fatal("expected refresh_token_reused auth to leave a tombstone")
+	}
+}
+
+func TestManager_RefreshAuth_DeletesPersistedAuthOnRefreshTokenInvalidated(t *testing.T) {
+	store := &deletingStore{}
+	mgr := NewManager(store, nil, nil)
+	mgr.RegisterExecutor(&revokedRefreshExecutor{
+		id: "codex",
+		err: &Error{
+			HTTPStatus: 0,
+			Message:    `token refresh failed with status 401: {"error":{"message":"Your refresh token has been invalidated. Please try signing in again.","code":"refresh_token_invalidated"}}`,
+		},
+	})
+
+	auth := newPersistedCodexAuth("auths/refresh-invalidated.json")
+	clearRevokedAuthTombstoneForTest(t, auth)
+	if _, err := mgr.Register(WithSkipPersist(context.Background()), auth); err != nil {
+		t.Fatalf("Register returned error: %v", err)
+	}
+
+	mgr.refreshAuth(context.Background(), auth.ID)
+
+	if _, ok := mgr.GetByID(auth.ID); ok {
+		t.Fatal("expected invalidated-refresh-token auth to be removed after refresh failure")
+	}
+	waitForDeletedIDs(t, store, []string{auth.ID})
+	if len(store.saved) != 0 {
+		t.Fatalf("expected invalidated-refresh-token auth not to be re-saved before delete, got saves=%d", len(store.saved))
+	}
+	if !HasRevokedAuthTombstone(auth, time.Now()) {
+		t.Fatal("expected refresh_token_invalidated auth to leave a tombstone")
 	}
 }
 
