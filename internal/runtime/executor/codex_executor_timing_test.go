@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/logging"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/proxypool"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -93,5 +94,28 @@ func TestLogSlowCodexUpstreamTimingSkipsFastRequests(t *testing.T) {
 
 	if got := buf.String(); got != "" {
 		t.Fatalf("expected no log output for fast request, got %s", got)
+	}
+}
+
+func TestRecordCodexProxyPassiveOutcomeMarksRepeatedSlowProxyUnusable(t *testing.T) {
+	manager := proxypool.NewHealthManager()
+	now := time.Now()
+	timing := codexUpstreamTiming{
+		proxyPool: "free-egress",
+		proxyName: "free-proxy-11",
+		status:    200,
+		bytesRead: 64 * 1024,
+		startedAt: now.Add(-2 * time.Minute),
+		readBody:  100 * time.Second,
+	}
+
+	recordCodexProxyPassiveOutcome(timing, manager)
+	if !manager.IsUsableAt("free-egress", "free-proxy-11", now) {
+		t.Fatal("expected first slow passive outcome to keep proxy usable")
+	}
+
+	recordCodexProxyPassiveOutcome(timing, manager)
+	if manager.IsUsableAt("free-egress", "free-proxy-11", now) {
+		t.Fatal("expected repeated slow passive outcomes to mark proxy unusable")
 	}
 }

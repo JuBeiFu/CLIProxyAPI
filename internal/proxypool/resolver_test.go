@@ -102,9 +102,9 @@ func TestResolveSkipsUnhealthyProxyPoolEntries(t *testing.T) {
 		CheckedAt: now,
 	})
 	manager.StoreResult("shared-egress", "proxy-b", ProbeResult{
-		Healthy:   true,
+		Healthy:    true,
 		StatusCode: 204,
-		CheckedAt: now,
+		CheckedAt:  now,
 	})
 
 	got := ResolveWithHealth(cfg, auth, manager)
@@ -250,5 +250,49 @@ func TestResolveCodexBoundStillUsesBinding(t *testing.T) {
 	}
 	if got.ProxyName != "proxy-b" {
 		t.Fatalf("expected ProxyName=proxy-b, got %q", got.ProxyName)
+	}
+}
+
+func TestResolveCodexBoundSkipsPassivelyUnhealthyBinding(t *testing.T) {
+	t.Parallel()
+
+	cfg := &config.Config{
+		SDKConfig: config.SDKConfig{
+			DefaultProxyPool: "free-egress",
+			ProxyPools: []config.ProxyPool{
+				{
+					Name:             "free-egress",
+					FallbackToDirect: true,
+					Entries: []config.ProxyPoolEntry{
+						{Name: "proxy-a", URL: "socks5://a.local:1080"},
+						{Name: "proxy-b", URL: "socks5://b.local:1080"},
+					},
+				},
+			},
+		},
+	}
+	auth := &coreauth.Auth{ID: "codex-bound", Provider: "codex"}
+	coreauth.SetBoundProxyEntry(auth, "proxy-a")
+	manager := NewHealthManager()
+	now := time.Now()
+	for i := 0; i < DefaultPassiveSlowStrikes; i++ {
+		manager.ReportPassiveOutcome("free-egress", "proxy-a", PassiveOutcome{
+			Total:         2 * time.Minute,
+			ReadBody:      100 * time.Second,
+			ResponseBytes: 64 * 1024,
+			StatusCode:    200,
+			CheckedAt:     now.Add(time.Duration(i) * time.Second),
+		})
+	}
+
+	got := ResolveWithHealth(cfg, auth, manager)
+	if got.Source != "codex-awaiting-rebind" {
+		t.Fatalf("expected Source=codex-awaiting-rebind, got %q", got.Source)
+	}
+	if got.ProxyURL != "" || got.ProxyName != "" {
+		t.Fatalf("expected no proxy while awaiting rebind, got URL=%q name=%q", got.ProxyURL, got.ProxyName)
+	}
+	if !got.FallbackToDirect {
+		t.Fatal("expected direct fallback while awaiting rebind")
 	}
 }

@@ -16,6 +16,7 @@ import (
 	codexauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/codex"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/misc"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/proxypool"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/executor/helps"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
@@ -106,6 +107,32 @@ func logSlowCodexUpstreamTiming(ctx context.Context, timing codexUpstreamTiming)
 		timing.streamChunks,
 		errText,
 	)
+}
+
+func recordCodexProxyPassiveOutcome(timing codexUpstreamTiming, manager *proxypool.HealthManager) {
+	if manager == nil {
+		return
+	}
+	if strings.TrimSpace(timing.proxyPool) == "" || strings.TrimSpace(timing.proxyName) == "" {
+		return
+	}
+	total := time.Since(timing.startedAt)
+	if total <= 0 {
+		return
+	}
+	manager.ReportPassiveOutcome(timing.proxyPool, timing.proxyName, proxypool.PassiveOutcome{
+		Total:         total,
+		ReadBody:      timing.readBody,
+		ResponseBytes: int64(timing.bytesRead),
+		StatusCode:    timing.status,
+		Error:         timing.streamErrText,
+		CheckedAt:     time.Now(),
+	})
+}
+
+func finishCodexUpstreamTiming(ctx context.Context, timing codexUpstreamTiming) {
+	recordCodexProxyPassiveOutcome(timing, proxypool.DefaultHealthManager())
+	logSlowCodexUpstreamTiming(ctx, timing)
 }
 
 type codexHTTPTraceState struct {
@@ -253,7 +280,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 		timing.authID = auth.ID
 	}
 	defer func() {
-		logSlowCodexUpstreamTiming(ctx, timing)
+		finishCodexUpstreamTiming(ctx, timing)
 	}()
 	prepareStarted := time.Now()
 	baseModel := thinking.ParseSuffix(req.Model).ModelName
@@ -432,7 +459,7 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 		timing.authID = auth.ID
 	}
 	defer func() {
-		logSlowCodexUpstreamTiming(ctx, timing)
+		finishCodexUpstreamTiming(ctx, timing)
 	}()
 	prepareStarted := time.Now()
 	baseModel := thinking.ParseSuffix(req.Model).ModelName
@@ -640,7 +667,8 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 	timing.httpDo = time.Since(httpStarted)
 	if err != nil {
 		helps.RecordAPIResponseError(ctx, e.cfg, err)
-		logSlowCodexUpstreamTiming(ctx, timing)
+		timing.streamErrText = err.Error()
+		finishCodexUpstreamTiming(ctx, timing)
 		return nil, err
 	}
 	timing.status = httpResp.StatusCode
@@ -655,12 +683,15 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 		}
 		if readErr != nil {
 			helps.RecordAPIResponseError(ctx, e.cfg, readErr)
+			timing.streamErrText = readErr.Error()
+			finishCodexUpstreamTiming(ctx, timing)
 			return nil, readErr
 		}
 		helps.AppendAPIResponseChunk(ctx, e.cfg, data)
 		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), data))
 		err = newCodexStatusErr(httpResp.StatusCode, data)
-		logSlowCodexUpstreamTiming(ctx, timing)
+		timing.streamErrText = err.Error()
+		finishCodexUpstreamTiming(ctx, timing)
 		return nil, err
 	}
 	out := make(chan cliproxyexecutor.StreamChunk)
@@ -670,12 +701,18 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 			if errClose := httpResp.Body.Close(); errClose != nil {
 				log.Errorf("codex executor: close response body error: %v", errClose)
 			}
-			logSlowCodexUpstreamTiming(ctx, timing)
+			finishCodexUpstreamTiming(ctx, timing)
 		}()
 		scanner := bufio.NewScanner(httpResp.Body)
 		scanner.Buffer(nil, 52_428_800) // 50MB
 		var param any
-		for scanner.Scan() {
+		for {
+			scanStarted := time.Now()
+			ok := scanner.Scan()
+			timing.readBody += time.Since(scanStarted)
+			if !ok {
+				break
+			}
 			timing.streamLines++
 			line := scanner.Bytes()
 			timing.bytesRead += len(line)
@@ -705,10 +742,6 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 			for i := range chunks {
 				out <- cliproxyexecutor.StreamChunk{Payload: chunks[i]}
 			}
-		}
-		timing.readBody = time.Since(httpStarted) - timing.httpDo - timing.translate
-		if timing.readBody < 0 {
-			timing.readBody = 0
 		}
 		if errScan := scanner.Err(); errScan != nil {
 			helps.RecordAPIResponseError(ctx, e.cfg, errScan)

@@ -13,11 +13,14 @@ import (
 )
 
 type ProbeResult struct {
-	Healthy    bool          `json:"healthy"`
-	StatusCode int           `json:"status_code,omitempty"`
-	Latency    time.Duration `json:"-"`
-	Error      string        `json:"error,omitempty"`
-	CheckedAt  time.Time     `json:"checked_at,omitempty"`
+	Healthy        bool          `json:"healthy"`
+	StatusCode     int           `json:"status_code,omitempty"`
+	Latency        time.Duration `json:"-"`
+	Error          string        `json:"error,omitempty"`
+	CheckedAt      time.Time     `json:"checked_at,omitempty"`
+	Passive        bool          `json:"passive,omitempty"`
+	UnhealthyUntil time.Time     `json:"unhealthy_until,omitempty"`
+	SlowStrikes    int           `json:"slow_strikes,omitempty"`
 }
 
 type EntryStatus struct {
@@ -46,6 +49,25 @@ type PoolStatus struct {
 type probeClientKey struct {
 	proxyURL string
 	timeout  time.Duration
+}
+
+const (
+	DefaultPassiveSlowTotal             = 60 * time.Second
+	DefaultPassiveSlowReadBody          = 45 * time.Second
+	DefaultPassiveSlowBytesPerSecond    = 20 * 1024
+	DefaultPassiveSlowStrikes           = 2
+	DefaultPassiveSlowCooldown          = 5 * time.Minute
+	DefaultPassiveSuccessTotal          = 20 * time.Second
+	DefaultPassiveSuccessBytesPerSecond = 40 * 1024
+)
+
+type PassiveOutcome struct {
+	Total         time.Duration
+	ReadBody      time.Duration
+	ResponseBytes int64
+	StatusCode    int
+	Error         string
+	CheckedAt     time.Time
 }
 
 type HealthManager struct {
@@ -156,11 +178,66 @@ func (m *HealthManager) Snapshot() map[string]map[string]ProbeResult {
 }
 
 func (m *HealthManager) IsUsable(poolName, entryName string) bool {
+	return m.IsUsableAt(poolName, entryName, time.Now())
+}
+
+func (m *HealthManager) IsUsableAt(poolName, entryName string, now time.Time) bool {
 	result, ok := m.Result(poolName, entryName)
 	if !ok || result.CheckedAt.IsZero() {
 		return true
 	}
+	if result.Passive && !result.UnhealthyUntil.IsZero() {
+		if now.IsZero() {
+			now = time.Now()
+		}
+		return now.After(result.UnhealthyUntil)
+	}
 	return result.Healthy
+}
+
+func (m *HealthManager) ReportPassiveOutcome(poolName, entryName string, outcome PassiveOutcome) {
+	if m == nil {
+		return
+	}
+	poolKey := normalizePoolName(poolName)
+	entryKey := normalizeEntryName(entryName)
+	if poolKey == "" || entryKey == "" {
+		return
+	}
+	if outcome.CheckedAt.IsZero() {
+		outcome.CheckedAt = time.Now()
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.entries == nil {
+		m.entries = make(map[string]map[string]ProbeResult)
+	}
+	if _, ok := m.entries[poolKey]; !ok {
+		m.entries[poolKey] = make(map[string]ProbeResult)
+	}
+	previous := m.entries[poolKey][entryKey]
+	next := ProbeResult{
+		Healthy:    true,
+		StatusCode: outcome.StatusCode,
+		Latency:    outcome.Total,
+		CheckedAt:  outcome.CheckedAt,
+		Passive:    true,
+	}
+	if passiveOutcomeIsSlow(outcome) {
+		next.SlowStrikes = previous.SlowStrikes + 1
+		next.Healthy = next.SlowStrikes < DefaultPassiveSlowStrikes
+		if !next.Healthy {
+			next.Error = passiveSlowError(outcome, next.SlowStrikes)
+			next.UnhealthyUntil = outcome.CheckedAt.Add(DefaultPassiveSlowCooldown)
+		}
+		m.entries[poolKey][entryKey] = next
+		return
+	}
+	if passiveOutcomeIsFastSuccess(outcome) || previous.Passive {
+		m.entries[poolKey][entryKey] = next
+	}
 }
 
 func (m *HealthManager) PoolStatuses(pools []config.ProxyPool, targetName string) []PoolStatus {
@@ -317,6 +394,9 @@ func (m *HealthManager) lastCheckedAt(poolName string) time.Time {
 
 	var last time.Time
 	for _, result := range snapshot[normalizePoolName(poolName)] {
+		if result.Passive {
+			continue
+		}
 		if result.CheckedAt.After(last) {
 			last = result.CheckedAt
 		}
@@ -463,6 +543,74 @@ func expectedStatusCodesForPool(pool config.ProxyPool) []int {
 		return append([]int(nil), pool.ExpectedStatusCodes...)
 	}
 	return []int{http.StatusOK, http.StatusNoContent}
+}
+
+func passiveOutcomeIsSlow(outcome PassiveOutcome) bool {
+	if outcome.Error != "" && outcome.StatusCode == 0 {
+		return true
+	}
+	if outcome.StatusCode != 0 && (outcome.StatusCode < http.StatusOK || outcome.StatusCode >= http.StatusBadRequest) {
+		return false
+	}
+	if outcome.Total < DefaultPassiveSlowTotal && outcome.ReadBody < DefaultPassiveSlowReadBody {
+		return false
+	}
+	duration := outcome.ReadBody
+	if duration <= 0 {
+		duration = outcome.Total
+	}
+	if duration <= 0 {
+		return false
+	}
+	if outcome.ResponseBytes <= 0 {
+		return duration >= DefaultPassiveSlowReadBody
+	}
+	return bytesPerSecond(outcome.ResponseBytes, duration) < DefaultPassiveSlowBytesPerSecond
+}
+
+func passiveOutcomeIsFastSuccess(outcome PassiveOutcome) bool {
+	if outcome.Error != "" {
+		return false
+	}
+	if outcome.StatusCode != 0 && (outcome.StatusCode < http.StatusOK || outcome.StatusCode >= http.StatusBadRequest) {
+		return false
+	}
+	if outcome.Total <= 0 || outcome.Total > DefaultPassiveSuccessTotal {
+		return false
+	}
+	duration := outcome.ReadBody
+	if duration <= 0 {
+		duration = outcome.Total
+	}
+	if duration <= 0 {
+		return false
+	}
+	if outcome.ResponseBytes <= 0 {
+		return true
+	}
+	return bytesPerSecond(outcome.ResponseBytes, duration) >= DefaultPassiveSuccessBytesPerSecond
+}
+
+func passiveSlowError(outcome PassiveOutcome, strikes int) string {
+	if strings.TrimSpace(outcome.Error) != "" {
+		return fmt.Sprintf("passive proxy error after %d strike(s): %s", strikes, strings.TrimSpace(outcome.Error))
+	}
+	duration := outcome.ReadBody
+	if duration <= 0 {
+		duration = outcome.Total
+	}
+	throughput := int64(0)
+	if duration > 0 && outcome.ResponseBytes > 0 {
+		throughput = int64(bytesPerSecond(outcome.ResponseBytes, duration))
+	}
+	return fmt.Sprintf("passive proxy slow after %d strike(s): total=%s read_body=%s bytes=%d bps=%d status=%d", strikes, outcome.Total.Round(time.Millisecond), outcome.ReadBody.Round(time.Millisecond), outcome.ResponseBytes, throughput, outcome.StatusCode)
+}
+
+func bytesPerSecond(bytes int64, duration time.Duration) float64 {
+	if bytes <= 0 || duration <= 0 {
+		return 0
+	}
+	return float64(bytes) / duration.Seconds()
 }
 
 func normalizePoolName(name string) string {

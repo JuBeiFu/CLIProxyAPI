@@ -57,6 +57,134 @@ func TestHealthManagerMarksUnprobedEntryUsable(t *testing.T) {
 	}
 }
 
+func TestHealthManagerPassiveSlowOutcomeTemporarilyMarksUnusable(t *testing.T) {
+	t.Parallel()
+
+	manager := NewHealthManager()
+	now := time.Unix(1_744_419_200, 0)
+
+	manager.ReportPassiveOutcome("shared-egress", "proxy-a", PassiveOutcome{
+		Total:         2 * time.Minute,
+		ReadBody:      95 * time.Second,
+		ResponseBytes: 128 * 1024,
+		StatusCode:    200,
+		CheckedAt:     now,
+	})
+	if !manager.IsUsableAt("shared-egress", "proxy-a", now) {
+		t.Fatal("expected a single slow passive sample to keep entry usable")
+	}
+
+	manager.ReportPassiveOutcome("shared-egress", "proxy-a", PassiveOutcome{
+		Total:         130 * time.Second,
+		ReadBody:      110 * time.Second,
+		ResponseBytes: 64 * 1024,
+		StatusCode:    200,
+		CheckedAt:     now.Add(time.Second),
+	})
+	if manager.IsUsableAt("shared-egress", "proxy-a", now.Add(time.Second)) {
+		t.Fatal("expected repeated slow passive samples to mark entry unusable")
+	}
+	result, ok := manager.Result("shared-egress", "proxy-a")
+	if !ok {
+		t.Fatal("expected passive result to be stored")
+	}
+	if !result.Passive {
+		t.Fatalf("Passive = false, want true")
+	}
+	if result.UnhealthyUntil.IsZero() {
+		t.Fatal("expected passive result to have UnhealthyUntil")
+	}
+	if !manager.IsUsableAt("shared-egress", "proxy-a", result.UnhealthyUntil.Add(time.Second)) {
+		t.Fatal("expected passive cooldown expiry to restore usability")
+	}
+}
+
+func TestHealthManagerPassiveHealthyOutcomeClearsPassiveCooldown(t *testing.T) {
+	t.Parallel()
+
+	manager := NewHealthManager()
+	now := time.Unix(1_744_419_200, 0)
+	for i := 0; i < DefaultPassiveSlowStrikes; i++ {
+		manager.ReportPassiveOutcome("shared-egress", "proxy-a", PassiveOutcome{
+			Total:         2 * time.Minute,
+			ReadBody:      100 * time.Second,
+			ResponseBytes: 64 * 1024,
+			StatusCode:    200,
+			CheckedAt:     now.Add(time.Duration(i) * time.Second),
+		})
+	}
+	if manager.IsUsableAt("shared-egress", "proxy-a", now.Add(2*time.Second)) {
+		t.Fatal("expected passive slow samples to mark entry unusable")
+	}
+
+	manager.ReportPassiveOutcome("shared-egress", "proxy-a", PassiveOutcome{
+		Total:         8 * time.Second,
+		ReadBody:      7 * time.Second,
+		ResponseBytes: 512 * 1024,
+		StatusCode:    200,
+		CheckedAt:     now.Add(3 * time.Second),
+	})
+	if !manager.IsUsableAt("shared-egress", "proxy-a", now.Add(3*time.Second)) {
+		t.Fatal("expected fast passive success to restore usability")
+	}
+}
+
+func TestHealthManagerLastCheckedAtIgnoresPassiveOutcomes(t *testing.T) {
+	t.Parallel()
+
+	manager := NewHealthManager()
+	now := time.Unix(1_744_419_200, 0)
+	manager.ReportPassiveOutcome("shared-egress", "proxy-a", PassiveOutcome{
+		Total:         5 * time.Second,
+		ReadBody:      4 * time.Second,
+		ResponseBytes: 512 * 1024,
+		StatusCode:    200,
+		CheckedAt:     now,
+	})
+
+	if got := manager.lastCheckedAt("shared-egress"); !got.IsZero() {
+		t.Fatalf("lastCheckedAt = %s, want zero for passive-only result", got)
+	}
+}
+
+func TestHealthManagerPassiveHighThroughputLongRequestStaysUsable(t *testing.T) {
+	t.Parallel()
+
+	manager := NewHealthManager()
+	now := time.Unix(1_744_419_200, 0)
+	for i := 0; i < DefaultPassiveSlowStrikes+1; i++ {
+		manager.ReportPassiveOutcome("shared-egress", "proxy-a", PassiveOutcome{
+			Total:         2 * time.Minute,
+			ReadBody:      100 * time.Second,
+			ResponseBytes: int64(DefaultPassiveSlowBytesPerSecond) * 100 * 2,
+			StatusCode:    200,
+			CheckedAt:     now.Add(time.Duration(i) * time.Second),
+		})
+	}
+	if !manager.IsUsableAt("shared-egress", "proxy-a", now.Add(time.Minute)) {
+		t.Fatal("expected high-throughput long request to keep entry usable")
+	}
+}
+
+func TestHealthManagerPassiveUpstreamErrorStatusStaysUsable(t *testing.T) {
+	t.Parallel()
+
+	manager := NewHealthManager()
+	now := time.Unix(1_744_419_200, 0)
+	for i := 0; i < DefaultPassiveSlowStrikes+1; i++ {
+		manager.ReportPassiveOutcome("shared-egress", "proxy-a", PassiveOutcome{
+			Total:         2 * time.Minute,
+			ReadBody:      100 * time.Second,
+			ResponseBytes: 64 * 1024,
+			StatusCode:    503,
+			CheckedAt:     now.Add(time.Duration(i) * time.Second),
+		})
+	}
+	if !manager.IsUsableAt("shared-egress", "proxy-a", now.Add(time.Minute)) {
+		t.Fatal("expected upstream status errors to keep entry usable")
+	}
+}
+
 func TestHealthManagerReusesProbeClientForEntry(t *testing.T) {
 	t.Parallel()
 
