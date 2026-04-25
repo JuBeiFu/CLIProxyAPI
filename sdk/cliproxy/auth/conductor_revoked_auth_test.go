@@ -272,7 +272,7 @@ func TestManager_RefreshAuth_DisablesPersistedAuthOnOrgRequired(t *testing.T) {
 	}
 }
 
-func TestManager_RefreshAuth_DisablesPersistedAuthOnRefreshTokenReused(t *testing.T) {
+func TestManager_RefreshAuth_DeletesPersistedAuthOnRefreshTokenReused(t *testing.T) {
 	store := &deletingStore{}
 	mgr := NewManager(store, nil, nil)
 	mgr.RegisterExecutor(&revokedRefreshExecutor{
@@ -290,22 +290,19 @@ func TestManager_RefreshAuth_DisablesPersistedAuthOnRefreshTokenReused(t *testin
 
 	mgr.refreshAuth(context.Background(), auth.ID)
 
-	stored, ok := mgr.GetByID(auth.ID)
-	if !ok {
-		t.Fatal("expected reused-token auth to remain registered after refresh failure")
+	if _, ok := mgr.GetByID(auth.ID); ok {
+		t.Fatal("expected reused-token auth to be removed after refresh failure")
 	}
-	if !stored.Disabled || stored.Status != StatusDisabled {
-		t.Fatalf("expected reused-token auth to be disabled, got disabled=%v status=%q", stored.Disabled, stored.Status)
+	waitForDeletedIDs(t, store, []string{auth.ID})
+	if len(store.saved) != 0 {
+		t.Fatalf("expected reused-token auth not to be re-saved before delete, got saves=%d", len(store.saved))
 	}
-	if len(store.deleted) != 0 {
-		t.Fatalf("expected reused-token auth to remain in store, got deletes %v", store.deleted)
-	}
-	if len(store.saved) == 0 || !store.saved[len(store.saved)-1].Disabled {
-		t.Fatalf("expected disabled reused-token auth to be persisted, got saves=%d", len(store.saved))
+	if !HasRevokedAuthTombstone(auth, time.Now()) {
+		t.Fatal("expected refresh_token_reused auth to leave a tombstone")
 	}
 }
 
-func TestManager_MarkResult_DisablesPersistedAuthOnRefreshTokenReused(t *testing.T) {
+func TestManager_MarkResult_DeletesPersistedAuthOnRefreshTokenReused(t *testing.T) {
 	store := &deletingStore{}
 	mgr := NewManager(store, nil, nil)
 	auth := newPersistedCodexAuth("auths/request-reused.json")
@@ -324,7 +321,10 @@ func TestManager_MarkResult_DisablesPersistedAuthOnRefreshTokenReused(t *testing
 		},
 	})
 
-	assertPersistedAuthDisabled(t, mgr, store, auth)
+	if _, ok := mgr.GetByID(auth.ID); ok {
+		t.Fatal("expected refresh_token_reused auth to be removed")
+	}
+	waitForDeletedIDs(t, store, []string{auth.ID})
 	if !HasRevokedAuthTombstone(auth, time.Now()) {
 		t.Fatal("expected refresh_token_reused auth to leave a tombstone")
 	}

@@ -2579,6 +2579,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	terminalAuthSnapshot := (*Auth)(nil)
 	terminalWarning := ""
 	terminallyDisabled := false
+	terminallyDeleted := false
 	var cyberAudit *cyberPolicyAuditRecord
 
 	m.mu.Lock()
@@ -2591,6 +2592,8 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 				terminalAuthSnapshot = auth.Clone()
 				terminalWarning = reason
 				terminallyDisabled = true
+				terminallyDeleted = true
+				delete(m.auths, result.AuthID)
 			} else if disableAuth, reason := shouldDisableRevokedAuth(auth, result.Error); disableAuth {
 				applyTerminalAuthDisabledState(auth, result.Error, reason, now)
 				terminalAuthSnapshot = auth.Clone()
@@ -2753,13 +2756,19 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 			}
 		}
 
-		_ = m.persist(ctx, auth)
-		authSnapshot = auth.Clone()
+		if !terminallyDeleted {
+			_ = m.persist(ctx, auth)
+			authSnapshot = auth.Clone()
+		}
 	}
 	m.mu.Unlock()
 
 	if terminalAuthSnapshot != nil {
-		m.markRevokedAuthDisabled(terminalAuthSnapshot, terminalWarning, "request")
+		if terminallyDeleted {
+			m.deleteRevokedAuth(terminalAuthSnapshot, terminalWarning, "request")
+		} else {
+			m.markRevokedAuthDisabled(terminalAuthSnapshot, terminalWarning, "request")
+		}
 		m.hook.OnResult(ctx, result)
 		return
 	}
@@ -3330,16 +3339,33 @@ func terminalAuthFailureReason(resultErr *Error) string {
 	}
 }
 
+func isRefreshTokenReusedResultError(resultErr *Error) bool {
+	if resultErr == nil {
+		return false
+	}
+	lower := strings.ToLower(strings.TrimSpace(resultErr.Message))
+	return strings.Contains(lower, "refresh_token_reused") || strings.Contains(lower, "refresh token has already been used")
+}
+
 func shouldDeleteRevokedAuth(auth *Auth, resultErr *Error) (bool, string) {
 	if !isCodexAuth(auth) || !hasPersistedAuthRecord(auth) {
 		return false, ""
 	}
+	if !isRefreshTokenReusedResultError(resultErr) {
+		return false, ""
+	}
 	reason := terminalAuthFailureReason(resultErr)
+	if reason == "" && resultErr != nil {
+		reason = strings.TrimSpace(resultErr.Message)
+	}
+	if reason == "" {
+		reason = "refresh_token_reused"
+	}
 	return reason != "", reason
 }
 
 func shouldDisableRevokedAuth(auth *Auth, resultErr *Error) (bool, string) {
-	if !isCodexAuth(auth) || auth == nil || hasPersistedAuthRecord(auth) {
+	if !isCodexAuth(auth) || auth == nil {
 		return false, ""
 	}
 	reason := terminalAuthFailureReason(resultErr)
@@ -4404,6 +4430,21 @@ func (m *Manager) refreshAuth(ctx context.Context, id string) {
 		resultErr := resultErrorFromError(err)
 		if deleteAuth, reason := shouldDeleteRevokedAuth(auth, resultErr); deleteAuth {
 			var authSnapshot *Auth
+			m.mu.Lock()
+			if current := m.auths[id]; current != nil {
+				applyTerminalAuthDisabledState(current, resultErr, reason, now)
+				current.NextRefreshAfter = time.Time{}
+				authSnapshot = current.Clone()
+				delete(m.auths, id)
+			}
+			m.mu.Unlock()
+			if authSnapshot != nil {
+				m.deleteRevokedAuth(authSnapshot, reason, "refresh")
+			}
+			return
+		}
+		if disableAuth, reason := shouldDisableRevokedAuth(auth, resultErr); disableAuth {
+			var authSnapshot *Auth
 			var persistErr error
 			m.mu.Lock()
 			if current := m.auths[id]; current != nil {
@@ -4414,30 +4455,11 @@ func (m *Manager) refreshAuth(ctx context.Context, id string) {
 				persistErr = m.persist(ctx, current)
 			}
 			m.mu.Unlock()
-			if authSnapshot != nil {
-				if m.scheduler != nil {
-					m.scheduler.upsertAuth(authSnapshot)
-				}
-				if persistErr != nil {
-					log.Warnf("disabled revoked auth %s%s after terminal auth failure during refresh, but failed to persist disabled state: %v", authSnapshot.ID, authPathSuffix(authSnapshot), persistErr)
-					return
-				}
-				log.Warnf("disabled revoked auth %s%s after terminal auth failure during refresh: %s", authSnapshot.ID, authPathSuffix(authSnapshot), reason)
-			}
-			return
-		}
-		if disableAuth, reason := shouldDisableRevokedAuth(auth, resultErr); disableAuth {
-			var authSnapshot *Auth
-			m.mu.Lock()
-			if current := m.auths[id]; current != nil {
-				applyTerminalAuthDisabledState(current, resultErr, reason, now)
-				current.NextRefreshAfter = time.Time{}
-				m.auths[id] = current
-				authSnapshot = current.Clone()
-			}
-			m.mu.Unlock()
 			if authSnapshot != nil && m.scheduler != nil {
 				m.scheduler.upsertAuth(authSnapshot)
+			}
+			if persistErr != nil {
+				log.Warnf("disabled revoked auth %s%s after terminal auth failure during refresh, but failed to persist disabled state: %v", authSnapshot.ID, authPathSuffix(authSnapshot), persistErr)
 			}
 			return
 		}
