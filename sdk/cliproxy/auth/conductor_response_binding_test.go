@@ -842,3 +842,45 @@ func TestManagerExecute_OpenAIResponsesCompactPreviousResponseOnlyExpandsToTrans
 		t.Fatalf("input[1].content[0].text = %q, want %q; payload=%s", got, "assistant-1", string(compactPayload))
 	}
 }
+
+func TestManager_UnbindResponsesForAuthRemovesCompactTranscripts(t *testing.T) {
+	t.Parallel()
+
+	manager := NewManager(nil, &RoundRobinSelector{}, nil)
+	manager.bindResponseToAuth("resp-a", "auth-a")
+	manager.bindCompactTranscript("resp-a", []byte(`[{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}]`))
+
+	if got := manager.lookupCompactTranscript("resp-a"); len(got) == 0 {
+		t.Fatal("compact transcript was not stored")
+	}
+
+	if removed := manager.unbindResponsesForAuth("auth-a"); removed != 1 {
+		t.Fatalf("removed bindings = %d, want 1", removed)
+	}
+	if got := manager.lookupCompactTranscript("resp-a"); len(got) != 0 {
+		t.Fatalf("compact transcript still present after unbind, len=%d", len(got))
+	}
+}
+
+func TestManager_BindCompactTranscriptEnforcesTotalByteLimit(t *testing.T) {
+	t.Parallel()
+
+	manager := NewManager(nil, &RoundRobinSelector{}, nil)
+	manager.responseCompactMaxBytes = 170
+	manager.responseCompactMaxEntries = 10
+
+	first := []byte(`[{"type":"message","role":"user","content":[{"type":"input_text","text":"first compact transcript"}]}]`)
+	second := []byte(`[{"type":"message","role":"user","content":[{"type":"input_text","text":"second compact transcript"}]}]`)
+	manager.bindCompactTranscript("resp-a", first)
+	manager.bindCompactTranscript("resp-b", second)
+
+	if got := manager.lookupCompactTranscript("resp-a"); len(got) != 0 {
+		t.Fatalf("old compact transcript was not evicted, len=%d", len(got))
+	}
+	if got := manager.lookupCompactTranscript("resp-b"); !bytes.Equal(got, second) {
+		t.Fatalf("new compact transcript = %s, want %s", string(got), string(second))
+	}
+	if manager.responseCompactsTotalBytes > manager.responseCompactMaxBytes {
+		t.Fatalf("compact transcript bytes = %d, limit = %d", manager.responseCompactsTotalBytes, manager.responseCompactMaxBytes)
+	}
+}

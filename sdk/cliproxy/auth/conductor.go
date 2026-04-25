@@ -79,6 +79,12 @@ const (
 	defaultMaxRetryInterval    = 120 * time.Second
 )
 
+const (
+	defaultResponseCompactMaxBytes     = 2 << 30
+	defaultResponseCompactMaxEntrySize = 16 << 20
+	defaultResponseCompactMaxEntries   = 10000
+)
+
 const responseBindingPinnedAuthMetadataKey = "__cliproxy_response_binding_pinned_auth"
 
 var quotaCooldownDisabled atomic.Bool
@@ -207,6 +213,13 @@ type Manager struct {
 	responseBindingsMu sync.Mutex
 	responseBindings   map[string]string
 	responseCompacts   map[string][]byte
+	responseCompactSeq map[string]uint64
+
+	responseCompactsTotalBytes  int
+	responseCompactMaxBytes     int
+	responseCompactMaxEntrySize int
+	responseCompactMaxEntries   int
+	responseCompactNextSeq      uint64
 
 	// Optional HTTP RoundTripper provider injected by host.
 	rtProvider RoundTripperProvider
@@ -228,16 +241,20 @@ func NewManager(store Store, selector Selector, hook Hook) *Manager {
 		hook = NoopHook{}
 	}
 	manager := &Manager{
-		store:            store,
-		executors:        make(map[string]ProviderExecutor),
-		selector:         selector,
-		hook:             hook,
-		auths:            make(map[string]*Auth),
-		providerOffsets:  make(map[string]int),
-		modelPoolOffsets: make(map[string]int),
-		responseBindings: make(map[string]string),
-		responseCompacts: make(map[string][]byte),
-		refreshSemaphore: make(chan struct{}, refreshMaxConcurrency),
+		store:                       store,
+		executors:                   make(map[string]ProviderExecutor),
+		selector:                    selector,
+		hook:                        hook,
+		auths:                       make(map[string]*Auth),
+		providerOffsets:             make(map[string]int),
+		modelPoolOffsets:            make(map[string]int),
+		responseBindings:            make(map[string]string),
+		responseCompacts:            make(map[string][]byte),
+		responseCompactSeq:          make(map[string]uint64),
+		responseCompactMaxBytes:     defaultResponseCompactMaxBytes,
+		responseCompactMaxEntrySize: defaultResponseCompactMaxEntrySize,
+		responseCompactMaxEntries:   defaultResponseCompactMaxEntries,
+		refreshSemaphore:            make(chan struct{}, refreshMaxConcurrency),
 	}
 	// atomic.Value requires non-nil initial value.
 	manager.runtimeConfig.Store(&internalconfig.Config{})
@@ -1872,6 +1889,7 @@ func (m *Manager) lookupCompactTranscript(responseID string) []byte {
 	m.responseBindingsMu.Lock()
 	defer m.responseBindingsMu.Unlock()
 	if raw, ok := m.responseCompacts[responseID]; ok && len(raw) > 0 {
+		m.touchCompactTranscriptLocked(responseID)
 		return bytes.Clone(raw)
 	}
 	return nil
@@ -1886,11 +1904,80 @@ func (m *Manager) bindCompactTranscript(responseID string, transcript []byte) {
 		return
 	}
 	m.responseBindingsMu.Lock()
+	defer m.responseBindingsMu.Unlock()
+	maxBytes, maxEntrySize, maxEntries := m.responseCompactLimits()
+	if len(transcript) > maxEntrySize {
+		m.removeCompactTranscriptLocked(responseID)
+		return
+	}
 	if m.responseCompacts == nil {
 		m.responseCompacts = make(map[string][]byte)
 	}
+	if m.responseCompactSeq == nil {
+		m.responseCompactSeq = make(map[string]uint64)
+	}
+	m.removeCompactTranscriptLocked(responseID)
 	m.responseCompacts[responseID] = bytes.Clone(transcript)
-	m.responseBindingsMu.Unlock()
+	m.responseCompactsTotalBytes += len(transcript)
+	m.touchCompactTranscriptLocked(responseID)
+	m.evictCompactTranscriptsLocked(maxBytes, maxEntries)
+}
+
+func (m *Manager) responseCompactLimits() (int, int, int) {
+	maxBytes := m.responseCompactMaxBytes
+	if maxBytes <= 0 {
+		maxBytes = defaultResponseCompactMaxBytes
+	}
+	maxEntrySize := m.responseCompactMaxEntrySize
+	if maxEntrySize <= 0 {
+		maxEntrySize = defaultResponseCompactMaxEntrySize
+	}
+	maxEntries := m.responseCompactMaxEntries
+	if maxEntries <= 0 {
+		maxEntries = defaultResponseCompactMaxEntries
+	}
+	return maxBytes, maxEntrySize, maxEntries
+}
+
+func (m *Manager) touchCompactTranscriptLocked(responseID string) {
+	if m.responseCompactSeq == nil {
+		m.responseCompactSeq = make(map[string]uint64)
+	}
+	m.responseCompactNextSeq++
+	m.responseCompactSeq[responseID] = m.responseCompactNextSeq
+}
+
+func (m *Manager) removeCompactTranscriptLocked(responseID string) bool {
+	if raw, ok := m.responseCompacts[responseID]; ok {
+		m.responseCompactsTotalBytes -= len(raw)
+		if m.responseCompactsTotalBytes < 0 {
+			m.responseCompactsTotalBytes = 0
+		}
+		delete(m.responseCompacts, responseID)
+		delete(m.responseCompactSeq, responseID)
+		return true
+	}
+	delete(m.responseCompactSeq, responseID)
+	return false
+}
+
+func (m *Manager) evictCompactTranscriptsLocked(maxBytes, maxEntries int) {
+	for (len(m.responseCompacts) > maxEntries || m.responseCompactsTotalBytes > maxBytes) && len(m.responseCompacts) > 0 {
+		oldestID := ""
+		var oldestSeq uint64
+		for responseID := range m.responseCompacts {
+			seq := m.responseCompactSeq[responseID]
+			if oldestID == "" || seq < oldestSeq {
+				oldestID = responseID
+				oldestSeq = seq
+			}
+		}
+		if oldestID == "" {
+			return
+		}
+		m.removeCompactTranscriptLocked(oldestID)
+		delete(m.responseBindings, oldestID)
+	}
 }
 
 func (m *Manager) expandCompactPreviousResponseRequest(req cliproxyexecutor.Request, opts cliproxyexecutor.Options) cliproxyexecutor.Request {
@@ -1967,6 +2054,7 @@ func (m *Manager) unbindResponsesForAuth(authID string) int {
 			continue
 		}
 		delete(m.responseBindings, responseID)
+		m.removeCompactTranscriptLocked(responseID)
 		removed++
 	}
 	return removed
