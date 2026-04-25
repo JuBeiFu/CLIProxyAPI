@@ -92,6 +92,10 @@ type Config struct {
 	// Routing controls credential selection behavior.
 	Routing RoutingConfig `yaml:"routing" json:"routing"`
 
+	// ResponseCompact controls the in-memory compact transcript cache used to
+	// expand responses/compact follow-up requests.
+	ResponseCompact ResponseCompactConfig `yaml:"response-compact" json:"response-compact"`
+
 	// WebsocketAuth enables or disables authentication for the WebSocket API.
 	WebsocketAuth bool `yaml:"ws-auth" json:"ws-auth"`
 
@@ -233,6 +237,13 @@ type RoutingConfig struct {
 	PerformanceWeightLatency  float64 `yaml:"performance-weight-latency,omitempty" json:"performance-weight-latency,omitempty"`
 	PerformanceWeightFailure  float64 `yaml:"performance-weight-failure,omitempty" json:"performance-weight-failure,omitempty"`
 	PerformanceWeightInflight float64 `yaml:"performance-weight-inflight,omitempty" json:"performance-weight-inflight,omitempty"`
+}
+
+// ResponseCompactConfig controls the in-memory compact transcript cache.
+type ResponseCompactConfig struct {
+	MaxBytes      int `yaml:"max-bytes,omitempty" json:"max-bytes,omitempty"`
+	MaxEntryBytes int `yaml:"max-entry-bytes,omitempty" json:"max-entry-bytes,omitempty"`
+	MaxEntries    int `yaml:"max-entries,omitempty" json:"max-entries,omitempty"`
 }
 
 func (c *Config) UnmarshalYAML(value *yaml.Node) error {

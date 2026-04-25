@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	internalconfig "github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v6/sdk/translator"
@@ -885,6 +886,55 @@ func TestManager_BindCompactTranscriptEnforcesTotalByteLimit(t *testing.T) {
 	}
 	if manager.responseCompactsTotalBytes > manager.responseCompactMaxBytes {
 		t.Fatalf("compact transcript bytes = %d, limit = %d", manager.responseCompactsTotalBytes, manager.responseCompactMaxBytes)
+	}
+}
+
+func TestManager_ResponseCompactDefaultTotalLimitIsBounded(t *testing.T) {
+	t.Parallel()
+
+	manager := NewManager(nil, &RoundRobinSelector{}, nil)
+	maxBytes, maxEntrySize, maxEntries := manager.responseCompactLimits()
+
+	if maxBytes > 256<<20 {
+		t.Fatalf("default compact transcript max bytes = %d, want <= %d", maxBytes, 256<<20)
+	}
+	if maxEntrySize != 16<<20 {
+		t.Fatalf("default compact transcript entry size = %d, want %d", maxEntrySize, 16<<20)
+	}
+	if maxEntries > 2048 {
+		t.Fatalf("default compact transcript entries = %d, want <= %d", maxEntries, 2048)
+	}
+}
+
+func TestManager_SetConfigAppliesResponseCompactLimitsAndEvicts(t *testing.T) {
+	t.Parallel()
+
+	manager := NewManager(nil, &RoundRobinSelector{}, nil)
+	first := []byte(`[{"type":"message","role":"user","content":[{"type":"input_text","text":"first compact transcript"}]}]`)
+	second := []byte(`[{"type":"message","role":"user","content":[{"type":"input_text","text":"second compact transcript"}]}]`)
+	manager.bindCompactTranscript("resp-a", first)
+	manager.bindCompactTranscript("resp-b", second)
+
+	manager.SetConfig(&internalconfig.Config{
+		ResponseCompact: internalconfig.ResponseCompactConfig{
+			MaxBytes:      len(second) + 8,
+			MaxEntryBytes: 256,
+			MaxEntries:    1,
+		},
+	})
+
+	maxBytes, maxEntrySize, maxEntries := manager.responseCompactLimits()
+	if maxBytes != len(second)+8 || maxEntrySize != 256 || maxEntries != 1 {
+		t.Fatalf("compact limits = (%d, %d, %d), want (%d, %d, %d)", maxBytes, maxEntrySize, maxEntries, len(second)+8, 256, 1)
+	}
+	if got := manager.lookupCompactTranscript("resp-a"); len(got) != 0 {
+		t.Fatalf("old compact transcript survived config eviction, len=%d", len(got))
+	}
+	if got := manager.lookupCompactTranscript("resp-b"); !bytes.Equal(got, second) {
+		t.Fatalf("latest compact transcript = %s, want %s", string(got), string(second))
+	}
+	if manager.responseCompactsTotalBytes > maxBytes {
+		t.Fatalf("compact transcript bytes = %d, limit = %d", manager.responseCompactsTotalBytes, maxBytes)
 	}
 }
 

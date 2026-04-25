@@ -262,6 +262,7 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 	s.applyAccessConfig(nil, cfg)
 	if authManager != nil {
 		authManager.SetRetryConfig(cfg.RequestRetry, time.Duration(cfg.MaxRetryInterval)*time.Second, cfg.MaxRetryCredentials)
+		authManager.SetConfig(cfg)
 		applyPerformanceRoutingConfigToAuthManager(cfg, authManager)
 		// Start quota state persistence (flush to auth JSON files periodically)
 		if cfg.AuthDir != "" {
@@ -987,6 +988,7 @@ func (s *Server) UpdateClients(cfg *config.Config) {
 
 	if s.handlers != nil && s.handlers.AuthManager != nil {
 		s.handlers.AuthManager.SetRetryConfig(cfg.RequestRetry, time.Duration(cfg.MaxRetryInterval)*time.Second, cfg.MaxRetryCredentials)
+		s.handlers.AuthManager.SetConfig(cfg)
 		applyPerformanceRoutingConfigToAuthManager(cfg, s.handlers.AuthManager)
 	}
 

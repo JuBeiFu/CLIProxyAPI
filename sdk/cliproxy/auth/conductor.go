@@ -90,9 +90,9 @@ const (
 )
 
 const (
-	defaultResponseCompactMaxBytes     = 2 << 30
+	defaultResponseCompactMaxBytes     = 256 << 20
 	defaultResponseCompactMaxEntrySize = 16 << 20
-	defaultResponseCompactMaxEntries   = 10000
+	defaultResponseCompactMaxEntries   = 2048
 )
 
 const responseBindingPinnedAuthMetadataKey = "__cliproxy_response_binding_pinned_auth"
@@ -704,7 +704,37 @@ func (m *Manager) SetConfig(cfg *internalconfig.Config) {
 		cfg = &internalconfig.Config{}
 	}
 	m.runtimeConfig.Store(cfg)
+	m.SetResponseCompactLimits(cfg.ResponseCompact.MaxBytes, cfg.ResponseCompact.MaxEntryBytes, cfg.ResponseCompact.MaxEntries)
 	m.rebuildAPIKeyModelAliasFromRuntimeConfig()
+}
+
+// SetResponseCompactLimits updates compact transcript cache limits and evicts
+// retained transcripts until the current cache fits the new budget.
+func (m *Manager) SetResponseCompactLimits(maxBytes, maxEntrySize, maxEntries int) {
+	if m == nil {
+		return
+	}
+	if maxBytes <= 0 {
+		maxBytes = defaultResponseCompactMaxBytes
+	}
+	if maxEntrySize <= 0 {
+		maxEntrySize = defaultResponseCompactMaxEntrySize
+	}
+	if maxEntries <= 0 {
+		maxEntries = defaultResponseCompactMaxEntries
+	}
+	m.responseBindingsMu.Lock()
+	defer m.responseBindingsMu.Unlock()
+	m.responseCompactMaxBytes = maxBytes
+	m.responseCompactMaxEntrySize = maxEntrySize
+	m.responseCompactMaxEntries = maxEntries
+	for responseID, transcript := range m.responseCompacts {
+		if len(transcript) > maxEntrySize {
+			m.removeCompactTranscriptLocked(responseID)
+			delete(m.responseBindings, responseID)
+		}
+	}
+	m.evictCompactTranscriptsLocked(maxBytes, maxEntries)
 }
 
 func (m *Manager) lookupAPIKeyUpstreamModel(authID, requestedModel string) string {
