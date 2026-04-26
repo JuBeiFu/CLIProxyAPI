@@ -1579,6 +1579,8 @@ func (h *Handler) PatchAuthFileStatus(c *gin.Context) {
 		return
 	}
 
+	refreshQuotaOnEnable := !*req.Disabled && managementEnableRequiresQuotaRefresh(targetAuth)
+
 	// Update disabled state
 	targetAuth.Disabled = *req.Disabled
 	if *req.Disabled {
@@ -1587,6 +1589,12 @@ func (h *Handler) PatchAuthFileStatus(c *gin.Context) {
 	} else {
 		targetAuth.Status = coreauth.StatusActive
 		targetAuth.StatusMessage = ""
+		if refreshQuotaOnEnable {
+			targetAuth.Unavailable = true
+			targetAuth.NextRetryAfter = time.Now().Add(30 * time.Second)
+			targetAuth.Status = coreauth.StatusError
+			targetAuth.StatusMessage = "quota refresh pending"
+		}
 	}
 	targetAuth.UpdatedAt = time.Now()
 
@@ -1595,7 +1603,25 @@ func (h *Handler) PatchAuthFileStatus(c *gin.Context) {
 		return
 	}
 
+	if refreshQuotaOnEnable {
+		h.authManager.RefreshAuthNow(ctx, targetAuth.ID)
+	}
+
 	c.JSON(http.StatusOK, gin.H{"status": "ok", "disabled": *req.Disabled})
+}
+
+func managementEnableRequiresQuotaRefresh(auth *coreauth.Auth) bool {
+	if auth == nil {
+		return false
+	}
+	if !strings.EqualFold(strings.TrimSpace(auth.Provider), "codex") {
+		return false
+	}
+	if auth.Quota.Exceeded || auth.Unavailable || !auth.NextRetryAfter.IsZero() {
+		return true
+	}
+	msg := strings.ToLower(strings.TrimSpace(auth.StatusMessage))
+	return strings.Contains(msg, "quota") || strings.Contains(msg, "usage_limit") || strings.Contains(msg, "rate_limit")
 }
 
 // PatchAuthFileFields updates editable fields (prefix, proxy_url, proxy_pool, headers, priority, note) of an auth file.

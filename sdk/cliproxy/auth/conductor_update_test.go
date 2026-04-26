@@ -252,3 +252,55 @@ func TestManager_Update_PreservesNewerRuntimeAvailabilityState(t *testing.T) {
 		t.Fatalf("expected newer auth cooldown to be preserved")
 	}
 }
+
+func TestManager_Update_PreservesRuntimeUsageLimitWhenRefreshHasNoQuotaProof(t *testing.T) {
+	m := NewManager(nil, nil, nil)
+
+	resetAt := time.Now().Add(time.Hour)
+	if _, err := m.Register(context.Background(), &Auth{
+		ID:       "auth-usage-limit-runtime",
+		Provider: "codex",
+		Status:   StatusActive,
+	}); err != nil {
+		t.Fatalf("register auth: %v", err)
+	}
+
+	limited, ok := m.GetByID("auth-usage-limit-runtime")
+	if !ok || limited == nil {
+		t.Fatalf("expected auth to be present")
+	}
+	limited.Status = StatusError
+	limited.StatusMessage = "quota exhausted"
+	limited.Unavailable = true
+	limited.NextRetryAfter = resetAt
+	limited.Quota = QuotaState{
+		Exceeded:      true,
+		Reason:        "usage_limit",
+		NextRecoverAt: resetAt,
+		UpdatedAt:     time.Now(),
+	}
+	limited.UpdatedAt = time.Now()
+	if _, err := m.Update(context.Background(), limited); err != nil {
+		t.Fatalf("update limited auth: %v", err)
+	}
+
+	refreshWithoutQuota := &Auth{
+		ID:              "auth-usage-limit-runtime",
+		Provider:        "codex",
+		Status:          StatusActive,
+		LastRefreshedAt: time.Now(),
+		UpdatedAt:       time.Now().Add(time.Second),
+		Metadata:        map[string]any{"type": "codex"},
+	}
+	if _, err := m.Update(context.Background(), refreshWithoutQuota); err != nil {
+		t.Fatalf("update refreshed auth: %v", err)
+	}
+
+	updated, ok := m.GetByID("auth-usage-limit-runtime")
+	if !ok || updated == nil {
+		t.Fatalf("expected auth to be present")
+	}
+	if !updated.Unavailable || !updated.Quota.Exceeded || updated.Quota.Reason != "usage_limit" {
+		t.Fatalf("expected runtime usage_limit cooldown to be preserved, unavailable=%v quota=%+v", updated.Unavailable, updated.Quota)
+	}
+}

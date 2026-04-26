@@ -566,6 +566,17 @@ func (m *Manager) RefreshSchedulerEntry(authID string) {
 	m.scheduler.upsertAuth(snapshot)
 }
 
+// RefreshAuthNow synchronously refreshes one auth through its provider executor.
+func (m *Manager) RefreshAuthNow(ctx context.Context, id string) {
+	if m == nil {
+		return
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	m.refreshAuthWithLimit(ctx, id)
+}
+
 // ReconcileRegistryModelStates aligns per-model runtime state with the current
 // registry snapshot for one auth.
 //
@@ -1542,7 +1553,7 @@ func preserveRuntimeAvailabilityState(auth, existing *Auth, now time.Time) {
 	if now.IsZero() {
 		now = time.Now()
 	}
-	if existing.UpdatedAt.After(auth.UpdatedAt) {
+	if existing.UpdatedAt.After(auth.UpdatedAt) || shouldPreserveRuntimeUsageLimit(auth, existing, now) {
 		if len(existing.ModelStates) > 0 {
 			auth.ModelStates = cloneModelStates(existing.ModelStates)
 		}
@@ -1565,6 +1576,29 @@ func preserveRuntimeAvailabilityState(auth, existing *Auth, now time.Time) {
 			auth.Status = StatusError
 		}
 	}
+}
+
+func shouldPreserveRuntimeUsageLimit(auth, existing *Auth, now time.Time) bool {
+	if auth == nil || existing == nil {
+		return false
+	}
+	if !isCodexAuth(existing) {
+		return false
+	}
+	if !existing.Quota.Exceeded || existing.Quota.Reason != "usage_limit" {
+		return false
+	}
+	next := existing.Quota.NextRecoverAt
+	if next.IsZero() {
+		next = existing.NextRetryAfter
+	}
+	if !next.After(now) {
+		return false
+	}
+	if _, hasFiveHourRatio := codexFiveHourRemainingRatio(auth); hasFiveHourRatio {
+		return false
+	}
+	return true
 }
 
 func cloneModelStates(states map[string]*ModelState) map[string]*ModelState {
@@ -4037,13 +4071,23 @@ func applyCodexFiveHourQuotaRest(auth *Auth, now time.Time) {
 		}
 		return
 	}
-	if auth.Quota.Exceeded && auth.Quota.Reason == codexFiveHourQuotaLowReason {
+	if codexQuotaRefreshRecoveredState(auth, ok) {
 		auth.Unavailable = false
 		auth.Status = StatusActive
 		auth.StatusMessage = ""
 		auth.NextRetryAfter = time.Time{}
 		auth.Quota = QuotaState{}
 	}
+}
+
+func codexQuotaRefreshRecoveredState(auth *Auth, hasFiveHourRatio bool) bool {
+	if auth == nil || !hasFiveHourRatio {
+		return false
+	}
+	if auth.Quota.Exceeded && (auth.Quota.Reason == codexFiveHourQuotaLowReason || auth.Quota.Reason == "usage_limit") {
+		return true
+	}
+	return auth.Unavailable && auth.Status == StatusError && strings.Contains(strings.ToLower(strings.TrimSpace(auth.StatusMessage)), "quota")
 }
 
 func codexFiveHourRemainingRatio(auth *Auth) (float64, bool) {
@@ -4624,6 +4668,9 @@ func (m *Manager) checkRefreshes(ctx context.Context) {
 }
 
 func (m *Manager) refreshAuthWithLimit(ctx context.Context, id string) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if m.refreshSemaphore == nil {
 		m.refreshAuth(ctx, id)
 		return
@@ -5084,7 +5131,13 @@ func (m *Manager) refreshAuth(ctx context.Context, id string) {
 		m.mu.Lock()
 		if current := m.auths[id]; current != nil {
 			current.NextRefreshAfter = now.Add(refreshFailureBackoff)
+			current.Unavailable = true
+			current.Status = StatusError
+			current.NextRetryAfter = now.Add(refreshFailureBackoff)
 			current.LastError = resultErr
+			if strings.TrimSpace(current.StatusMessage) == "" || strings.Contains(strings.ToLower(strings.TrimSpace(current.StatusMessage)), "pending") {
+				current.StatusMessage = resultErr.Message
+			}
 			m.auths[id] = current
 			if m.scheduler != nil {
 				m.scheduler.upsertAuth(current.Clone())
