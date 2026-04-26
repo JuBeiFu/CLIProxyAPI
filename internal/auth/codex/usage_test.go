@@ -3,6 +3,7 @@ package codex
 import (
 	"context"
 	"io"
+	"math"
 	"net/http"
 	"strconv"
 	"strings"
@@ -229,5 +230,38 @@ func TestFetchWhamUsageInfoExtractsFiveHourQuota(t *testing.T) {
 	}
 	if got.FiveHourQuota.ResetAt.IsZero() || got.FiveHourQuota.ResetAt.Unix() != resetAt {
 		t.Fatalf("ResetAt = %s, want unix %d", got.FiveHourQuota.ResetAt, resetAt)
+	}
+}
+
+func TestParseWhamUsageFiveHourQuota(t *testing.T) {
+	t.Parallel()
+
+	resetAt := time.Now().Add(2 * time.Hour).UTC().Unix()
+	got := ParseWhamUsageFiveHourQuota([]byte(
+		`{"rate_limits":[{"window":"5h","limit":100,"remaining":19,"resets_at":` + strconv.FormatInt(resetAt, 10) + `}]}`,
+	))
+	if got == nil {
+		t.Fatal("ParseWhamUsageFiveHourQuota = nil, want quota")
+	}
+	if got.RemainingRatio != 0.19 {
+		t.Fatalf("RemainingRatio = %v, want 0.19", got.RemainingRatio)
+	}
+}
+
+func TestParseWhamUsageFiveHourQuotaFromUsedPercentWindow(t *testing.T) {
+	t.Parallel()
+
+	resetAt := time.Now().Add(2 * time.Hour).UTC().Unix()
+	got := ParseWhamUsageFiveHourQuota([]byte(
+		`{"rate_limit":{"primary_window":{"limit_window_seconds":18000,"used_percent":58,"reset_at":` + strconv.FormatInt(resetAt, 10) + `}}}`,
+	))
+	if got == nil {
+		t.Fatal("ParseWhamUsageFiveHourQuota = nil, want quota")
+	}
+	if math.Abs(got.RemainingRatio-0.42) > 0.0001 {
+		t.Fatalf("RemainingRatio = %v, want 0.42", got.RemainingRatio)
+	}
+	if got.ResetAt.IsZero() || got.ResetAt.Unix() != resetAt {
+		t.Fatalf("ResetAt = %s, want unix %d", got.ResetAt, resetAt)
 	}
 }

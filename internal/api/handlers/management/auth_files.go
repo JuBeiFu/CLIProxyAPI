@@ -746,6 +746,9 @@ func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
 	if claims := extractCodexIDTokenClaims(auth); claims != nil {
 		entry["id_token"] = claims
 	}
+	if snapshot := codexQuotaSnapshot(auth); snapshot != nil {
+		entry["codex_quota_snapshot"] = snapshot
+	}
 	// Expose priority from Attributes (set by synthesizer from JSON "priority" field).
 	// Fall back to Metadata for auths registered via UploadAuthFile (no synthesizer).
 	if p := strings.TrimSpace(authAttribute(auth, "priority")); p != "" {
@@ -842,11 +845,57 @@ func authFilesSignature(auths []*coreauth.Auth) string {
 			auth.Quota.Reason,
 			strconv.FormatBool(auth.Quota.Exceeded),
 			auth.Quota.NextRecoverAt.UTC().Format(time.RFC3339Nano),
+			metadataSignatureValue(auth.Metadata, coreauth.MetadataCodexFiveHourQuotaRemainingRatioKey),
+			metadataSignatureValue(auth.Metadata, coreauth.MetadataCodexFiveHourQuotaResetAtKey),
+			metadataSignatureValue(auth.Metadata, coreauth.MetadataCodexFiveHourQuotaLimitKey),
+			metadataSignatureValue(auth.Metadata, coreauth.MetadataCodexFiveHourQuotaRemainingKey),
+			metadataSignatureValue(auth.Metadata, coreauth.MetadataCodexFiveHourQuotaUpdatedAtKey),
 		}, "\x00"))
 	}
 	sort.Strings(parts)
 	sum := sha256.Sum256([]byte(strings.Join(parts, "\x01")))
 	return hex.EncodeToString(sum[:])
+}
+
+func metadataSignatureValue(meta map[string]any, key string) string {
+	if len(meta) == 0 {
+		return ""
+	}
+	raw, ok := meta[key]
+	if !ok {
+		return ""
+	}
+	return fmt.Sprint(raw)
+}
+
+func codexQuotaSnapshot(auth *coreauth.Auth) gin.H {
+	if auth == nil || auth.Metadata == nil {
+		return nil
+	}
+	if !strings.EqualFold(strings.TrimSpace(auth.Provider), "codex") {
+		return nil
+	}
+
+	snapshot := gin.H{"window": "5h"}
+	if raw, ok := auth.Metadata[coreauth.MetadataCodexFiveHourQuotaRemainingRatioKey]; ok {
+		snapshot["remaining_ratio"] = raw
+	}
+	if raw, ok := auth.Metadata[coreauth.MetadataCodexFiveHourQuotaLimitKey]; ok {
+		snapshot["limit"] = raw
+	}
+	if raw, ok := auth.Metadata[coreauth.MetadataCodexFiveHourQuotaRemainingKey]; ok {
+		snapshot["remaining"] = raw
+	}
+	if raw, ok := auth.Metadata[coreauth.MetadataCodexFiveHourQuotaResetAtKey]; ok {
+		snapshot["reset_at"] = raw
+	}
+	if raw, ok := auth.Metadata[coreauth.MetadataCodexFiveHourQuotaUpdatedAtKey]; ok {
+		snapshot["updated_at"] = raw
+	}
+	if len(snapshot) == 1 {
+		return nil
+	}
+	return snapshot
 }
 
 func extractCodexIDTokenClaims(auth *coreauth.Auth) gin.H {

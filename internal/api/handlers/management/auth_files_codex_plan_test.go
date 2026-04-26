@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
@@ -72,6 +73,61 @@ func TestBuildAuthFileEntry_CodexPromotesPlanTypeToTopLevel(t *testing.T) {
 	}
 	if got, _ := idToken["plan_type"].(string); got != "plus" {
 		t.Fatalf("entry.id_token.plan_type = %q, want %q", got, "plus")
+	}
+}
+
+func TestBuildAuthFileEntry_CodexExposesQuotaSnapshot(t *testing.T) {
+	t.Parallel()
+
+	resetAt := time.Date(2026, 4, 27, 8, 30, 0, 0, time.UTC)
+	updatedAt := time.Date(2026, 4, 27, 8, 12, 0, 0, time.UTC)
+	auth := &coreauth.Auth{
+		ID:       "codex-user@example.com-plus.json",
+		FileName: "codex-user@example.com-plus.json",
+		Provider: "codex",
+		Attributes: map[string]string{
+			"path": `C:\auths\codex-user@example.com-plus.json`,
+		},
+		Metadata: map[string]any{
+			coreauth.MetadataCodexFiveHourQuotaRemainingRatioKey: 0.42,
+			coreauth.MetadataCodexFiveHourQuotaLimitKey:          float64(1000),
+			coreauth.MetadataCodexFiveHourQuotaRemainingKey:      "420",
+			coreauth.MetadataCodexFiveHourQuotaResetAtKey:        resetAt.Format(time.RFC3339),
+			coreauth.MetadataCodexFiveHourQuotaUpdatedAtKey:      updatedAt.Format(time.RFC3339Nano),
+		},
+	}
+
+	h := &Handler{}
+	entry := h.buildAuthFileEntry(auth)
+	if entry == nil {
+		t.Fatal("expected entry")
+	}
+
+	rawSnapshot, ok := entry["codex_quota_snapshot"]
+	if !ok {
+		t.Fatal("expected codex_quota_snapshot field")
+	}
+	snapshot, ok := rawSnapshot.(gin.H)
+	if !ok {
+		t.Fatalf("codex_quota_snapshot type = %T, want gin.H", rawSnapshot)
+	}
+	if got := snapshot["remaining_ratio"]; got != 0.42 {
+		t.Fatalf("remaining_ratio = %v, want 0.42", got)
+	}
+	if got := snapshot["limit"]; got != float64(1000) {
+		t.Fatalf("limit = %v, want 1000", got)
+	}
+	if got := snapshot["remaining"]; got != "420" {
+		t.Fatalf("remaining = %v, want 420", got)
+	}
+	if got := snapshot["reset_at"]; got != resetAt.Format(time.RFC3339) {
+		t.Fatalf("reset_at = %v, want %s", got, resetAt.Format(time.RFC3339))
+	}
+	if got := snapshot["updated_at"]; got != updatedAt.Format(time.RFC3339Nano) {
+		t.Fatalf("updated_at = %v, want %s", got, updatedAt.Format(time.RFC3339Nano))
+	}
+	if got := snapshot["window"]; got != "5h" {
+		t.Fatalf("window = %v, want 5h", got)
 	}
 }
 

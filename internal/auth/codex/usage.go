@@ -163,6 +163,10 @@ func extractWhamUsageSupportedModels(body []byte) []string {
 }
 
 func extractWhamUsageFiveHourQuota(body []byte) *WhamQuotaWindow {
+	return ParseWhamUsageFiveHourQuota(body)
+}
+
+func ParseWhamUsageFiveHourQuota(body []byte) *WhamQuotaWindow {
 	var root any
 	if err := json.Unmarshal(body, &root); err != nil {
 		return nil
@@ -286,6 +290,15 @@ func quotaWindowFromObject(obj map[string]any) *WhamQuotaWindow {
 		"used_count",
 		"messages_used",
 	)
+	usedPercent, hasUsedPercent := firstWhamNumber(numbers,
+		"used_percent",
+		"usedPercent",
+		"usage_percent",
+		"usagePercent",
+		"used_percentage",
+		"usage_percentage",
+		"percent_used",
+	)
 
 	if !hasRatio {
 		switch {
@@ -299,6 +312,13 @@ func quotaWindowFromObject(obj map[string]any) *WhamQuotaWindow {
 			}
 			hasRemaining = true
 			ratio = remaining / limit
+			hasRatio = true
+		case hasUsedPercent:
+			usedRatio := usedPercent
+			if usedRatio > 1 {
+				usedRatio /= 100
+			}
+			ratio = 1 - usedRatio
 			hasRatio = true
 		}
 	}

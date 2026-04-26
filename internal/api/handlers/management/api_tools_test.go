@@ -263,6 +263,92 @@ func TestAPICallMarksQuotaExceededCooldown(t *testing.T) {
 	}
 }
 
+func TestCaptureCodexWhamUsageSnapshotPersistsFiveHourQuota(t *testing.T) {
+	t.Parallel()
+
+	store := &memoryAuthStore{}
+	manager := coreauth.NewManager(store, nil, nil)
+	auth := &coreauth.Auth{
+		ID:       "codex-snapshot@example.com-plus.json",
+		Provider: "codex",
+		FileName: "codex-snapshot@example.com-plus.json",
+		Attributes: map[string]string{
+			"path": `C:\auths\codex-snapshot@example.com-plus.json`,
+		},
+		Metadata: map[string]any{
+			"type": "codex",
+		},
+	}
+	if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "https://chatgpt.com/backend-api/wham/usage", nil)
+	resetAt := time.Now().Add(2 * time.Hour).UTC().Unix()
+	body := []byte(`{"plan_type":"plus","rate_limits":[{"window":"5h","limit":100,"remaining":42,"resets_at":` + strconv.FormatInt(resetAt, 10) + `}]}`)
+
+	h := &Handler{authManager: manager}
+	h.captureCodexWhamUsageSnapshot(context.Background(), auth, req, http.StatusOK, body)
+
+	updated, ok := manager.GetByID(auth.ID)
+	if !ok || updated == nil {
+		t.Fatal("expected auth to remain registered")
+	}
+	if got := updated.Metadata[coreauth.MetadataCodexFiveHourQuotaRemainingRatioKey]; got != 0.42 {
+		t.Fatalf("remaining ratio = %v, want 0.42", got)
+	}
+	if got := updated.Metadata[coreauth.MetadataCodexFiveHourQuotaLimitKey]; got != float64(100) {
+		t.Fatalf("limit = %v, want 100", got)
+	}
+	if got := updated.Metadata[coreauth.MetadataCodexFiveHourQuotaRemainingKey]; got != float64(42) {
+		t.Fatalf("remaining = %v, want 42", got)
+	}
+	if _, ok := updated.Metadata[coreauth.MetadataCodexFiveHourQuotaUpdatedAtKey]; !ok {
+		t.Fatal("expected updated_at metadata")
+	}
+	if _, ok := store.items[auth.ID]; !ok {
+		t.Fatal("expected quota snapshot to be persisted")
+	}
+}
+
+func TestCaptureCodexWhamUsageSnapshotKeepsExistingSnapshotWhenQuotaMissing(t *testing.T) {
+	t.Parallel()
+
+	store := &memoryAuthStore{}
+	manager := coreauth.NewManager(store, nil, nil)
+	auth := &coreauth.Auth{
+		ID:       "codex-existing-snapshot@example.com-plus.json",
+		Provider: "codex",
+		FileName: "codex-existing-snapshot@example.com-plus.json",
+		Attributes: map[string]string{
+			"path": `C:\auths\codex-existing-snapshot@example.com-plus.json`,
+		},
+		Metadata: map[string]any{
+			"type": "codex",
+			coreauth.MetadataCodexFiveHourQuotaRemainingRatioKey: 0.5,
+			coreauth.MetadataCodexFiveHourQuotaUpdatedAtKey:      "2026-04-27T01:00:00Z",
+		},
+	}
+	if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "https://chatgpt.com/backend-api/wham/usage", nil)
+	h := &Handler{authManager: manager}
+	h.captureCodexWhamUsageSnapshot(context.Background(), auth, req, http.StatusOK, []byte(`{"rate_limit":{}}`))
+
+	updated, ok := manager.GetByID(auth.ID)
+	if !ok || updated == nil {
+		t.Fatal("expected auth to remain registered")
+	}
+	if got := updated.Metadata[coreauth.MetadataCodexFiveHourQuotaRemainingRatioKey]; got != 0.5 {
+		t.Fatalf("remaining ratio = %v, want existing 0.5", got)
+	}
+	if got := updated.Metadata[coreauth.MetadataCodexFiveHourQuotaUpdatedAtKey]; got != "2026-04-27T01:00:00Z" {
+		t.Fatalf("updated_at = %v, want existing timestamp", got)
+	}
+}
+
 func TestAPICallDeletesRevokedCodexAuthOn401(t *testing.T) {
 	t.Parallel()
 

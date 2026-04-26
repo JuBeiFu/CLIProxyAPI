@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	codexauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/codex"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/proxypool"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/geminicli"
@@ -214,6 +215,7 @@ func (h *Handler) APICall(c *gin.Context) {
 	}
 
 	h.markAPICallResponse(c.Request.Context(), auth, resp.StatusCode, respBody)
+	h.captureCodexWhamUsageSnapshot(c.Request.Context(), auth, req, resp.StatusCode, respBody)
 
 	c.JSON(http.StatusOK, apiCallResponse{
 		StatusCode: resp.StatusCode,
@@ -270,6 +272,62 @@ func (h *Handler) resolveTokenForAuth(ctx context.Context, auth *coreauth.Auth) 
 	}
 
 	return tokenValueForAuth(auth), nil
+}
+
+func (h *Handler) captureCodexWhamUsageSnapshot(ctx context.Context, auth *coreauth.Auth, req *http.Request, statusCode int, body []byte) {
+	if h == nil || h.authManager == nil || auth == nil || req == nil {
+		return
+	}
+	if statusCode < http.StatusOK || statusCode >= http.StatusMultipleChoices {
+		return
+	}
+	if !strings.EqualFold(strings.TrimSpace(auth.Provider), "codex") {
+		return
+	}
+	if !strings.EqualFold(req.Method, http.MethodGet) {
+		return
+	}
+	if !strings.EqualFold(req.URL.Host, "chatgpt.com") || req.URL.Path != "/backend-api/wham/usage" {
+		return
+	}
+
+	now := time.Now()
+	quota := codexauth.ParseWhamUsageFiveHourQuota(body)
+	if quota == nil {
+		log.Debug("codex wham usage response did not include parseable 5h quota snapshot")
+		return
+	}
+	applyCodexFiveHourQuotaMetadataForManagement(auth, quota, now)
+	auth.UpdatedAt = now
+	if _, err := h.authManager.Update(ctx, auth); err != nil {
+		log.WithError(err).Debug("failed to persist codex wham usage quota snapshot")
+	}
+}
+
+func applyCodexFiveHourQuotaMetadataForManagement(auth *coreauth.Auth, quota *codexauth.WhamQuotaWindow, now time.Time) {
+	if auth == nil {
+		return
+	}
+	if auth.Metadata == nil {
+		auth.Metadata = make(map[string]any)
+	}
+	auth.Metadata[coreauth.MetadataCodexFiveHourQuotaRemainingRatioKey] = quota.RemainingRatio
+	auth.Metadata[coreauth.MetadataCodexFiveHourQuotaUpdatedAtKey] = now.UTC().Format(time.RFC3339)
+	if quota.Limit > 0 {
+		auth.Metadata[coreauth.MetadataCodexFiveHourQuotaLimitKey] = quota.Limit
+	} else {
+		delete(auth.Metadata, coreauth.MetadataCodexFiveHourQuotaLimitKey)
+	}
+	if quota.Remaining > 0 {
+		auth.Metadata[coreauth.MetadataCodexFiveHourQuotaRemainingKey] = quota.Remaining
+	} else {
+		delete(auth.Metadata, coreauth.MetadataCodexFiveHourQuotaRemainingKey)
+	}
+	if !quota.ResetAt.IsZero() {
+		auth.Metadata[coreauth.MetadataCodexFiveHourQuotaResetAtKey] = quota.ResetAt.UTC().Format(time.RFC3339)
+	} else {
+		delete(auth.Metadata, coreauth.MetadataCodexFiveHourQuotaResetAtKey)
+	}
 }
 
 func (h *Handler) markAPICallFailure(ctx context.Context, auth *coreauth.Auth, err error) {
