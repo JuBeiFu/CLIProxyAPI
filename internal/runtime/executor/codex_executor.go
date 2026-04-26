@@ -948,7 +948,10 @@ func (e *CodexExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*
 	// sees the same node and OpenAI's cache decision is self-consistent.
 	// Header note: Chatgpt-Account-Id has no observable effect on the
 	// response (verified 2026-04-20 across 5 egress paths); we omit it.
-	realPlan, boundEntry, supportedModels, fiveHourQuota, probeOK := helps.ProbeCodexPlanAcrossPool(ctx, e.cfg, auth, accessToken)
+	realPlan, boundEntry, supportedModels, fiveHourQuota, probeOK, probeErr := helps.ProbeCodexPlanAcrossPool(ctx, e.cfg, auth, accessToken)
+	if probeErr != nil {
+		return nil, probeErr
+	}
 	if !probeOK {
 		log.Warnf("codex executor: /wham/usage multi-path probe for auth %s failed on every candidate", auth.ID)
 	}

@@ -53,7 +53,7 @@ func ProbeCodexPlanAcrossPool(
 	cfg *config.Config,
 	auth *cliproxyauth.Auth,
 	accessToken string,
-) (plan string, boundEntry string, supportedModels []string, fiveHourQuota *codexauth.WhamQuotaWindow, probeOK bool) {
+) (plan string, boundEntry string, supportedModels []string, fiveHourQuota *codexauth.WhamQuotaWindow, probeOK bool, err error) {
 	pool := resolveCodexProbePool(cfg, auth)
 	candidates := shuffledHealthyEntries(pool)
 	boundPreferredName := strings.TrimSpace(cliproxyauth.BoundProxyEntry(auth))
@@ -83,6 +83,7 @@ func ProbeCodexPlanAcrossPool(
 
 	var lastFreePlan string
 	var anySucceeded bool
+	var terminalAuthErr error
 
 	for _, c := range ordered {
 		if ctx.Err() != nil {
@@ -93,6 +94,11 @@ func ProbeCodexPlanAcrossPool(
 		got := info.PlanType
 		cancel()
 		if probeErr != nil {
+			if isTerminalCodexProbeAuthError(probeErr) {
+				if terminalAuthErr == nil {
+					terminalAuthErr = probeErr
+				}
+			}
 			continue
 		}
 		got = strings.ToLower(strings.TrimSpace(got))
@@ -103,7 +109,7 @@ func ProbeCodexPlanAcrossPool(
 		}
 		anySucceeded = true
 		if isPaidPlanName(got) {
-			return got, c.entryName, info.SupportedModels, info.FiveHourQuota, true
+			return got, c.entryName, info.SupportedModels, info.FiveHourQuota, true, nil
 		}
 		// Successful probe but reports free. Keep searching for a paid
 		// path through other nodes: OpenAI edge caches sometimes disagree
@@ -114,11 +120,61 @@ func ProbeCodexPlanAcrossPool(
 	if anySucceeded {
 		// All paths reported free. Clear any previous binding: the auth
 		// has no egress that will serve it as paid right now.
-		return lastFreePlan, "", nil, nil, true
+		return lastFreePlan, "", nil, nil, true, nil
+	}
+
+	if terminalAuthErr != nil {
+		return "", "", nil, nil, false, terminalCodexProbeAuthError{cause: terminalAuthErr}
 	}
 
 	// Every candidate errored. Caller keeps existing state.
-	return "", "", nil, nil, false
+	return "", "", nil, nil, false, nil
+}
+
+func isTerminalCodexProbeAuthError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if statusProvider, ok := err.(interface{ StatusCode() int }); ok {
+		switch statusProvider.StatusCode() {
+		case http.StatusUnauthorized, http.StatusForbidden:
+			return true
+		}
+	}
+	lower := strings.ToLower(err.Error())
+	return strings.Contains(lower, "status 401") ||
+		strings.Contains(lower, "status 403") ||
+		strings.Contains(lower, "token_invalidated") ||
+		strings.Contains(lower, "token_revoked") ||
+		strings.Contains(lower, "refresh_token_reused")
+}
+
+type terminalCodexProbeAuthError struct {
+	cause error
+}
+
+func (e terminalCodexProbeAuthError) Error() string {
+	if e.cause == nil {
+		return "codex: /wham/usage terminal auth failure"
+	}
+	return e.cause.Error()
+}
+
+func (e terminalCodexProbeAuthError) Unwrap() error { return e.cause }
+
+func (e terminalCodexProbeAuthError) StatusCode() int {
+	if e.cause != nil {
+		if statusProvider, ok := e.cause.(interface{ StatusCode() int }); ok {
+			if status := statusProvider.StatusCode(); status > 0 {
+				return status
+			}
+		}
+		lower := strings.ToLower(e.cause.Error())
+		if strings.Contains(lower, "status 403") || strings.Contains(lower, "forbidden") {
+			return http.StatusForbidden
+		}
+	}
+	return http.StatusUnauthorized
 }
 
 // resolveCodexProbePool returns the proxy pool to enumerate for the auth.
