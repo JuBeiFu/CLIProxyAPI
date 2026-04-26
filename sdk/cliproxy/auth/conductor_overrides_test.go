@@ -72,6 +72,50 @@ func TestManager_ShouldRetryAfterError_RespectsAuthRequestRetryOverride(t *testi
 	}
 }
 
+func TestManager_MarkResult_ImageUnsupportedRegionClearsBoundProxy(t *testing.T) {
+	m := NewManager(nil, nil, nil)
+	auth := &Auth{
+		ID:       "auth-image-region",
+		Provider: "codex",
+		Metadata: map[string]any{
+			MetadataProbedPlanTypeKey: "plus",
+		},
+	}
+	SetBoundProxyEntry(auth, "proxy-a")
+	if _, errRegister := m.Register(context.Background(), auth); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+
+	m.MarkResult(context.Background(), Result{
+		AuthID:   auth.ID,
+		Provider: "codex",
+		Model:    "gpt-image-2",
+		Success:  false,
+		Error: &Error{
+			HTTPStatus: http.StatusInternalServerError,
+			Message:    `{"error":{"code":"unsupported_country_region_territory","message":"Country, region, or territory not supported","type":"request_forbidden"}}`,
+		},
+		RequestPayload: []byte(`{"model":"gpt-5.4-mini","tools":[{"type":"image_generation","model":"gpt-image-2"}]}`),
+	})
+
+	updated, ok := m.GetByID(auth.ID)
+	if !ok {
+		t.Fatal("expected auth to remain registered")
+	}
+	if updated.Disabled {
+		t.Fatal("expected auth to remain enabled")
+	}
+	if got := BoundProxyEntry(updated); got != "" {
+		t.Fatalf("bound proxy = %q, want empty", got)
+	}
+	if updated.Status != StatusError {
+		t.Fatalf("status = %q, want %q", updated.Status, StatusError)
+	}
+	if updated.StatusMessage == "" || !strings.Contains(updated.StatusMessage, "unsupported_country_region_territory") {
+		t.Fatalf("expected unsupported region status message, got %q", updated.StatusMessage)
+	}
+}
+
 func TestManager_ShouldRetryAfterError_UsesOAuthModelAliasForCooldown(t *testing.T) {
 	m := NewManager(nil, nil, nil)
 	m.SetRetryConfig(3, 30*time.Second, 0)

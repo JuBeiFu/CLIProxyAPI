@@ -370,6 +370,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 		helps.AppendAPIResponseChunk(ctx, e.cfg, b)
 		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), b))
 		err = newCodexStatusErr(httpResp.StatusCode, b)
+		handleImageUnsupportedRegion(ctx, opts, auth, req.Model, resolution, err)
 		return resp, err
 	}
 	readStarted := time.Now()
@@ -392,8 +393,9 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 
 		eventData := bytes.TrimSpace(line[5:])
 		eventType := gjson.GetBytes(eventData, "type").String()
-		if bodyCyber, ok := codexResponsesEventCyberPolicyErrorBody(eventData); ok {
-			err = newCodexStatusErr(http.StatusBadRequest, bodyCyber)
+		if body, status, ok := codexResponsesEventErrorBody(eventData); ok {
+			err = newCodexStatusErr(status, body)
+			handleImageUnsupportedRegion(ctx, opts, auth, req.Model, resolution, err)
 			return resp, err
 		}
 
@@ -690,6 +692,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 		helps.AppendAPIResponseChunk(ctx, e.cfg, data)
 		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), data))
 		err = newCodexStatusErr(httpResp.StatusCode, data)
+		handleImageUnsupportedRegion(ctx, opts, auth, req.Model, resolution, err)
 		timing.streamErrText = err.Error()
 		finishCodexUpstreamTiming(ctx, timing)
 		return nil, err
@@ -720,12 +723,13 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 
 			if bytes.HasPrefix(line, dataTag) {
 				data := bytes.TrimSpace(line[5:])
-				if bodyCyber, ok := codexResponsesEventCyberPolicyErrorBody(data); ok {
-					cyberErr := newCodexStatusErr(http.StatusBadRequest, bodyCyber)
-					helps.RecordAPIResponseError(ctx, e.cfg, cyberErr)
-					reporter.PublishFailureWithError(ctx, cyberErr)
-					timing.streamErrText = cyberErr.Error()
-					out <- cliproxyexecutor.StreamChunk{Err: cyberErr}
+				if body, status, ok := codexResponsesEventErrorBody(data); ok {
+					eventErr := newCodexStatusErr(status, body)
+					handleImageUnsupportedRegion(ctx, opts, auth, req.Model, resolution, eventErr)
+					helps.RecordAPIResponseError(ctx, e.cfg, eventErr)
+					reporter.PublishFailureWithError(ctx, eventErr)
+					timing.streamErrText = eventErr.Error()
+					out <- cliproxyexecutor.StreamChunk{Err: eventErr}
 					return
 				}
 				if gjson.GetBytes(data, "type").String() == "response.completed" {
@@ -1233,6 +1237,8 @@ func newCodexStatusErr(statusCode int, body []byte) statusErr {
 	errCode := statusCode
 	if isCodexModelCapacityError(body) {
 		errCode = http.StatusTooManyRequests
+	} else if codexErrorBodyIsUnsupportedRegion(body) {
+		errCode = http.StatusInternalServerError
 	}
 	err := statusErr{code: errCode, msg: string(body)}
 	if retryAfter := parseCodexRetryAfter(errCode, body, time.Now()); retryAfter != nil {
@@ -1245,36 +1251,123 @@ func newCodexStatusErr(statusCode int, body []byte) statusErr {
 	return err
 }
 
-func codexResponsesEventCyberPolicyErrorBody(eventData []byte) ([]byte, bool) {
+func codexResponsesEventErrorBody(eventData []byte) ([]byte, int, bool) {
 	if len(eventData) == 0 {
-		return nil, false
+		return nil, 0, false
 	}
 	eventType := strings.TrimSpace(gjson.GetBytes(eventData, "type").String())
 	if eventType != "response.failed" && eventType != "response.error" {
-		return nil, false
+		return nil, 0, false
 	}
 	errNode := gjson.GetBytes(eventData, "response.error")
 	if !errNode.Exists() {
 		errNode = gjson.GetBytes(eventData, "error")
 	}
 	if !errNode.Exists() || errNode.Type != gjson.JSON {
-		return nil, false
-	}
-	if !codexErrorNodeIsCyberPolicy(errNode) {
-		return nil, false
+		return nil, 0, false
 	}
 	body := []byte(`{}`)
 	body, _ = sjson.SetRawBytes(body, "error", []byte(errNode.Raw))
-	return body, true
+	return body, codexResponsesEventErrorStatus(errNode), true
 }
 
-func codexErrorNodeIsCyberPolicy(errNode gjson.Result) bool {
+func codexResponsesEventErrorStatus(errNode gjson.Result) int {
 	code := strings.TrimSpace(errNode.Get("code").String())
-	if strings.EqualFold(code, "cyber_policy") {
-		return true
+	errType := strings.TrimSpace(errNode.Get("type").String())
+	switch {
+	case strings.EqualFold(code, "unsupported_country_region_territory"):
+		return http.StatusInternalServerError
+	case strings.EqualFold(code, "cyber_policy"):
+		return http.StatusBadRequest
+	case strings.EqualFold(errType, "request_forbidden"):
+		return http.StatusInternalServerError
+	case strings.EqualFold(errType, "invalid_request_error"):
+		return http.StatusBadRequest
+	case strings.EqualFold(errType, "usage_limit_reached"):
+		return http.StatusTooManyRequests
+	default:
+		return http.StatusBadRequest
 	}
-	message := strings.ToLower(strings.TrimSpace(errNode.Get("message").String()))
-	return strings.Contains(message, "cyber_policy")
+}
+
+func codexErrorBodyIsUnsupportedRegion(body []byte) bool {
+	if len(body) == 0 {
+		return false
+	}
+	code := strings.TrimSpace(gjson.GetBytes(body, "error.code").String())
+	errType := strings.TrimSpace(gjson.GetBytes(body, "error.type").String())
+	return strings.EqualFold(code, "unsupported_country_region_territory") || strings.EqualFold(errType, "request_forbidden")
+}
+
+func handleImageUnsupportedRegion(ctx context.Context, opts cliproxyexecutor.Options, auth *cliproxyauth.Auth, model string, resolution proxypool.Resolution, err error) {
+	if !imageGenerationRequestFromOptions(opts) || !codexErrorIsUnsupportedRegion(err) {
+		return
+	}
+	authID := ""
+	if auth != nil {
+		authID = strings.TrimSpace(auth.ID)
+	}
+	errText := ""
+	if err != nil {
+		errText = err.Error()
+	}
+	errorCode := strings.TrimSpace(gjson.Get(errText, "error.code").String())
+	errorType := strings.TrimSpace(gjson.Get(errText, "error.type").String())
+	helps.LogWithRequestID(ctx).WithFields(log.Fields{
+		"auth_id":    authID,
+		"proxy_pool": strings.TrimSpace(resolution.ProxyPool),
+		"proxy_name": strings.TrimSpace(resolution.ProxyName),
+		"proxy_src":  strings.TrimSpace(resolution.Source),
+		"status":     http.StatusInternalServerError,
+		"error_code": errorCode,
+		"error_type": errorType,
+		"model":      strings.TrimSpace(model),
+	}).Warn("codex image generation unsupported country/region; marking proxy for rebind")
+
+	if strings.TrimSpace(resolution.ProxyPool) != "" && strings.TrimSpace(resolution.ProxyName) != "" {
+		proxypool.DefaultHealthManager().ReportPassiveUnsupportedRegion(resolution.ProxyPool, resolution.ProxyName, proxypool.PassiveOutcome{
+			StatusCode: http.StatusForbidden,
+			Error:      strings.TrimSpace(errorCode),
+			CheckedAt:  time.Now(),
+		})
+	}
+	if auth != nil && strings.TrimSpace(cliproxyauth.BoundProxyEntry(auth)) == strings.TrimSpace(resolution.ProxyName) && strings.TrimSpace(resolution.ProxyName) != "" {
+		cliproxyauth.SetBoundProxyEntry(auth, "")
+	}
+}
+
+func imageGenerationRequestFromOptions(opts cliproxyexecutor.Options) bool {
+	if len(opts.Metadata) == 0 {
+		return false
+	}
+	value, ok := opts.Metadata[cliproxyexecutor.ImageGenerationRequestMetadataKey].(bool)
+	return ok && value
+}
+
+func codexErrorIsUnsupportedRegion(err error) bool {
+	if err == nil {
+		return false
+	}
+	errText := err.Error()
+	code := strings.TrimSpace(gjson.Get(errText, "error.code").String())
+	errType := strings.TrimSpace(gjson.Get(errText, "error.type").String())
+	return strings.EqualFold(code, "unsupported_country_region_territory") || strings.EqualFold(errType, "request_forbidden")
+}
+
+func codexResponsesEventCyberPolicyErrorBody(eventData []byte) ([]byte, bool) {
+	body, _, ok := codexResponsesEventErrorBody(eventData)
+	if !ok {
+		return nil, false
+	}
+	code := strings.TrimSpace(gjson.GetBytes(body, "error.code").String())
+	if strings.EqualFold(code, "cyber_policy") {
+		return body, true
+	}
+	message := strings.ToLower(strings.TrimSpace(gjson.GetBytes(body, "error.message").String()))
+	if strings.Contains(message, "cyber_policy") {
+		return body, true
+	}
+	return nil, false
 }
 
 func normalizeCodexInstructions(body []byte) []byte {

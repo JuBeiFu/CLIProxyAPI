@@ -2983,6 +2983,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	setModelQuota := false
 	modelSupportFailure := false
 	unbindResponseAuthID := ""
+	rebindProxyAuthID := ""
 	var authSnapshot *Auth
 	terminalAuthSnapshot := (*Auth)(nil)
 	terminalWarning := ""
@@ -2995,18 +2996,21 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 		now := time.Now()
 
 		if !result.Success {
-			if deleteAuth, reason := shouldDeleteRevokedAuth(auth, result.Error, result.SkipAccessTokenRefresh); deleteAuth {
-				applyTerminalAuthDisabledState(auth, result.Error, reason, now)
-				terminalAuthSnapshot = auth.Clone()
-				terminalWarning = reason
-				terminallyDisabled = true
-				terminallyDeleted = true
-				delete(m.auths, result.AuthID)
-			} else if disableAuth, reason := shouldDisableRevokedAuth(auth, result.Error, result.SkipAccessTokenRefresh); disableAuth {
-				applyTerminalAuthDisabledState(auth, result.Error, reason, now)
-				terminalAuthSnapshot = auth.Clone()
-				terminalWarning = reason
-				terminallyDisabled = true
+			imageUnsupportedRegion := isImageUnsupportedRegionResult(result)
+			if !imageUnsupportedRegion {
+				if deleteAuth, reason := shouldDeleteRevokedAuth(auth, result.Error, result.SkipAccessTokenRefresh); deleteAuth {
+					applyTerminalAuthDisabledState(auth, result.Error, reason, now)
+					terminalAuthSnapshot = auth.Clone()
+					terminalWarning = reason
+					terminallyDisabled = true
+					terminallyDeleted = true
+					delete(m.auths, result.AuthID)
+				} else if disableAuth, reason := shouldDisableRevokedAuth(auth, result.Error, result.SkipAccessTokenRefresh); disableAuth {
+					applyTerminalAuthDisabledState(auth, result.Error, reason, now)
+					terminalAuthSnapshot = auth.Clone()
+					terminalWarning = reason
+					terminallyDisabled = true
+				}
 			}
 		}
 
@@ -3042,6 +3046,10 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 						state.StatusMessage = result.Error.Message
 						auth.LastError = cloneError(result.Error)
 						auth.StatusMessage = result.Error.Message
+					}
+					if isImageUnsupportedRegionResult(result) {
+						SetBoundProxyEntry(auth, "")
+						rebindProxyAuthID = result.AuthID
 					}
 
 					statusCode := statusCodeFromResult(result.Error)
@@ -3194,6 +3202,9 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	if unbindResponseAuthID != "" {
 		m.unbindResponsesForAuth(unbindResponseAuthID)
 	}
+	if rebindProxyAuthID != "" {
+		m.KickAsyncBindingProbe(rebindProxyAuthID)
+	}
 
 	if clearModelQuota && result.Model != "" {
 		registry.GetGlobalRegistry().ClearModelQuotaExceeded(result.AuthID, result.Model)
@@ -3214,6 +3225,42 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	}
 
 	m.hook.OnResult(ctx, result)
+}
+
+func isImageUnsupportedRegionResult(result Result) bool {
+	if result.Error == nil || len(result.RequestPayload) == 0 {
+		return false
+	}
+	if !payloadContainsImageGenerationTool(result.RequestPayload) {
+		return false
+	}
+	return resultErrorIsUnsupportedRegion(result.Error)
+}
+
+func payloadContainsImageGenerationTool(payload []byte) bool {
+	if len(payload) == 0 {
+		return false
+	}
+	tools := gjson.GetBytes(payload, "tools")
+	if !tools.IsArray() {
+		return false
+	}
+	for _, tool := range tools.Array() {
+		if strings.EqualFold(strings.TrimSpace(tool.Get("type").String()), "image_generation") {
+			return true
+		}
+	}
+	return false
+}
+
+func resultErrorIsUnsupportedRegion(err *Error) bool {
+	if err == nil {
+		return false
+	}
+	message := strings.TrimSpace(err.Message)
+	code := strings.TrimSpace(gjson.Get(message, "error.code").String())
+	errType := strings.TrimSpace(gjson.Get(message, "error.type").String())
+	return strings.EqualFold(code, "unsupported_country_region_territory") || strings.EqualFold(errType, "request_forbidden")
 }
 
 func ensureModelState(auth *Auth, model string) *ModelState {

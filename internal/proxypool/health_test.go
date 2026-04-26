@@ -185,6 +185,41 @@ func TestHealthManagerPassiveUpstreamErrorStatusStaysUsable(t *testing.T) {
 	}
 }
 
+func TestHealthManagerUnsupportedRegionTemporarilyMarksUnusable(t *testing.T) {
+	t.Parallel()
+
+	manager := NewHealthManager()
+	now := time.Unix(1_744_419_200, 0)
+	manager.ReportPassiveUnsupportedRegion("shared-egress", "proxy-a", PassiveOutcome{
+		StatusCode: 403,
+		Error:      "unsupported_country_region_territory",
+		CheckedAt:  now,
+	})
+
+	if manager.IsUsableAt("shared-egress", "proxy-a", now) {
+		t.Fatal("expected unsupported-region passive result to mark entry unusable")
+	}
+	result, ok := manager.Result("shared-egress", "proxy-a")
+	if !ok {
+		t.Fatal("expected unsupported-region result to be stored")
+	}
+	if result.Healthy {
+		t.Fatal("expected result Healthy=false")
+	}
+	if result.StatusCode != 403 {
+		t.Fatalf("status = %d, want 403", result.StatusCode)
+	}
+	if result.Error != "unsupported_country_region_territory" {
+		t.Fatalf("error = %q, want unsupported_country_region_territory", result.Error)
+	}
+	if result.UnhealthyUntil.IsZero() {
+		t.Fatal("expected unsupported-region result to have UnhealthyUntil")
+	}
+	if !manager.IsUsableAt("shared-egress", "proxy-a", result.UnhealthyUntil.Add(time.Second)) {
+		t.Fatal("expected unsupported-region cooldown expiry to restore usability")
+	}
+}
+
 func TestHealthManagerReusesProbeClientForEntry(t *testing.T) {
 	t.Parallel()
 

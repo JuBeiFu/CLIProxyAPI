@@ -240,6 +240,42 @@ func (m *HealthManager) ReportPassiveOutcome(poolName, entryName string, outcome
 	}
 }
 
+func (m *HealthManager) ReportPassiveUnsupportedRegion(poolName, entryName string, outcome PassiveOutcome) {
+	if m == nil {
+		return
+	}
+	poolKey := normalizePoolName(poolName)
+	entryKey := normalizeEntryName(entryName)
+	if poolKey == "" || entryKey == "" {
+		return
+	}
+	if outcome.CheckedAt.IsZero() {
+		outcome.CheckedAt = time.Now()
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.entries == nil {
+		m.entries = make(map[string]map[string]ProbeResult)
+	}
+	if _, ok := m.entries[poolKey]; !ok {
+		m.entries[poolKey] = make(map[string]ProbeResult)
+	}
+	errText := strings.TrimSpace(outcome.Error)
+	if errText == "" {
+		errText = "unsupported_country_region_territory"
+	}
+	m.entries[poolKey][entryKey] = ProbeResult{
+		Healthy:        false,
+		StatusCode:     outcome.StatusCode,
+		Error:          errText,
+		CheckedAt:      outcome.CheckedAt,
+		Passive:        true,
+		UnhealthyUntil: outcome.CheckedAt.Add(DefaultPassiveSlowCooldown),
+	}
+}
+
 func (m *HealthManager) PoolStatuses(pools []config.ProxyPool, targetName string) []PoolStatus {
 	if len(pools) == 0 {
 		return nil
