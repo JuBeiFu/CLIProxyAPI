@@ -311,6 +311,54 @@ func TestCaptureCodexWhamUsageSnapshotPersistsFiveHourQuota(t *testing.T) {
 	}
 }
 
+func TestCaptureCodexWhamUsageSnapshotPersistsPrimaryRateLimit(t *testing.T) {
+	t.Parallel()
+
+	store := &memoryAuthStore{}
+	manager := coreauth.NewManager(store, nil, nil)
+	auth := &coreauth.Auth{
+		ID:       "codex-primary-snapshot@example.com-plus.json",
+		Provider: "codex",
+		FileName: "codex-primary-snapshot@example.com-plus.json",
+		Attributes: map[string]string{
+			"path": `C:\auths\codex-primary-snapshot@example.com-plus.json`,
+		},
+		Metadata: map[string]any{
+			"type": "codex",
+		},
+	}
+	if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "https://chatgpt.com/backend-api/wham/usage", nil)
+	primaryResetAt := time.Now().Add(2 * time.Hour).UTC().Unix()
+	reviewResetAt := time.Now().Add(1 * time.Hour).UTC().Unix()
+	body := []byte(`{
+		"code_review_rate_limit":{
+			"primary_window":{"limit_window_seconds":18000,"used_percent":100,"reset_at":` + strconv.FormatInt(reviewResetAt, 10) + `}
+		},
+		"rate_limit":{
+			"primary_window":{"limit_window_seconds":18000,"used_percent":1,"reset_at":` + strconv.FormatInt(primaryResetAt, 10) + `}
+		}
+	}`)
+
+	h := &Handler{authManager: manager}
+	h.captureCodexWhamUsageSnapshot(context.Background(), auth, req, http.StatusOK, body)
+
+	updated, ok := manager.GetByID(auth.ID)
+	if !ok || updated == nil {
+		t.Fatal("expected auth to remain registered")
+	}
+	got, _ := updated.Metadata[coreauth.MetadataCodexFiveHourQuotaRemainingRatioKey].(float64)
+	if got < 0.989 || got > 0.991 {
+		t.Fatalf("remaining ratio = %v, want about 0.99", got)
+	}
+	if gotReset := updated.Metadata[coreauth.MetadataCodexFiveHourQuotaResetAtKey]; gotReset != time.Unix(primaryResetAt, 0).UTC().Format(time.RFC3339) {
+		t.Fatalf("reset_at = %v, want primary reset", gotReset)
+	}
+}
+
 func TestCaptureCodexWhamUsageSnapshotKeepsExistingSnapshotWhenQuotaMissing(t *testing.T) {
 	t.Parallel()
 

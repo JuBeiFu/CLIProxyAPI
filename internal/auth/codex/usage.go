@@ -171,6 +171,9 @@ func ParseWhamUsageFiveHourQuota(body []byte) *WhamQuotaWindow {
 	if err := json.Unmarshal(body, &root); err != nil {
 		return nil
 	}
+	if quota := preferredWhamFiveHourQuota(root); quota != nil {
+		return quota
+	}
 	var best *WhamQuotaWindow
 	walkWhamUsageObjects(root, "", func(path string, obj map[string]any) {
 		if best != nil {
@@ -184,6 +187,38 @@ func ParseWhamUsageFiveHourQuota(body []byte) *WhamQuotaWindow {
 		}
 	})
 	return best
+}
+
+func preferredWhamFiveHourQuota(root any) *WhamQuotaWindow {
+	obj, ok := root.(map[string]any)
+	if !ok {
+		return nil
+	}
+	for _, rateLimitKey := range []string{"rate_limit", "rateLimit"} {
+		rateLimit, ok := childWhamObject(obj, rateLimitKey)
+		if !ok {
+			continue
+		}
+		for _, windowKey := range []string{"primary_window", "primaryWindow"} {
+			window, ok := childWhamObject(rateLimit, windowKey)
+			if !ok || !looksLikeFiveHourWindow("rate_limit."+windowKey, window) {
+				continue
+			}
+			if quota := quotaWindowFromObject(window); quota != nil {
+				return quota
+			}
+		}
+	}
+	return nil
+}
+
+func childWhamObject(obj map[string]any, key string) (map[string]any, bool) {
+	child, ok := obj[key]
+	if !ok {
+		return nil, false
+	}
+	typed, ok := child.(map[string]any)
+	return typed, ok
 }
 
 func walkWhamUsageObjects(value any, path string, visit func(string, map[string]any)) {
@@ -250,7 +285,7 @@ func quotaWindowFromObject(obj map[string]any) *WhamQuotaWindow {
 	stringsByPath := make(map[string]string)
 	collectWhamFields(obj, "", numbers, stringsByPath)
 
-	ratio, hasRatio := firstWhamNumber(numbers,
+	ratio, ratioKey, hasRatio := firstWhamNumberWithKey(numbers,
 		"remaining_ratio",
 		"remainingRatio",
 		"remaining_percent",
@@ -259,8 +294,8 @@ func quotaWindowFromObject(obj map[string]any) *WhamQuotaWindow {
 		"percent_remaining",
 		"ratio_remaining",
 	)
-	if hasRatio && ratio > 1 && ratio <= 100 {
-		ratio /= 100
+	if hasRatio {
+		ratio = normaliseWhamRatio(ratio, ratioKey)
 	}
 
 	limit, hasLimit := firstWhamNumber(numbers,
@@ -314,10 +349,7 @@ func quotaWindowFromObject(obj map[string]any) *WhamQuotaWindow {
 			ratio = remaining / limit
 			hasRatio = true
 		case hasUsedPercent:
-			usedRatio := usedPercent
-			if usedRatio > 1 {
-				usedRatio /= 100
-			}
+			usedRatio := normaliseWhamPercent(usedPercent)
 			ratio = 1 - usedRatio
 			hasRatio = true
 		}
@@ -339,6 +371,28 @@ func quotaWindowFromObject(obj map[string]any) *WhamQuotaWindow {
 		RemainingRatio: ratio,
 		ResetAt:        whamResetTime(numbers, stringsByPath, time.Now().UTC()),
 	}
+}
+
+func normaliseWhamRatio(value float64, key string) float64 {
+	if isWhamPercentKey(key) {
+		return normaliseWhamPercent(value)
+	}
+	if value > 1 && value <= 100 {
+		return value / 100
+	}
+	return value
+}
+
+func normaliseWhamPercent(value float64) float64 {
+	if value >= 0 && value <= 100 {
+		return value / 100
+	}
+	return value
+}
+
+func isWhamPercentKey(key string) bool {
+	norm := normalizeWhamKey(key)
+	return strings.Contains(norm, "percent") || strings.Contains(norm, "percentage")
 }
 
 func collectWhamFields(value any, path string, numbers map[string]float64, stringsByPath map[string]string) {
@@ -372,16 +426,21 @@ func collectWhamFields(value any, path string, numbers map[string]float64, strin
 }
 
 func firstWhamNumber(fields map[string]float64, names ...string) (float64, bool) {
+	value, _, ok := firstWhamNumberWithKey(fields, names...)
+	return value, ok
+}
+
+func firstWhamNumberWithKey(fields map[string]float64, names ...string) (float64, string, bool) {
 	for _, name := range names {
 		want := normalizeWhamKey(name)
 		for key, value := range fields {
 			got := normalizeWhamKey(key)
 			if got == want || strings.HasSuffix(got, want) {
-				return value, true
+				return value, key, true
 			}
 		}
 	}
-	return 0, false
+	return 0, "", false
 }
 
 func whamResetTime(numbers map[string]float64, stringsByPath map[string]string, now time.Time) time.Time {

@@ -265,3 +265,29 @@ func TestParseWhamUsageFiveHourQuotaFromUsedPercentWindow(t *testing.T) {
 		t.Fatalf("ResetAt = %s, want unix %d", got.ResetAt, resetAt)
 	}
 }
+
+func TestParseWhamUsageFiveHourQuotaPrefersPrimaryRateLimit(t *testing.T) {
+	t.Parallel()
+
+	primaryResetAt := time.Now().Add(2 * time.Hour).UTC().Unix()
+	reviewResetAt := time.Now().Add(1 * time.Hour).UTC().Unix()
+	got := ParseWhamUsageFiveHourQuota([]byte(
+		`{
+			"code_review_rate_limit":{
+				"primary_window":{"limit_window_seconds":18000,"used_percent":100,"reset_at":` + strconv.FormatInt(reviewResetAt, 10) + `}
+			},
+			"rate_limit":{
+				"primary_window":{"limit_window_seconds":18000,"used_percent":1,"reset_at":` + strconv.FormatInt(primaryResetAt, 10) + `}
+			}
+		}`,
+	))
+	if got == nil {
+		t.Fatal("ParseWhamUsageFiveHourQuota = nil, want quota")
+	}
+	if math.Abs(got.RemainingRatio-0.99) > 0.0001 {
+		t.Fatalf("RemainingRatio = %v, want 0.99", got.RemainingRatio)
+	}
+	if got.ResetAt.IsZero() || got.ResetAt.Unix() != primaryResetAt {
+		t.Fatalf("ResetAt = %s, want primary unix %d", got.ResetAt, primaryResetAt)
+	}
+}
