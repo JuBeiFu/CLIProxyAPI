@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -26,16 +27,38 @@ const (
 )
 
 type cyberPolicyAuditRecord struct {
-	Timestamp      string `json:"timestamp"`
-	AuthID         string `json:"auth_id"`
-	Provider       string `json:"provider,omitempty"`
-	Model          string `json:"model,omitempty"`
-	Count          int    `json:"count"`
-	Status         int    `json:"status,omitempty"`
-	ErrorMessage   string `json:"error_message,omitempty"`
-	RequestSHA256  string `json:"request_sha256,omitempty"`
-	RequestPreview string `json:"request_preview,omitempty"`
-	RequestPayload string `json:"request_payload,omitempty"`
+	Timestamp       string `json:"timestamp"`
+	AuthID          string `json:"auth_id"`
+	Provider        string `json:"provider,omitempty"`
+	Model           string `json:"model,omitempty"`
+	Count           int    `json:"count"`
+	Status          int    `json:"status,omitempty"`
+	ErrorMessage    string `json:"error_message,omitempty"`
+	RequestID       string `json:"request_id,omitempty"`
+	SourceRequestID string `json:"source_request_id,omitempty"`
+	SourceUserID    string `json:"source_user_id,omitempty"`
+	SourceUsername  string `json:"source_username,omitempty"`
+	SourceTokenID   string `json:"source_token_id,omitempty"`
+	SourceTokenName string `json:"source_token_name,omitempty"`
+	SourceIP        string `json:"source_ip,omitempty"`
+	RequestSHA256   string `json:"request_sha256,omitempty"`
+	RequestPreview  string `json:"request_preview,omitempty"`
+	RequestPayload  string `json:"request_payload,omitempty"`
+}
+
+type cyberPolicyTrace struct {
+	RequestID       string
+	SourceRequestID string
+	SourceUserID    string
+	SourceUsername  string
+	SourceTokenID   string
+	SourceTokenName string
+	SourceIP        string
+}
+
+type requestHeaderContext interface {
+	GetHeader(string) string
+	ClientIP() string
 }
 
 func authCyberPolicyTriggerCount(auth *Auth) int {
@@ -105,12 +128,13 @@ func isCyberPolicyErrorMessage(message string) bool {
 	return false
 }
 
-func recordCyberPolicyTriggerLocked(auth *Auth, result Result, now time.Time) cyberPolicyAuditRecord {
+func recordCyberPolicyTriggerLocked(auth *Auth, result Result, now time.Time, ctx context.Context) cyberPolicyAuditRecord {
 	if auth.Metadata == nil {
 		auth.Metadata = make(map[string]any)
 	}
 	count := authCyberPolicyTriggerCount(auth) + 1
 	hash, preview := cyberPolicyRequestSnapshot(result.RequestPayload)
+	trace := cyberPolicyTraceFromContext(ctx)
 	auth.Metadata[cyberPolicyTriggerCountKey] = count
 	auth.Metadata[cyberPolicyLastTriggeredAtKey] = now.UTC().Format(time.RFC3339Nano)
 	auth.Metadata[cyberPolicyLastModelKey] = result.Model
@@ -122,20 +146,76 @@ func recordCyberPolicyTriggerLocked(auth *Auth, result Result, now time.Time) cy
 	}
 
 	record := cyberPolicyAuditRecord{
-		Timestamp:      now.UTC().Format(time.RFC3339Nano),
-		AuthID:         result.AuthID,
-		Provider:       result.Provider,
-		Model:          result.Model,
-		Count:          count,
-		RequestSHA256:  hash,
-		RequestPreview: preview,
-		RequestPayload: string(result.RequestPayload),
+		Timestamp:       now.UTC().Format(time.RFC3339Nano),
+		AuthID:          result.AuthID,
+		Provider:        result.Provider,
+		Model:           result.Model,
+		Count:           count,
+		RequestID:       trace.RequestID,
+		SourceRequestID: trace.SourceRequestID,
+		SourceUserID:    trace.SourceUserID,
+		SourceUsername:  trace.SourceUsername,
+		SourceTokenID:   trace.SourceTokenID,
+		SourceTokenName: trace.SourceTokenName,
+		SourceIP:        trace.SourceIP,
+		RequestSHA256:   hash,
+		RequestPreview:  preview,
+		RequestPayload:  string(result.RequestPayload),
 	}
 	if result.Error != nil {
 		record.Status = result.Error.StatusCode()
 		record.ErrorMessage = result.Error.Message
 	}
 	return record
+}
+
+func cyberPolicyTraceFromContext(ctx context.Context) cyberPolicyTrace {
+	trace := cyberPolicyTrace{RequestID: strings.TrimSpace(logging.GetRequestID(ctx))}
+	if ctx == nil {
+		return trace
+	}
+	headerSource, _ := ctx.Value("gin").(requestHeaderContext)
+	if headerSource == nil {
+		return trace
+	}
+	trace.SourceRequestID = firstCyberPolicyHeader(headerSource, "X-Oneapi-Request-Id", "X-Newapi-Request-Id", "X-Request-Id", "X-Request-ID")
+	trace.SourceUserID = firstCyberPolicyHeader(headerSource, "X-Oneapi-User-Id", "X-Newapi-User-Id", "X-User-Id")
+	trace.SourceUsername = firstCyberPolicyHeader(headerSource, "X-Oneapi-Username", "X-Newapi-Username", "X-Username")
+	trace.SourceTokenID = firstCyberPolicyHeader(headerSource, "X-Oneapi-Token-Id", "X-Newapi-Token-Id", "X-Token-Id")
+	trace.SourceTokenName = firstCyberPolicyHeader(headerSource, "X-Oneapi-Token-Name", "X-Newapi-Token-Name", "X-Token-Name")
+	trace.SourceIP = firstCyberPolicyIP(headerSource)
+	return trace
+}
+
+func firstCyberPolicyHeader(source requestHeaderContext, names ...string) string {
+	for _, name := range names {
+		if value := trimCyberPolicyTraceValue(source.GetHeader(name)); value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func firstCyberPolicyIP(source requestHeaderContext) string {
+	for _, name := range []string{"X-Oneapi-Client-Ip", "X-Newapi-Client-Ip", "CF-Connecting-IP", "True-Client-IP", "X-Real-IP", "X-Forwarded-For"} {
+		if value := trimCyberPolicyTraceValue(source.GetHeader(name)); value != "" {
+			if comma := strings.IndexByte(value, ','); comma >= 0 {
+				value = strings.TrimSpace(value[:comma])
+			}
+			if value != "" {
+				return value
+			}
+		}
+	}
+	return trimCyberPolicyTraceValue(source.ClientIP())
+}
+
+func trimCyberPolicyTraceValue(value string) string {
+	value = strings.TrimSpace(value)
+	if len(value) > 512 {
+		return value[:512]
+	}
+	return value
 }
 
 func cyberPolicyRequestSnapshot(payload []byte) (string, string) {

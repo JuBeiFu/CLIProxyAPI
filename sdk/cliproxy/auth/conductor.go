@@ -3057,7 +3057,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 						unbindResponseAuthID = result.AuthID
 					}
 					if isCyberPolicyResultError(result.Error) {
-						audit := recordCyberPolicyTriggerLocked(auth, result, now)
+						audit := recordCyberPolicyTriggerLocked(auth, result, now, ctx)
 						cyberAudit = &audit
 						count := authCyberPolicyTriggerCount(auth)
 						next := now.Add(cyberPolicyCooldown(count))

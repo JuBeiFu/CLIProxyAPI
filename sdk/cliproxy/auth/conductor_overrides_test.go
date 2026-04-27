@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -14,8 +15,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	internalconfig "github.com/router-for-me/CLIProxyAPI/v6/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 )
@@ -113,6 +116,47 @@ func TestManager_MarkResult_ImageUnsupportedRegionClearsBoundProxy(t *testing.T)
 	}
 	if updated.StatusMessage == "" || !strings.Contains(updated.StatusMessage, "unsupported_country_region_territory") {
 		t.Fatalf("expected unsupported region status message, got %q", updated.StatusMessage)
+	}
+}
+
+func TestRecordCyberPolicyTriggerLocked_IncludesRequestTrace(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	c.Request.Header.Set("X-Oneapi-Request-Id", "oneapi-req-1")
+	c.Request.Header.Set("X-Oneapi-User-Id", "784")
+	c.Request.Header.Set("X-Oneapi-Username", "shsizhen")
+	c.Request.Header.Set("X-Oneapi-Token-Id", "1031")
+	c.Request.Header.Set("X-Oneapi-Token-Name", "11")
+	c.Request.Header.Set("X-Forwarded-For", "23.151.104.40, 172.18.0.1")
+	ctx := logging.WithRequestID(context.Background(), "cpa-req-1")
+	ctx = context.WithValue(ctx, "gin", c)
+
+	auth := &Auth{ID: "auth-1", Provider: "codex"}
+	record := recordCyberPolicyTriggerLocked(auth, Result{
+		AuthID:         auth.ID,
+		Provider:       "codex",
+		Model:          "gpt-5.5",
+		Success:        false,
+		Error:          &Error{HTTPStatus: http.StatusBadRequest, Code: "cyber_policy", Message: "cyber_policy"},
+		RequestPayload: []byte(`{"model":"gpt-5.5"}`),
+	}, time.Unix(1777182062, 0), ctx)
+
+	if record.RequestID != "cpa-req-1" {
+		t.Fatalf("request_id = %q, want cpa-req-1", record.RequestID)
+	}
+	if record.SourceRequestID != "oneapi-req-1" {
+		t.Fatalf("source_request_id = %q, want oneapi-req-1", record.SourceRequestID)
+	}
+	if record.SourceUserID != "784" || record.SourceUsername != "shsizhen" {
+		t.Fatalf("source user = %q/%q, want 784/shsizhen", record.SourceUserID, record.SourceUsername)
+	}
+	if record.SourceTokenID != "1031" || record.SourceTokenName != "11" {
+		t.Fatalf("source token = %q/%q, want 1031/11", record.SourceTokenID, record.SourceTokenName)
+	}
+	if record.SourceIP != "23.151.104.40" {
+		t.Fatalf("source_ip = %q, want 23.151.104.40", record.SourceIP)
 	}
 }
 
