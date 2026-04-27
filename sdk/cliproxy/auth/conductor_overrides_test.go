@@ -203,6 +203,14 @@ func TestRecordCyberPolicyTriggerLocked_IncludesRequestTrace(t *testing.T) {
 	}
 }
 
+func TestIsCyberPolicyErrorMessageDetectsSanitizedRetryableMetadata(t *testing.T) {
+	message := `{"error":{"code":"service_unavailable","message":"upstream cyber policy retryable failure","type":"upstream_error","metadata":{"cpa_reason":"cyber_policy"}}}`
+
+	if !isCyberPolicyErrorMessage(message) {
+		t.Fatal("expected sanitized retryable cyber error metadata to be detected")
+	}
+}
+
 func TestManager_ShouldRetryAfterError_UsesOAuthModelAliasForCooldown(t *testing.T) {
 	m := NewManager(nil, nil, nil)
 	m.SetRetryConfig(3, 30*time.Second, 0)

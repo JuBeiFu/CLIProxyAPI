@@ -129,3 +129,52 @@ func TestCodexExecutorExecuteStreamZeroUsageCompletionWithOutputPasses(t *testin
 		t.Fatalf("response.completed was not forwarded; got %s", got.String())
 	}
 }
+
+func TestCodexExecutorExecuteStreamCyberPolicyReturnsRetryableSanitizedError(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n\n"))
+		_, _ = w.Write([]byte("data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"cyber_policy\",\"message\":\"This content was flagged for possible cybersecurity risk. To get authorized for security work, join the Trusted Access for Cyber program: https://chatgpt.com/cyber\"}}}\n\n"))
+	}))
+	defer server.Close()
+
+	executor := NewCodexExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"base_url": server.URL,
+		"api_key":  "test",
+	}}
+
+	result, err := executor.ExecuteStream(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "gpt-5.5",
+		Payload: []byte(`{"model":"gpt-5.5","input":"hello","stream":true}`),
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("openai-response"),
+		Stream:       true,
+	})
+	if err != nil {
+		t.Fatalf("ExecuteStream error: %v", err)
+	}
+
+	var gotErr error
+	for chunk := range result.Chunks {
+		if chunk.Err != nil {
+			gotErr = chunk.Err
+		}
+	}
+	if gotErr == nil {
+		t.Fatal("expected cyber policy error chunk")
+	}
+	statusCoder, ok := gotErr.(interface{ StatusCode() int })
+	if !ok {
+		t.Fatalf("expected status coder error, got %T: %v", gotErr, gotErr)
+	}
+	if got := statusCoder.StatusCode(); got != http.StatusServiceUnavailable {
+		t.Fatalf("StatusCode = %d, want %d", got, http.StatusServiceUnavailable)
+	}
+	if bytes.Contains([]byte(gotErr.Error()), []byte("Trusted Access")) || bytes.Contains([]byte(gotErr.Error()), []byte("chatgpt.com/cyber")) {
+		t.Fatalf("cyber policy error leaked upstream message: %s", gotErr.Error())
+	}
+	if got := gjson.Get(gotErr.Error(), "error.message").String(); got != "upstream cyber policy retryable failure" {
+		t.Fatalf("error.message = %q", got)
+	}
+}

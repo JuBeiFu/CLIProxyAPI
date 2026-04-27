@@ -683,7 +683,7 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 			return resp, wsErr
 		}
 		if bodyCyber, ok := codexResponsesEventCyberPolicyErrorBody(payload); ok {
-			cyberErr := newCodexStatusErr(http.StatusBadRequest, bodyCyber)
+			cyberErr := newCodexCyberPolicyStatusErr(bodyCyber)
 			if sess != nil {
 				e.invalidateUpstreamConn(sess, conn, "cyber_policy", cyberErr)
 			}
@@ -974,7 +974,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 				return
 			}
 			if bodyCyber, ok := codexResponsesEventCyberPolicyErrorBody(payload); ok {
-				cyberErr := newCodexStatusErr(http.StatusBadRequest, bodyCyber)
+				cyberErr := newCodexCyberPolicyStatusErr(bodyCyber)
 				terminateReason = "cyber_policy"
 				terminateErr = cyberErr
 				helps.RecordAPIWebsocketError(ctx, e.cfg, "cyber_policy", cyberErr)

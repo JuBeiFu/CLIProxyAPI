@@ -745,6 +745,9 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 				data := bytes.TrimSpace(line[5:])
 				if body, status, ok := codexResponsesEventErrorBody(data); ok {
 					eventErr := newCodexStatusErr(status, body)
+					if bodyCyber, okCyber := codexResponsesEventCyberPolicyErrorBody(data); okCyber {
+						eventErr = newCodexCyberPolicyStatusErr(bodyCyber)
+					}
 					handleImageUnsupportedRegion(ctx, opts, auth, req.Model, resolution, eventErr)
 					helps.RecordAPIResponseError(ctx, e.cfg, eventErr)
 					reporter.PublishFailureWithError(ctx, eventErr)
@@ -1347,6 +1350,11 @@ func newCodexStatusErr(statusCode int, body []byte) statusErr {
 		err.retryAfter = &fallback
 	}
 	return err
+}
+
+func newCodexCyberPolicyStatusErr(body []byte) statusErr {
+	sanitized := []byte(`{"error":{"code":"service_unavailable","message":"upstream cyber policy retryable failure","type":"upstream_error","metadata":{"cpa_reason":"cyber_policy"}}}`)
+	return statusErr{code: http.StatusServiceUnavailable, msg: string(sanitized)}
 }
 
 func codexResponsesEventErrorBody(eventData []byte) ([]byte, int, bool) {

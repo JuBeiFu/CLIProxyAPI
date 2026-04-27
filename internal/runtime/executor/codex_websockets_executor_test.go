@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"bytes"
 	"context"
 	"net/http"
 	"net/http/httptest"
@@ -629,6 +630,91 @@ func TestCodexWebsocketExecuteStreamZeroUsageCompletionReturnsError(t *testing.T
 	}
 	if got := statusCoder.StatusCode(); got != http.StatusBadGateway {
 		t.Fatalf("StatusCode = %d, want %d", got, http.StatusBadGateway)
+	}
+}
+
+func TestCodexWebsocketExecuteStreamCyberPolicyReturnsRetryableSanitizedError(t *testing.T) {
+	upgrader := websocket.Upgrader{
+		CheckOrigin: func(r *http.Request) bool { return true },
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !websocket.IsWebSocketUpgrade(r) {
+			http.Error(w, "upgrade required", http.StatusUpgradeRequired)
+			return
+		}
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Errorf("Upgrade() error = %v", err)
+			return
+		}
+		defer conn.Close()
+
+		if _, _, err := conn.ReadMessage(); err != nil {
+			t.Errorf("ReadMessage() error = %v", err)
+			return
+		}
+
+		frames := [][]byte{
+			[]byte(`{"type":"response.output_text.delta","delta":"partial"}`),
+			[]byte(`{"type":"response.failed","response":{"error":{"code":"cyber_policy","message":"This content was flagged for possible cybersecurity risk. To get authorized for security work, join the Trusted Access for Cyber program: https://chatgpt.com/cyber"}}}`),
+		}
+		for _, frame := range frames {
+			if err := conn.WriteMessage(websocket.TextMessage, frame); err != nil {
+				t.Errorf("WriteMessage() error = %v", err)
+				return
+			}
+		}
+	}))
+	defer server.Close()
+
+	exec := NewCodexWebsocketsExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{
+		ID:       "auth-cyber",
+		Provider: "codex",
+		Attributes: map[string]string{
+			"api_key":    "sk-test",
+			"base_url":   server.URL,
+			"websockets": "true",
+		},
+	}
+	req := cliproxyexecutor.Request{
+		Model:   "gpt-5.5",
+		Payload: []byte(`{"model":"gpt-5.5","input":[{"role":"user","content":"hi"}]}`),
+	}
+	opts := cliproxyexecutor.Options{
+		Stream:       true,
+		SourceFormat: sdktranslator.FromString("openai-response"),
+	}
+
+	result, err := exec.ExecuteStream(context.Background(), auth, req, opts)
+	if err != nil {
+		t.Fatalf("ExecuteStream() error = %v", err)
+	}
+	if result == nil || result.Chunks == nil {
+		t.Fatalf("expected stream result with chunks")
+	}
+
+	var gotErr error
+	for chunk := range result.Chunks {
+		if chunk.Err != nil {
+			gotErr = chunk.Err
+		}
+	}
+	if gotErr == nil {
+		t.Fatal("expected cyber policy error chunk")
+	}
+	statusCoder, ok := gotErr.(interface{ StatusCode() int })
+	if !ok {
+		t.Fatalf("expected status coder error, got %T: %v", gotErr, gotErr)
+	}
+	if got := statusCoder.StatusCode(); got != http.StatusServiceUnavailable {
+		t.Fatalf("StatusCode = %d, want %d", got, http.StatusServiceUnavailable)
+	}
+	if bytes.Contains([]byte(gotErr.Error()), []byte("Trusted Access")) || bytes.Contains([]byte(gotErr.Error()), []byte("chatgpt.com/cyber")) {
+		t.Fatalf("cyber policy error leaked upstream message: %s", gotErr.Error())
+	}
+	if got := gjson.Get(gotErr.Error(), "error.message").String(); got != "upstream cyber policy retryable failure" {
+		t.Fatalf("error.message = %q", got)
 	}
 }
 

@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"bytes"
 	"net/http"
 	"strconv"
 	"testing"
@@ -166,6 +167,28 @@ func TestCodexResponsesEventCyberPolicyErrorBody(t *testing.T) {
 	}
 	if got := gjson.GetBytes(body, "error.message").String(); got == "" {
 		t.Fatalf("expected error message, got empty")
+	}
+}
+
+func TestNewCodexCyberPolicyStatusErrReturnsRetryableSanitizedError(t *testing.T) {
+	body := []byte(`{"error":{"code":"cyber_policy","message":"This content was flagged for possible cybersecurity risk. To get authorized for security work, join the Trusted Access for Cyber program: https://chatgpt.com/cyber"}}`)
+
+	err := newCodexCyberPolicyStatusErr(body)
+
+	if got := err.StatusCode(); got != http.StatusServiceUnavailable {
+		t.Fatalf("status code = %d, want %d", got, http.StatusServiceUnavailable)
+	}
+	if got := gjson.Get(err.Error(), "error.code").String(); got != "service_unavailable" {
+		t.Fatalf("error.code = %q, want service_unavailable; body=%s", got, err.Error())
+	}
+	if got := gjson.Get(err.Error(), "error.message").String(); got != "upstream cyber policy retryable failure" {
+		t.Fatalf("error.message = %q", got)
+	}
+	if got := gjson.Get(err.Error(), "error.metadata.cpa_reason").String(); got != "cyber_policy" {
+		t.Fatalf("error.metadata.cpa_reason = %q, want cyber_policy", got)
+	}
+	if bytes.Contains([]byte(err.Error()), []byte("Trusted Access")) || bytes.Contains([]byte(err.Error()), []byte("chatgpt.com/cyber")) {
+		t.Fatalf("cyber policy error leaked upstream message: %s", err.Error())
 	}
 }
 

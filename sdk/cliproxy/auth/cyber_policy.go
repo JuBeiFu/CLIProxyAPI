@@ -114,8 +114,11 @@ func isCyberPolicyErrorMessage(message string) bool {
 	}
 	paths := []string{
 		"error.code",
+		"error.metadata.cpa_reason",
 		"code",
+		"metadata.cpa_reason",
 		"response.error.code",
+		"response.error.metadata.cpa_reason",
 		"response.metadata.openai_verification_recommendation",
 		"metadata.openai_verification_recommendation",
 	}
