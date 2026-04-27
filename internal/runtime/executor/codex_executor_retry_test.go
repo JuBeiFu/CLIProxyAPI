@@ -118,6 +118,42 @@ func TestNewCodexStatusErrTreatsCurrentModelUnavailableAsRetryableRateLimit(t *t
 	}
 }
 
+func TestNewCodexStatusErrTreatsImageInputRateLimitAsRetryableRateLimit(t *testing.T) {
+	body := []byte(`{"error":{"message":"Rate limit reached for gpt-image-2 (for limit gpt-image) in organization org-test on input-images per min: Limit 250, Used 250, Requested 1. Please try again in 240ms.","type":"upstream_error","code":"rate_limit_exceeded"}}`)
+
+	err := newCodexStatusErr(http.StatusBadRequest, body)
+
+	if got := err.StatusCode(); got != http.StatusTooManyRequests {
+		t.Fatalf("status code = %d, want %d", got, http.StatusTooManyRequests)
+	}
+	if err.RetryAfter() == nil {
+		t.Fatal("expected retryAfter from upstream image rate limit, got nil")
+	}
+	if *err.RetryAfter() != 240*time.Millisecond {
+		t.Fatalf("retryAfter = %v, want %v", *err.RetryAfter(), 240*time.Millisecond)
+	}
+}
+
+func TestNewCodexStatusErrTreatsSSEImageInputRateLimitAsRetryableRateLimit(t *testing.T) {
+	event := []byte(`{"type":"response.failed","response":{"status":"failed","error":{"message":"Rate limit reached for gpt-image-2 (for limit gpt-image) on input-images per min: Limit 250, Used 250, Requested 1. Please try again in 240ms.","type":"upstream_error","code":"rate_limit_exceeded"}}}`)
+	body, status, ok := codexResponsesEventErrorBody(event)
+	if !ok {
+		t.Fatal("expected response.failed error body")
+	}
+
+	err := newCodexStatusErr(status, body)
+
+	if got := err.StatusCode(); got != http.StatusTooManyRequests {
+		t.Fatalf("status code = %d, want %d", got, http.StatusTooManyRequests)
+	}
+	if err.RetryAfter() == nil {
+		t.Fatal("expected retryAfter from SSE image rate limit, got nil")
+	}
+	if *err.RetryAfter() != 240*time.Millisecond {
+		t.Fatalf("retryAfter = %v, want %v", *err.RetryAfter(), 240*time.Millisecond)
+	}
+}
+
 func TestCodexResponsesEventCyberPolicyErrorBody(t *testing.T) {
 	event := []byte(`{"type":"response.failed","response":{"error":{"code":"cyber_policy","message":"This chat was flagged for possible cybersecurity risk"}}}`)
 

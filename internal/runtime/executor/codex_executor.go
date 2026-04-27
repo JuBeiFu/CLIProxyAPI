@@ -9,7 +9,9 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptrace"
+	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -41,6 +43,8 @@ const (
 var dataTag = []byte("data:")
 
 const codexSlowTimingThreshold = 30 * time.Second
+
+var codexRetryAfterPhrasePattern = regexp.MustCompile(`(?i)please try again in ([0-9]+(?:\.[0-9]+)?)(ms|milliseconds?|s|sec|secs|seconds?)`)
 
 type codexUpstreamTiming struct {
 	endpoint        string
@@ -1237,6 +1241,8 @@ func newCodexStatusErr(statusCode int, body []byte) statusErr {
 	errCode := statusCode
 	if isCodexModelCapacityError(body) {
 		errCode = http.StatusTooManyRequests
+	} else if isCodexImageInputRateLimitError(body) {
+		errCode = http.StatusTooManyRequests
 	} else if codexErrorBodyIsUnsupportedRegion(body) {
 		errCode = http.StatusInternalServerError
 	}
@@ -1408,6 +1414,9 @@ func parseCodexRetryAfter(statusCode int, errorBody []byte, now time.Time) *time
 		return nil
 	}
 	if strings.TrimSpace(gjson.GetBytes(errorBody, "error.type").String()) != "usage_limit_reached" {
+		if parsed := parseCodexRetryAfterPhrase(errorBody); parsed != nil {
+			return parsed
+		}
 		if isCodexPlainRateLimitError(errorBody) {
 			retryAfter := 60 * time.Second
 			return &retryAfter
@@ -1428,17 +1437,34 @@ func parseCodexRetryAfter(statusCode int, errorBody []byte, now time.Time) *time
 	return nil
 }
 
+func parseCodexRetryAfterPhrase(errorBody []byte) *time.Duration {
+	for _, candidate := range codexErrorTextCandidates(errorBody) {
+		matches := codexRetryAfterPhrasePattern.FindStringSubmatch(candidate)
+		if len(matches) != 3 {
+			continue
+		}
+		value, err := strconv.ParseFloat(matches[1], 64)
+		if err != nil || value <= 0 {
+			continue
+		}
+		unit := strings.ToLower(matches[2])
+		switch {
+		case strings.HasPrefix(unit, "ms") || strings.HasPrefix(unit, "millisecond"):
+			retryAfter := time.Duration(value * float64(time.Millisecond))
+			return &retryAfter
+		default:
+			retryAfter := time.Duration(value * float64(time.Second))
+			return &retryAfter
+		}
+	}
+	return nil
+}
+
 func isCodexPlainRateLimitError(errorBody []byte) bool {
 	if len(errorBody) == 0 {
 		return false
 	}
-	candidates := []string{
-		gjson.GetBytes(errorBody, "detail").String(),
-		gjson.GetBytes(errorBody, "error.message").String(),
-		gjson.GetBytes(errorBody, "message").String(),
-		string(errorBody),
-	}
-	for _, candidate := range candidates {
+	for _, candidate := range codexErrorTextCandidates(errorBody) {
 		lower := strings.ToLower(strings.TrimSpace(candidate))
 		if lower == "" {
 			continue
@@ -1451,6 +1477,39 @@ func isCodexPlainRateLimitError(errorBody []byte) bool {
 		}
 	}
 	return false
+}
+
+func isCodexImageInputRateLimitError(errorBody []byte) bool {
+	if len(errorBody) == 0 {
+		return false
+	}
+	code := strings.TrimSpace(gjson.GetBytes(errorBody, "error.code").String())
+	for _, candidate := range codexErrorTextCandidates(errorBody) {
+		lower := strings.ToLower(strings.TrimSpace(candidate))
+		if lower == "" {
+			continue
+		}
+		if strings.EqualFold(code, "rate_limit_exceeded") &&
+			strings.Contains(lower, "gpt-image") &&
+			strings.Contains(lower, "input-images per min") {
+			return true
+		}
+		if strings.Contains(lower, "rate limit reached for gpt-image") &&
+			strings.Contains(lower, "for limit gpt-image") &&
+			strings.Contains(lower, "input-images per min") {
+			return true
+		}
+	}
+	return false
+}
+
+func codexErrorTextCandidates(errorBody []byte) []string {
+	return []string{
+		gjson.GetBytes(errorBody, "detail").String(),
+		gjson.GetBytes(errorBody, "error.message").String(),
+		gjson.GetBytes(errorBody, "message").String(),
+		string(errorBody),
+	}
 }
 
 func codexCreds(a *cliproxyauth.Auth) (apiKey, baseURL string) {

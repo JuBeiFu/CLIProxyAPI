@@ -119,6 +119,49 @@ func TestManager_MarkResult_ImageUnsupportedRegionClearsBoundProxy(t *testing.T)
 	}
 }
 
+func TestManager_MarkResult_ImageInputRateLimitAppliesToolModelCooldown(t *testing.T) {
+	m := NewManager(nil, nil, nil)
+	auth := &Auth{
+		ID:       "auth-image-input-limit",
+		Provider: "codex",
+	}
+	if _, errRegister := m.Register(context.Background(), auth); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+	retryAfter := 240 * time.Millisecond
+
+	m.MarkResult(context.Background(), Result{
+		AuthID:     auth.ID,
+		Provider:   "codex",
+		Model:      "gpt-image-2",
+		Success:    false,
+		RetryAfter: &retryAfter,
+		Error: &Error{
+			HTTPStatus: http.StatusTooManyRequests,
+			Message:    `{"error":{"message":"Rate limit reached for gpt-image-2 (for limit gpt-image) on input-images per min: Limit 250, Used 250, Requested 1. Please try again in 240ms.","type":"upstream_error","code":"rate_limit_exceeded"}}`,
+		},
+		RequestPayload: []byte(`{"model":"gpt-5.4-mini","tools":[{"type":"image_generation","model":"gpt-image-2"}]}`),
+	})
+
+	updated, ok := m.GetByID(auth.ID)
+	if !ok {
+		t.Fatal("expected auth to remain registered")
+	}
+	imageState := updated.ModelStates["gpt-image-2"]
+	if imageState == nil {
+		t.Fatalf("gpt-image-2 model state missing; states=%v", updated.ModelStates)
+	}
+	if !imageState.Unavailable {
+		t.Fatalf("gpt-image-2 unavailable = false; state=%+v", imageState)
+	}
+	if imageState.Quota.Reason != "rate_limit" {
+		t.Fatalf("quota reason = %q, want rate_limit", imageState.Quota.Reason)
+	}
+	if imageState.NextRetryAfter.IsZero() || time.Until(imageState.NextRetryAfter) > time.Second {
+		t.Fatalf("next retry after = %s, want short image rate-limit cooldown", imageState.NextRetryAfter)
+	}
+}
+
 func TestRecordCyberPolicyTriggerLocked_IncludesRequestTrace(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	w := httptest.NewRecorder()
