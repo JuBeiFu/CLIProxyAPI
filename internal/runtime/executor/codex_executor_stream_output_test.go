@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	_ "github.com/router-for-me/CLIProxyAPI/v6/internal/translator"
@@ -14,6 +15,70 @@ import (
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v6/sdk/translator"
 	"github.com/tidwall/gjson"
 )
+
+func TestCodexExecutorExecuteStreamForwardsInitialMetadataBeforeUserOutput(t *testing.T) {
+	proceed := make(chan struct{})
+	createdSent := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_early\",\"created_at\":1775555723,\"model\":\"gpt-5.5\"}}\n\n"))
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+		close(createdSent)
+		<-proceed
+		_, _ = w.Write([]byte("data: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n\n"))
+		_, _ = w.Write([]byte("data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_early\",\"object\":\"response\",\"status\":\"completed\",\"output\":[{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"hello\"}]}],\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\n"))
+	}))
+	defer server.Close()
+
+	executor := NewCodexExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"base_url": server.URL,
+		"api_key":  "test",
+	}}
+
+	result, err := executor.ExecuteStream(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "gpt-5.5",
+		Payload: []byte(`{"model":"gpt-5.5","input":"hello","stream":true}`),
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("openai-response"),
+		Stream:       true,
+	})
+	if err != nil {
+		t.Fatalf("ExecuteStream error: %v", err)
+	}
+
+	select {
+	case <-createdSent:
+	case <-time.After(time.Second):
+		close(proceed)
+		t.Fatal("upstream did not send response.created")
+	}
+
+	var first cliproxyexecutor.StreamChunk
+	timedOut := false
+	select {
+	case first = <-result.Chunks:
+	case <-time.After(200 * time.Millisecond):
+		timedOut = true
+	}
+	close(proceed)
+	for chunk := range result.Chunks {
+		if chunk.Err != nil {
+			t.Fatalf("unexpected stream error: %v", chunk.Err)
+		}
+	}
+	if timedOut {
+		t.Fatal("response.created was buffered until user output")
+	}
+	if first.Err != nil {
+		t.Fatalf("unexpected first chunk error: %v", first.Err)
+	}
+	if !bytes.Contains(first.Payload, []byte("response.created")) {
+		t.Fatalf("first chunk = %s, want response.created", string(first.Payload))
+	}
+}
 
 func TestCodexExecutorExecute_EmptyStreamCompletionOutputUsesOutputItemDone(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

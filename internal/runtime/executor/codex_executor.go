@@ -714,8 +714,6 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 		scanner.Buffer(nil, 52_428_800) // 50MB
 		var param any
 		hadUserContent := false
-		bufferedInitial := make([][]byte, 0, 4)
-		flushedInitial := false
 		sendChunk := func(chunk cliproxyexecutor.StreamChunk) bool {
 			if ctx == nil {
 				out <- chunk
@@ -740,7 +738,6 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 			timing.bytesRead += len(line)
 			helps.AppendAPIResponseChunk(ctx, e.cfg, line)
 
-			isResponseCompleted := false
 			if bytes.HasPrefix(line, dataTag) {
 				data := bytes.TrimSpace(line[5:])
 				if body, status, ok := codexResponsesEventErrorBody(data); ok {
@@ -760,7 +757,6 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 					hadUserContent = true
 				}
 				if eventType == "response.completed" {
-					isResponseCompleted = true
 					if detail, ok := helps.ParseCodexUsage(data); ok {
 						reporter.Publish(ctx, detail)
 						if !hadUserContent && detail.TotalTokens == 0 {
@@ -787,19 +783,6 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 			timing.translate += time.Since(translateStarted)
 			timing.streamChunks += len(chunks)
 			for i := range chunks {
-				if !flushedInitial && !hadUserContent && !isResponseCompleted {
-					bufferedInitial = append(bufferedInitial, bytes.Clone(chunks[i]))
-					continue
-				}
-				if !flushedInitial {
-					for _, buffered := range bufferedInitial {
-						if !sendChunk(cliproxyexecutor.StreamChunk{Payload: buffered}) {
-							return
-						}
-					}
-					bufferedInitial = nil
-					flushedInitial = true
-				}
 				if !sendChunk(cliproxyexecutor.StreamChunk{Payload: chunks[i]}) {
 					return
 				}
