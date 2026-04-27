@@ -713,6 +713,21 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 		scanner := bufio.NewScanner(httpResp.Body)
 		scanner.Buffer(nil, 52_428_800) // 50MB
 		var param any
+		hadUserContent := false
+		bufferedInitial := make([][]byte, 0, 4)
+		flushedInitial := false
+		sendChunk := func(chunk cliproxyexecutor.StreamChunk) bool {
+			if ctx == nil {
+				out <- chunk
+				return true
+			}
+			select {
+			case out <- chunk:
+				return true
+			case <-ctx.Done():
+				return false
+			}
+		}
 		for {
 			scanStarted := time.Now()
 			ok := scanner.Scan()
@@ -725,6 +740,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 			timing.bytesRead += len(line)
 			helps.AppendAPIResponseChunk(ctx, e.cfg, line)
 
+			isResponseCompleted := false
 			if bytes.HasPrefix(line, dataTag) {
 				data := bytes.TrimSpace(line[5:])
 				if body, status, ok := codexResponsesEventErrorBody(data); ok {
@@ -733,12 +749,32 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 					helps.RecordAPIResponseError(ctx, e.cfg, eventErr)
 					reporter.PublishFailureWithError(ctx, eventErr)
 					timing.streamErrText = eventErr.Error()
-					out <- cliproxyexecutor.StreamChunk{Err: eventErr}
+					_ = sendChunk(cliproxyexecutor.StreamChunk{Err: eventErr})
 					return
 				}
-				if gjson.GetBytes(data, "type").String() == "response.completed" {
+				eventType := gjson.GetBytes(data, "type").String()
+				if codexHTTPStreamEventHasUserContent(eventType, data) {
+					hadUserContent = true
+				}
+				if eventType == "response.completed" {
+					isResponseCompleted = true
 					if detail, ok := helps.ParseCodexUsage(data); ok {
 						reporter.Publish(ctx, detail)
+						if !hadUserContent && detail.TotalTokens == 0 {
+							zeroErr := statusErr{code: http.StatusBadGateway, msg: "upstream zero-usage completion without output events"}
+							helps.RecordAPIResponseError(ctx, e.cfg, zeroErr)
+							reporter.PublishFailureWithError(ctx, zeroErr)
+							timing.streamErrText = zeroErr.Error()
+							_ = sendChunk(cliproxyexecutor.StreamChunk{Err: zeroErr})
+							return
+						}
+					} else if !hadUserContent {
+						zeroErr := statusErr{code: http.StatusBadGateway, msg: "upstream zero-usage completion without output events"}
+						helps.RecordAPIResponseError(ctx, e.cfg, zeroErr)
+						reporter.PublishFailureWithError(ctx, zeroErr)
+						timing.streamErrText = zeroErr.Error()
+						_ = sendChunk(cliproxyexecutor.StreamChunk{Err: zeroErr})
+						return
 					}
 				}
 			}
@@ -748,17 +784,73 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 			timing.translate += time.Since(translateStarted)
 			timing.streamChunks += len(chunks)
 			for i := range chunks {
-				out <- cliproxyexecutor.StreamChunk{Payload: chunks[i]}
+				if !flushedInitial && !hadUserContent && !isResponseCompleted {
+					bufferedInitial = append(bufferedInitial, bytes.Clone(chunks[i]))
+					continue
+				}
+				if !flushedInitial {
+					for _, buffered := range bufferedInitial {
+						if !sendChunk(cliproxyexecutor.StreamChunk{Payload: buffered}) {
+							return
+						}
+					}
+					bufferedInitial = nil
+					flushedInitial = true
+				}
+				if !sendChunk(cliproxyexecutor.StreamChunk{Payload: chunks[i]}) {
+					return
+				}
 			}
 		}
 		if errScan := scanner.Err(); errScan != nil {
 			helps.RecordAPIResponseError(ctx, e.cfg, errScan)
 			reporter.PublishFailure(ctx)
 			timing.streamErrText = errScan.Error()
-			out <- cliproxyexecutor.StreamChunk{Err: errScan}
+			_ = sendChunk(cliproxyexecutor.StreamChunk{Err: errScan})
 		}
 	}()
 	return &cliproxyexecutor.StreamResult{Headers: httpResp.Header.Clone(), Chunks: out}, nil
+}
+
+func codexHTTPStreamEventHasUserContent(eventType string, data []byte) bool {
+	switch {
+	case strings.HasPrefix(eventType, "response.output_text"):
+		return strings.TrimSpace(gjson.GetBytes(data, "delta").String()) != ""
+	case strings.HasPrefix(eventType, "response.function_call_arguments"):
+		return strings.TrimSpace(gjson.GetBytes(data, "delta").String()) != ""
+	case eventType == "response.output_item.done":
+		return codexHTTPResponseOutputHasUserContent(gjson.GetBytes(data, "item"))
+	case eventType == "response.completed":
+		for _, item := range gjson.GetBytes(data, "response.output").Array() {
+			if codexHTTPResponseOutputHasUserContent(item) {
+				return true
+			}
+		}
+		return false
+	default:
+		return false
+	}
+}
+
+func codexHTTPResponseOutputHasUserContent(item gjson.Result) bool {
+	if !item.Exists() {
+		return false
+	}
+	switch item.Get("type").String() {
+	case "message":
+		for _, content := range item.Get("content").Array() {
+			if strings.TrimSpace(content.Get("text").String()) != "" {
+				return true
+			}
+		}
+		return false
+	case "function_call":
+		return strings.TrimSpace(item.Get("call_id").String()) != "" ||
+			strings.TrimSpace(item.Get("name").String()) != "" ||
+			strings.TrimSpace(item.Get("arguments").String()) != ""
+	default:
+		return strings.TrimSpace(item.Get("type").String()) != ""
+	}
 }
 
 func (e *CodexExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
