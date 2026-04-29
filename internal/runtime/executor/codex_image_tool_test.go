@@ -30,6 +30,16 @@ func TestMaybeAttachImageGenerationToolOmitsDefaultSize(t *testing.T) {
 	}
 }
 
+func TestMaybeAttachImageGenerationToolSkipsCodexSparkModels(t *testing.T) {
+	t.Setenv(codexAutoImageToolEnv, "")
+
+	out := maybeAttachImageGenerationTool("gpt-5.3-codex-spark", []byte(`{"model":"gpt-5.3-codex-spark","input":"hi"}`))
+
+	if gjson.GetBytes(out, "tools").Exists() {
+		t.Fatalf("gpt-5.3-codex-spark must not auto-inject image_generation tools: %s", string(out))
+	}
+}
+
 func TestMaybeAttachImageGenerationToolLargePayloadAllocationsStayBounded(t *testing.T) {
 	t.Setenv(codexAutoImageToolEnv, "1")
 	body := buildLargeCodexBodyWithTools(64, 16*1024)

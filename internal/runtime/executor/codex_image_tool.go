@@ -45,6 +45,9 @@ func isCodexFamilyModel(name string) bool {
 	if name == "" {
 		return false
 	}
+	if strings.HasSuffix(name, "-codex-spark") {
+		return false
+	}
 	return strings.HasPrefix(name, "gpt-5")
 }
 
