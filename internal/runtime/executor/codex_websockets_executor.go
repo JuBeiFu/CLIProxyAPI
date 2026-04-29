@@ -647,7 +647,6 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 	}
 
 	aggregator := newCodexNonStreamAggregator()
-	hadUserContent := false
 	for {
 		if ctx != nil && ctx.Err() != nil {
 			return resp, ctx.Err()
@@ -695,23 +694,11 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 		payload = normalizeCodexWebsocketCompletion(payload)
 		aggregator.ingest(payload)
 		eventType := gjson.GetBytes(payload, "type").String()
-		if codexWebsocketEventHasUserContent(eventType) {
-			hadUserContent = true
-		}
 		if eventType == "response.completed" || eventType == "response.done" {
 			payload = aggregator.applyCompleted(payload)
 			detail, hasUsage := helps.ParseCodexUsage(payload)
 			if hasUsage {
 				reporter.Publish(ctx, detail)
-			}
-			if !hadUserContent && (!hasUsage || detail.TotalTokens == 0) {
-				zeroErr := statusErr{code: http.StatusBadGateway, msg: "upstream zero-usage completion without output events"}
-				helps.RecordAPIWebsocketError(ctx, e.cfg, "upstream_zero_usage", zeroErr)
-				reporter.PublishFailureWithError(ctx, zeroErr)
-				if sess != nil {
-					e.invalidateUpstreamConn(sess, conn, "upstream_zero_usage", zeroErr)
-				}
-				return resp, zeroErr
 			}
 			var param any
 			out := sdktranslator.TranslateNonStream(ctx, to, from, req.Model, originalPayload, body, payload, &param)
@@ -910,14 +897,6 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 		}
 
 		var param any
-		// hadUserContent tracks whether we've seen any event that carries
-		// user-visible output (text delta, function-call args, item added/done).
-		// Reasoning-only traffic (response.reasoning_summary_text.*) does NOT
-		// count, because upstream can emit reasoning deltas for minutes and
-		// then complete with total_tokens=0 and no real output — that's the
-		// "zero-usage completion" failure mode we want to surface as an error
-		// instead of a clean empty stream.
-		hadUserContent := false
 		for {
 			if ctx != nil && ctx.Err() != nil {
 				terminateReason = "context_done"
@@ -988,33 +967,10 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 
 			payload = normalizeCodexWebsocketCompletion(payload)
 			eventType := gjson.GetBytes(payload, "type").String()
-			// Only actual content-carrying events count as "had user content".
-			// response.output_item.added / .done are just metadata declarations
-			// — upstream can emit those and then stall with no real deltas,
-			// which is exactly the failure mode we want to catch.
-			if codexWebsocketEventHasUserContent(eventType) {
-				hadUserContent = true
-			}
 			if eventType == "response.completed" || eventType == "response.done" {
 				detail, hasUsage := helps.ParseCodexUsage(payload)
 				if hasUsage {
 					reporter.Publish(ctx, detail)
-				}
-				// Zero-usage completion without any prior output event is an
-				// upstream silent failure. Surface as error so the handler
-				// emits `event: error` to the client, cooldown the auth, and
-				// skip forwarding the misleading response.completed event.
-				if !hadUserContent && (!hasUsage || detail.TotalTokens == 0) {
-					zeroErr := statusErr{code: http.StatusBadGateway, msg: "upstream zero-usage completion without output events"}
-					terminateReason = "upstream_zero_usage"
-					terminateErr = zeroErr
-					helps.RecordAPIWebsocketError(ctx, e.cfg, "upstream_zero_usage", zeroErr)
-					reporter.PublishFailureWithError(ctx, zeroErr)
-					if sess != nil {
-						e.invalidateUpstreamConn(sess, conn, "upstream_zero_usage", zeroErr)
-					}
-					_ = send(cliproxyexecutor.StreamChunk{Err: zeroErr})
-					return
 				}
 			}
 

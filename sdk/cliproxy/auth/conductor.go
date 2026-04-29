@@ -1595,9 +1595,6 @@ func shouldPreserveRuntimeUsageLimit(auth, existing *Auth, now time.Time) bool {
 	if !next.After(now) {
 		return false
 	}
-	if _, hasFiveHourRatio := codexFiveHourRemainingRatio(auth); hasFiveHourRatio {
-		return false
-	}
 	return true
 }
 
@@ -1749,11 +1746,12 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 	opts = ensureResponseBindingMetadata(req, opts, m.lookupBoundAuthID)
 	tried := make(map[string]struct{})
 	attempted := make(map[string]struct{})
+	usageLimitRetryCredentials := m.usageLimitRetryCredentialCap(providers, routeModel, opts)
 	imageRequest := imageGenerationRequestFromMetadata(opts.Metadata)
 	skippedBusyImageAuth := false
 	var lastErr error
 	for {
-		if maxRetryCredentials > 0 && len(attempted) >= maxRetryCredentials {
+		if credentialRetryLimitReached(maxRetryCredentials, usageLimitRetryCredentials, len(attempted), lastErr) {
 			if lastErr != nil {
 				return cliproxyexecutor.Response{}, lastErr
 			}
@@ -1879,9 +1877,10 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 	opts = ensureResponseBindingMetadata(req, opts, m.lookupBoundAuthID)
 	tried := make(map[string]struct{})
 	attempted := make(map[string]struct{})
+	usageLimitRetryCredentials := m.usageLimitRetryCredentialCap(providers, routeModel, opts)
 	var lastErr error
 	for {
-		if maxRetryCredentials > 0 && len(attempted) >= maxRetryCredentials {
+		if credentialRetryLimitReached(maxRetryCredentials, usageLimitRetryCredentials, len(attempted), lastErr) {
 			if lastErr != nil {
 				return cliproxyexecutor.Response{}, lastErr
 			}
@@ -1979,9 +1978,10 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 	opts = ensureResponseBindingMetadata(req, opts, m.lookupBoundAuthID)
 	tried := make(map[string]struct{})
 	attempted := make(map[string]struct{})
+	usageLimitRetryCredentials := m.usageLimitRetryCredentialCap(providers, routeModel, opts)
 	var lastErr error
 	for {
-		if maxRetryCredentials > 0 && len(attempted) >= maxRetryCredentials {
+		if credentialRetryLimitReached(maxRetryCredentials, usageLimitRetryCredentials, len(attempted), lastErr) {
 			if lastErr != nil {
 				var bootstrapErr *streamBootstrapError
 				if errors.As(lastErr, &bootstrapErr) && bootstrapErr != nil {
@@ -2970,6 +2970,83 @@ func waitForCooldown(ctx context.Context, wait time.Duration) error {
 	}
 }
 
+func credentialRetryLimitReached(maxRetryCredentials, usageLimitRetryCredentials, attempted int, lastErr error) bool {
+	if shouldBypassCredentialRetryLimit(lastErr) {
+		if usageLimitRetryCredentials > 0 {
+			return attempted >= usageLimitRetryCredentials
+		}
+		return maxRetryCredentials > 0 && attempted >= maxRetryCredentials
+	}
+	return maxRetryCredentials > 0 && attempted >= maxRetryCredentials
+}
+
+func (m *Manager) usageLimitRetryCredentialCap(providers []string, routeModel string, opts cliproxyexecutor.Options) int {
+	if m == nil || len(providers) == 0 {
+		return 0
+	}
+	pinnedAuthID := pinnedAuthIDFromMetadata(opts.Metadata)
+	providerSet := make(map[string]struct{}, len(providers))
+	for _, provider := range providers {
+		providerKey := strings.TrimSpace(strings.ToLower(provider))
+		if providerKey == "" {
+			continue
+		}
+		providerSet[providerKey] = struct{}{}
+	}
+	if len(providerSet) == 0 {
+		return 0
+	}
+
+	modelKey := strings.TrimSpace(routeModel)
+	if modelKey != "" {
+		parsed := thinking.ParseSuffix(modelKey)
+		if parsed.ModelName != "" {
+			modelKey = strings.TrimSpace(parsed.ModelName)
+		}
+	}
+
+	now := time.Now()
+	registryRef := registry.GetGlobalRegistry()
+	cap := 0
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	for _, candidate := range m.auths {
+		if candidate == nil || candidate.Disabled {
+			continue
+		}
+		if pinnedAuthID != "" && candidate.ID != pinnedAuthID {
+			continue
+		}
+		providerKey := strings.TrimSpace(strings.ToLower(candidate.Provider))
+		if providerKey == "" {
+			continue
+		}
+		if _, ok := providerSet[providerKey]; !ok {
+			continue
+		}
+		if _, ok := m.executors[providerKey]; !ok {
+			continue
+		}
+		if modelKey != "" && !m.authSupportsRouteModel(registryRef, candidate, routeModel) {
+			continue
+		}
+		checkModel := m.selectionModelForAuth(candidate, routeModel)
+		blocked, _, _ := isAuthBlockedForModel(candidate, checkModel, now)
+		if blocked {
+			continue
+		}
+		cap++
+	}
+	return cap
+}
+
+func shouldBypassCredentialRetryLimit(err error) bool {
+	if err == nil {
+		return false
+	}
+	return isUsageLimitReachedError(resultErrorFromError(err))
+}
+
 // MarkResult records an execution result and notifies hooks.
 func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	if result.AuthID == "" {
@@ -2981,6 +3058,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	suspendReason := ""
 	clearModelQuota := false
 	setModelQuota := false
+	modelQuotaRecoverAt := time.Time{}
 	modelSupportFailure := false
 	unbindResponseAuthID := ""
 	rebindProxyAuthID := ""
@@ -3062,6 +3140,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 						count := authCyberPolicyTriggerCount(auth)
 						next := now.Add(cyberPolicyCooldown(count))
 						state.NextRetryAfter = next
+						modelQuotaRecoverAt = next
 						state.Quota = QuotaState{
 							Exceeded:      true,
 							Reason:        "cyber_policy",
@@ -3079,6 +3158,32 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 						suspendReason = "model_not_supported"
 						shouldSuspendModel = true
 						modelSupportFailure = true
+					} else if isUsageLimitReachedError(result.Error) {
+						var next time.Time
+						backoffLevel := state.Quota.BackoffLevel
+						retryAfter := normalizedRetryAfter(statusCode, result.RetryAfter, state.StatusMessage)
+						if retryAfter != nil {
+							next = now.Add(*retryAfter)
+						} else {
+							cooldown, nextLevel := nextQuotaCooldown(backoffLevel, false)
+							if cooldown > 0 {
+								next = now.Add(cooldown)
+							}
+							backoffLevel = nextLevel
+						}
+						state.NextRetryAfter = next
+						modelQuotaRecoverAt = next
+						state.Quota = QuotaState{
+							Exceeded:      true,
+							Reason:        "usage_limit",
+							NextRecoverAt: next,
+							BackoffLevel:  backoffLevel,
+							UpdatedAt:     now,
+						}
+						applyAggregatedQuotaCooldown(auth, next, backoffLevel, "usage_limit")
+						suspendReason = "quota"
+						shouldSuspendModel = true
+						setModelQuota = true
 					} else {
 						switch statusCode {
 						case 401:
@@ -3130,6 +3235,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 								}
 							}
 							state.NextRetryAfter = next
+							modelQuotaRecoverAt = next
 							state.Quota = QuotaState{
 								Exceeded:      true,
 								Reason:        quotaReason,
@@ -3210,7 +3316,11 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 		registry.GetGlobalRegistry().ClearModelQuotaExceeded(result.AuthID, result.Model)
 	}
 	if setModelQuota && result.Model != "" {
-		registry.GetGlobalRegistry().SetModelQuotaExceeded(result.AuthID, result.Model)
+		if !modelQuotaRecoverAt.IsZero() {
+			registry.GetGlobalRegistry().SetModelQuotaExceededUntil(result.AuthID, result.Model, modelQuotaRecoverAt)
+		} else {
+			registry.GetGlobalRegistry().SetModelQuotaExceeded(result.AuthID, result.Model)
+		}
 	}
 	if shouldResumeModel {
 		registry.GetGlobalRegistry().ResumeClientModel(result.AuthID, result.Model)
@@ -3219,7 +3329,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	}
 
 	if !result.Success && m.quotaFlusher != nil {
-		if result.Error != nil && result.Error.StatusCode() == http.StatusTooManyRequests {
+		if result.Error != nil && (result.Error.StatusCode() == http.StatusTooManyRequests || isUsageLimitReachedError(result.Error)) {
 			m.quotaFlusher.notifyActivity()
 		}
 	}
@@ -3534,11 +3644,11 @@ func normalizedRetryAfter(statusCode int, retryAfter *time.Duration, message str
 		d := *retryAfter
 		return &d
 	}
-	if statusCode != http.StatusTooManyRequests {
-		return nil
-	}
 	if parsed := usageLimitRetryAfterFromMessage(message, time.Now()); parsed != nil {
 		return parsed
+	}
+	if statusCode != http.StatusTooManyRequests {
+		return nil
 	}
 	if parsed := fallbackRetryAfterFor429Message(message); parsed != nil {
 		return parsed
@@ -4027,6 +4137,30 @@ func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Durati
 		}
 	}
 	statusCode := statusCodeFromResult(resultErr)
+	if isUsageLimitReachedError(resultErr) {
+		auth.StatusMessage = "quota exhausted"
+		auth.Quota.Exceeded = true
+		auth.Quota.Reason = "usage_limit"
+		var next time.Time
+		message := auth.StatusMessage
+		if resultErr != nil && strings.TrimSpace(resultErr.Message) != "" {
+			message = resultErr.Message
+		}
+		retryAfter = normalizedRetryAfter(statusCode, retryAfter, message)
+		if retryAfter != nil {
+			next = now.Add(*retryAfter)
+		} else {
+			cooldown, nextLevel := nextQuotaCooldown(auth.Quota.BackoffLevel, false)
+			if cooldown > 0 {
+				next = now.Add(cooldown)
+			}
+			auth.Quota.BackoffLevel = nextLevel
+		}
+		auth.Quota.NextRecoverAt = next
+		auth.Quota.UpdatedAt = now
+		auth.NextRetryAfter = next
+		return
+	}
 	switch statusCode {
 	case 401:
 		auth.StatusMessage = "unauthorized"
@@ -4118,7 +4252,7 @@ func applyCodexFiveHourQuotaRest(auth *Auth, now time.Time) {
 		}
 		return
 	}
-	if codexQuotaRefreshRecoveredState(auth, ok) {
+	if codexQuotaRefreshRecoveredState(auth, ok, now) {
 		auth.Unavailable = false
 		auth.Status = StatusActive
 		auth.StatusMessage = ""
@@ -4127,12 +4261,19 @@ func applyCodexFiveHourQuotaRest(auth *Auth, now time.Time) {
 	}
 }
 
-func codexQuotaRefreshRecoveredState(auth *Auth, hasFiveHourRatio bool) bool {
+func codexQuotaRefreshRecoveredState(auth *Auth, hasFiveHourRatio bool, now time.Time) bool {
 	if auth == nil || !hasFiveHourRatio {
 		return false
 	}
-	if auth.Quota.Exceeded && (auth.Quota.Reason == codexFiveHourQuotaLowReason || auth.Quota.Reason == "usage_limit") {
+	if auth.Quota.Exceeded && auth.Quota.Reason == codexFiveHourQuotaLowReason {
 		return true
+	}
+	if auth.Quota.Exceeded && auth.Quota.Reason == "usage_limit" {
+		next := auth.Quota.NextRecoverAt
+		if next.IsZero() {
+			next = auth.NextRetryAfter
+		}
+		return !next.IsZero() && !next.After(now)
 	}
 	return auth.Unavailable && auth.Status == StatusError && strings.Contains(strings.ToLower(strings.TrimSpace(auth.StatusMessage)), "quota")
 }

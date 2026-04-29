@@ -66,6 +66,8 @@ func (s *FileTokenStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (str
 		return "", fmt.Errorf("auth filestore: create dir failed: %w", err)
 	}
 
+	metadata := applyRuntimeQuotaStateMetadata(auth.Metadata, auth.Quota)
+
 	// metadataSetter is a private interface for TokenStorage implementations that support metadata injection.
 	type metadataSetter interface {
 		SetMetadata(map[string]any)
@@ -74,14 +76,14 @@ func (s *FileTokenStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (str
 	switch {
 	case auth.Storage != nil:
 		if setter, ok := auth.Storage.(metadataSetter); ok {
-			setter.SetMetadata(auth.Metadata)
+			setter.SetMetadata(metadata)
 		}
 		if err = auth.Storage.SaveTokenToFile(path); err != nil {
 			return "", err
 		}
-	case auth.Metadata != nil:
-		auth.Metadata["disabled"] = auth.Disabled
-		raw, errMarshal := json.Marshal(auth.Metadata)
+	case metadata != nil:
+		metadata["disabled"] = auth.Disabled
+		raw, errMarshal := json.Marshal(metadata)
 		if errMarshal != nil {
 			return "", fmt.Errorf("auth filestore: marshal metadata failed: %w", errMarshal)
 		}
@@ -121,6 +123,28 @@ func (s *FileTokenStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (str
 	}
 
 	return path, nil
+}
+
+func applyRuntimeQuotaStateMetadata(metadata map[string]any, quota cliproxyauth.QuotaState) map[string]any {
+	hasQuota := quota.Exceeded || quota.Reason != "" || !quota.NextRecoverAt.IsZero() || quota.BackoffLevel != 0
+	if metadata == nil {
+		if !hasQuota {
+			return nil
+		}
+		metadata = make(map[string]any)
+	}
+	if hasQuota {
+		metadata["quota_state"] = map[string]any{
+			"exceeded":        quota.Exceeded,
+			"reason":          quota.Reason,
+			"next_recover_at": quota.NextRecoverAt.UTC().Format(time.RFC3339),
+			"backoff_level":   quota.BackoffLevel,
+			"updated_at":      quota.UpdatedAt.UTC().Format(time.RFC3339),
+		}
+		return metadata
+	}
+	delete(metadata, "quota_state")
+	return metadata
 }
 
 // List enumerates all auth JSON files under the configured directory.

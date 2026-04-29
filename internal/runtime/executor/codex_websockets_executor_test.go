@@ -537,7 +537,7 @@ func TestCodexWebsocketExecuteNonStreamSynthesizesChatCompletionContent(t *testi
 	}
 }
 
-func TestCodexWebsocketExecuteStreamZeroUsageCompletionReturnsError(t *testing.T) {
+func TestCodexWebsocketExecuteStreamZeroUsageCompletionForwardsCompleted(t *testing.T) {
 	upgrader := websocket.Upgrader{
 		CheckOrigin: func(r *http.Request) bool { return true },
 	}
@@ -602,34 +602,19 @@ func TestCodexWebsocketExecuteStreamZeroUsageCompletionReturnsError(t *testing.T
 		t.Fatalf("expected stream result with chunks")
 	}
 
-	var gotErr error
 	sawCompleted := false
 	for chunk := range result.Chunks {
 		if chunk.Err != nil {
-			gotErr = chunk.Err
-			continue
+			t.Fatalf("unexpected stream error: %v", chunk.Err)
 		}
 		if len(chunk.Payload) > 0 {
-			// response.completed must NOT be forwarded when we flag the stream
-			// as zero-usage; otherwise downstream sees a misleading 0-token
-			// success.
 			if gjson.GetBytes(chunk.Payload, "type").String() == "response.completed" {
 				sawCompleted = true
 			}
 		}
 	}
-	if gotErr == nil {
-		t.Fatal("expected error chunk for zero-usage completion, got nil")
-	}
-	if sawCompleted {
-		t.Fatalf("response.completed chunk was forwarded to client; expected it to be suppressed")
-	}
-	statusCoder, ok := gotErr.(interface{ StatusCode() int })
-	if !ok {
-		t.Fatalf("expected status coder error, got %T: %v", gotErr, gotErr)
-	}
-	if got := statusCoder.StatusCode(); got != http.StatusBadGateway {
-		t.Fatalf("StatusCode = %d, want %d", got, http.StatusBadGateway)
+	if !sawCompleted {
+		t.Fatalf("response.completed chunk was not forwarded to client")
 	}
 }
 
@@ -718,7 +703,7 @@ func TestCodexWebsocketExecuteStreamCyberPolicyReturnsRetryableSanitizedError(t 
 	}
 }
 
-func TestCodexWebsocketExecuteNonStreamZeroUsageCompletionReturnsError(t *testing.T) {
+func TestCodexWebsocketExecuteNonStreamZeroUsageCompletionReturnsResponse(t *testing.T) {
 	upgrader := websocket.Upgrader{
 		CheckOrigin: func(r *http.Request) bool { return true },
 	}
@@ -774,15 +759,14 @@ func TestCodexWebsocketExecuteNonStreamZeroUsageCompletionReturnsError(t *testin
 
 	resp, err := exec.Execute(context.Background(), auth, req, opts)
 
-	if err == nil {
-		t.Fatalf("Execute() error = nil, payload=%s", resp.Payload)
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
 	}
-	statusCoder, ok := err.(interface{ StatusCode() int })
-	if !ok {
-		t.Fatalf("expected status coder error, got %T: %v", err, err)
+	if got := gjson.GetBytes(resp.Payload, "status").String(); got != "completed" {
+		t.Fatalf("status = %q, want completed; payload=%s", got, resp.Payload)
 	}
-	if got := statusCoder.StatusCode(); got != http.StatusBadGateway {
-		t.Fatalf("StatusCode = %d, want %d", got, http.StatusBadGateway)
+	if got := gjson.GetBytes(resp.Payload, "usage.total_tokens").Int(); got != 0 {
+		t.Fatalf("usage.total_tokens = %d, want 0; payload=%s", got, resp.Payload)
 	}
 }
 

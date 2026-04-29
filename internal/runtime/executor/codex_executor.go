@@ -35,7 +35,7 @@ import (
 )
 
 const (
-	codexUserAgent                  = "codex-tui/0.118.0 (Mac OS 26.3.1; arm64) iTerm.app/3.6.9 (codex-tui; 0.118.0)"
+	codexUserAgent                  = "codex-tui/0.125.0 (Mac OS 26.3.1; arm64) iTerm.app/3.6.9 (codex-tui; 0.125.0)"
 	codexOriginator                 = "codex-tui"
 	newAPIDownstreamTransportHeader = "X-NewAPI-Downstream-Transport"
 )
@@ -713,7 +713,6 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 		scanner := bufio.NewScanner(httpResp.Body)
 		scanner.Buffer(nil, 52_428_800) // 50MB
 		var param any
-		hadUserContent := false
 		sendChunk := func(chunk cliproxyexecutor.StreamChunk) bool {
 			if ctx == nil {
 				out <- chunk
@@ -753,27 +752,9 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 					return
 				}
 				eventType := gjson.GetBytes(data, "type").String()
-				if codexHTTPStreamEventHasUserContent(eventType, data) {
-					hadUserContent = true
-				}
 				if eventType == "response.completed" {
 					if detail, ok := helps.ParseCodexUsage(data); ok {
 						reporter.Publish(ctx, detail)
-						if !hadUserContent && detail.TotalTokens == 0 {
-							zeroErr := statusErr{code: http.StatusBadGateway, msg: "upstream zero-usage completion without output events"}
-							helps.RecordAPIResponseError(ctx, e.cfg, zeroErr)
-							reporter.PublishFailureWithError(ctx, zeroErr)
-							timing.streamErrText = zeroErr.Error()
-							_ = sendChunk(cliproxyexecutor.StreamChunk{Err: zeroErr})
-							return
-						}
-					} else if !hadUserContent {
-						zeroErr := statusErr{code: http.StatusBadGateway, msg: "upstream zero-usage completion without output events"}
-						helps.RecordAPIResponseError(ctx, e.cfg, zeroErr)
-						reporter.PublishFailureWithError(ctx, zeroErr)
-						timing.streamErrText = zeroErr.Error()
-						_ = sendChunk(cliproxyexecutor.StreamChunk{Err: zeroErr})
-						return
 					}
 				}
 			}

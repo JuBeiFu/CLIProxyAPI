@@ -93,7 +93,7 @@ type ModelRegistration struct {
 	Count int
 	// LastUpdated tracks when this registration was last modified
 	LastUpdated time.Time
-	// QuotaExceededClients tracks which clients have exceeded quota for this model
+	// QuotaExceededClients tracks quota recovery times for clients on this model.
 	QuotaExceededClients map[string]*time.Time
 	// Providers tracks available clients grouped by provider identifier
 	Providers map[string]int
@@ -638,15 +638,24 @@ func (r *ModelRegistry) unregisterClientInternal(clientID string) {
 //   - clientID: The client that exceeded quota
 //   - modelID: The model that exceeded quota
 func (r *ModelRegistry) SetModelQuotaExceeded(clientID, modelID string) {
+	r.SetModelQuotaExceededUntil(clientID, modelID, time.Now().Add(modelQuotaExceededWindow))
+}
+
+// SetModelQuotaExceededUntil marks a model as quota exceeded until a concrete
+// recovery time from upstream quota metadata.
+func (r *ModelRegistry) SetModelQuotaExceededUntil(clientID, modelID string, recoverAt time.Time) {
 	r.mutex.Lock()
 	defer r.mutex.Unlock()
 	r.ensureAvailableModelsCacheLocked()
 
 	if registration, exists := r.models[modelID]; exists {
 		now := time.Now()
-		registration.QuotaExceededClients[clientID] = &now
+		if !recoverAt.After(now) {
+			recoverAt = now.Add(modelQuotaExceededWindow)
+		}
+		registration.QuotaExceededClients[clientID] = &recoverAt
 		r.invalidateAvailableModelsCacheLocked()
-		log.Debugf("Marked model %s as quota exceeded for client %s", modelID, clientID)
+		log.Debugf("Marked model %s as quota exceeded for client %s until %s", modelID, clientID, recoverAt.Format(time.RFC3339))
 	}
 }
 
@@ -792,10 +801,7 @@ func (r *ModelRegistry) buildAvailableModelsLocked(handlerType string, now time.
 
 		expiredClients := 0
 		for _, quotaTime := range registration.QuotaExceededClients {
-			if quotaTime == nil {
-				continue
-			}
-			recoveryAt := quotaTime.Add(modelQuotaExceededWindow)
+			recoveryAt := modelQuotaRecoveryAt(quotaTime)
 			if now.Before(recoveryAt) {
 				expiredClients++
 				if expiresAt.IsZero() || recoveryAt.Before(expiresAt) {
@@ -951,7 +957,7 @@ func (r *ModelRegistry) GetAvailableModelsByProvider(provider string) []*ModelIn
 					if p, okProvider := r.clientProviders[clientID]; !okProvider || p != provider {
 						continue
 					}
-					if quotaTime != nil && now.Sub(*quotaTime) < modelQuotaExceededWindow {
+					if modelQuotaExceededActive(quotaTime, now) {
 						expiredClients++
 					}
 				}
@@ -1009,7 +1015,7 @@ func (r *ModelRegistry) GetModelCount(modelID string) int {
 		// Count clients that have exceeded quota but haven't recovered yet
 		expiredClients := 0
 		for _, quotaTime := range registration.QuotaExceededClients {
-			if quotaTime != nil && now.Sub(*quotaTime) < modelQuotaExceededWindow {
+			if modelQuotaExceededActive(quotaTime, now) {
 				expiredClients++
 			}
 		}
@@ -1222,7 +1228,7 @@ func (r *ModelRegistry) CleanupExpiredQuotas() {
 
 	for modelID, registration := range r.models {
 		for clientID, quotaTime := range registration.QuotaExceededClients {
-			if quotaTime != nil && now.Sub(*quotaTime) >= modelQuotaExceededWindow {
+			if !modelQuotaExceededActive(quotaTime, now) {
 				delete(registration.QuotaExceededClients, clientID)
 				invalidated = true
 				log.Debugf("Cleaned up expired quota tracking for model %s, client %s", modelID, clientID)
@@ -1232,6 +1238,18 @@ func (r *ModelRegistry) CleanupExpiredQuotas() {
 	if invalidated {
 		r.invalidateAvailableModelsCacheLocked()
 	}
+}
+
+func modelQuotaRecoveryAt(quotaTime *time.Time) time.Time {
+	if quotaTime == nil {
+		return time.Time{}
+	}
+	return *quotaTime
+}
+
+func modelQuotaExceededActive(quotaTime *time.Time, now time.Time) bool {
+	recoveryAt := modelQuotaRecoveryAt(quotaTime)
+	return !recoveryAt.IsZero() && now.Before(recoveryAt)
 }
 
 // GetFirstAvailableModel returns the first available model for the given handler type.

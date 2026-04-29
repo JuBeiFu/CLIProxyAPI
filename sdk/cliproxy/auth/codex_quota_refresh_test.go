@@ -187,20 +187,60 @@ func TestManager_RefreshAuth_ClearsCodexQuotaRestWhenRecovered(t *testing.T) {
 	}
 }
 
-func TestManager_RefreshAuth_ClearsCodexUsageLimitWhenFiveHourQuotaRecovered(t *testing.T) {
+func TestManager_RefreshAuth_PreservesCodexUsageLimitBeforeUpstreamReset(t *testing.T) {
 	ctx := context.Background()
 	mgr := NewManager(nil, nil, nil)
+	next := time.Now().Add(time.Hour)
 	auth := &Auth{
 		ID:             "codex-recovered-usage-limit",
 		Provider:       "codex",
 		Status:         StatusError,
 		StatusMessage:  "quota exhausted",
 		Unavailable:    true,
-		NextRetryAfter: time.Now().Add(time.Hour),
+		NextRetryAfter: next,
 		Quota: QuotaState{
 			Exceeded:      true,
 			Reason:        "usage_limit",
-			NextRecoverAt: time.Now().Add(time.Hour),
+			NextRecoverAt: next,
+		},
+		Metadata: map[string]any{"type": "codex", "access_token": "tok"},
+	}
+	if _, err := mgr.Register(ctx, auth); err != nil {
+		t.Fatalf("Register returned error: %v", err)
+	}
+	exec := &codexQuotaRefreshExecutor{updated: &Auth{Metadata: map[string]any{
+		MetadataCodexFiveHourQuotaRemainingRatioKey: 0.5,
+	}}}
+	mgr.RegisterExecutor(exec)
+
+	mgr.refreshAuth(ctx, auth.ID)
+
+	stored, ok := mgr.GetByID(auth.ID)
+	if !ok {
+		t.Fatal("expected auth to remain registered")
+	}
+	if !stored.Unavailable || !stored.Quota.Exceeded || stored.Status != StatusError {
+		t.Fatalf("expected usage_limit quota state to remain active before upstream reset, status=%q unavailable=%v quota=%+v", stored.Status, stored.Unavailable, stored.Quota)
+	}
+	if stored.Quota.Reason != "usage_limit" {
+		t.Fatalf("quota reason = %q, want usage_limit", stored.Quota.Reason)
+	}
+}
+
+func TestManager_RefreshAuth_ClearsCodexUsageLimitAfterUpstreamReset(t *testing.T) {
+	ctx := context.Background()
+	mgr := NewManager(nil, nil, nil)
+	auth := &Auth{
+		ID:             "codex-recovered-usage-limit-after-reset",
+		Provider:       "codex",
+		Status:         StatusError,
+		StatusMessage:  "quota exhausted",
+		Unavailable:    true,
+		NextRetryAfter: time.Now().Add(-time.Minute),
+		Quota: QuotaState{
+			Exceeded:      true,
+			Reason:        "usage_limit",
+			NextRecoverAt: time.Now().Add(-time.Minute),
 		},
 		Metadata: map[string]any{"type": "codex", "access_token": "tok"},
 	}
@@ -219,7 +259,7 @@ func TestManager_RefreshAuth_ClearsCodexUsageLimitWhenFiveHourQuotaRecovered(t *
 		t.Fatal("expected auth to remain registered")
 	}
 	if stored.Unavailable || stored.Quota.Exceeded || stored.Status != StatusActive {
-		t.Fatalf("expected usage_limit quota state to clear after recovered quota refresh, status=%q unavailable=%v quota=%+v", stored.Status, stored.Unavailable, stored.Quota)
+		t.Fatalf("expected usage_limit quota state to clear after upstream reset and recovered quota refresh, status=%q unavailable=%v quota=%+v", stored.Status, stored.Unavailable, stored.Quota)
 	}
 }
 

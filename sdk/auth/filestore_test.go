@@ -265,3 +265,52 @@ func TestFileTokenStore_PersistQuotaState(t *testing.T) {
 		t.Error("expected original email to be preserved")
 	}
 }
+
+func TestFileTokenStore_SavePersistsRuntimeQuotaState(t *testing.T) {
+	dir := t.TempDir()
+	store := NewFileTokenStore()
+	store.SetBaseDir(dir)
+
+	recoverAt := time.Now().Add(2 * time.Hour).UTC().Truncate(time.Second)
+	updatedAt := time.Now().UTC().Truncate(time.Second)
+	auth := &cliproxyauth.Auth{
+		ID:       "codex-quota.json",
+		FileName: "codex-quota.json",
+		Provider: "codex",
+		Metadata: map[string]any{
+			"type":         "codex",
+			"access_token": "token",
+			"email":        "quota@example.com",
+		},
+		Quota: cliproxyauth.QuotaState{
+			Exceeded:      true,
+			Reason:        "usage_limit",
+			NextRecoverAt: recoverAt,
+			BackoffLevel:  2,
+			UpdatedAt:     updatedAt,
+		},
+	}
+
+	if _, err := store.Save(t.Context(), auth); err != nil {
+		t.Fatalf("Save error: %v", err)
+	}
+
+	raw, err := os.ReadFile(filepath.Join(dir, "codex-quota.json"))
+	if err != nil {
+		t.Fatalf("read saved auth: %v", err)
+	}
+	var saved map[string]any
+	if err := json.Unmarshal(raw, &saved); err != nil {
+		t.Fatalf("unmarshal saved auth: %v", err)
+	}
+	quotaRaw, ok := saved["quota_state"].(map[string]any)
+	if !ok {
+		t.Fatalf("quota_state missing from saved auth: %s", string(raw))
+	}
+	if quotaRaw["reason"] != "usage_limit" {
+		t.Fatalf("quota_state.reason = %v, want usage_limit", quotaRaw["reason"])
+	}
+	if quotaRaw["next_recover_at"] != recoverAt.Format(time.RFC3339) {
+		t.Fatalf("quota_state.next_recover_at = %v, want %s", quotaRaw["next_recover_at"], recoverAt.Format(time.RFC3339))
+	}
+}

@@ -370,6 +370,77 @@ func (e *authFallbackExecutor) StreamCalls() []string {
 	return out
 }
 
+type registeringUsageLimitExecutor struct {
+	id      string
+	manager *Manager
+	model   string
+	extraID string
+
+	registerOnce sync.Once
+	mu           sync.Mutex
+	calls        []string
+}
+
+func (e *registeringUsageLimitExecutor) Identifier() string {
+	return e.id
+}
+
+func (e *registeringUsageLimitExecutor) Execute(ctx context.Context, auth *Auth, _ cliproxyexecutor.Request, _ cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	e.recordCall(auth.ID)
+	e.registerExtraAuth(ctx)
+	return cliproxyexecutor.Response{}, e.usageLimitError()
+}
+
+func (e *registeringUsageLimitExecutor) ExecuteStream(ctx context.Context, auth *Auth, _ cliproxyexecutor.Request, _ cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
+	e.recordCall(auth.ID)
+	e.registerExtraAuth(ctx)
+	return nil, e.usageLimitError()
+}
+
+func (e *registeringUsageLimitExecutor) Refresh(_ context.Context, auth *Auth) (*Auth, error) {
+	return auth, nil
+}
+
+func (e *registeringUsageLimitExecutor) CountTokens(ctx context.Context, auth *Auth, _ cliproxyexecutor.Request, _ cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	e.recordCall(auth.ID)
+	e.registerExtraAuth(ctx)
+	return cliproxyexecutor.Response{}, e.usageLimitError()
+}
+
+func (e *registeringUsageLimitExecutor) HttpRequest(context.Context, *Auth, *http.Request) (*http.Response, error) {
+	return nil, nil
+}
+
+func (e *registeringUsageLimitExecutor) recordCall(authID string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.calls = append(e.calls, authID)
+}
+
+func (e *registeringUsageLimitExecutor) registerExtraAuth(ctx context.Context) {
+	e.registerOnce.Do(func() {
+		registry.GetGlobalRegistry().RegisterClient(e.extraID, e.id, []*registry.ModelInfo{{ID: e.model}})
+		_, _ = e.manager.Register(ctx, &Auth{ID: e.extraID, Provider: e.id})
+	})
+}
+
+func (e *registeringUsageLimitExecutor) usageLimitError() error {
+	resetAt := time.Now().Add(2 * time.Hour).Unix()
+	return &Error{
+		HTTPStatus: http.StatusServiceUnavailable,
+		Message: `{"error":{"type":"usage_limit_reached","message":"The usage limit has been reached","resets_at":` +
+			strconv.FormatInt(resetAt, 10) + `,"resets_in_seconds":7200}}`,
+	}
+}
+
+func (e *registeringUsageLimitExecutor) Calls() []string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	out := make([]string, len(e.calls))
+	copy(out, e.calls)
+	return out
+}
+
 type retryAfterStatusError struct {
 	status     int
 	message    string
@@ -625,6 +696,138 @@ func TestManagerExecuteStream_ModelSupportBadRequestFallsBackAndSuspendsAuth(t *
 	}
 	if state.NextRetryAfter.IsZero() {
 		t.Fatalf("expected bad auth model state cooldown to be set")
+	}
+}
+
+func TestManager_UsageLimitReachedBypassesCredentialRetryLimit(t *testing.T) {
+	model := "gpt-5.5"
+	resetAt := time.Now().Add(2 * time.Hour).Unix()
+	usageLimitErr := &Error{
+		HTTPStatus: http.StatusServiceUnavailable,
+		Message: `{"error":{"type":"usage_limit_reached","message":"The usage limit has been reached","resets_at":` +
+			strconv.FormatInt(resetAt, 10) + `,"resets_in_seconds":7200}}`,
+	}
+
+	for _, tc := range []struct {
+		name   string
+		invoke func(*Manager) (string, error)
+	}{
+		{
+			name: "execute",
+			invoke: func(m *Manager) (string, error) {
+				resp, err := m.Execute(context.Background(), []string{"codex"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
+				return string(resp.Payload), err
+			},
+		},
+		{
+			name: "execute_stream",
+			invoke: func(m *Manager) (string, error) {
+				result, err := m.ExecuteStream(context.Background(), []string{"codex"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
+				if err != nil {
+					return "", err
+				}
+				var out strings.Builder
+				for chunk := range result.Chunks {
+					if chunk.Err != nil {
+						return "", chunk.Err
+					}
+					out.Write(chunk.Payload)
+				}
+				return out.String(), nil
+			},
+		},
+	} {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			m := NewManager(nil, nil, nil)
+			m.SetRetryConfig(0, 0, 3)
+			executor := &authFallbackExecutor{
+				id: "codex",
+				executeErrors: map[string]error{
+					"aa-limited-auth": usageLimitErr,
+					"ab-limited-auth": usageLimitErr,
+					"ac-limited-auth": usageLimitErr,
+				},
+				streamFirstErrors: map[string]error{
+					"aa-limited-auth": usageLimitErr,
+					"ab-limited-auth": usageLimitErr,
+					"ac-limited-auth": usageLimitErr,
+				},
+			}
+			m.RegisterExecutor(executor)
+
+			auths := []*Auth{
+				{ID: "aa-limited-auth", Provider: "codex"},
+				{ID: "ab-limited-auth", Provider: "codex"},
+				{ID: "ac-limited-auth", Provider: "codex"},
+				{ID: "ad-good-auth", Provider: "codex"},
+			}
+			reg := registry.GetGlobalRegistry()
+			for _, auth := range auths {
+				reg.RegisterClient(auth.ID, "codex", []*registry.ModelInfo{{ID: model}})
+				if _, err := m.Register(context.Background(), auth); err != nil {
+					t.Fatalf("register %s: %v", auth.ID, err)
+				}
+			}
+			t.Cleanup(func() {
+				for _, auth := range auths {
+					reg.UnregisterClient(auth.ID)
+				}
+			})
+
+			payload, err := tc.invoke(m)
+			if err != nil {
+				t.Fatalf("invoke error = %v", err)
+			}
+			if payload != "ad-good-auth" {
+				t.Fatalf("payload = %q, want ad-good-auth", payload)
+			}
+		})
+	}
+}
+
+func TestManager_UsageLimitReachedRetryLimitUsesInitialAvailableAuthCount(t *testing.T) {
+	model := "gpt-5.5"
+	m := NewManager(nil, &FillFirstSelector{}, nil)
+	m.SetRetryConfig(0, 0, 1)
+	executor := &registeringUsageLimitExecutor{
+		id:      "claude",
+		manager: m,
+		model:   model,
+		extraID: "zz-extra-auth",
+	}
+	m.RegisterExecutor(executor)
+
+	auths := []*Auth{
+		{ID: "aa-initial-auth", Provider: "claude"},
+		{ID: "ab-initial-auth", Provider: "claude"},
+	}
+	reg := registry.GetGlobalRegistry()
+	for _, auth := range auths {
+		reg.RegisterClient(auth.ID, "claude", []*registry.ModelInfo{{ID: model}})
+		if _, err := m.Register(context.Background(), auth); err != nil {
+			t.Fatalf("register %s: %v", auth.ID, err)
+		}
+	}
+	t.Cleanup(func() {
+		for _, auth := range auths {
+			reg.UnregisterClient(auth.ID)
+		}
+		reg.UnregisterClient(executor.extraID)
+	})
+
+	_, err := m.Execute(context.Background(), []string{"claude"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
+	if err == nil {
+		t.Fatal("expected usage limit error")
+	}
+	calls := executor.Calls()
+	if len(calls) != len(auths) {
+		t.Fatalf("calls = %v, want exactly the initial %d available auths", calls, len(auths))
+	}
+	for _, authID := range calls {
+		if authID == executor.extraID {
+			t.Fatalf("calls = %v; usage_limit_reached retried newly registered auth %q", calls, executor.extraID)
+		}
 	}
 }
 
@@ -1642,6 +1845,54 @@ func TestMarkResult_UsageLimitIgnoresCooldownDisabled(t *testing.T) {
 	}
 	if state, exists := got.ModelStates["gpt-4"]; !exists || !state.Quota.Exceeded {
 		t.Error("expected model state gpt-4 to have Quota.Exceeded = true")
+	}
+}
+
+func TestMarkResult_UsageLimitReachedWithServiceUnavailableUsesQuotaCooldown(t *testing.T) {
+	m := NewManager(nil, nil, nil)
+	auth := &Auth{
+		ID:          "auth-ul-503",
+		Provider:    "codex",
+		ModelStates: make(map[string]*ModelState),
+	}
+	_, _ = m.Register(context.Background(), auth)
+
+	resetAt := time.Now().Add(2 * time.Hour).Unix()
+	m.MarkResult(context.Background(), Result{
+		AuthID:   auth.ID,
+		Provider: auth.Provider,
+		Model:    "gpt-5.5",
+		Success:  false,
+		Error: &Error{
+			Message: `{"error":{"type":"usage_limit_reached","message":"The usage limit has been reached","resets_at":` +
+				strconv.FormatInt(resetAt, 10) + `,"resets_in_seconds":7200}}`,
+			HTTPStatus: http.StatusServiceUnavailable,
+		},
+	})
+
+	got, ok := m.GetByID(auth.ID)
+	if !ok {
+		t.Fatal("auth not found after MarkResult")
+	}
+	if !got.Quota.Exceeded {
+		t.Fatal("expected auth quota to be exceeded")
+	}
+	if got.Quota.Reason != "usage_limit" {
+		t.Fatalf("quota reason = %q, want usage_limit", got.Quota.Reason)
+	}
+	remaining := time.Until(got.NextRetryAfter)
+	if remaining < 110*time.Minute {
+		t.Fatalf("auth cooldown remaining = %v, want usage_limit reset window", remaining)
+	}
+	state := got.ModelStates["gpt-5.5"]
+	if state == nil {
+		t.Fatal("expected model state to exist")
+	}
+	if !state.Quota.Exceeded {
+		t.Fatal("expected model quota to be exceeded")
+	}
+	if state.Quota.Reason != "usage_limit" {
+		t.Fatalf("model quota reason = %q, want usage_limit", state.Quota.Reason)
 	}
 }
 

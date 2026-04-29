@@ -111,7 +111,7 @@ func TestCodexExecutorExecute_EmptyStreamCompletionOutputUsesOutputItemDone(t *t
 	}
 }
 
-func TestCodexExecutorExecuteStreamZeroUsageCompletionReturnsErrorBeforePayload(t *testing.T) {
+func TestCodexExecutorExecuteStreamZeroUsageCompletionForwardsCompleted(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		_, _ = w.Write([]byte("data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_empty\"}}\n\n"))
@@ -137,25 +137,15 @@ func TestCodexExecutorExecuteStreamZeroUsageCompletionReturnsErrorBeforePayload(
 		t.Fatalf("ExecuteStream error: %v", err)
 	}
 
-	var gotErr error
+	var got bytes.Buffer
 	for chunk := range result.Chunks {
 		if chunk.Err != nil {
-			gotErr = chunk.Err
-			continue
+			t.Fatalf("unexpected stream error: %v", chunk.Err)
 		}
-		if bytes.Contains(chunk.Payload, []byte("response.completed")) {
-			t.Fatalf("response.completed chunk was forwarded: %s", string(chunk.Payload))
-		}
+		got.Write(chunk.Payload)
 	}
-	if gotErr == nil {
-		t.Fatal("expected error chunk for zero-usage completion")
-	}
-	statusCoder, ok := gotErr.(interface{ StatusCode() int })
-	if !ok {
-		t.Fatalf("expected status coder error, got %T: %v", gotErr, gotErr)
-	}
-	if got := statusCoder.StatusCode(); got != http.StatusBadGateway {
-		t.Fatalf("StatusCode = %d, want %d", got, http.StatusBadGateway)
+	if !bytes.Contains(got.Bytes(), []byte("response.completed")) {
+		t.Fatalf("response.completed was not forwarded; got %s", got.String())
 	}
 }
 

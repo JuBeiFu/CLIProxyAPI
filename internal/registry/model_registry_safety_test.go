@@ -110,6 +110,27 @@ func TestCleanupExpiredQuotasInvalidatesAvailableModelsCache(t *testing.T) {
 	}
 }
 
+func TestSetModelQuotaExceededUntilHonorsUpstreamResetTime(t *testing.T) {
+	r := newTestModelRegistry()
+	r.RegisterClient("client-1", "codex", []*ModelInfo{{ID: "gpt-5.5", Created: 1}})
+
+	recoverAt := time.Now().Add(2 * time.Hour)
+	r.SetModelQuotaExceededUntil("client-1", "gpt-5.5", recoverAt)
+	if count := r.GetModelCount("gpt-5.5"); count != 0 {
+		t.Fatalf("expected quota-limited model count 0 before upstream reset, got %d", count)
+	}
+
+	r.mutex.Lock()
+	expiredAt := time.Now().Add(-time.Second)
+	r.models["gpt-5.5"].QuotaExceededClients["client-1"] = &expiredAt
+	r.mutex.Unlock()
+
+	r.CleanupExpiredQuotas()
+	if count := r.GetModelCount("gpt-5.5"); count != 1 {
+		t.Fatalf("expected model count 1 after upstream reset, got %d", count)
+	}
+}
+
 func TestGetAvailableModelsReturnsClonedSupportedParameters(t *testing.T) {
 	r := newTestModelRegistry()
 	r.RegisterClient("client-1", "openai", []*ModelInfo{{
