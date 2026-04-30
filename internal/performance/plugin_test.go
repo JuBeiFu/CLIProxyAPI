@@ -45,3 +45,72 @@ func TestPluginIgnoresNilTracker(t *testing.T) {
 		AuthID:   "auth-a",
 	})
 }
+
+func TestPluginIgnoresRequestScopedClientFailure(t *testing.T) {
+	tracker := NewTracker(Config{Window: time.Minute, MinSamples: 1, EWMAAlpha: 1})
+	plugin := NewPlugin(tracker)
+	now := time.Date(2026, 5, 1, 2, 30, 0, 0, time.UTC)
+
+	plugin.HandleUsage(context.Background(), coreusage.Record{
+		Provider:    "codex",
+		Model:       "gpt-5.4",
+		AuthID:      "auth-a",
+		RequestedAt: now,
+		Failed:      true,
+		Detail: coreusage.Detail{
+			StatusCode:   400,
+			ErrorMessage: `{"error":{"type":"invalid_request_error","code":"missing_required_parameter","message":"One of \"input\" or \"previous_response_id\" must be provided."}}`,
+		},
+	})
+
+	if got := tracker.Snapshot(SnapshotFilter{}, now); len(got) != 0 {
+		t.Fatalf("request-scoped client failure polluted auth performance: %+v", got)
+	}
+}
+
+func TestPluginKeepsUpstreamFailure(t *testing.T) {
+	tracker := NewTracker(Config{Window: time.Minute, MinSamples: 1, EWMAAlpha: 1})
+	plugin := NewPlugin(tracker)
+	now := time.Date(2026, 5, 1, 2, 31, 0, 0, time.UTC)
+
+	plugin.HandleUsage(context.Background(), coreusage.Record{
+		Provider:    "codex",
+		Model:       "gpt-5.4",
+		AuthID:      "auth-a",
+		RequestedAt: now,
+		Failed:      true,
+		Detail: coreusage.Detail{
+			StatusCode:   502,
+			ErrorMessage: `{"error":{"type":"server_error","message":"bad gateway"}}`,
+		},
+	})
+
+	got := tracker.Snapshot(SnapshotFilter{}, now)
+	if len(got) != 1 {
+		t.Fatalf("snapshot count = %d, want 1", len(got))
+	}
+	if got[0].FailureCount != 1 {
+		t.Fatalf("FailureCount = %d, want 1", got[0].FailureCount)
+	}
+}
+
+func TestPluginIgnoresClientCanceledFailure(t *testing.T) {
+	tracker := NewTracker(Config{Window: time.Minute, MinSamples: 1, EWMAAlpha: 1})
+	plugin := NewPlugin(tracker)
+	now := time.Date(2026, 5, 1, 2, 32, 0, 0, time.UTC)
+
+	plugin.HandleUsage(context.Background(), coreusage.Record{
+		Provider:    "codex",
+		Model:       "gpt-5.4",
+		AuthID:      "auth-a",
+		RequestedAt: now,
+		Failed:      true,
+		Detail: coreusage.Detail{
+			ErrorMessage: "context canceled",
+		},
+	})
+
+	if got := tracker.Snapshot(SnapshotFilter{}, now); len(got) != 0 {
+		t.Fatalf("client cancellation polluted auth performance: %+v", got)
+	}
+}

@@ -441,6 +441,42 @@ func TestNormalizeResponsesWebsocketRequestCreateStringInput(t *testing.T) {
 	}
 }
 
+func TestNormalizeResponsesWebsocketRequestCreateMissingPayloadFails(t *testing.T) {
+	raw := []byte(`{"type":"response.create","model":"test-model"}`)
+
+	_, _, errMsg := normalizeResponsesWebsocketRequest(raw, nil, nil)
+	if errMsg == nil {
+		t.Fatal("expected missing payload error")
+	}
+	if errMsg.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d", errMsg.StatusCode, http.StatusBadRequest)
+	}
+	if !strings.Contains(errMsg.Error.Error(), "missing_required_parameter") {
+		t.Fatalf("error = %v, want missing_required_parameter", errMsg.Error)
+	}
+}
+
+func TestNormalizeResponsesWebsocketRequestCreatePrewarmMayOmitPayload(t *testing.T) {
+	raw := []byte(`{"type":"response.create","model":"test-model","generate":false}`)
+
+	normalized, _, errMsg := normalizeResponsesWebsocketRequest(raw, nil, nil)
+	if errMsg != nil {
+		t.Fatalf("unexpected error: %v", errMsg.Error)
+	}
+	if !gjson.GetBytes(normalized, "input").Exists() {
+		t.Fatalf("prewarm request should keep synthetic empty input: %s", normalized)
+	}
+}
+
+func TestResponsesPayloadRejectsEmptyInputArray(t *testing.T) {
+	if hasResponsesPayload([]byte(`{"model":"test-model","input":[]}`)) {
+		t.Fatal("empty input array should be treated as missing payload")
+	}
+	if !hasResponsesPayload([]byte(`{"model":"test-model","input":[{"type":"message","content":"hi"}]}`)) {
+		t.Fatal("non-empty input array should be accepted")
+	}
+}
+
 func TestNormalizeResponsesWebsocketRequestCreateWithHistory(t *testing.T) {
 	lastRequest := []byte(`{"model":"test-model","stream":true,"input":[{"type":"message","id":"msg-1"}]}`)
 	lastResponseOutput := []byte(`[

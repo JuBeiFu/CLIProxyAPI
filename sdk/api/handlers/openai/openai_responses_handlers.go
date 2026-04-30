@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 
 	"github.com/gin-gonic/gin"
 	. "github.com/router-for-me/CLIProxyAPI/v6/internal/constant"
@@ -281,8 +282,20 @@ func (h *OpenAIResponsesAPIHandler) Responses(c *gin.Context) {
 }
 
 func hasResponsesPayload(rawJSON []byte) bool {
-	for _, path := range []string{"input", "previous_response_id", "prompt", "conversation_id"} {
-		if gjson.GetBytes(rawJSON, path).Exists() {
+	input := gjson.GetBytes(rawJSON, "input")
+	if input.Exists() {
+		switch {
+		case input.IsArray():
+			return len(input.Array()) > 0
+		case input.Type == gjson.String:
+			return strings.TrimSpace(input.String()) != ""
+		default:
+			return input.Type != gjson.Null
+		}
+	}
+	for _, path := range []string{"previous_response_id", "prompt", "conversation_id"} {
+		value := gjson.GetBytes(rawJSON, path)
+		if value.Exists() && strings.TrimSpace(value.String()) != "" {
 			return true
 		}
 	}

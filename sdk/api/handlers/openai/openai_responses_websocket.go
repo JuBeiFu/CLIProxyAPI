@@ -319,10 +319,6 @@ func normalizeResponseCreateRequest(rawJSON []byte) ([]byte, []byte, *interfaces
 		normalized = bytes.Clone(rawJSON)
 	}
 	normalized = normalizeResponsesStringInput(normalized)
-	normalized, _ = sjson.SetBytes(normalized, "stream", true)
-	if !gjson.GetBytes(normalized, "input").Exists() {
-		normalized, _ = sjson.SetRawBytes(normalized, "input", []byte("[]"))
-	}
 
 	modelName := strings.TrimSpace(gjson.GetBytes(normalized, "model").String())
 	if modelName == "" {
@@ -330,6 +326,17 @@ func normalizeResponseCreateRequest(rawJSON []byte) ([]byte, []byte, *interfaces
 			StatusCode: http.StatusBadRequest,
 			Error:      fmt.Errorf("missing model in response.create request"),
 		}
+	}
+	prewarm := gjson.GetBytes(normalized, "generate").Exists() && !gjson.GetBytes(normalized, "generate").Bool()
+	if !prewarm && !hasResponsesPayload(normalized) {
+		return nil, nil, &interfaces.ErrorMessage{
+			StatusCode: http.StatusBadRequest,
+			Error:      fmt.Errorf(`missing_required_parameter: One of "input", "previous_response_id", "prompt", or "conversation_id" must be provided.`),
+		}
+	}
+	normalized, _ = sjson.SetBytes(normalized, "stream", true)
+	if !gjson.GetBytes(normalized, "input").Exists() {
+		normalized, _ = sjson.SetRawBytes(normalized, "input", []byte("[]"))
 	}
 	return normalized, bytes.Clone(normalized), nil
 }

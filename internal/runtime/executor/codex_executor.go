@@ -771,7 +771,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 		}
 		if errScan := scanner.Err(); errScan != nil {
 			helps.RecordAPIResponseError(ctx, e.cfg, errScan)
-			reporter.PublishFailure(ctx)
+			reporter.PublishFailureWithError(ctx, errScan)
 			timing.streamErrText = errScan.Error()
 			_ = sendChunk(cliproxyexecutor.StreamChunk{Err: errScan})
 		}

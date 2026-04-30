@@ -4082,7 +4082,7 @@ func isModerationBlockedErrorMessage(message string) bool {
 }
 
 func isRequestScopedResultError(err *Error) bool {
-	return isRequestScopedNotFoundResultError(err) || isModerationBlockedResultError(err) || isCyberPolicyResultError(err)
+	return isRequestInvalidError(err)
 }
 
 // isRequestInvalidError returns true if the error represents a client request

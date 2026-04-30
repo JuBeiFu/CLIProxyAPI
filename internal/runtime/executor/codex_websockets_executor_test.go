@@ -282,6 +282,32 @@ func contextWithGinHeaders(headers map[string]string) context.Context {
 	return context.WithValue(context.Background(), "gin", ginCtx)
 }
 
+func TestShouldUseCodexWebsocketExecutorIgnoresBridgeHeader(t *testing.T) {
+	ctx := contextWithGinHeaders(map[string]string{
+		newAPIDownstreamTransportHeader: "websocket",
+	})
+	auth := &cliproxyauth.Auth{
+		Provider:   "codex",
+		Attributes: map[string]string{"websockets": "true"},
+	}
+
+	if shouldUseCodexWebsocketExecutor(ctx, auth) {
+		t.Fatal("expected new-api websocket bridge header to prefer HTTP SSE upstream")
+	}
+}
+
+func TestShouldUseCodexWebsocketExecutorAllowsExplicitDownstreamWebsocket(t *testing.T) {
+	ctx := cliproxyexecutor.WithDownstreamWebsocket(context.Background())
+	auth := &cliproxyauth.Auth{
+		Provider:   "codex",
+		Attributes: map[string]string{"websockets": "true"},
+	}
+
+	if !shouldUseCodexWebsocketExecutor(ctx, auth) {
+		t.Fatal("expected explicit downstream websocket context to use websocket upstream")
+	}
+}
+
 func TestNewProxyAwareWebsocketDialerDirectDisablesProxy(t *testing.T) {
 	t.Parallel()
 

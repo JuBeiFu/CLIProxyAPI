@@ -17,7 +17,7 @@ type noopAPIHandler struct{}
 func (noopAPIHandler) HandlerType() string      { return "noop" }
 func (noopAPIHandler) Models() []map[string]any { return nil }
 
-func TestGetContextWithCancel_InjectsDownstreamWebsocketForBridgeHeader(t *testing.T) {
+func TestGetContextWithCancel_DoesNotInjectDownstreamWebsocketForBridgeHeader(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	recorder := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(recorder)
@@ -28,8 +28,11 @@ func TestGetContextWithCancel_InjectsDownstreamWebsocketForBridgeHeader(t *testi
 	ctx, cancel := base.GetContextWithCancel(noopAPIHandler{}, c, context.Background())
 	cancel(nil)
 
-	if !coreexecutor.DownstreamWebsocket(ctx) {
-		t.Fatal("expected bridge websocket header to mark logical downstream websocket context")
+	if coreexecutor.DownstreamWebsocket(ctx) {
+		t.Fatal("expected bridge websocket header to keep upstream websocket disabled by default")
+	}
+	if !DownstreamWebsocketBridge(ctx) {
+		t.Fatal("expected bridge websocket header to remain visible as downstream bridge metadata")
 	}
 }
 
