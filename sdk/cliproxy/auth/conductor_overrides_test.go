@@ -1954,7 +1954,7 @@ func TestManager_MarkResult_CodexSparkUsageLimitOnlyBlocksSpark(t *testing.T) {
 	}
 }
 
-func TestManager_MarkResult_GenericSparkUsageLimitStillBlocksAuth(t *testing.T) {
+func TestManager_MarkResult_GenericSparkUsageLimitOnlyBlocksSpark(t *testing.T) {
 	m := NewManager(nil, nil, nil)
 	auth := &Auth{
 		ID:       "auth-spark-generic-limit",
@@ -1988,14 +1988,76 @@ func TestManager_MarkResult_GenericSparkUsageLimitStillBlocksAuth(t *testing.T) 
 	if !ok {
 		t.Fatal("auth not found after MarkResult")
 	}
-	if !got.Unavailable || !got.Quota.Exceeded {
-		t.Fatalf("expected generic usage_limit to block auth, unavailable=%v quota=%+v", got.Unavailable, got.Quota)
+	if got.Unavailable || got.Quota.Exceeded {
+		t.Fatalf("expected generic Spark usage_limit to leave auth available, unavailable=%v quota=%+v", got.Unavailable, got.Quota)
 	}
-	if got.Quota.Reason != "usage_limit" {
-		t.Fatalf("auth quota reason = %q, want usage_limit", got.Quota.Reason)
+	if blocked, reason, next := isAuthBlockedForModel(got, "gpt-5.3-codex-spark", time.Now()); !blocked || reason != blockReasonCooldown || next.IsZero() {
+		t.Fatalf("Spark block = %v reason=%v next=%v, want model cooldown", blocked, reason, next)
 	}
-	if blocked, reason, next := isAuthBlockedForModel(got, "gpt-5.4", time.Now()); !blocked || reason != blockReasonCooldown || next.IsZero() {
-		t.Fatalf("gpt-5.4 block = %v reason=%v next=%v, want auth-level cooldown", blocked, reason, next)
+	if blocked, reason, next := isAuthBlockedForModel(got, "gpt-5.4", time.Now()); blocked {
+		t.Fatalf("gpt-5.4 unexpectedly blocked, reason=%v next=%v auth=%+v", reason, next, got)
+	}
+}
+
+func TestManager_MarkResult_CodexStandardUsageLimitOnlyBlocksNonSparkModels(t *testing.T) {
+	m := NewManager(nil, nil, nil)
+	auth := &Auth{
+		ID:       "auth-standard-limit",
+		Provider: "codex",
+		Status:   StatusActive,
+		Attributes: map[string]string{
+			"plan_type": "prolite",
+		},
+		ModelStates: map[string]*ModelState{
+			"gpt-5.3-codex-spark": {
+				Status: StatusActive,
+			},
+		},
+	}
+	registry.GetGlobalRegistry().RegisterClient(auth.ID, "codex", []*registry.ModelInfo{
+		{ID: "gpt-5.4"},
+		{ID: "gpt-5.5"},
+		{ID: "gpt-5.3-codex-spark"},
+	})
+	t.Cleanup(func() {
+		registry.GetGlobalRegistry().UnregisterClient(auth.ID)
+	})
+	if _, errRegister := m.Register(context.Background(), auth); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+
+	m.MarkResult(context.Background(), Result{
+		AuthID:   auth.ID,
+		Provider: auth.Provider,
+		Model:    "gpt-5.4",
+		Success:  false,
+		Error: &Error{
+			Message:    `{"error":{"type":"usage_limit_reached","message":"The usage limit has been reached","resets_in_seconds":7200}}`,
+			HTTPStatus: http.StatusTooManyRequests,
+		},
+	})
+
+	got, ok := m.GetByID(auth.ID)
+	if !ok {
+		t.Fatal("auth not found after MarkResult")
+	}
+	if got.Unavailable || got.Quota.Exceeded {
+		t.Fatalf("expected auth-level quota to stay clear for standard model limit, unavailable=%v quota=%+v", got.Unavailable, got.Quota)
+	}
+	for _, model := range []string{"gpt-5.4", "gpt-5.5"} {
+		state := got.ModelStates[model]
+		if state == nil || !state.Unavailable || !state.Quota.Exceeded {
+			t.Fatalf("%s state = %+v, want standard model quota cooldown", model, state)
+		}
+		if state.Quota.Reason != "codex_standard_usage_limit" {
+			t.Fatalf("%s quota reason = %q, want codex_standard_usage_limit", model, state.Quota.Reason)
+		}
+		if blocked, reason, next := isAuthBlockedForModel(got, model, time.Now()); !blocked || reason != blockReasonCooldown || next.IsZero() {
+			t.Fatalf("%s block = %v reason=%v next=%v, want cooldown", model, blocked, reason, next)
+		}
+	}
+	if blocked, reason, next := isAuthBlockedForModel(got, "gpt-5.3-codex-spark", time.Now()); blocked {
+		t.Fatalf("Spark unexpectedly blocked by standard usage limit, reason=%v next=%v auth=%+v", reason, next, got)
 	}
 }
 

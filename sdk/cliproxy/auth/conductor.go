@@ -82,6 +82,7 @@ const (
 	codexFiveHourQuotaRestThreshold = 0.20
 	codexFiveHourQuotaLowReason     = "codex_5h_quota_low"
 	codexSparkUsageLimitReason      = "codex_spark_usage_limit"
+	codexStandardUsageLimitReason   = "codex_standard_usage_limit"
 )
 
 const (
@@ -3060,6 +3061,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	clearModelQuota := false
 	setModelQuota := false
 	modelQuotaRecoverAt := time.Time{}
+	modelQuotaTargets := []string(nil)
 	modelSupportFailure := false
 	unbindResponseAuthID := ""
 	rebindProxyAuthID := ""
@@ -3182,11 +3184,14 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 							BackoffLevel:  backoffLevel,
 							UpdatedAt:     now,
 						}
-						if !modelScopedQuota {
+						if modelScopedQuota {
+							modelQuotaTargets = codexUsageLimitAffectedModels(auth, result.Model, quotaReason)
+							applyModelScopedQuotaToStates(auth, modelQuotaTargets, result.Error, next, quotaReason, backoffLevel, now)
+						} else {
 							applyAggregatedQuotaCooldown(auth, next, backoffLevel, quotaReason)
+							suspendReason = "quota"
+							shouldSuspendModel = true
 						}
-						suspendReason = "quota"
-						shouldSuspendModel = true
 						setModelQuota = true
 					} else {
 						switch statusCode {
@@ -3251,9 +3256,12 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 							if !effectiveDisable {
 								if !modelScopedQuota {
 									applyAggregatedQuotaCooldown(auth, next, backoffLevel, quotaReason)
+									suspendReason = "quota"
+									shouldSuspendModel = true
+								} else {
+									modelQuotaTargets = codexUsageLimitAffectedModels(auth, result.Model, quotaReason)
+									applyModelScopedQuotaToStates(auth, modelQuotaTargets, result.Error, next, quotaReason, backoffLevel, now)
 								}
-								suspendReason = "quota"
-								shouldSuspendModel = true
 								setModelQuota = true
 							}
 						case 408, 500, 502, 503, 504:
@@ -3323,10 +3331,13 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 		registry.GetGlobalRegistry().ClearModelQuotaExceeded(result.AuthID, result.Model)
 	}
 	if setModelQuota && result.Model != "" {
-		if !modelQuotaRecoverAt.IsZero() {
-			registry.GetGlobalRegistry().SetModelQuotaExceededUntil(result.AuthID, result.Model, modelQuotaRecoverAt)
-		} else {
-			registry.GetGlobalRegistry().SetModelQuotaExceeded(result.AuthID, result.Model)
+		targets := modelQuotaTargetsOrDefault(modelQuotaTargets, result.Model)
+		for _, targetModel := range targets {
+			if !modelQuotaRecoverAt.IsZero() {
+				registry.GetGlobalRegistry().SetModelQuotaExceededUntil(result.AuthID, targetModel, modelQuotaRecoverAt)
+			} else {
+				registry.GetGlobalRegistry().SetModelQuotaExceeded(result.AuthID, targetModel)
+			}
 		}
 	}
 	if shouldResumeModel {
@@ -3557,7 +3568,7 @@ func modelStateIsModelScopedOnly(state *ModelState) bool {
 	if state == nil {
 		return false
 	}
-	return state.Quota.Exceeded && state.Quota.Reason == codexSparkUsageLimitReason
+	return state.Quota.Exceeded && (state.Quota.Reason == codexSparkUsageLimitReason || state.Quota.Reason == codexStandardUsageLimitReason)
 }
 
 func clearAggregatedAvailability(auth *Auth) {
@@ -3755,20 +3766,23 @@ func isUsageLimitReachedError(resultErr *Error) bool {
 }
 
 func usageLimitQuotaReasonForModel(auth *Auth, model string, resultErr *Error) (string, bool) {
-	if codexSparkUsageLimitIsModelScoped(auth, model, resultErr) {
-		return codexSparkUsageLimitReason, true
+	if codexUsageLimitIsModelScoped(auth, model, resultErr) {
+		if isCodexSparkModel(model) {
+			return codexSparkUsageLimitReason, true
+		}
+		return codexStandardUsageLimitReason, true
 	}
 	return "usage_limit", false
 }
 
-func codexSparkUsageLimitIsModelScoped(auth *Auth, model string, resultErr *Error) bool {
-	if auth == nil || !isCodexAuth(auth) || !isCodexSparkModel(model) || !isUsageLimitReachedError(resultErr) {
+func codexUsageLimitIsModelScoped(auth *Auth, model string, resultErr *Error) bool {
+	if auth == nil || !isCodexAuth(auth) || strings.TrimSpace(model) == "" || !isUsageLimitReachedError(resultErr) {
 		return false
 	}
 	if !codexPlanAllowsSparkModels(codexPlanTypeForAuth(auth)) {
 		return false
 	}
-	return usageLimitErrorMentionsCodexSpark(resultErr)
+	return true
 }
 
 func isCodexSparkModel(model string) bool {
@@ -3803,15 +3817,98 @@ func codexPlanAllowsSparkModels(planType string) bool {
 	}
 }
 
-func usageLimitErrorMentionsCodexSpark(resultErr *Error) bool {
-	if resultErr == nil {
-		return false
+func codexUsageLimitAffectedModels(auth *Auth, model, quotaReason string) []string {
+	model = strings.TrimSpace(model)
+	if auth == nil || model == "" {
+		return nil
 	}
-	lower := strings.ToLower(strings.TrimSpace(resultErr.Message))
-	if lower == "" {
-		return false
+	if quotaReason == codexSparkUsageLimitReason {
+		return []string{model}
 	}
-	return strings.Contains(lower, "codex-spark") || strings.Contains(lower, "codex spark")
+	if quotaReason != codexStandardUsageLimitReason {
+		return []string{model}
+	}
+	models := registry.GetGlobalRegistry().GetModelsForClient(auth.ID)
+	targets := make([]string, 0, len(models))
+	seen := make(map[string]struct{}, len(models)+1)
+	for _, registered := range models {
+		if registered == nil {
+			continue
+		}
+		id := strings.TrimSpace(registered.ID)
+		if id == "" || isCodexSparkModel(id) {
+			continue
+		}
+		key := strings.ToLower(canonicalModelKey(id))
+		if key == "" {
+			key = strings.ToLower(id)
+		}
+		if _, exists := seen[key]; exists {
+			continue
+		}
+		seen[key] = struct{}{}
+		targets = append(targets, id)
+	}
+	if len(targets) == 0 && !isCodexSparkModel(model) {
+		targets = append(targets, model)
+	}
+	return targets
+}
+
+func applyModelScopedQuotaToStates(auth *Auth, models []string, resultErr *Error, next time.Time, reason string, backoffLevel int, now time.Time) {
+	if auth == nil {
+		return
+	}
+	for _, model := range models {
+		model = strings.TrimSpace(model)
+		if model == "" {
+			continue
+		}
+		state := ensureModelState(auth, model)
+		state.Unavailable = true
+		state.Status = StatusError
+		state.NextRetryAfter = next
+		state.UpdatedAt = now
+		if resultErr != nil {
+			state.LastError = cloneError(resultErr)
+			state.StatusMessage = resultErr.Message
+		}
+		state.Quota = QuotaState{
+			Exceeded:      true,
+			Reason:        reason,
+			NextRecoverAt: next,
+			BackoffLevel:  backoffLevel,
+			UpdatedAt:     now,
+		}
+	}
+}
+
+func modelQuotaTargetsOrDefault(targets []string, fallback string) []string {
+	if len(targets) == 0 {
+		fallback = strings.TrimSpace(fallback)
+		if fallback == "" {
+			return nil
+		}
+		return []string{fallback}
+	}
+	out := make([]string, 0, len(targets))
+	seen := make(map[string]struct{}, len(targets))
+	for _, target := range targets {
+		target = strings.TrimSpace(target)
+		if target == "" {
+			continue
+		}
+		key := strings.ToLower(canonicalModelKey(target))
+		if key == "" {
+			key = strings.ToLower(target)
+		}
+		if _, exists := seen[key]; exists {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, target)
+	}
+	return out
 }
 
 func statusCodeFromResult(err *Error) int {
