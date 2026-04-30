@@ -618,7 +618,7 @@ func TestCodexWebsocketExecuteStreamZeroUsageCompletionForwardsCompleted(t *test
 	}
 }
 
-func TestCodexWebsocketExecuteStreamCyberPolicyReturnsRetryableSanitizedError(t *testing.T) {
+func TestCodexWebsocketExecuteStreamCyberPolicyReturnsNonRetryableSanitizedError(t *testing.T) {
 	upgrader := websocket.Upgrader{
 		CheckOrigin: func(r *http.Request) bool { return true },
 	}
@@ -692,13 +692,13 @@ func TestCodexWebsocketExecuteStreamCyberPolicyReturnsRetryableSanitizedError(t 
 	if !ok {
 		t.Fatalf("expected status coder error, got %T: %v", gotErr, gotErr)
 	}
-	if got := statusCoder.StatusCode(); got != http.StatusServiceUnavailable {
-		t.Fatalf("StatusCode = %d, want %d", got, http.StatusServiceUnavailable)
+	if got := statusCoder.StatusCode(); got != http.StatusBadRequest {
+		t.Fatalf("StatusCode = %d, want %d", got, http.StatusBadRequest)
 	}
 	if bytes.Contains([]byte(gotErr.Error()), []byte("Trusted Access")) || bytes.Contains([]byte(gotErr.Error()), []byte("chatgpt.com/cyber")) {
 		t.Fatalf("cyber policy error leaked upstream message: %s", gotErr.Error())
 	}
-	if got := gjson.Get(gotErr.Error(), "error.message").String(); got != "upstream cyber policy retryable failure" {
+	if got := gjson.Get(gotErr.Error(), "error.message").String(); got != "request rejected by safety system" {
 		t.Fatalf("error.message = %q", got)
 	}
 }

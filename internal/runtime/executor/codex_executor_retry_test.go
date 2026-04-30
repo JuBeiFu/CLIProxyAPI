@@ -170,18 +170,18 @@ func TestCodexResponsesEventCyberPolicyErrorBody(t *testing.T) {
 	}
 }
 
-func TestNewCodexCyberPolicyStatusErrReturnsRetryableSanitizedError(t *testing.T) {
+func TestNewCodexCyberPolicyStatusErrReturnsNonRetryableSanitizedError(t *testing.T) {
 	body := []byte(`{"error":{"code":"cyber_policy","message":"This content was flagged for possible cybersecurity risk. To get authorized for security work, join the Trusted Access for Cyber program: https://chatgpt.com/cyber"}}`)
 
 	err := newCodexCyberPolicyStatusErr(body)
 
-	if got := err.StatusCode(); got != http.StatusServiceUnavailable {
-		t.Fatalf("status code = %d, want %d", got, http.StatusServiceUnavailable)
+	if got := err.StatusCode(); got != http.StatusBadRequest {
+		t.Fatalf("status code = %d, want %d", got, http.StatusBadRequest)
 	}
-	if got := gjson.Get(err.Error(), "error.code").String(); got != "service_unavailable" {
-		t.Fatalf("error.code = %q, want service_unavailable; body=%s", got, err.Error())
+	if got := gjson.Get(err.Error(), "error.code").String(); got != "cyber_policy" {
+		t.Fatalf("error.code = %q, want cyber_policy; body=%s", got, err.Error())
 	}
-	if got := gjson.Get(err.Error(), "error.message").String(); got != "upstream cyber policy retryable failure" {
+	if got := gjson.Get(err.Error(), "error.message").String(); got != "request rejected by safety system" {
 		t.Fatalf("error.message = %q", got)
 	}
 	if got := gjson.Get(err.Error(), "error.metadata.cpa_reason").String(); got != "cyber_policy" {

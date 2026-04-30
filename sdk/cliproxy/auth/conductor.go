@@ -3116,7 +3116,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 			}
 		} else {
 			if result.Model != "" {
-				if !isRequestScopedNotFoundResultError(result.Error) {
+				if !isRequestScopedResultError(result.Error) {
 					disableCooling := quotaCooldownDisabledForAuth(auth)
 					state := ensureModelState(auth, result.Model)
 					state.Unavailable = true
@@ -4050,18 +4050,60 @@ func isRequestScopedNotFoundResultError(err *Error) bool {
 	return isRequestScopedNotFoundMessage(err.Message)
 }
 
+func isModerationBlockedResultError(err *Error) bool {
+	if err == nil {
+		return false
+	}
+	return isModerationBlockedErrorMessage(err.Message) || strings.EqualFold(strings.TrimSpace(err.Code), "moderation_blocked")
+}
+
+func isModerationBlockedErrorMessage(message string) bool {
+	message = strings.TrimSpace(message)
+	if message == "" {
+		return false
+	}
+	if strings.Contains(strings.ToLower(message), "moderation_blocked") {
+		return true
+	}
+	if !gjson.Valid(message) {
+		return false
+	}
+	paths := []string{
+		"error.code",
+		"code",
+		"response.error.code",
+	}
+	for _, path := range paths {
+		if strings.EqualFold(strings.TrimSpace(gjson.Get(message, path).String()), "moderation_blocked") {
+			return true
+		}
+	}
+	return false
+}
+
+func isRequestScopedResultError(err *Error) bool {
+	return isRequestScopedNotFoundResultError(err) || isModerationBlockedResultError(err) || isCyberPolicyResultError(err)
+}
+
 // isRequestInvalidError returns true if the error represents a client request
-// error that should not be retried. Specifically, it treats 400 responses with
-// "invalid_request_error", request-scoped 404 item misses caused by `store=false`,
-// and all 422 responses as request-shape failures, where switching auths or
-// pooled upstream models will not help. Model-support errors are excluded so
-// routing can fall through to another auth or upstream.
+// error that should not be retried. Specifically, it treats safety-policy
+// blocks, 400 responses with "invalid_request_error", request-scoped 404 item
+// misses caused by `store=false`, and all 422 responses as request-shape
+// failures, where switching auths or pooled upstream models will not help.
+// Model-support errors are excluded so routing can fall through to another auth
+// or upstream.
 func isRequestInvalidError(err error) bool {
 	if err == nil {
 		return false
 	}
 	if isModelSupportError(err) {
 		return false
+	}
+	if isModerationBlockedErrorMessage(err.Error()) {
+		return true
+	}
+	if isCyberPolicyErrorMessage(err.Error()) {
+		return true
 	}
 	status := statusCodeFromError(err)
 	switch status {

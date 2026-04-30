@@ -2,13 +2,8 @@ package auth
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
-	"encoding/json"
 	"net/http"
 	"net/http/httptest"
-	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -203,7 +198,7 @@ func TestRecordCyberPolicyTriggerLocked_IncludesRequestTrace(t *testing.T) {
 	}
 }
 
-func TestIsCyberPolicyErrorMessageDetectsSanitizedRetryableMetadata(t *testing.T) {
+func TestIsCyberPolicyErrorMessageDetectsLegacySanitizedMetadata(t *testing.T) {
 	message := `{"error":{"code":"service_unavailable","message":"upstream cyber policy retryable failure","type":"upstream_error","metadata":{"cpa_reason":"cyber_policy"}}}`
 
 	if !isCyberPolicyErrorMessage(message) {
@@ -699,6 +694,96 @@ func TestManagerExecuteStream_ModelSupportBadRequestFallsBackAndSuspendsAuth(t *
 	}
 }
 
+func TestManager_ModerationBlockedDoesNotRetryOrCooldownAuth(t *testing.T) {
+	testCases := []struct {
+		name   string
+		invoke func(*Manager) error
+		calls  func(*authFallbackExecutor) []string
+	}{
+		{
+			name: "execute",
+			invoke: func(m *Manager) error {
+				_, errExecute := m.Execute(context.Background(), []string{"codex"}, cliproxyexecutor.Request{Model: "gpt-5.4"}, cliproxyexecutor.Options{})
+				return errExecute
+			},
+			calls: func(executor *authFallbackExecutor) []string {
+				return executor.ExecuteCalls()
+			},
+		},
+		{
+			name: "execute_stream",
+			invoke: func(m *Manager) error {
+				_, errExecute := m.ExecuteStream(context.Background(), []string{"codex"}, cliproxyexecutor.Request{Model: "gpt-5.4"}, cliproxyexecutor.Options{})
+				return errExecute
+			},
+			calls: func(executor *authFallbackExecutor) []string {
+				return executor.StreamCalls()
+			},
+		},
+	}
+
+	for _, tc := range testCases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			m := NewManager(nil, nil, nil)
+			m.SetRetryConfig(0, 0, 0)
+			moderationErr := &Error{
+				HTTPStatus: http.StatusBadRequest,
+				Message:    `{"error":{"code":"moderation_blocked","message":"Your request was rejected by the safety system. safety_violations=[sexual]."}}`,
+			}
+			executor := &authFallbackExecutor{
+				id: "codex",
+				executeErrors: map[string]error{
+					"aa-flagged-auth": moderationErr,
+				},
+				streamFirstErrors: map[string]error{
+					"aa-flagged-auth": moderationErr,
+				},
+			}
+			m.RegisterExecutor(executor)
+
+			model := "gpt-5.4"
+			flaggedAuth := &Auth{ID: "aa-flagged-auth", Provider: "codex"}
+			fallbackAuth := &Auth{ID: "bb-fallback-auth", Provider: "codex"}
+			reg := registry.GetGlobalRegistry()
+			reg.RegisterClient(flaggedAuth.ID, "codex", []*registry.ModelInfo{{ID: model}})
+			reg.RegisterClient(fallbackAuth.ID, "codex", []*registry.ModelInfo{{ID: model}})
+			t.Cleanup(func() {
+				reg.UnregisterClient(flaggedAuth.ID)
+				reg.UnregisterClient(fallbackAuth.ID)
+			})
+
+			if _, errRegister := m.Register(context.Background(), flaggedAuth); errRegister != nil {
+				t.Fatalf("register flagged auth: %v", errRegister)
+			}
+			if _, errRegister := m.Register(context.Background(), fallbackAuth); errRegister != nil {
+				t.Fatalf("register fallback auth: %v", errRegister)
+			}
+
+			errExecute := tc.invoke(m)
+			if errExecute == nil {
+				t.Fatal("expected moderation_blocked error")
+			}
+			if !strings.Contains(errExecute.Error(), "moderation_blocked") {
+				t.Fatalf("execute error = %v, want moderation_blocked", errExecute)
+			}
+			if got := tc.calls(executor); len(got) != 1 || got[0] != flaggedAuth.ID {
+				t.Fatalf("calls = %v, want only flagged auth", got)
+			}
+			updated, ok := m.GetByID(flaggedAuth.ID)
+			if !ok {
+				t.Fatal("flagged auth missing after moderation_blocked")
+			}
+			if updated.Unavailable || updated.Quota.Exceeded {
+				t.Fatalf("auth polluted by request-scoped moderation error: unavailable=%v quota=%+v", updated.Unavailable, updated.Quota)
+			}
+			if state := updated.ModelStates[model]; state != nil && (state.Unavailable || state.Quota.Exceeded) {
+				t.Fatalf("model state polluted by request-scoped moderation error: %+v", state)
+			}
+		})
+	}
+}
+
 func TestManager_UsageLimitReachedBypassesCredentialRetryLimit(t *testing.T) {
 	model := "gpt-5.5"
 	resetAt := time.Now().Add(2 * time.Hour).Unix()
@@ -1174,12 +1259,10 @@ func TestManager_Execute_Plain429RateLimitSuspendsAuthFor60SecondsAndSwitchesAut
 	}
 }
 
-func TestManager_Execute_CyberPolicyRecordsCountCoolsAuthAndSwitchesAuth(t *testing.T) {
+func TestManager_Execute_CyberPolicyDoesNotRetryOrCooldownAuth(t *testing.T) {
 	prev := quotaCooldownDisabled.Load()
 	quotaCooldownDisabled.Store(false)
 	t.Cleanup(func() { quotaCooldownDisabled.Store(prev) })
-	writablePath := t.TempDir()
-	t.Setenv("WRITABLE_PATH", writablePath)
 
 	m := NewManager(nil, nil, nil)
 	m.SetRetryConfig(1, 100*time.Millisecond, 2)
@@ -1219,16 +1302,16 @@ func TestManager_Execute_CyberPolicyRecordsCountCoolsAuthAndSwitchesAuth(t *test
 
 	longInput := strings.Repeat("inspect sandbox target for CTF flow ", 180)
 	payload := []byte(`{"model":"` + model + `","input":"` + longInput + `"}`)
-	resp, errExecute := m.Execute(context.Background(), []string{"codex"}, cliproxyexecutor.Request{Model: model, Payload: payload}, cliproxyexecutor.Options{})
-	if errExecute != nil {
-		t.Fatalf("execute error = %v, want nil", errExecute)
+	_, errExecute := m.Execute(context.Background(), []string{"codex"}, cliproxyexecutor.Request{Model: model, Payload: payload}, cliproxyexecutor.Options{})
+	if errExecute == nil {
+		t.Fatal("expected cyber_policy error")
 	}
-	if string(resp.Payload) != healthy.ID {
-		t.Fatalf("response payload = %q, want %q", string(resp.Payload), healthy.ID)
+	if !strings.Contains(errExecute.Error(), "cyber_policy") {
+		t.Fatalf("execute error = %v, want cyber_policy", errExecute)
 	}
 
 	calls := executor.ExecuteCalls()
-	wantCalls := []string{flagged.ID, healthy.ID}
+	wantCalls := []string{flagged.ID}
 	if len(calls) != len(wantCalls) {
 		t.Fatalf("execute calls = %v, want %v", calls, wantCalls)
 	}
@@ -1242,62 +1325,11 @@ func TestManager_Execute_CyberPolicyRecordsCountCoolsAuthAndSwitchesAuth(t *test
 	if !ok || updated == nil {
 		t.Fatalf("expected flagged auth to remain present")
 	}
-	if got := authCyberPolicyTriggerCount(updated); got != 1 {
-		t.Fatalf("cyber trigger count = %d, want 1", got)
+	if updated.Unavailable || updated.Quota.Exceeded {
+		t.Fatalf("auth polluted by request-scoped cyber policy error: unavailable=%v quota=%+v", updated.Unavailable, updated.Quota)
 	}
-	if got, _ := updated.Metadata["cyber_policy_last_model"].(string); got != model {
-		t.Fatalf("last model = %q, want %q", got, model)
-	}
-	wantPreview := string(payload[:cyberPolicyRequestPreviewMaxBytes])
-	if got, _ := updated.Metadata["cyber_policy_last_request_preview"].(string); got != wantPreview {
-		t.Fatalf("request preview length = %d, want preview length %d", len(got), len(wantPreview))
-	}
-	sum := sha256.Sum256(payload)
-	wantHash := hex.EncodeToString(sum[:])
-	if got, _ := updated.Metadata["cyber_policy_last_request_sha256"].(string); got != wantHash {
-		t.Fatalf("request sha256 = %q, want %q", got, wantHash)
-	}
-	state := updated.ModelStates[model]
-	if state == nil {
-		t.Fatalf("expected model state to exist")
-	}
-	if !state.NextRetryAfter.After(time.Now().Add(4 * time.Minute)) {
-		t.Fatalf("model NextRetryAfter = %v, want cyber cooldown", state.NextRetryAfter)
-	}
-	if state.Quota.Reason != "cyber_policy" {
-		t.Fatalf("quota reason = %q, want cyber_policy", state.Quota.Reason)
-	}
-	if updated.Quota.Reason != "cyber_policy" {
-		t.Fatalf("auth quota reason = %q, want cyber_policy", updated.Quota.Reason)
-	}
-
-	auditPath := filepath.Join(writablePath, "logs", cyberPolicyAuditFilename)
-	auditData, errRead := os.ReadFile(auditPath)
-	if errRead != nil {
-		t.Fatalf("read cyber policy audit: %v", errRead)
-	}
-	lines := strings.Split(strings.TrimSpace(string(auditData)), "\n")
-	if len(lines) != 1 {
-		t.Fatalf("audit line count = %d, want 1", len(lines))
-	}
-	var audit map[string]any
-	if errUnmarshal := json.Unmarshal([]byte(lines[0]), &audit); errUnmarshal != nil {
-		t.Fatalf("unmarshal cyber policy audit: %v", errUnmarshal)
-	}
-	if got, _ := audit["auth_id"].(string); got != flagged.ID {
-		t.Fatalf("audit auth_id = %q, want %q", got, flagged.ID)
-	}
-	if got, _ := audit["model"].(string); got != model {
-		t.Fatalf("audit model = %q, want %q", got, model)
-	}
-	if got, _ := audit["request_sha256"].(string); got != wantHash {
-		t.Fatalf("audit request_sha256 = %q, want %q", got, wantHash)
-	}
-	if got, _ := audit["request_preview"].(string); got != wantPreview {
-		t.Fatalf("audit request_preview length = %d, want %d", len(got), cyberPolicyRequestPreviewMaxBytes)
-	}
-	if got, _ := audit["request_payload"].(string); got != string(payload) {
-		t.Fatalf("audit request_payload length = %d, want %d", len(got), len(payload))
+	if state := updated.ModelStates[model]; state != nil && (state.Unavailable || state.Quota.Exceeded) {
+		t.Fatalf("model state polluted by request-scoped cyber policy error: %+v", state)
 	}
 }
 

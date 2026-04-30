@@ -1317,8 +1317,8 @@ func newCodexStatusErr(statusCode int, body []byte) statusErr {
 }
 
 func newCodexCyberPolicyStatusErr(body []byte) statusErr {
-	sanitized := []byte(`{"error":{"code":"service_unavailable","message":"upstream cyber policy retryable failure","type":"upstream_error","metadata":{"cpa_reason":"cyber_policy"}}}`)
-	return statusErr{code: http.StatusServiceUnavailable, msg: string(sanitized)}
+	sanitized := []byte(`{"error":{"code":"cyber_policy","message":"request rejected by safety system","type":"invalid_request_error","metadata":{"cpa_reason":"cyber_policy"}}}`)
+	return statusErr{code: http.StatusBadRequest, msg: string(sanitized)}
 }
 
 func codexResponsesEventErrorBody(eventData []byte) ([]byte, int, bool) {
