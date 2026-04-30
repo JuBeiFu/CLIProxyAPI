@@ -13,9 +13,12 @@ func TestIsPaidPlan(t *testing.T) {
 	}{
 		{"plus", true},
 		{"pro", true},
+		{"prolite", true},
+		{"pro_lite", true},
+		{"pro-lite", true},
 		{"team", true},
 		{"enterprise", true},
-		{"Plus", true},  // case-insensitive
+		{"Plus", true},   // case-insensitive
 		{"  pro ", true}, // trimmed
 		{"free", false},
 		{"none", false},

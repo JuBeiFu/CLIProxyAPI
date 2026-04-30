@@ -126,12 +126,12 @@ func authPlanTierScore(auth *Auth) int {
 	if auth == nil || auth.Attributes == nil {
 		return 0
 	}
-	switch strings.ToLower(strings.TrimSpace(auth.Attributes["plan_type"])) {
+	switch normalizedPlanTypeKey(auth.Attributes["plan_type"]) {
 	case "pro":
 		return 4
 	case "team", "business", "go":
 		return 3
-	case "plus":
+	case "plus", "prolite":
 		return 2
 	case "free":
 		return 1

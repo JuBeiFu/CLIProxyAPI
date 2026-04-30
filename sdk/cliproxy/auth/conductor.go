@@ -81,6 +81,7 @@ const (
 	codexFrequentActivityThreshold  = 3
 	codexFiveHourQuotaRestThreshold = 0.20
 	codexFiveHourQuotaLowReason     = "codex_5h_quota_low"
+	codexSparkUsageLimitReason      = "codex_spark_usage_limit"
 )
 
 const (
@@ -3161,6 +3162,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 					} else if isUsageLimitReachedError(result.Error) {
 						var next time.Time
 						backoffLevel := state.Quota.BackoffLevel
+						quotaReason, modelScopedQuota := usageLimitQuotaReasonForModel(auth, result.Model, result.Error)
 						retryAfter := normalizedRetryAfter(statusCode, result.RetryAfter, state.StatusMessage)
 						if retryAfter != nil {
 							next = now.Add(*retryAfter)
@@ -3175,12 +3177,14 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 						modelQuotaRecoverAt = next
 						state.Quota = QuotaState{
 							Exceeded:      true,
-							Reason:        "usage_limit",
+							Reason:        quotaReason,
 							NextRecoverAt: next,
 							BackoffLevel:  backoffLevel,
 							UpdatedAt:     now,
 						}
-						applyAggregatedQuotaCooldown(auth, next, backoffLevel, "usage_limit")
+						if !modelScopedQuota {
+							applyAggregatedQuotaCooldown(auth, next, backoffLevel, quotaReason)
+						}
 						suspendReason = "quota"
 						shouldSuspendModel = true
 						setModelQuota = true
@@ -3220,8 +3224,9 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 							quotaExhausted := isUsageLimitReachedError(result.Error)
 							effectiveDisable := disableCooling && !quotaExhausted
 							quotaReason := "rate_limit"
+							modelScopedQuota := false
 							if quotaExhausted {
-								quotaReason = "usage_limit"
+								quotaReason, modelScopedQuota = usageLimitQuotaReasonForModel(auth, result.Model, result.Error)
 							}
 							if !effectiveDisable {
 								if retryAfter != nil {
@@ -3244,7 +3249,9 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 								UpdatedAt:     now,
 							}
 							if !effectiveDisable {
-								applyAggregatedQuotaCooldown(auth, next, backoffLevel, quotaReason)
+								if !modelScopedQuota {
+									applyAggregatedQuotaCooldown(auth, next, backoffLevel, quotaReason)
+								}
 								suspendReason = "quota"
 								shouldSuspendModel = true
 								setModelQuota = true
@@ -3474,6 +3481,9 @@ func updateAggregatedAvailability(auth *Auth, now time.Time) {
 		if state == nil {
 			continue
 		}
+		if modelStateIsModelScopedOnly(state) {
+			continue
+		}
 		hasState = true
 		stateUnavailable := false
 		if state.Status == StatusDisabled {
@@ -3541,6 +3551,13 @@ func updateAggregatedAvailability(auth *Auth, now time.Time) {
 		auth.Quota.NextRecoverAt = time.Time{}
 		auth.Quota.BackoffLevel = 0
 	}
+}
+
+func modelStateIsModelScopedOnly(state *ModelState) bool {
+	if state == nil {
+		return false
+	}
+	return state.Quota.Exceeded && state.Quota.Reason == codexSparkUsageLimitReason
 }
 
 func clearAggregatedAvailability(auth *Auth) {
@@ -3735,6 +3752,66 @@ func isUsageLimitReachedError(resultErr *Error) bool {
 		return true
 	}
 	return false
+}
+
+func usageLimitQuotaReasonForModel(auth *Auth, model string, resultErr *Error) (string, bool) {
+	if codexSparkUsageLimitIsModelScoped(auth, model, resultErr) {
+		return codexSparkUsageLimitReason, true
+	}
+	return "usage_limit", false
+}
+
+func codexSparkUsageLimitIsModelScoped(auth *Auth, model string, resultErr *Error) bool {
+	if auth == nil || !isCodexAuth(auth) || !isCodexSparkModel(model) || !isUsageLimitReachedError(resultErr) {
+		return false
+	}
+	if !codexPlanAllowsSparkModels(codexPlanTypeForAuth(auth)) {
+		return false
+	}
+	return usageLimitErrorMentionsCodexSpark(resultErr)
+}
+
+func isCodexSparkModel(model string) bool {
+	modelKey := strings.ToLower(strings.TrimSpace(canonicalModelKey(model)))
+	if modelKey == "" {
+		return false
+	}
+	return strings.HasSuffix(modelKey, "-codex-spark")
+}
+
+func codexPlanTypeForAuth(auth *Auth) string {
+	if auth == nil {
+		return ""
+	}
+	if auth.Attributes != nil {
+		if planType := strings.TrimSpace(auth.Attributes["plan_type"]); planType != "" {
+			return planType
+		}
+	}
+	if planType := strings.TrimSpace(probedPlanType(auth)); planType != "" {
+		return planType
+	}
+	return strings.TrimSpace(submittedPlanType(auth))
+}
+
+func codexPlanAllowsSparkModels(planType string) bool {
+	switch normalizedPlanTypeKey(planType) {
+	case "pro", "plus", "prolite":
+		return true
+	default:
+		return false
+	}
+}
+
+func usageLimitErrorMentionsCodexSpark(resultErr *Error) bool {
+	if resultErr == nil {
+		return false
+	}
+	lower := strings.ToLower(strings.TrimSpace(resultErr.Message))
+	if lower == "" {
+		return false
+	}
+	return strings.Contains(lower, "codex-spark") || strings.Contains(lower, "codex spark")
 }
 
 func statusCodeFromResult(err *Error) int {

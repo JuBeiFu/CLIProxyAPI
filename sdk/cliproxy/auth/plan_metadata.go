@@ -100,19 +100,27 @@ func SetBoundProxyEntry(auth *Auth, name string) {
 }
 
 func isPaidPlan(planType string) bool {
-	switch strings.ToLower(strings.TrimSpace(planType)) {
-	case "plus", "pro", "team", "enterprise":
+	switch normalizedPlanTypeKey(planType) {
+	case "plus", "pro", "prolite", "team", "enterprise":
 		return true
 	}
 	return false
 }
 
 func isFreePlan(planType string) bool {
-	switch strings.ToLower(strings.TrimSpace(planType)) {
+	switch normalizedPlanTypeKey(planType) {
 	case "", "free", "none", "unknown":
 		return true
 	}
 	return false
+}
+
+func normalizedPlanTypeKey(planType string) string {
+	key := strings.ToLower(strings.TrimSpace(planType))
+	key = strings.ReplaceAll(key, "_", "")
+	key = strings.ReplaceAll(key, "-", "")
+	key = strings.ReplaceAll(key, " ", "")
+	return key
 }
 
 func submittedPlanType(auth *Auth) string {

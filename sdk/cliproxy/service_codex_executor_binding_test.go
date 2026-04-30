@@ -133,3 +133,68 @@ func TestRegisterModelsForAuth_CodexEmptySupportedModelsDoesNotFallbackToPlanMod
 		t.Fatalf("registered models = %+v, want none for empty entitlements", models)
 	}
 }
+
+func TestRegisterModelsForAuth_CodexTeamEntitlementsFilterSpark(t *testing.T) {
+	service := &Service{
+		cfg:         &config.Config{},
+		coreManager: coreauth.NewManager(nil, nil, nil),
+	}
+	auth := &coreauth.Auth{
+		ID:       "codex-team-spark-entitlements-auth",
+		Provider: "codex",
+		Status:   coreauth.StatusActive,
+		Attributes: map[string]string{
+			"plan_type":                "team",
+			"supported_models":         "gpt-5.3-codex-spark,gpt-5.4",
+			"supported_models_source":  "codex_entitlements",
+			"supported_models_updated": "2026-04-30T00:00:00Z",
+		},
+	}
+	t.Cleanup(func() {
+		registry.GetGlobalRegistry().UnregisterClient(auth.ID)
+	})
+
+	service.registerModelsForAuth(auth)
+	models := registry.GetGlobalRegistry().GetModelsForClient(auth.ID)
+	ids := make(map[string]struct{}, len(models))
+	for _, model := range models {
+		if model != nil {
+			ids[model.ID] = struct{}{}
+		}
+	}
+	if _, ok := ids["gpt-5.3-codex-spark"]; ok {
+		t.Fatalf("registered Spark model for team auth: %+v", ids)
+	}
+	if _, ok := ids["gpt-5.4"]; !ok {
+		t.Fatalf("registered models missing gpt-5.4 after Spark filter: %+v", ids)
+	}
+}
+
+func TestRegisterModelsForAuth_CodexUnknownPlanFallbackFiltersSpark(t *testing.T) {
+	service := &Service{
+		cfg:         &config.Config{},
+		coreManager: coreauth.NewManager(nil, nil, nil),
+	}
+	auth := &coreauth.Auth{
+		ID:       "codex-unknown-plan-auth",
+		Provider: "codex",
+		Status:   coreauth.StatusActive,
+		Attributes: map[string]string{
+			"plan_type": "unknown",
+		},
+	}
+	t.Cleanup(func() {
+		registry.GetGlobalRegistry().UnregisterClient(auth.ID)
+	})
+
+	service.registerModelsForAuth(auth)
+	models := registry.GetGlobalRegistry().GetModelsForClient(auth.ID)
+	if len(models) == 0 {
+		t.Fatal("expected unknown plan fallback to keep non-Spark Codex models")
+	}
+	for _, model := range models {
+		if model != nil && model.ID == "gpt-5.3-codex-spark" {
+			t.Fatalf("registered Spark model for unknown plan fallback: %+v", models)
+		}
+	}
+}

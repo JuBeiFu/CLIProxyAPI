@@ -975,10 +975,10 @@ func (s *Service) registerModelsForAuth(a *coreauth.Auth) {
 			codexPlanType = strings.TrimSpace(a.Attributes["plan_type"])
 		}
 		if len(models) == 0 && !entitlementsModelsKnown {
-			switch strings.ToLower(codexPlanType) {
+			switch normalizedCodexPlanTypeKey(codexPlanType) {
 			case "pro":
 				models = registry.GetCodexProModels()
-			case "plus":
+			case "plus", "prolite":
 				models = registry.GetCodexPlusModels()
 			case "team", "business", "go":
 				models = registry.GetCodexTeamModels()
@@ -997,6 +997,7 @@ func (s *Service) registerModelsForAuth(a *coreauth.Auth) {
 			}
 		}
 		models = applyExcludedModels(models, excluded)
+		models = filterCodexSparkModelsByPlan(models, codexPlanType)
 	case "qwen":
 		models = registry.GetQwenModels()
 		models = applyExcludedModels(models, excluded)
@@ -1334,6 +1335,45 @@ func codexSupportedModelsKnownFromAuth(a *coreauth.Auth) bool {
 	}
 	return strings.EqualFold(strings.TrimSpace(a.Attributes["supported_models_source"]), "codex_entitlements") &&
 		strings.TrimSpace(a.Attributes["supported_models_updated"]) != ""
+}
+
+func filterCodexSparkModelsByPlan(models []*ModelInfo, planType string) []*ModelInfo {
+	if len(models) == 0 || codexPlanAllowsSparkModels(planType) {
+		return models
+	}
+	filtered := make([]*ModelInfo, 0, len(models))
+	for _, model := range models {
+		if model == nil {
+			continue
+		}
+		if isCodexSparkModelID(model.ID) {
+			continue
+		}
+		filtered = append(filtered, model)
+	}
+	return filtered
+}
+
+func codexPlanAllowsSparkModels(planType string) bool {
+	switch normalizedCodexPlanTypeKey(planType) {
+	case "pro", "plus", "prolite":
+		return true
+	default:
+		return false
+	}
+}
+
+func normalizedCodexPlanTypeKey(planType string) string {
+	key := strings.ToLower(strings.TrimSpace(planType))
+	key = strings.ReplaceAll(key, "_", "")
+	key = strings.ReplaceAll(key, "-", "")
+	key = strings.ReplaceAll(key, " ", "")
+	return key
+}
+
+func isCodexSparkModelID(modelID string) bool {
+	modelID = strings.ToLower(strings.TrimSpace(modelID))
+	return strings.HasSuffix(modelID, "-codex-spark")
 }
 
 func applyExcludedModels(models []*ModelInfo, excluded []string) []*ModelInfo {
