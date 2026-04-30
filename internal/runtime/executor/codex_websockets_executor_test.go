@@ -296,15 +296,15 @@ func TestShouldUseCodexWebsocketExecutorIgnoresBridgeHeader(t *testing.T) {
 	}
 }
 
-func TestShouldUseCodexWebsocketExecutorAllowsExplicitDownstreamWebsocket(t *testing.T) {
+func TestShouldUseCodexWebsocketExecutorIgnoresExplicitDownstreamWebsocket(t *testing.T) {
 	ctx := cliproxyexecutor.WithDownstreamWebsocket(context.Background())
 	auth := &cliproxyauth.Auth{
 		Provider:   "codex",
 		Attributes: map[string]string{"websockets": "true"},
 	}
 
-	if !shouldUseCodexWebsocketExecutor(ctx, auth) {
-		t.Fatal("expected explicit downstream websocket context to use websocket upstream")
+	if shouldUseCodexWebsocketExecutor(ctx, auth) {
+		t.Fatal("expected downstream websocket clients to use HTTP SSE upstream")
 	}
 }
 

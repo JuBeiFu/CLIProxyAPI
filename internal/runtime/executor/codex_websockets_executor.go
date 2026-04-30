@@ -1908,7 +1908,7 @@ func codexWebsocketsEnabled(auth *cliproxyauth.Auth) bool {
 }
 
 func shouldUseCodexWebsocketExecutor(ctx context.Context, auth *cliproxyauth.Auth) bool {
-	return cliproxyexecutor.DownstreamWebsocket(ctx) && codexWebsocketsEnabled(auth)
+	return false
 }
 
 func shouldEnrichCodexWebsocketBridgeFollowupRequest(ctx context.Context, executionSessionID string) bool {
