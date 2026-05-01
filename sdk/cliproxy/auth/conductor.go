@@ -2412,6 +2412,7 @@ func (m *Manager) expandPreviousResponseRequest(req cliproxyexecutor.Request, op
 		return req
 	}
 	payload, _ = sjson.DeleteBytes(payload, "previous_response_id")
+	expandedInput = sanitizeResponseTranscriptToolPairs(expandedInput)
 	payload, _ = sjson.SetRawBytes(payload, "input", expandedInput)
 	rewritten.Payload = payload
 	return rewritten
@@ -2452,6 +2453,89 @@ func mergeResponseTranscriptInput(transcript []byte, input gjson.Result) ([]byte
 	}
 	merged.WriteByte(']')
 	return merged.Bytes(), true
+}
+
+func sanitizeResponseTranscriptToolPairs(input []byte) []byte {
+	if len(input) == 0 {
+		return input
+	}
+	var items []json.RawMessage
+	if err := json.Unmarshal(input, &items); err != nil {
+		return input
+	}
+	if len(items) == 0 {
+		return input
+	}
+
+	callPresent := make(map[string]struct{}, len(items))
+	outputPresent := make(map[string]struct{}, len(items))
+	for _, item := range items {
+		itemType := strings.TrimSpace(gjson.GetBytes(item, "type").String())
+		callID := strings.TrimSpace(gjson.GetBytes(item, "call_id").String())
+		if callID == "" {
+			continue
+		}
+		switch {
+		case isResponseTranscriptToolCallType(itemType):
+			callPresent[callID] = struct{}{}
+		case isResponseTranscriptToolOutputType(itemType):
+			outputPresent[callID] = struct{}{}
+		}
+	}
+	if len(callPresent) == 0 && len(outputPresent) == 0 {
+		return input
+	}
+
+	filtered := make([]json.RawMessage, 0, len(items))
+	for _, item := range items {
+		itemType := strings.TrimSpace(gjson.GetBytes(item, "type").String())
+		switch {
+		case isResponseTranscriptToolCallType(itemType):
+			callID := strings.TrimSpace(gjson.GetBytes(item, "call_id").String())
+			if callID == "" {
+				continue
+			}
+			if _, ok := outputPresent[callID]; !ok {
+				continue
+			}
+			filtered = append(filtered, item)
+		case isResponseTranscriptToolOutputType(itemType):
+			callID := strings.TrimSpace(gjson.GetBytes(item, "call_id").String())
+			if callID == "" {
+				continue
+			}
+			if _, ok := callPresent[callID]; !ok {
+				continue
+			}
+			filtered = append(filtered, item)
+		default:
+			filtered = append(filtered, item)
+		}
+	}
+
+	out, err := json.Marshal(filtered)
+	if err != nil {
+		return input
+	}
+	return out
+}
+
+func isResponseTranscriptToolCallType(itemType string) bool {
+	switch strings.TrimSpace(itemType) {
+	case "function_call", "custom_tool_call":
+		return true
+	default:
+		return false
+	}
+}
+
+func isResponseTranscriptToolOutputType(itemType string) bool {
+	switch strings.TrimSpace(itemType) {
+	case "function_call_output", "custom_tool_call_output":
+		return true
+	default:
+		return false
+	}
 }
 
 func (m *Manager) lookupBoundAuthID(responseID string) string {
@@ -2524,15 +2608,18 @@ func (m *Manager) bindResponseFromStreamResult(authID string, reqPayload []byte,
 	out := make(chan cliproxyexecutor.StreamChunk)
 	go func() {
 		defer close(out)
+		streamOutput := responseStreamTranscriptAccumulator{}
 		for chunk := range result.Chunks {
 			if chunk.Err == nil {
+				payload := bytes.TrimSpace(chunk.Payload)
+				if bytes.HasPrefix(payload, []byte("data:")) {
+					payload = bytes.TrimSpace(payload[len("data:"):])
+				}
+				streamOutput.recordFromEvent(payload)
 				if responseID := responseIDFromStreamChunk(chunk.Payload); responseID != "" {
 					m.bindResponseToAuth(responseID, authID)
-					payload := bytes.TrimSpace(chunk.Payload)
-					if bytes.HasPrefix(payload, []byte("data:")) {
-						payload = bytes.TrimSpace(payload[len("data:"):])
-					}
 					responsePayload := []byte(gjson.GetBytes(payload, "response").Raw)
+					responsePayload = streamOutput.mergeIntoResponse(responsePayload)
 					if transcript := compactTranscriptFromPayload(reqPayload, responsePayload); len(transcript) > 0 {
 						m.bindCompactTranscript(responseID, transcript)
 					}
@@ -2542,6 +2629,93 @@ func (m *Manager) bindResponseFromStreamResult(authID string, reqPayload []byte,
 		}
 	}()
 	return &cliproxyexecutor.StreamResult{Headers: result.Headers, Chunks: out}
+}
+
+type responseStreamTranscriptAccumulator struct {
+	items []json.RawMessage
+	seen  map[string]int
+}
+
+func (a *responseStreamTranscriptAccumulator) recordFromEvent(payload []byte) {
+	if a == nil || len(payload) == 0 || !gjson.ValidBytes(payload) {
+		return
+	}
+	eventType := strings.TrimSpace(gjson.GetBytes(payload, "type").String())
+	if eventType != "response.output_item.done" {
+		return
+	}
+	item := gjson.GetBytes(payload, "item")
+	if !item.Exists() || !item.IsObject() {
+		return
+	}
+	itemType := strings.TrimSpace(item.Get("type").String())
+	if itemType != "message" && !isResponseTranscriptToolCallType(itemType) && !isResponseTranscriptToolOutputType(itemType) {
+		return
+	}
+	a.record(json.RawMessage(item.Raw))
+}
+
+func (a *responseStreamTranscriptAccumulator) mergeIntoResponse(responsePayload []byte) []byte {
+	if a == nil || len(a.items) == 0 || len(responsePayload) == 0 || !gjson.ValidBytes(responsePayload) {
+		return responsePayload
+	}
+	merged := responseStreamTranscriptAccumulator{}
+	for _, item := range a.items {
+		merged.record(item)
+	}
+	output := gjson.GetBytes(responsePayload, "output")
+	if output.Exists() && output.IsArray() {
+		output.ForEach(func(_, item gjson.Result) bool {
+			if strings.TrimSpace(item.Raw) != "" {
+				merged.record(json.RawMessage(item.Raw))
+			}
+			return true
+		})
+	}
+	if len(merged.items) == 0 {
+		return responsePayload
+	}
+	raw, err := json.Marshal(merged.items)
+	if err != nil {
+		return responsePayload
+	}
+	updated, err := sjson.SetRawBytes(responsePayload, "output", raw)
+	if err != nil {
+		return responsePayload
+	}
+	return updated
+}
+
+func (a *responseStreamTranscriptAccumulator) record(item json.RawMessage) {
+	if a == nil || len(item) == 0 || !gjson.ValidBytes(item) {
+		return
+	}
+	key := responseTranscriptOutputItemKey(item)
+	if key == "" {
+		key = string(item)
+	}
+	if a.seen == nil {
+		a.seen = make(map[string]int)
+	}
+	if idx, ok := a.seen[key]; ok {
+		a.items[idx] = bytes.Clone(item)
+		return
+	}
+	a.seen[key] = len(a.items)
+	a.items = append(a.items, bytes.Clone(item))
+}
+
+func responseTranscriptOutputItemKey(item []byte) string {
+	itemType := strings.TrimSpace(gjson.GetBytes(item, "type").String())
+	id := strings.TrimSpace(gjson.GetBytes(item, "id").String())
+	if id != "" {
+		return itemType + "\x00id\x00" + id
+	}
+	callID := strings.TrimSpace(gjson.GetBytes(item, "call_id").String())
+	if callID != "" {
+		return itemType + "\x00call_id\x00" + callID
+	}
+	return ""
 }
 
 func hasRequestedModelMetadata(meta map[string]any) bool {

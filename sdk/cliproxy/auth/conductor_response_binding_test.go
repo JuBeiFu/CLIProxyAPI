@@ -23,12 +23,14 @@ import (
 type responseStickyExecutor struct {
 	id string
 
-	mu            sync.Mutex
-	executeCalls  []string
-	streamCalls   []string
-	payloads      [][]byte
-	executeErrors map[string]error
-	streamErrors  map[string]error
+	mu                    sync.Mutex
+	executeCalls          []string
+	streamCalls           []string
+	payloads              [][]byte
+	captureStreamPayloads bool
+	streamPayloads        [][][]byte
+	executeErrors         map[string]error
+	streamErrors          map[string]error
 }
 
 func (e *responseStickyExecutor) Identifier() string {
@@ -58,16 +60,28 @@ func (e *responseStickyExecutor) Execute(ctx context.Context, auth *Auth, req cl
 
 func (e *responseStickyExecutor) ExecuteStream(ctx context.Context, auth *Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
 	_ = ctx
-	_ = req
 	_ = opts
 
 	e.mu.Lock()
 	callIndex := len(e.streamCalls)
 	e.streamCalls = append(e.streamCalls, auth.ID)
+	if e.captureStreamPayloads {
+		e.payloads = append(e.payloads, bytes.Clone(req.Payload))
+	}
+	var streamPayloads [][]byte
+	if callIndex < len(e.streamPayloads) {
+		for _, payload := range e.streamPayloads[callIndex] {
+			streamPayloads = append(streamPayloads, bytes.Clone(payload))
+		}
+	}
 	err := e.streamErrors[auth.ID]
 	e.mu.Unlock()
 
-	chunks := make(chan cliproxyexecutor.StreamChunk, 2)
+	chunkCap := 2
+	if len(streamPayloads) > chunkCap {
+		chunkCap = len(streamPayloads)
+	}
+	chunks := make(chan cliproxyexecutor.StreamChunk, chunkCap)
 	if err != nil {
 		chunks <- cliproxyexecutor.StreamChunk{Err: err}
 		close(chunks)
@@ -76,9 +90,14 @@ func (e *responseStickyExecutor) ExecuteStream(ctx context.Context, auth *Auth, 
 			Chunks:  chunks,
 		}, nil
 	}
-	chunks <- cliproxyexecutor.StreamChunk{Payload: []byte(`data: {"type":"response.output_text.delta","delta":"hi"}`)}
-	chunks <- cliproxyexecutor.StreamChunk{
-		Payload: []byte(fmt.Sprintf(`data: {"type":"response.completed","response":{"id":"resp-stream-%d","auth_id":"%s"}}`, callIndex+1, auth.ID)),
+	if len(streamPayloads) == 0 {
+		streamPayloads = [][]byte{
+			[]byte(`data: {"type":"response.output_text.delta","delta":"hi"}`),
+			[]byte(fmt.Sprintf(`data: {"type":"response.completed","response":{"id":"resp-stream-%d","auth_id":"%s"}}`, callIndex+1, auth.ID)),
+		}
+	}
+	for _, payload := range streamPayloads {
+		chunks <- cliproxyexecutor.StreamChunk{Payload: payload}
 	}
 	close(chunks)
 	return &cliproxyexecutor.StreamResult{
@@ -402,6 +421,157 @@ func TestManagerExecuteStream_OpenAIResponsesPreviousResponseIDPinsAuth(t *testi
 	_, secondAuthID := readStickyCompletedChunk(t, secondResult)
 	if secondAuthID != firstAuthID {
 		t.Fatalf("second ExecuteStream() auth = %q, selected = %q, want %q", secondAuthID, secondSelectedAuth, firstAuthID)
+	}
+}
+
+func TestManagerExecuteStream_OpenAIResponsesPreviousResponseIDKeepsStreamToolCalls(t *testing.T) {
+	t.Parallel()
+
+	const authID = "response-bind-stream-toolcall-auth"
+
+	manager := NewManager(nil, &RoundRobinSelector{}, nil)
+	executor := &responseStickyExecutor{
+		id:                    "codex",
+		captureStreamPayloads: true,
+		streamPayloads: [][][]byte{
+			{
+				[]byte(`data: {"type":"response.output_item.done","item":{"type":"function_call","id":"fc_1","call_id":"call_1","name":"lookup","arguments":"{\"q\":\"ping\"}","status":"completed"}}`),
+				[]byte(fmt.Sprintf(`data: {"type":"response.completed","response":{"id":"resp-stream-tool-1","auth_id":"%s","output":[]}}`, authID)),
+			},
+			nil,
+		},
+	}
+	manager.RegisterExecutor(executor)
+	reg := registry.GetGlobalRegistry()
+	reg.RegisterClient(authID, "codex", []*registry.ModelInfo{{ID: "gpt-5.4"}})
+	t.Cleanup(func() {
+		reg.UnregisterClient(authID)
+	})
+
+	if _, errRegister := manager.Register(context.Background(), &Auth{
+		ID:       authID,
+		Provider: "codex",
+	}); errRegister != nil {
+		t.Fatalf("Register(auth) error = %v", errRegister)
+	}
+
+	firstPayload := []byte(`{"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"call lookup"}]}]}`)
+	firstResult, errExecute := manager.ExecuteStream(context.Background(), []string{"codex"}, cliproxyexecutor.Request{
+		Model:   "gpt-5.4",
+		Payload: firstPayload,
+	}, cliproxyexecutor.Options{
+		Stream:          true,
+		OriginalRequest: firstPayload,
+		SourceFormat:    sdktranslator.FromString("openai-response"),
+		Metadata: map[string]any{
+			cliproxyexecutor.PinnedAuthMetadataKey: authID,
+		},
+	})
+	if errExecute != nil {
+		t.Fatalf("first ExecuteStream() error = %v", errExecute)
+	}
+	firstResponseID, _ := readStickyCompletedChunk(t, firstResult)
+	if firstResponseID == "" {
+		t.Fatal("first stream response id = empty")
+	}
+
+	secondPayload := []byte(fmt.Sprintf(`{"previous_response_id":"%s","input":[{"type":"function_call_output","call_id":"call_1","output":"pong"}]}`, firstResponseID))
+	secondResult, errExecute := manager.ExecuteStream(context.Background(), []string{"codex"}, cliproxyexecutor.Request{
+		Model:   "gpt-5.4",
+		Payload: secondPayload,
+	}, cliproxyexecutor.Options{
+		Stream:          true,
+		OriginalRequest: secondPayload,
+		SourceFormat:    sdktranslator.FromString("openai-response"),
+	})
+	if errExecute != nil {
+		t.Fatalf("second ExecuteStream() error = %v", errExecute)
+	}
+	readStickyCompletedChunk(t, secondResult)
+
+	executor.mu.Lock()
+	defer executor.mu.Unlock()
+	if len(executor.payloads) != 2 {
+		t.Fatalf("payload count = %d, want 2", len(executor.payloads))
+	}
+	secondUpstream := executor.payloads[1]
+	if prev := gjson.GetBytes(secondUpstream, "previous_response_id").String(); prev != "" {
+		t.Fatalf("previous_response_id leaked upstream: %q payload=%s", prev, string(secondUpstream))
+	}
+	input := gjson.GetBytes(secondUpstream, "input").Array()
+	if len(input) != 3 {
+		t.Fatalf("expanded input len = %d, want 3; payload=%s", len(input), string(secondUpstream))
+	}
+	if got := input[1].Get("type").String(); got != "function_call" {
+		t.Fatalf("input[1].type = %q, want function_call; payload=%s", got, string(secondUpstream))
+	}
+	if got := input[1].Get("call_id").String(); got != "call_1" {
+		t.Fatalf("input[1].call_id = %q, want call_1; payload=%s", got, string(secondUpstream))
+	}
+	if got := input[2].Get("type").String(); got != "function_call_output" {
+		t.Fatalf("input[2].type = %q, want function_call_output; payload=%s", got, string(secondUpstream))
+	}
+	if got := input[2].Get("call_id").String(); got != "call_1" {
+		t.Fatalf("input[2].call_id = %q, want call_1; payload=%s", got, string(secondUpstream))
+	}
+}
+
+func TestManagerExecute_OpenAIResponsesPreviousResponseIDDropsOrphanToolOutput(t *testing.T) {
+	t.Parallel()
+
+	const (
+		authID     = "response-bind-orphan-tool-output-auth"
+		responseID = "resp-orphan-tool-output"
+	)
+
+	manager := NewManager(nil, &RoundRobinSelector{}, nil)
+	executor := &responseStickyExecutor{id: "codex"}
+	manager.RegisterExecutor(executor)
+	reg := registry.GetGlobalRegistry()
+	reg.RegisterClient(authID, "codex", []*registry.ModelInfo{{ID: "gpt-5.4"}})
+	t.Cleanup(func() {
+		reg.UnregisterClient(authID)
+	})
+
+	if _, errRegister := manager.Register(context.Background(), &Auth{
+		ID:       authID,
+		Provider: "codex",
+	}); errRegister != nil {
+		t.Fatalf("Register(auth) error = %v", errRegister)
+	}
+	manager.bindResponseToAuth(responseID, authID)
+	manager.bindCompactTranscript(responseID, []byte(`[{"type":"message","role":"user","content":[{"type":"input_text","text":"call lookup"}]}]`))
+
+	payload := []byte(fmt.Sprintf(`{"previous_response_id":"%s","input":[{"type":"function_call_output","call_id":"call_missing","output":"pong"}]}`, responseID))
+	_, errExecute := manager.Execute(context.Background(), []string{"codex"}, cliproxyexecutor.Request{
+		Model:   "gpt-5.4",
+		Payload: payload,
+	}, cliproxyexecutor.Options{
+		OriginalRequest: payload,
+		SourceFormat:    sdktranslator.FromString("openai-response"),
+	})
+	if errExecute != nil {
+		t.Fatalf("Execute() error = %v", errExecute)
+	}
+
+	executor.mu.Lock()
+	defer executor.mu.Unlock()
+	if len(executor.payloads) != 1 {
+		t.Fatalf("payload count = %d, want 1", len(executor.payloads))
+	}
+	upstream := executor.payloads[0]
+	if prev := gjson.GetBytes(upstream, "previous_response_id").String(); prev != "" {
+		t.Fatalf("previous_response_id leaked upstream: %q payload=%s", prev, string(upstream))
+	}
+	input := gjson.GetBytes(upstream, "input").Array()
+	if len(input) != 1 {
+		t.Fatalf("expanded input len = %d, want 1; payload=%s", len(input), string(upstream))
+	}
+	if got := input[0].Get("type").String(); got != "message" {
+		t.Fatalf("input[0].type = %q, want message; payload=%s", got, string(upstream))
+	}
+	if strings.Contains(string(upstream), "function_call_output") {
+		t.Fatalf("orphan function_call_output leaked upstream: %s", string(upstream))
 	}
 }
 
