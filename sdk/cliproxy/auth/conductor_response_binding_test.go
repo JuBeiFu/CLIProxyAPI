@@ -244,6 +244,82 @@ func TestManagerExecute_OpenAIResponsesPreviousResponseIDPinsAuth(t *testing.T) 
 	}
 }
 
+func TestManagerExecute_OpenAIResponsesPreviousResponseIDExpandsToTranscript(t *testing.T) {
+	t.Parallel()
+
+	const authID = "response-bind-expand-auth"
+
+	manager := NewManager(nil, &RoundRobinSelector{}, nil)
+	executor := &responseStickyExecutor{id: "codex"}
+	manager.RegisterExecutor(executor)
+	reg := registry.GetGlobalRegistry()
+	reg.RegisterClient(authID, "codex", []*registry.ModelInfo{{ID: "gpt-5.4"}})
+	t.Cleanup(func() {
+		reg.UnregisterClient(authID)
+	})
+
+	if _, errRegister := manager.Register(context.Background(), &Auth{
+		ID:       authID,
+		Provider: "codex",
+	}); errRegister != nil {
+		t.Fatalf("Register(auth) error = %v", errRegister)
+	}
+
+	firstPayload := []byte(`{"input":"hello"}`)
+	firstResp, errExecute := manager.Execute(context.Background(), []string{"codex"}, cliproxyexecutor.Request{
+		Model:   "gpt-5.4",
+		Payload: firstPayload,
+	}, cliproxyexecutor.Options{
+		OriginalRequest: firstPayload,
+		SourceFormat:    sdktranslator.FromString("openai-response"),
+		Metadata: map[string]any{
+			cliproxyexecutor.PinnedAuthMetadataKey: authID,
+		},
+	})
+	if errExecute != nil {
+		t.Fatalf("first Execute() error = %v", errExecute)
+	}
+	firstResponseID := parseStickyResponseID(firstResp.Payload)
+	if firstResponseID == "" {
+		t.Fatalf("first response id = empty, payload = %s", string(firstResp.Payload))
+	}
+
+	secondPayload := []byte(fmt.Sprintf(`{"previous_response_id":"%s","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"follow up"}]}]}`, firstResponseID))
+	_, errExecute = manager.Execute(context.Background(), []string{"codex"}, cliproxyexecutor.Request{
+		Model:   "gpt-5.4",
+		Payload: secondPayload,
+	}, cliproxyexecutor.Options{
+		OriginalRequest: secondPayload,
+		SourceFormat:    sdktranslator.FromString("openai-response"),
+	})
+	if errExecute != nil {
+		t.Fatalf("second Execute() error = %v", errExecute)
+	}
+
+	executor.mu.Lock()
+	defer executor.mu.Unlock()
+	if len(executor.payloads) != 2 {
+		t.Fatalf("payload count = %d, want 2", len(executor.payloads))
+	}
+	secondUpstream := executor.payloads[1]
+	if prev := gjson.GetBytes(secondUpstream, "previous_response_id").String(); prev != "" {
+		t.Fatalf("previous_response_id leaked upstream: %q payload=%s", prev, string(secondUpstream))
+	}
+	input := gjson.GetBytes(secondUpstream, "input").Array()
+	if len(input) != 3 {
+		t.Fatalf("expanded input len = %d, want 3; payload=%s", len(input), string(secondUpstream))
+	}
+	if got := input[0].Get("content.0.text").String(); got != "hello" {
+		t.Fatalf("input[0] text = %q, want hello; payload=%s", got, string(secondUpstream))
+	}
+	if got := input[1].Get("content.0.text").String(); got != "assistant-1" {
+		t.Fatalf("input[1] text = %q, want assistant-1; payload=%s", got, string(secondUpstream))
+	}
+	if got := input[2].Get("content.0.text").String(); got != "follow up" {
+		t.Fatalf("input[2] text = %q, want follow up; payload=%s", got, string(secondUpstream))
+	}
+}
+
 func TestManagerExecuteStream_OpenAIResponsesPreviousResponseIDPinsAuth(t *testing.T) {
 	t.Parallel()
 

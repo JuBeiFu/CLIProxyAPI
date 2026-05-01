@@ -1815,7 +1815,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			resultModel := resultModelForOptions(opts, m.stateModelForExecution(auth, routeModel, upstreamModel, pooled))
 			execReq := req
 			execReq.Model = upstreamModel
-			execReq = m.expandCompactPreviousResponseRequest(execReq, opts)
+			execReq = m.expandPreviousResponseRequest(execReq, opts)
 			resp, errExec := executor.Execute(execCtx, auth, execReq, opts)
 			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: errExec == nil, RequestPayload: bytes.Clone(execReq.Payload)}
 			if errExec != nil {
@@ -2025,7 +2025,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 		}
 		attempted[auth.ID] = struct{}{}
 		lease := m.acquireInflightLease(provider, routeModel, auth.ID)
-		execReq := m.expandCompactPreviousResponseRequest(req, opts)
+		execReq := m.expandPreviousResponseRequest(req, opts)
 		streamResult, errStream := m.executeStreamWithModelPool(execCtx, executor, auth, provider, execReq, opts, routeModel, models, pooled, lease)
 		if errStream != nil {
 			if errCtx := execCtx.Err(); errCtx != nil {
@@ -2183,16 +2183,6 @@ func responseIDFromStreamChunk(payload []byte) string {
 		return ""
 	}
 	return strings.TrimSpace(gjson.GetBytes(payload, "response.id").String())
-}
-
-func compactRequestNeedsTranscriptRewrite(req cliproxyexecutor.Request, opts cliproxyexecutor.Options) bool {
-	if !strings.EqualFold(strings.TrimSpace(opts.Alt), "responses/compact") {
-		return false
-	}
-	if compactRequestHasInput(req, opts) {
-		return false
-	}
-	return previousResponseIDFromRequest(req, opts) != ""
 }
 
 func compactRequestHasInput(req cliproxyexecutor.Request, opts cliproxyexecutor.Options) bool {
@@ -2391,10 +2381,7 @@ func (m *Manager) evictCompactTranscriptsLocked(maxBytes, maxEntries int) {
 	}
 }
 
-func (m *Manager) expandCompactPreviousResponseRequest(req cliproxyexecutor.Request, opts cliproxyexecutor.Options) cliproxyexecutor.Request {
-	if !compactRequestNeedsTranscriptRewrite(req, opts) {
-		return req
-	}
+func (m *Manager) expandPreviousResponseRequest(req cliproxyexecutor.Request, opts cliproxyexecutor.Options) cliproxyexecutor.Request {
 	responseID := previousResponseIDFromRequest(req, opts)
 	if responseID == "" {
 		return req
@@ -2413,10 +2400,58 @@ func (m *Manager) expandCompactPreviousResponseRequest(req cliproxyexecutor.Requ
 	} else {
 		payload = bytes.Clone(payload)
 	}
+	currentInput := gjson.GetBytes(payload, "input")
+	expandedInput := transcript
+	if currentInput.Exists() {
+		if merged, ok := mergeResponseTranscriptInput(transcript, currentInput); ok {
+			expandedInput = merged
+		} else if !strings.EqualFold(strings.TrimSpace(opts.Alt), "responses/compact") {
+			return req
+		}
+	} else if !strings.EqualFold(strings.TrimSpace(opts.Alt), "responses/compact") {
+		return req
+	}
 	payload, _ = sjson.DeleteBytes(payload, "previous_response_id")
-	payload, _ = sjson.SetRawBytes(payload, "input", transcript)
+	payload, _ = sjson.SetRawBytes(payload, "input", expandedInput)
 	rewritten.Payload = payload
 	return rewritten
+}
+
+func mergeResponseTranscriptInput(transcript []byte, input gjson.Result) ([]byte, bool) {
+	if len(transcript) == 0 || !gjson.ValidBytes(transcript) || !input.Exists() {
+		return nil, false
+	}
+	var merged bytes.Buffer
+	merged.Grow(len(transcript) + len(input.Raw) + 32)
+	merged.WriteByte('[')
+	firstItem := true
+	gjson.ParseBytes(transcript).ForEach(func(_, item gjson.Result) bool {
+		if strings.TrimSpace(item.Raw) == "" {
+			return true
+		}
+		appendCompactTranscriptItem(&merged, &firstItem, item.Raw)
+		return true
+	})
+	switch {
+	case input.IsArray():
+		input.ForEach(func(_, item gjson.Result) bool {
+			if strings.TrimSpace(item.Raw) == "" {
+				return true
+			}
+			appendCompactTranscriptItem(&merged, &firstItem, item.Raw)
+			return true
+		})
+	case input.Type == gjson.String && strings.TrimSpace(input.String()) != "":
+		appendCompactTranscriptItemPrefix(&merged, &firstItem)
+		writeCompactInputTextMessage(&merged, input.String())
+	default:
+		return nil, false
+	}
+	if firstItem {
+		return nil, false
+	}
+	merged.WriteByte(']')
+	return merged.Bytes(), true
 }
 
 func (m *Manager) lookupBoundAuthID(responseID string) string {

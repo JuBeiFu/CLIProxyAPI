@@ -594,10 +594,7 @@ func dedupeFunctionCallsByCallID(rawArray string) (string, error) {
 }
 
 func websocketUpstreamSupportsIncrementalInput(auth *coreauth.Auth) bool {
-	if auth == nil {
-		return false
-	}
-	return auth.WebsocketsEnabled()
+	return false
 }
 
 func readResponsesWebsocketImmediateError(errs <-chan *interfaces.ErrorMessage) *interfaces.ErrorMessage {
