@@ -200,26 +200,12 @@ func withCodexHTTPTrace(ctx context.Context, timing *codexUpstreamTiming) contex
 }
 
 func shouldPreserveCodexPreviousResponseID(ctx context.Context, auth *cliproxyauth.Auth, from sdktranslator.Format, body []byte) bool {
-	if from == sdktranslator.FromString("openai-response") && strings.TrimSpace(gjson.GetBytes(body, "previous_response_id").String()) != "" {
-		return true
-	}
 	if cliproxyexecutor.DownstreamWebsocket(ctx) {
 		return true
 	}
-	if ctx == nil {
-		return false
-	}
-	ginCtx, ok := ctx.Value("gin").(*gin.Context)
-	if !ok || ginCtx == nil || ginCtx.Request == nil {
-		return false
-	}
-	if strings.EqualFold(strings.TrimSpace(ginCtx.Request.Header.Get(newAPIDownstreamTransportHeader)), "websocket") {
-		// A downstream websocket bridge can continue a Responses turn via HTTP upstream,
-		// so previous_response_id must survive even when the selected auth does not use
-		// websocket transport to the provider.
-		return true
-	}
 	_ = auth
+	_ = from
+	_ = body
 	return false
 }
 

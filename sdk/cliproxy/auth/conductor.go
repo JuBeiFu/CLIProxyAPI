@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"path/filepath"
@@ -1815,7 +1816,12 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			resultModel := resultModelForOptions(opts, m.stateModelForExecution(auth, routeModel, upstreamModel, pooled))
 			execReq := req
 			execReq.Model = upstreamModel
-			execReq = m.expandPreviousResponseRequest(execReq, opts)
+			var errExpand error
+			execReq, errExpand = m.expandPreviousResponseRequest(execReq, opts)
+			if errExpand != nil {
+				releaseLeases()
+				return cliproxyexecutor.Response{}, errExpand
+			}
 			resp, errExec := executor.Execute(execCtx, auth, execReq, opts)
 			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: errExec == nil, RequestPayload: bytes.Clone(execReq.Payload)}
 			if errExec != nil {
@@ -2025,7 +2031,11 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 		}
 		attempted[auth.ID] = struct{}{}
 		lease := m.acquireInflightLease(provider, routeModel, auth.ID)
-		execReq := m.expandPreviousResponseRequest(req, opts)
+		execReq, errExpand := m.expandPreviousResponseRequest(req, opts)
+		if errExpand != nil {
+			lease.Release()
+			return nil, errExpand
+		}
 		streamResult, errStream := m.executeStreamWithModelPool(execCtx, executor, auth, provider, execReq, opts, routeModel, models, pooled, lease)
 		if errStream != nil {
 			if errCtx := execCtx.Err(); errCtx != nil {
@@ -2381,14 +2391,17 @@ func (m *Manager) evictCompactTranscriptsLocked(maxBytes, maxEntries int) {
 	}
 }
 
-func (m *Manager) expandPreviousResponseRequest(req cliproxyexecutor.Request, opts cliproxyexecutor.Options) cliproxyexecutor.Request {
+func (m *Manager) expandPreviousResponseRequest(req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Request, error) {
 	responseID := previousResponseIDFromRequest(req, opts)
 	if responseID == "" {
-		return req
+		return req, nil
 	}
 	transcript := m.lookupCompactTranscript(responseID)
 	if len(transcript) == 0 {
-		return req
+		if strings.EqualFold(strings.TrimSpace(opts.Alt), "responses/compact") {
+			return req, nil
+		}
+		return req, newPreviousResponseNotFoundError(responseID)
 	}
 	rewritten := req
 	payload := req.Payload
@@ -2406,16 +2419,27 @@ func (m *Manager) expandPreviousResponseRequest(req cliproxyexecutor.Request, op
 		if merged, ok := mergeResponseTranscriptInput(transcript, currentInput); ok {
 			expandedInput = merged
 		} else if !strings.EqualFold(strings.TrimSpace(opts.Alt), "responses/compact") {
-			return req
+			return req, newPreviousResponseNotFoundError(responseID)
 		}
 	} else if !strings.EqualFold(strings.TrimSpace(opts.Alt), "responses/compact") {
-		return req
+		return req, newPreviousResponseNotFoundError(responseID)
 	}
 	payload, _ = sjson.DeleteBytes(payload, "previous_response_id")
 	expandedInput = sanitizeResponseTranscriptToolPairs(expandedInput)
 	payload, _ = sjson.SetRawBytes(payload, "input", expandedInput)
 	rewritten.Payload = payload
-	return rewritten
+	return rewritten, nil
+}
+
+func newPreviousResponseNotFoundError(responseID string) error {
+	responseID = strings.TrimSpace(responseID)
+	body := []byte(`{"error":{"code":"previous_response_not_found","message":"","type":"invalid_request_error","param":"previous_response_id"}}`)
+	message := "Previous response not found."
+	if responseID != "" {
+		message = fmt.Sprintf("Previous response with id %q not found.", responseID)
+	}
+	body, _ = sjson.SetBytes(body, "error.message", message)
+	return &Error{HTTPStatus: http.StatusBadRequest, Code: "previous_response_not_found", Message: string(body)}
 }
 
 func mergeResponseTranscriptInput(transcript []byte, input gjson.Result) ([]byte, bool) {
@@ -2585,6 +2609,27 @@ func (m *Manager) unbindResponsesForAuth(authID string) int {
 		}
 		delete(m.responseBindings, responseID)
 		m.removeCompactTranscriptLocked(responseID)
+		removed++
+	}
+	return removed
+}
+
+func (m *Manager) unpinResponsesForAuth(authID string) int {
+	if m == nil {
+		return 0
+	}
+	authID = strings.TrimSpace(authID)
+	if authID == "" {
+		return 0
+	}
+	m.responseBindingsMu.Lock()
+	defer m.responseBindingsMu.Unlock()
+	removed := 0
+	for responseID, boundAuthID := range m.responseBindings {
+		if strings.TrimSpace(boundAuthID) != authID {
+			continue
+		}
+		delete(m.responseBindings, responseID)
 		removed++
 	}
 	return removed
@@ -3530,7 +3575,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 		m.scheduler.upsertAuth(authSnapshot)
 	}
 	if unbindResponseAuthID != "" {
-		m.unbindResponsesForAuth(unbindResponseAuthID)
+		m.unpinResponsesForAuth(unbindResponseAuthID)
 	}
 	if rebindProxyAuthID != "" {
 		m.KickAsyncBindingProbe(rebindProxyAuthID)

@@ -77,12 +77,8 @@ func (e *responseStickyExecutor) ExecuteStream(ctx context.Context, auth *Auth, 
 	err := e.streamErrors[auth.ID]
 	e.mu.Unlock()
 
-	chunkCap := 2
-	if len(streamPayloads) > chunkCap {
-		chunkCap = len(streamPayloads)
-	}
-	chunks := make(chan cliproxyexecutor.StreamChunk, chunkCap)
 	if err != nil {
+		chunks := make(chan cliproxyexecutor.StreamChunk, 1)
 		chunks <- cliproxyexecutor.StreamChunk{Err: err}
 		close(chunks)
 		return &cliproxyexecutor.StreamResult{
@@ -93,9 +89,15 @@ func (e *responseStickyExecutor) ExecuteStream(ctx context.Context, auth *Auth, 
 	if len(streamPayloads) == 0 {
 		streamPayloads = [][]byte{
 			[]byte(`data: {"type":"response.output_text.delta","delta":"hi"}`),
+			[]byte(`data: {"type":"response.output_item.done","item":{"id":"msg-stream","type":"message","status":"completed","role":"assistant","content":[{"type":"output_text","text":"hi"}]},"output_index":0}`),
 			[]byte(fmt.Sprintf(`data: {"type":"response.completed","response":{"id":"resp-stream-%d","auth_id":"%s"}}`, callIndex+1, auth.ID)),
 		}
 	}
+	chunkCap := len(streamPayloads)
+	if chunkCap < 1 {
+		chunkCap = 1
+	}
+	chunks := make(chan cliproxyexecutor.StreamChunk, chunkCap)
 	for _, payload := range streamPayloads {
 		chunks <- cliproxyexecutor.StreamChunk{Payload: payload}
 	}
@@ -572,6 +574,49 @@ func TestManagerExecute_OpenAIResponsesPreviousResponseIDDropsOrphanToolOutput(t
 	}
 	if strings.Contains(string(upstream), "function_call_output") {
 		t.Fatalf("orphan function_call_output leaked upstream: %s", string(upstream))
+	}
+}
+
+func TestManagerExecute_OpenAIResponsesPreviousResponseIDMissingTranscriptFailsBeforeUpstream(t *testing.T) {
+	t.Parallel()
+
+	const authID = "response-bind-missing-transcript-auth"
+
+	manager := NewManager(nil, &RoundRobinSelector{}, nil)
+	executor := &responseStickyExecutor{id: "codex"}
+	manager.RegisterExecutor(executor)
+	reg := registry.GetGlobalRegistry()
+	reg.RegisterClient(authID, "codex", []*registry.ModelInfo{{ID: "gpt-5.4"}})
+	t.Cleanup(func() {
+		reg.UnregisterClient(authID)
+	})
+
+	if _, errRegister := manager.Register(context.Background(), &Auth{
+		ID:       authID,
+		Provider: "codex",
+	}); errRegister != nil {
+		t.Fatalf("Register(auth) error = %v", errRegister)
+	}
+
+	payload := []byte(`{"previous_response_id":"resp-missing","input":[{"type":"function_call_output","call_id":"call_missing","output":"pong"}]}`)
+	_, errExecute := manager.Execute(context.Background(), []string{"codex"}, cliproxyexecutor.Request{
+		Model:   "gpt-5.4",
+		Payload: payload,
+	}, cliproxyexecutor.Options{
+		OriginalRequest: payload,
+		SourceFormat:    sdktranslator.FromString("openai-response"),
+	})
+	if errExecute == nil {
+		t.Fatal("Execute() error = nil, want previous_response_not_found")
+	}
+	if !strings.Contains(errExecute.Error(), "previous_response_not_found") {
+		t.Fatalf("Execute() error = %v, want previous_response_not_found", errExecute)
+	}
+
+	executor.mu.Lock()
+	defer executor.mu.Unlock()
+	if len(executor.payloads) != 0 {
+		t.Fatalf("upstream payload count = %d, want 0", len(executor.payloads))
 	}
 }
 

@@ -127,7 +127,7 @@ func buildLargeCacheHelperCodexBodyWithTools(messageCount, messageSize int) []by
 	return []byte(b.String())
 }
 
-func TestShouldPreserveCodexPreviousResponseID_TrueForOpenAIResponsesFollowupOverHTTP(t *testing.T) {
+func TestShouldPreserveCodexPreviousResponseID_FalseForOpenAIResponsesFollowupOverHTTP(t *testing.T) {
 	ctx := contextWithGinHeaders(map[string]string{
 		"X-NewAPI-Downstream-Transport": "sse",
 	})
@@ -137,8 +137,8 @@ func TestShouldPreserveCodexPreviousResponseID_TrueForOpenAIResponsesFollowupOve
 	}
 	body := []byte(`{"model":"gpt-5.4","previous_response_id":"resp-1","input":[{"type":"function_call_output","call_id":"call-1","output":"ok"}]}`)
 
-	if !shouldPreserveCodexPreviousResponseID(ctx, auth, sdktranslator.FromString("openai-response"), body) {
-		t.Fatal("expected openai responses follow-up to preserve previous_response_id over HTTP")
+	if shouldPreserveCodexPreviousResponseID(ctx, auth, sdktranslator.FromString("openai-response"), body) {
+		t.Fatal("expected HTTP/SSE upstream to strip previous_response_id after manager transcript expansion")
 	}
 }
 
@@ -156,7 +156,7 @@ func TestShouldPreserveCodexPreviousResponseID_FalseForNonResponsesSSEHeader(t *
 	}
 }
 
-func TestShouldPreserveCodexPreviousResponseID_FalseWhenAuthDisablesWebsockets(t *testing.T) {
+func TestShouldPreserveCodexPreviousResponseID_FalseForNewAPIWebsocketHeader(t *testing.T) {
 	ctx := contextWithGinHeaders(map[string]string{
 		"X-NewAPI-Downstream-Transport": "websocket",
 	})
@@ -165,15 +165,13 @@ func TestShouldPreserveCodexPreviousResponseID_FalseWhenAuthDisablesWebsockets(t
 		Attributes: map[string]string{"websockets": "false"},
 	}
 
-	if !shouldPreserveCodexPreviousResponseID(ctx, auth, sdktranslator.FromString("openai"), nil) {
-		t.Fatal("expected websocket bridge header to preserve previous_response_id even when selected auth uses HTTP upstream")
+	if shouldPreserveCodexPreviousResponseID(ctx, auth, sdktranslator.FromString("openai"), nil) {
+		t.Fatal("expected new-api websocket header to still use SSE-safe transcript expansion")
 	}
 }
 
-func TestShouldPreserveCodexPreviousResponseID_TrueForCodexOAuthWithoutExplicitWebsocketFlag(t *testing.T) {
-	ctx := contextWithGinHeaders(map[string]string{
-		"X-NewAPI-Downstream-Transport": "websocket",
-	})
+func TestShouldPreserveCodexPreviousResponseID_TrueForExplicitDownstreamWebsocketContext(t *testing.T) {
+	ctx := cliproxyexecutor.WithDownstreamWebsocket(context.Background())
 	auth := &cliproxyauth.Auth{
 		Provider: "codex",
 		Metadata: map[string]any{
@@ -182,7 +180,7 @@ func TestShouldPreserveCodexPreviousResponseID_TrueForCodexOAuthWithoutExplicitW
 	}
 
 	if !shouldPreserveCodexPreviousResponseID(ctx, auth, sdktranslator.FromString("openai"), nil) {
-		t.Fatal("expected codex oauth auth to preserve previous_response_id for websocket bridge")
+		t.Fatal("expected explicit downstream websocket context to preserve previous_response_id")
 	}
 }
 
