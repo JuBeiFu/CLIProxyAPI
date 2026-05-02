@@ -1333,6 +1333,50 @@ func TestResponsesHTTPBridgeRetriesMissingPreviousResponseIDAsTranscriptReset(t 
 	}
 }
 
+func TestResponsesHTTPBridgeNormalizesWebsocketCreateEnvelope(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	executor := &websocketSessionCaptureExecutor{}
+	manager := coreauth.NewManager(nil, nil, nil)
+	manager.RegisterExecutor(executor)
+
+	auth := &coreauth.Auth{ID: "auth-http-bridge-envelope", Provider: executor.Identifier(), Status: coreauth.StatusActive}
+	if _, err := manager.Register(context.Background(), auth); err != nil {
+		t.Fatalf("Register auth: %v", err)
+	}
+	registry.GetGlobalRegistry().RegisterClient(auth.ID, auth.Provider, []*registry.ModelInfo{{ID: "test-model"}})
+	t.Cleanup(func() {
+		registry.GetGlobalRegistry().UnregisterClient(auth.ID)
+	})
+
+	base := handlers.NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, manager)
+	h := NewOpenAIResponsesAPIHandler(base)
+	router := gin.New()
+	router.POST("/v1/responses", h.Responses)
+
+	body := `{"type":"response.create","response":{"model":"test-model","input":[{"type":"message","id":"msg-bridge","role":"user","content":[{"type":"input_text","text":"hi"}]}]},"event_id":"evt-1"}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-NewAPI-Downstream-Transport", "websocket")
+	resp := httptest.NewRecorder()
+
+	router.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", resp.Code, http.StatusOK, resp.Body.String())
+	}
+	payloads := executor.Payloads()
+	if len(payloads) != 1 {
+		t.Fatalf("captured payload count = %d, want 1", len(payloads))
+	}
+	if gjson.GetBytes(payloads[0], "type").Exists() {
+		t.Fatalf("websocket envelope type leaked upstream: %s", payloads[0])
+	}
+	if got := gjson.GetBytes(payloads[0], "input.0.id").String(); got != "msg-bridge" {
+		t.Fatalf("forwarded input id = %q, want msg-bridge; payload=%s", got, payloads[0])
+	}
+}
+
 func TestResponsesHTTPDoesNotRetryMissingPreviousResponseIDWithoutBridgeHeader(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 

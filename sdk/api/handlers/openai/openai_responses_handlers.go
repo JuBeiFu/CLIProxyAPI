@@ -260,6 +260,7 @@ func (h *OpenAIResponsesAPIHandler) Responses(c *gin.Context) {
 		writeImageGenerationEndpointError(c, modelName)
 		return
 	}
+	rawJSON = normalizeResponsesHTTPBridgePayload(c, rawJSON)
 	if !hasResponsesPayload(rawJSON) {
 		c.JSON(http.StatusBadRequest, handlers.ErrorResponse{
 			Error: handlers.ErrorDetail{
@@ -279,6 +280,27 @@ func (h *OpenAIResponsesAPIHandler) Responses(c *gin.Context) {
 		h.handleNonStreamingResponse(c, rawJSON)
 	}
 
+}
+
+func normalizeResponsesHTTPBridgePayload(c *gin.Context, rawJSON []byte) []byte {
+	if c == nil || c.Request == nil {
+		return rawJSON
+	}
+	if !strings.EqualFold(strings.TrimSpace(c.Request.Header.Get("X-NewAPI-Downstream-Transport")), "websocket") {
+		return rawJSON
+	}
+	if strings.TrimSpace(gjson.GetBytes(rawJSON, "type").String()) != wsRequestTypeCreate {
+		return rawJSON
+	}
+	response := gjson.GetBytes(rawJSON, "response")
+	if !response.Exists() || !response.IsObject() {
+		return rawJSON
+	}
+	normalized, _, errMsg := normalizeResponseCreateRequest([]byte(response.Raw))
+	if errMsg != nil || len(normalized) == 0 {
+		return rawJSON
+	}
+	return normalized
 }
 
 func hasResponsesPayload(rawJSON []byte) bool {
