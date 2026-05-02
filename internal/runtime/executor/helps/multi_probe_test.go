@@ -9,6 +9,7 @@ import (
 
 	codexauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/codex"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/proxypool"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 )
 
@@ -236,5 +237,183 @@ func TestProbeCodexPlanAcrossPoolReturnsTerminalAuthErrorWithMixedProbeFailures(
 	statusProvider, okStatus := err.(interface{ StatusCode() int })
 	if !okStatus || statusProvider.StatusCode() != http.StatusUnauthorized {
 		t.Fatalf("expected status 401 terminal error, got %T %v", err, err)
+	}
+}
+
+func TestProbeCodexPlanAcrossPoolStartsWithStablePreferredEntryWhenUnbound(t *testing.T) {
+	orig := fetchUsageInfoWithProxy
+	defer func() { fetchUsageInfoWithProxy = orig }()
+
+	cfg := &config.Config{
+		SDKConfig: config.SDKConfig{
+			DefaultProxyPool: "free-egress",
+			ProxyPools: []config.ProxyPool{
+				{
+					Name: "free-egress",
+					Entries: []config.ProxyPoolEntry{
+						{Name: "proxy-a", URL: "http://proxy-a"},
+						{Name: "proxy-b", URL: "http://proxy-b"},
+						{Name: "proxy-c", URL: "http://proxy-c"},
+					},
+				},
+			},
+		},
+	}
+	auth := &cliproxyauth.Auth{
+		ID:       "auth-stable",
+		Provider: "codex",
+		Metadata: map[string]any{},
+	}
+	pool := cfg.ProxyPoolByName("free-egress")
+	expected, ok := proxypool.SelectPoolEntryWithHealth(pool, auth, proxypool.DefaultHealthManager())
+	if !ok {
+		t.Fatal("expected stable proxy-pool selection")
+	}
+
+	var requests []string
+	fetchUsageInfoWithProxy = func(ctx context.Context, proxyURL, accessToken string) (codexauth.WhamUsageInfo, error) {
+		requests = append(requests, proxyURL)
+		if proxyURL == expected.URL {
+			return codexauth.WhamUsageInfo{PlanType: "plus"}, nil
+		}
+		return codexauth.WhamUsageInfo{PlanType: "free"}, nil
+	}
+
+	plan, bound, _, _, ok, err := ProbeCodexPlanAcrossPool(context.Background(), cfg, auth, "token")
+	if err != nil {
+		t.Fatalf("ProbeCodexPlanAcrossPool error = %v", err)
+	}
+	if !ok {
+		t.Fatal("probeOK = false, want true")
+	}
+	if plan != "plus" {
+		t.Fatalf("plan = %q, want %q", plan, "plus")
+	}
+	if bound != expected.Name {
+		t.Fatalf("bound = %q, want %q", bound, expected.Name)
+	}
+	if len(requests) != 1 {
+		t.Fatalf("requests = %v, want exactly one probe", requests)
+	}
+	if requests[0] != expected.URL {
+		t.Fatalf("first request = %q, want %q", requests[0], expected.URL)
+	}
+}
+
+func TestProbeCodexPlanAcrossPoolStartsWithIPv6BindLease(t *testing.T) {
+	orig := fetchUsageInfoWithProxy
+	defer func() { fetchUsageInfoWithProxy = orig }()
+
+	var requests []string
+	fetchUsageInfoWithProxy = func(ctx context.Context, proxyURL, accessToken string) (codexauth.WhamUsageInfo, error) {
+		requests = append(requests, proxyURL)
+		if proxyURL == "bind://[2602:294:0:eb::42]" {
+			return codexauth.WhamUsageInfo{PlanType: "plus"}, nil
+		}
+		return codexauth.WhamUsageInfo{PlanType: "free"}, nil
+	}
+
+	cfg := &config.Config{
+		SDKConfig: config.SDKConfig{
+			DefaultProxyPool: "dedicated-v6",
+			ProxyPools: []config.ProxyPool{
+				{
+					Name: "dedicated-v6",
+					IPv6BindLeaseRanges: []config.IPv6BindLeaseRange{
+						{CIDR: "2602:294:0:eb::/64"},
+					},
+					Entries: []config.ProxyPoolEntry{
+						{Name: "proxy-a", URL: "http://proxy-a"},
+					},
+				},
+			},
+		},
+	}
+	auth := &cliproxyauth.Auth{
+		ID:       "auth-ipv6-lease",
+		Provider: "codex",
+		Metadata: map[string]any{},
+	}
+	cliproxyauth.SetIPv6BindLease(auth, cliproxyauth.IPv6BindLeaseInfo{
+		Pool:      "dedicated-v6",
+		EntryName: "acct-v6-auth",
+		IP:        "2602:294:0:eb::42",
+		URL:       "bind://[2602:294:0:eb::42]",
+	})
+
+	plan, bound, _, _, ok, err := ProbeCodexPlanAcrossPool(context.Background(), cfg, auth, "token")
+	if err != nil {
+		t.Fatalf("ProbeCodexPlanAcrossPool error = %v", err)
+	}
+	if !ok {
+		t.Fatal("probeOK = false, want true")
+	}
+	if plan != "plus" {
+		t.Fatalf("plan = %q, want plus", plan)
+	}
+	if bound != "" {
+		t.Fatalf("bound = %q, want empty legacy bound entry for IPv6 lease", bound)
+	}
+	if len(requests) != 1 || requests[0] != "bind://[2602:294:0:eb::42]" {
+		t.Fatalf("requests = %v, want only IPv6 lease probe", requests)
+	}
+}
+
+func TestProbeCodexPlanAcrossPoolWithIPv6BindLeaseDoesNotProbePoolEntries(t *testing.T) {
+	orig := fetchUsageInfoWithProxy
+	defer func() { fetchUsageInfoWithProxy = orig }()
+
+	var requests []string
+	fetchUsageInfoWithProxy = func(ctx context.Context, proxyURL, accessToken string) (codexauth.WhamUsageInfo, error) {
+		requests = append(requests, proxyURL)
+		if proxyURL == "bind://[2602:294:0:eb::42]" {
+			return codexauth.WhamUsageInfo{PlanType: "free"}, nil
+		}
+		return codexauth.WhamUsageInfo{PlanType: "plus"}, nil
+	}
+
+	cfg := &config.Config{
+		SDKConfig: config.SDKConfig{
+			DefaultProxyPool: "dedicated-v6",
+			ProxyPools: []config.ProxyPool{
+				{
+					Name: "dedicated-v6",
+					IPv6BindLeaseRanges: []config.IPv6BindLeaseRange{
+						{CIDR: "2602:294:0:eb::/64"},
+					},
+					Entries: []config.ProxyPoolEntry{
+						{Name: "proxy-a", URL: "http://proxy-a"},
+					},
+				},
+			},
+		},
+	}
+	auth := &cliproxyauth.Auth{
+		ID:       "auth-ipv6-lease-free",
+		Provider: "codex",
+		Metadata: map[string]any{},
+	}
+	cliproxyauth.SetIPv6BindLease(auth, cliproxyauth.IPv6BindLeaseInfo{
+		Pool:      "dedicated-v6",
+		EntryName: "acct-v6-auth",
+		IP:        "2602:294:0:eb::42",
+		URL:       "bind://[2602:294:0:eb::42]",
+	})
+
+	plan, bound, _, _, ok, err := ProbeCodexPlanAcrossPool(context.Background(), cfg, auth, "token")
+	if err != nil {
+		t.Fatalf("ProbeCodexPlanAcrossPool error = %v", err)
+	}
+	if !ok {
+		t.Fatal("probeOK = false, want true")
+	}
+	if plan != "free" {
+		t.Fatalf("plan = %q, want free", plan)
+	}
+	if bound != "" {
+		t.Fatalf("bound = %q, want empty", bound)
+	}
+	if len(requests) != 1 {
+		t.Fatalf("requests = %v, want only lease probe", requests)
 	}
 }

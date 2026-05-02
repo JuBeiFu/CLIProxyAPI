@@ -99,6 +99,37 @@ func TestHealthManagerPassiveSlowOutcomeTemporarilyMarksUnusable(t *testing.T) {
 	}
 }
 
+func TestHealthManagerPassiveSlowFirstByteTemporarilyMarksUnusable(t *testing.T) {
+	t.Parallel()
+
+	manager := NewHealthManager()
+	now := time.Unix(1_744_419_200, 0)
+
+	manager.ReportPassiveOutcome("shared-egress", "proxy-a", PassiveOutcome{
+		Total:         20 * time.Second,
+		FirstByte:     DefaultPassiveSlowFirstByte + time.Second,
+		ReadBody:      15 * time.Second,
+		ResponseBytes: int64(DefaultPassiveSuccessBytesPerSecond) * 15 * 2,
+		StatusCode:    200,
+		CheckedAt:     now,
+	})
+	if !manager.IsUsableAt("shared-egress", "proxy-a", now) {
+		t.Fatal("expected a single slow first-byte sample to keep entry usable")
+	}
+
+	manager.ReportPassiveOutcome("shared-egress", "proxy-a", PassiveOutcome{
+		Total:         19 * time.Second,
+		FirstByte:     DefaultPassiveSlowFirstByte + 2*time.Second,
+		ReadBody:      14 * time.Second,
+		ResponseBytes: int64(DefaultPassiveSuccessBytesPerSecond) * 14 * 2,
+		StatusCode:    200,
+		CheckedAt:     now.Add(time.Second),
+	})
+	if manager.IsUsableAt("shared-egress", "proxy-a", now.Add(time.Second)) {
+		t.Fatal("expected repeated slow first-byte samples to mark entry unusable")
+	}
+}
+
 func TestHealthManagerPassiveHealthyOutcomeClearsPassiveCooldown(t *testing.T) {
 	t.Parallel()
 

@@ -133,3 +133,43 @@ func TestSaveConfigPreserveCommentsDoesNotAddRoutingPerformanceDefaults(t *testi
 		t.Fatalf("routing performance defaults were added to config:\n%s", text)
 	}
 }
+
+func TestSaveConfigPreserveCommentsDropsRuntimeGeneratedProxyEntries(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	original := []byte("proxy-pools:\n  - name: free-egress\n    entries:\n      - name: existing\n        url: http://example.com\n")
+	if err := os.WriteFile(path, original, 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	cfg := &Config{
+		SDKConfig: SDKConfig{
+			ProxyPools: []ProxyPool{
+				{
+					Name: "free-egress",
+					Entries: []ProxyPoolEntry{
+						{Name: "existing", URL: "http://example.com"},
+						{Name: "generated", URL: "bind://[2602:294:0:eb::100]", runtimeGenerated: true},
+					},
+					IPv6BindRanges: []IPv6BindRange{
+						{NamePrefix: "free-v6-", Start: "2602:294:0:eb::100"},
+					},
+				},
+			},
+		},
+	}
+	if err := SaveConfigPreserveComments(path, cfg); err != nil {
+		t.Fatalf("SaveConfigPreserveComments: %v", err)
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read config: %v", err)
+	}
+	text := string(data)
+	if strings.Contains(text, "generated") || strings.Contains(text, "bind://[2602:294:0:eb::100]") {
+		t.Fatalf("runtime generated proxy entries were persisted:\n%s", text)
+	}
+	if !strings.Contains(text, "ipv6-bind-ranges") {
+		t.Fatalf("expected ipv6-bind-ranges to remain in persisted config:\n%s", text)
+	}
+}

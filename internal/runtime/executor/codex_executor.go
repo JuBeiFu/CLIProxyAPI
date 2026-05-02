@@ -126,12 +126,20 @@ func recordCodexProxyPassiveOutcome(timing codexUpstreamTiming, manager *proxypo
 	}
 	manager.ReportPassiveOutcome(timing.proxyPool, timing.proxyName, proxypool.PassiveOutcome{
 		Total:         total,
+		FirstByte:     passiveFirstByteForCodexTiming(timing),
 		ReadBody:      timing.readBody,
 		ResponseBytes: int64(timing.bytesRead),
 		StatusCode:    timing.status,
 		Error:         timing.streamErrText,
 		CheckedAt:     time.Now(),
 	})
+}
+
+func passiveFirstByteForCodexTiming(timing codexUpstreamTiming) time.Duration {
+	if strings.EqualFold(strings.TrimSpace(timing.endpoint), "responses/compact") {
+		return 0
+	}
+	return timing.traceFirstByte
 }
 
 func finishCodexUpstreamTiming(ctx context.Context, timing codexUpstreamTiming) {

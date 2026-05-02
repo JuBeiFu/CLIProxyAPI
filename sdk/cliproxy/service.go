@@ -756,6 +756,9 @@ func isBoundProxyUnusable(cfg *config.Config, auth *coreauth.Auth) bool {
 	if cfg == nil || auth == nil {
 		return false
 	}
+	if lease := coreauth.IPv6BindLease(auth); lease.URL != "" && lease.IP != "" {
+		return false
+	}
 	bound := coreauth.BoundProxyEntry(auth)
 	if bound == "" || bound == coreauth.BoundProxyEntryDirect {
 		return false

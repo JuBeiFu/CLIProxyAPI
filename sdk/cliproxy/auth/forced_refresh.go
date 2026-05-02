@@ -98,7 +98,7 @@ func shouldForceRefresh(auth *Auth) bool {
 	if isPaidPlan(submitted) && isFreePlan(probed) {
 		return true
 	}
-	if isPaidPlan(probed) && BoundProxyEntry(auth) == "" {
+	if isPaidPlan(probed) && BoundProxyEntry(auth) == "" && IPv6BindLease(auth).URL == "" {
 		return true
 	}
 	if BoundProxyHealthChecker != nil && BoundProxyHealthChecker(auth) {
@@ -111,7 +111,7 @@ func shouldForceRefresh(auth *Auth) bool {
 	// fallback the rule would never fire for any auth loaded from disk
 	// (their LastRefreshedAt is zero until they're refreshed in-process),
 	// leaving stale bindings uncaught until some other trigger fires.
-	if isPaidPlan(probed) && BoundProxyEntry(auth) != "" {
+	if isPaidPlan(probed) && (BoundProxyEntry(auth) != "" || IPv6BindLease(auth).URL != "") {
 		lastRefresh := auth.LastRefreshedAt
 		if lastRefresh.IsZero() {
 			if ts, ok := authLastRefreshTimestamp(auth); ok {

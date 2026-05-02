@@ -1078,7 +1078,9 @@ func NormalizeProxyPools(pools []ProxyPool) []ProxyPool {
 			pool.HealthCheckTimeoutSeconds = 0
 		}
 		pool.Entries = normalizeProxyPoolEntries(pool.Entries)
-		if len(pool.Entries) == 0 {
+		pool.Entries = append(pool.Entries, expandIPv6BindRangeEntries(pool.IPv6BindRanges, pool.Entries)...)
+		pool.IPv6BindLeaseRanges = normalizeIPv6BindLeaseRanges(pool.IPv6BindLeaseRanges)
+		if len(pool.Entries) == 0 && len(pool.IPv6BindLeaseRanges) == 0 {
 			continue
 		}
 		out = append(out, pool)
@@ -1107,6 +1109,25 @@ func normalizeProxyPoolEntries(entries []ProxyPoolEntry) []ProxyPoolEntry {
 			entry.Name = fmt.Sprintf("proxy-%d", idx+1)
 		}
 		out = append(out, entry)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func normalizeIPv6BindLeaseRanges(ranges []IPv6BindLeaseRange) []IPv6BindLeaseRange {
+	if len(ranges) == 0 {
+		return nil
+	}
+	out := make([]IPv6BindLeaseRange, 0, len(ranges))
+	for _, rng := range ranges {
+		rng.NamePrefix = strings.TrimSpace(rng.NamePrefix)
+		rng.CIDR = strings.TrimSpace(rng.CIDR)
+		if _, ok := normalizeIPv6BindLeaseRange(rng); !ok {
+			continue
+		}
+		out = append(out, rng)
 	}
 	if len(out) == 0 {
 		return nil
@@ -1218,6 +1239,9 @@ func hashSecret(secret string) (string, error) {
 // and key ordering by loading the original file into a yaml.Node tree and updating values in-place.
 func SaveConfigPreserveComments(configFile string, cfg *Config) error {
 	persistCfg := cfg
+	if cfg != nil {
+		persistCfg = cfg.cloneForPersistence()
+	}
 	// Load original YAML as a node tree to preserve comments and ordering.
 	data, err := os.ReadFile(configFile)
 	if err != nil {
@@ -2072,6 +2096,38 @@ func findOpenAICompatTarget(entries []OpenAICompatibility, legacyName, legacyBas
 		}
 	}
 	return nil
+}
+
+func (cfg *Config) cloneForPersistence() *Config {
+	if cfg == nil {
+		return nil
+	}
+	clone := *cfg
+	if len(cfg.ProxyPools) == 0 {
+		return &clone
+	}
+	clone.ProxyPools = make([]ProxyPool, len(cfg.ProxyPools))
+	for i := range cfg.ProxyPools {
+		pool := cfg.ProxyPools[i]
+		if len(pool.Entries) > 0 {
+			entries := make([]ProxyPoolEntry, 0, len(pool.Entries))
+			for _, entry := range pool.Entries {
+				if entry.runtimeGenerated {
+					continue
+				}
+				entries = append(entries, entry)
+			}
+			pool.Entries = entries
+		}
+		if len(pool.IPv6BindRanges) > 0 {
+			pool.IPv6BindRanges = append([]IPv6BindRange(nil), pool.IPv6BindRanges...)
+		}
+		if len(pool.IPv6BindLeaseRanges) > 0 {
+			pool.IPv6BindLeaseRanges = append([]IPv6BindLeaseRange(nil), pool.IPv6BindLeaseRanges...)
+		}
+		clone.ProxyPools[i] = pool
+	}
+	return &clone
 }
 
 func (cfg *Config) migrateLegacyAmpConfig(legacy *legacyConfigData) bool {

@@ -261,3 +261,71 @@ func TestDefaultRequestLoggerFactory_UsesResolvedLogDirectory(t *testing.T) {
 		}
 	}
 }
+
+func TestCommercialModeStillWritesErrorRequestLogs(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	tmpDir := t.TempDir()
+	originalWD, errGetwd := os.Getwd()
+	if errGetwd != nil {
+		t.Fatalf("failed to get current working directory: %v", errGetwd)
+	}
+	if errChdir := os.Chdir(tmpDir); errChdir != nil {
+		t.Fatalf("failed to switch working directory: %v", errChdir)
+	}
+	defer func() {
+		if errChdirBack := os.Chdir(originalWD); errChdirBack != nil {
+			t.Fatalf("failed to restore working directory: %v", errChdirBack)
+		}
+	}()
+
+	authDir := filepath.Join(tmpDir, "auth")
+	if err := os.MkdirAll(authDir, 0o700); err != nil {
+		t.Fatalf("failed to create auth dir: %v", err)
+	}
+
+	cfg := &proxyconfig.Config{
+		SDKConfig: sdkconfig.SDKConfig{
+			APIKeys:    []string{"test-key"},
+			RequestLog: false,
+		},
+		Port:                   0,
+		AuthDir:                authDir,
+		Debug:                  true,
+		LoggingToFile:          false,
+		UsageStatisticsEnabled: false,
+		CommercialMode:         true,
+		ErrorLogsMaxFiles:      10,
+	}
+
+	authManager := auth.NewManager(nil, nil, nil)
+	accessManager := sdkaccess.NewManager()
+	configPath := filepath.Join(tmpDir, "config.yaml")
+	server := NewServer(cfg, authManager, accessManager, configPath)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-5.4"}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer test-key")
+	rr := httptest.NewRecorder()
+	server.engine.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("unexpected status: got %d want %d body=%s", rr.Code, http.StatusBadRequest, rr.Body.String())
+	}
+
+	logsDir := internallogging.ResolveLogDirectory(cfg)
+	entries, errRead := os.ReadDir(logsDir)
+	if errRead != nil {
+		t.Fatalf("failed to read logs dir: %v", errRead)
+	}
+	found := false
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), "error-v1-responses-") && strings.HasSuffix(entry.Name(), ".log") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("expected error request log in commercial mode, entries=%v", entries)
+	}
+}

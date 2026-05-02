@@ -46,8 +46,7 @@ var fetchUsageInfoWithProxy = func(ctx context.Context, proxyURL, accessToken st
 //     keeps the auth's plan_type and bound entry unchanged.
 //
 // The shuffle randomizes the start order so probes spread across pool
-// entries rather than hammering whichever entry the FNV hash happens to
-// land on first.
+// entries after the auth's stable preferred entry has been tried.
 func ProbeCodexPlanAcrossPool(
 	ctx context.Context,
 	cfg *config.Config,
@@ -55,7 +54,7 @@ func ProbeCodexPlanAcrossPool(
 	accessToken string,
 ) (plan string, boundEntry string, supportedModels []string, fiveHourQuota *codexauth.WhamQuotaWindow, probeOK bool, err error) {
 	pool := resolveCodexProbePool(cfg, auth)
-	candidates := shuffledHealthyEntries(pool)
+	candidates := healthyEntries(pool)
 	boundPreferredName := strings.TrimSpace(cliproxyauth.BoundProxyEntry(auth))
 
 	type probeCandidate struct {
@@ -63,23 +62,42 @@ func ProbeCodexPlanAcrossPool(
 		proxyURL  string // "" means direct
 	}
 	ordered := make([]probeCandidate, 0, len(candidates)+1)
-	if boundPreferredName != "" && boundPreferredName != cliproxyauth.BoundProxyEntryDirect {
+	hasLeaseCandidate := false
+	if lease := cliproxyauth.IPv6BindLease(auth); lease.URL != "" && lease.IP != "" {
+		if pool != nil && config.IPv6BindLeasePoolContains(pool, lease.IP) {
+			// A per-auth IPv6 lease is already the binding. Return an empty
+			// boundEntry on success so callers clear stale legacy pool-entry
+			// bindings instead of persisting a synthetic lease name there.
+			ordered = append(ordered, probeCandidate{entryName: "", proxyURL: lease.URL})
+			hasLeaseCandidate = true
+		}
+	}
+	if !hasLeaseCandidate {
+		if boundPreferredName != "" && boundPreferredName != cliproxyauth.BoundProxyEntryDirect {
+			for _, e := range candidates {
+				if e.Name != boundPreferredName {
+					continue
+				}
+				ordered = append(ordered, probeCandidate{entryName: e.Name, proxyURL: e.URL})
+				break
+			}
+		}
+		if boundPreferredName == "" {
+			if preferred, ok := proxypool.SelectPoolEntryWithHealth(pool, auth, proxypool.DefaultHealthManager()); ok {
+				ordered = append(ordered, probeCandidate{entryName: preferred.Name, proxyURL: preferred.URL})
+				candidates = removeProxyPoolEntryByName(candidates, preferred.Name)
+			}
+		}
+		secureShuffle(candidates)
 		for _, e := range candidates {
-			if e.Name != boundPreferredName {
+			if boundPreferredName != "" && e.Name == boundPreferredName {
 				continue
 			}
 			ordered = append(ordered, probeCandidate{entryName: e.Name, proxyURL: e.URL})
-			break
 		}
+		// Direct egress is always appended as last-resort fallback.
+		ordered = append(ordered, probeCandidate{entryName: cliproxyauth.BoundProxyEntryDirect, proxyURL: ""})
 	}
-	for _, e := range candidates {
-		if boundPreferredName != "" && e.Name == boundPreferredName {
-			continue
-		}
-		ordered = append(ordered, probeCandidate{entryName: e.Name, proxyURL: e.URL})
-	}
-	// Direct egress is always appended as last-resort fallback.
-	ordered = append(ordered, probeCandidate{entryName: cliproxyauth.BoundProxyEntryDirect, proxyURL: ""})
 
 	var lastFreePlan string
 	var anySucceeded bool
@@ -197,9 +215,9 @@ func resolveCodexProbePool(cfg *config.Config, auth *cliproxyauth.Auth) *config.
 	return cfg.ProxyPoolByName(poolName)
 }
 
-// shuffledHealthyEntries returns enabled + healthy entries from the pool
-// in a random order. Returns nil if pool is empty or missing.
-func shuffledHealthyEntries(pool *config.ProxyPool) []config.ProxyPoolEntry {
+// healthyEntries returns enabled + healthy entries from the pool in config
+// order. Callers decide whether to prioritize or shuffle the result.
+func healthyEntries(pool *config.ProxyPool) []config.ProxyPoolEntry {
 	if pool == nil || len(pool.Entries) == 0 {
 		return nil
 	}
@@ -214,7 +232,20 @@ func shuffledHealthyEntries(pool *config.ProxyPool) []config.ProxyPoolEntry {
 		}
 		out = append(out, e)
 	}
-	secureShuffle(out)
+	return out
+}
+
+func removeProxyPoolEntryByName(entries []config.ProxyPoolEntry, name string) []config.ProxyPoolEntry {
+	if len(entries) == 0 || strings.TrimSpace(name) == "" {
+		return entries
+	}
+	out := entries[:0]
+	for _, entry := range entries {
+		if entry.Name == name {
+			continue
+		}
+		out = append(out, entry)
+	}
 	return out
 }
 

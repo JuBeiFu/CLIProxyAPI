@@ -221,15 +221,13 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 	// Resolve logs directory relative to the configuration file directory.
 	var requestLogger logging.RequestLogger
 	var toggle func(bool)
-	if !cfg.CommercialMode {
-		if optionState.requestLoggerFactory != nil {
-			requestLogger = optionState.requestLoggerFactory(cfg, configFilePath)
-		}
-		if requestLogger != nil {
-			engine.Use(middleware.RequestLoggingMiddleware(requestLogger))
-			if setter, ok := requestLogger.(interface{ SetEnabled(bool) }); ok {
-				toggle = setter.SetEnabled
-			}
+	if optionState.requestLoggerFactory != nil {
+		requestLogger = optionState.requestLoggerFactory(cfg, configFilePath)
+	}
+	if requestLogger != nil {
+		engine.Use(middleware.RequestLoggingMiddlewareWithOptions(requestLogger, cfg.CommercialMode))
+		if setter, ok := requestLogger.(interface{ SetEnabled(bool) }); ok {
+			toggle = setter.SetEnabled
 		}
 	}
 

@@ -78,6 +78,17 @@ type ProxyPool struct {
 	// ExpectedStatusCodes marks which upstream statuses count as healthy.
 	ExpectedStatusCodes []int `yaml:"health-check-expected-status-codes,omitempty" json:"health-check-expected-status-codes,omitempty"`
 
+	// IPv6BindRanges expands inclusive IPv6 address ranges into direct bind://
+	// proxy entries during normalization. This allows a pool to materialize
+	// host-assigned IPv6 egress addresses without defining each entry manually.
+	IPv6BindRanges []IPv6BindRange `yaml:"ipv6-bind-ranges,omitempty" json:"ipv6-bind-ranges,omitempty"`
+
+	// IPv6BindLeaseRanges defines large IPv6 pools that are allocated lazily
+	// per auth and persisted on the auth record. Unlike IPv6BindRanges, these
+	// ranges are not expanded into ProxyPoolEntry values, so a /64 remains
+	// cheap to configure.
+	IPv6BindLeaseRanges []IPv6BindLeaseRange `yaml:"ipv6-bind-lease-ranges,omitempty" json:"ipv6-bind-lease-ranges,omitempty"`
+
 	Entries []ProxyPoolEntry `yaml:"entries" json:"entries"`
 }
 
@@ -87,4 +98,27 @@ type ProxyPoolEntry struct {
 	URL      string `yaml:"url" json:"url"`
 	Weight   int    `yaml:"weight,omitempty" json:"weight,omitempty"`
 	Disabled bool   `yaml:"disabled,omitempty" json:"disabled,omitempty"`
+
+	// runtimeGenerated marks entries synthesized from configuration ranges.
+	// They are used at runtime but should not be persisted back into config.yaml.
+	runtimeGenerated bool `yaml:"-" json:"-"`
+}
+
+// IPv6BindRange describes an inclusive IPv6 address span that should be
+// expanded into bind://[ipv6] proxy entries.
+type IPv6BindRange struct {
+	NamePrefix string `yaml:"name-prefix,omitempty" json:"name-prefix,omitempty"`
+	Start      string `yaml:"start,omitempty" json:"start,omitempty"`
+	End        string `yaml:"end,omitempty" json:"end,omitempty"`
+	Weight     int    `yaml:"weight,omitempty" json:"weight,omitempty"`
+	Disabled   bool   `yaml:"disabled,omitempty" json:"disabled,omitempty"`
+}
+
+// IPv6BindLeaseRange describes a CIDR block used for per-auth bind:// IPv6
+// leases. It is intentionally CIDR-only so huge host ranges never expand into
+// runtime proxy entries.
+type IPv6BindLeaseRange struct {
+	NamePrefix string `yaml:"name-prefix,omitempty" json:"name-prefix,omitempty"`
+	CIDR       string `yaml:"cidr,omitempty" json:"cidr,omitempty"`
+	Disabled   bool   `yaml:"disabled,omitempty" json:"disabled,omitempty"`
 }

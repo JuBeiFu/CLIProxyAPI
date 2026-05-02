@@ -363,6 +363,11 @@ func (h *OpenAIResponsesAPIHandler) handleNonStreamingResponse(c *gin.Context, r
 	resp, upstreamHeaders, errMsg := h.ExecuteWithAuthManager(cliCtx, h.HandlerType(), modelName, rawJSON, "")
 	stopKeepAlive()
 	if errMsg != nil {
+		if retryJSON, ok := responsesHTTPBridgeTranscriptResetPayload(c, rawJSON, errMsg); ok {
+			cliCancel(errMsg.Error)
+			h.handleNonStreamingResponse(c, retryJSON)
+			return
+		}
 		h.WriteErrorResponse(c, errMsg)
 		cliCancel(errMsg.Error)
 		return
@@ -418,6 +423,15 @@ func (h *OpenAIResponsesAPIHandler) handleStreamingResponse(c *gin.Context, rawJ
 				continue
 			}
 			// Upstream failed immediately. Return proper error status and JSON.
+			if retryJSON, ok := responsesHTTPBridgeTranscriptResetPayload(c, rawJSON, errMsg); ok {
+				if errMsg != nil {
+					cliCancel(errMsg.Error)
+				} else {
+					cliCancel(nil)
+				}
+				h.handleStreamingResponse(c, retryJSON)
+				return
+			}
 			h.WriteErrorResponse(c, errMsg)
 			if errMsg != nil {
 				cliCancel(errMsg.Error)
@@ -448,6 +462,41 @@ func (h *OpenAIResponsesAPIHandler) handleStreamingResponse(c *gin.Context, rawJ
 			h.forwardResponsesStream(c, flusher, func(err error) { cliCancel(err) }, dataChan, errChan, framer)
 			return
 		}
+	}
+}
+
+func responsesHTTPBridgeTranscriptResetPayload(c *gin.Context, rawJSON []byte, errMsg *interfaces.ErrorMessage) ([]byte, bool) {
+	if c == nil || c.Request == nil || errMsg == nil || errMsg.Error == nil {
+		return nil, false
+	}
+	if !strings.EqualFold(strings.TrimSpace(c.Request.Header.Get("X-NewAPI-Downstream-Transport")), "websocket") {
+		return nil, false
+	}
+	if errMsg.StatusCode != http.StatusBadRequest || !responsesWebsocketPreviousResponseNotFound(errMsg.Error) {
+		return nil, false
+	}
+	if strings.TrimSpace(gjson.GetBytes(rawJSON, "previous_response_id").String()) == "" || !hasUsableResponsesInput(rawJSON) {
+		return nil, false
+	}
+	retryJSON, err := sjson.DeleteBytes(rawJSON, "previous_response_id")
+	if err != nil {
+		return nil, false
+	}
+	return retryJSON, true
+}
+
+func hasUsableResponsesInput(rawJSON []byte) bool {
+	input := gjson.GetBytes(rawJSON, "input")
+	if !input.Exists() {
+		return false
+	}
+	switch {
+	case input.IsArray():
+		return len(input.Array()) > 0
+	case input.Type == gjson.String:
+		return strings.TrimSpace(input.String()) != ""
+	default:
+		return input.Type != gjson.Null
 	}
 }
 

@@ -40,6 +40,13 @@ const (
 	// free and eligible for the 5min forced-refresh retry cycle.
 	MetadataBoundProxyEntryKey = "cliproxy_bound_proxy_entry"
 
+	// IPv6 bind lease metadata pins one auth to one dedicated host IPv6.
+	// The manager owns assignment/release; request routing only reads it.
+	MetadataIPv6BindLeasePoolKey  = "cliproxy_ipv6_bind_lease_pool"
+	MetadataIPv6BindLeaseEntryKey = "cliproxy_ipv6_bind_lease_entry"
+	MetadataIPv6BindLeaseIPKey    = "cliproxy_ipv6_bind_lease_ip"
+	MetadataIPv6BindLeaseURLKey   = "cliproxy_ipv6_bind_lease_url"
+
 	// MetadataCodexFiveHourQuotaRemainingRatioKey stores the remaining quota
 	// ratio for Codex's rolling 5-hour window as returned by /wham/usage.
 	MetadataCodexFiveHourQuotaRemainingRatioKey = "cliproxy_codex_5h_remaining_ratio"
@@ -71,6 +78,14 @@ const (
 	metadataBoundProxyEntryKey   = MetadataBoundProxyEntryKey
 )
 
+// IPv6BindLeaseInfo is the persisted per-auth IPv6 bind lease.
+type IPv6BindLeaseInfo struct {
+	Pool      string
+	EntryName string
+	IP        string
+	URL       string
+}
+
 // BoundProxyEntry returns the pool entry name this auth is bound to, or
 // empty string if unbound. BoundProxyEntryDirect is returned for auths
 // pinned to direct egress.
@@ -97,6 +112,57 @@ func SetBoundProxyEntry(auth *Auth, name string) {
 		return
 	}
 	auth.Metadata[metadataBoundProxyEntryKey] = v
+}
+
+// IPv6BindLease returns the persisted IPv6 bind lease, if present.
+func IPv6BindLease(auth *Auth) IPv6BindLeaseInfo {
+	if auth == nil || auth.Metadata == nil {
+		return IPv6BindLeaseInfo{}
+	}
+	pool, _ := auth.Metadata[MetadataIPv6BindLeasePoolKey].(string)
+	entry, _ := auth.Metadata[MetadataIPv6BindLeaseEntryKey].(string)
+	ip, _ := auth.Metadata[MetadataIPv6BindLeaseIPKey].(string)
+	url, _ := auth.Metadata[MetadataIPv6BindLeaseURLKey].(string)
+	return IPv6BindLeaseInfo{
+		Pool:      strings.TrimSpace(pool),
+		EntryName: strings.TrimSpace(entry),
+		IP:        strings.TrimSpace(ip),
+		URL:       strings.TrimSpace(url),
+	}
+}
+
+// SetIPv6BindLease overwrites the persisted IPv6 bind lease. Empty IP or URL
+// clears the lease.
+func SetIPv6BindLease(auth *Auth, lease IPv6BindLeaseInfo) {
+	if auth == nil {
+		return
+	}
+	lease.Pool = strings.TrimSpace(lease.Pool)
+	lease.EntryName = strings.TrimSpace(lease.EntryName)
+	lease.IP = strings.TrimSpace(lease.IP)
+	lease.URL = strings.TrimSpace(lease.URL)
+	if auth.Metadata == nil {
+		auth.Metadata = make(map[string]any)
+	}
+	if lease.IP == "" || lease.URL == "" {
+		ClearIPv6BindLease(auth)
+		return
+	}
+	auth.Metadata[MetadataIPv6BindLeasePoolKey] = lease.Pool
+	auth.Metadata[MetadataIPv6BindLeaseEntryKey] = lease.EntryName
+	auth.Metadata[MetadataIPv6BindLeaseIPKey] = lease.IP
+	auth.Metadata[MetadataIPv6BindLeaseURLKey] = lease.URL
+}
+
+// ClearIPv6BindLease removes any persisted IPv6 bind lease metadata.
+func ClearIPv6BindLease(auth *Auth) {
+	if auth == nil || auth.Metadata == nil {
+		return
+	}
+	delete(auth.Metadata, MetadataIPv6BindLeasePoolKey)
+	delete(auth.Metadata, MetadataIPv6BindLeaseEntryKey)
+	delete(auth.Metadata, MetadataIPv6BindLeaseIPKey)
+	delete(auth.Metadata, MetadataIPv6BindLeaseURLKey)
 }
 
 func isPaidPlan(planType string) bool {

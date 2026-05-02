@@ -54,6 +54,7 @@ type probeClientKey struct {
 const (
 	DefaultPassiveSlowTotal             = 60 * time.Second
 	DefaultPassiveSlowReadBody          = 45 * time.Second
+	DefaultPassiveSlowFirstByte         = 5 * time.Second
 	DefaultPassiveSlowBytesPerSecond    = 20 * 1024
 	DefaultPassiveSlowStrikes           = 2
 	DefaultPassiveSlowCooldown          = 5 * time.Minute
@@ -63,6 +64,7 @@ const (
 
 type PassiveOutcome struct {
 	Total         time.Duration
+	FirstByte     time.Duration
 	ReadBody      time.Duration
 	ResponseBytes int64
 	StatusCode    int
@@ -587,6 +589,9 @@ func passiveOutcomeIsSlow(outcome PassiveOutcome) bool {
 	}
 	if outcome.StatusCode != 0 && (outcome.StatusCode < http.StatusOK || outcome.StatusCode >= http.StatusBadRequest) {
 		return false
+	}
+	if outcome.FirstByte >= DefaultPassiveSlowFirstByte {
+		return true
 	}
 	if outcome.Total < DefaultPassiveSlowTotal && outcome.ReadBody < DefaultPassiveSlowReadBody {
 		return false

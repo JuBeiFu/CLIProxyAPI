@@ -296,3 +296,43 @@ func TestResolveCodexBoundSkipsPassivelyUnhealthyBinding(t *testing.T) {
 		t.Fatal("expected direct fallback while awaiting rebind")
 	}
 }
+
+func TestResolveUsesPersistedIPv6BindLeaseBeforePoolBinding(t *testing.T) {
+	t.Parallel()
+
+	cfg := &config.Config{
+		SDKConfig: config.SDKConfig{
+			DefaultProxyPool: "dedicated-v6",
+			ProxyPools: []config.ProxyPool{
+				{
+					Name: "dedicated-v6",
+					IPv6BindLeaseRanges: []config.IPv6BindLeaseRange{
+						{CIDR: "2602:294:0:eb::/64"},
+					},
+					Entries: []config.ProxyPoolEntry{
+						{Name: "proxy-a", URL: "socks5://a.local:1080"},
+					},
+				},
+			},
+		},
+	}
+	auth := &coreauth.Auth{ID: "codex-bound", Provider: "codex"}
+	coreauth.SetBoundProxyEntry(auth, "proxy-a")
+	coreauth.SetIPv6BindLease(auth, coreauth.IPv6BindLeaseInfo{
+		Pool:      "dedicated-v6",
+		EntryName: "acct-v6-auth",
+		IP:        "2602:294:0:eb::42",
+		URL:       "bind://[2602:294:0:eb::42]",
+	})
+
+	got := ResolveWithHealth(cfg, auth, nil)
+	if got.Source != "ipv6-bind-lease" {
+		t.Fatalf("expected Source=ipv6-bind-lease, got %q", got.Source)
+	}
+	if got.ProxyURL != "bind://[2602:294:0:eb::42]" {
+		t.Fatalf("ProxyURL = %q, want bind lease URL", got.ProxyURL)
+	}
+	if got.ProxyName != "acct-v6-auth" {
+		t.Fatalf("ProxyName = %q, want lease entry name", got.ProxyName)
+	}
+}

@@ -119,3 +119,49 @@ func TestRecordCodexProxyPassiveOutcomeMarksRepeatedSlowProxyUnusable(t *testing
 		t.Fatal("expected repeated slow passive outcomes to mark proxy unusable")
 	}
 }
+
+func TestRecordCodexProxyPassiveOutcomeMarksRepeatedSlowFirstByteUnusable(t *testing.T) {
+	manager := proxypool.NewHealthManager()
+	now := time.Now()
+	timing := codexUpstreamTiming{
+		endpoint:       "responses_stream",
+		proxyPool:      "free-egress",
+		proxyName:      "free-proxy-12",
+		status:         200,
+		bytesRead:      512 * 1024,
+		startedAt:      now.Add(-20 * time.Second),
+		readBody:       12 * time.Second,
+		traceFirstByte: proxypool.DefaultPassiveSlowFirstByte + time.Second,
+	}
+
+	recordCodexProxyPassiveOutcome(timing, manager)
+	if !manager.IsUsableAt("free-egress", "free-proxy-12", now) {
+		t.Fatal("expected first slow first-byte passive outcome to keep proxy usable")
+	}
+
+	recordCodexProxyPassiveOutcome(timing, manager)
+	if manager.IsUsableAt("free-egress", "free-proxy-12", now) {
+		t.Fatal("expected repeated slow first-byte passive outcomes to mark proxy unusable")
+	}
+}
+
+func TestRecordCodexProxyPassiveOutcomeIgnoresCompactFirstByte(t *testing.T) {
+	manager := proxypool.NewHealthManager()
+	now := time.Now()
+	timing := codexUpstreamTiming{
+		endpoint:       "responses/compact",
+		proxyPool:      "free-egress",
+		proxyName:      "free-proxy-10",
+		status:         200,
+		bytesRead:      512 * 1024,
+		startedAt:      now.Add(-65 * time.Second),
+		readBody:       100 * time.Millisecond,
+		traceFirstByte: time.Minute,
+	}
+
+	recordCodexProxyPassiveOutcome(timing, manager)
+	recordCodexProxyPassiveOutcome(timing, manager)
+	if !manager.IsUsableAt("free-egress", "free-proxy-10", now) {
+		t.Fatal("expected compact first-byte latency to stay out of passive proxy health")
+	}
+}

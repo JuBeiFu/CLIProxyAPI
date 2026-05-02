@@ -22,6 +22,13 @@ const maxErrorOnlyCapturedRequestBodyBytes int64 = 1 << 20 // 1 MiB
 // and uses the provided RequestLogger to record this data. When full request logging is disabled,
 // body capture is limited to small known-size payloads to avoid large per-request memory spikes.
 func RequestLoggingMiddleware(logger logging.RequestLogger) gin.HandlerFunc {
+	return RequestLoggingMiddlewareWithOptions(logger, false)
+}
+
+// RequestLoggingMiddlewareWithOptions creates a request logger middleware.
+// When captureResponseOnly is true, it avoids pre-reading request bodies and only
+// captures response/error metadata; this keeps commercial mode overhead minimal.
+func RequestLoggingMiddlewareWithOptions(logger logging.RequestLogger, captureResponseOnly bool) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		if logger == nil {
 			c.Next()
@@ -42,7 +49,8 @@ func RequestLoggingMiddleware(logger logging.RequestLogger) gin.HandlerFunc {
 		loggerEnabled := logger.IsEnabled()
 
 		// Capture request information
-		requestInfo, err := captureRequestInfo(c, shouldCaptureRequestBody(loggerEnabled, c.Request))
+		captureBody := !captureResponseOnly && shouldCaptureRequestBody(loggerEnabled, c.Request)
+		requestInfo, err := captureRequestInfo(c, captureBody)
 		if err != nil {
 			// Log error but continue processing
 			// In a real implementation, you might want to use a proper logger here

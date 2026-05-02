@@ -44,6 +44,20 @@ func ResolveWithHealth(cfg *config.Config, auth *coreauth.Auth, manager *HealthM
 	}
 	if cfg != nil && poolName != "" {
 		if pool := cfg.ProxyPoolByName(poolName); pool != nil {
+			if lease := coreauth.IPv6BindLease(auth); lease.URL != "" && lease.IP != "" {
+				leasePool := strings.TrimSpace(lease.Pool)
+				if leasePool == "" || strings.EqualFold(leasePool, pool.Name) {
+					if config.IPv6BindLeasePoolContains(pool, lease.IP) {
+						return Resolution{
+							ProxyURL:         lease.URL,
+							ProxyPool:        pool.Name,
+							ProxyName:        lease.EntryName,
+							Source:           "ipv6-bind-lease",
+							FallbackToDirect: pool.FallbackToDirect,
+						}
+					}
+				}
+			}
 			// Prefer the pool entry the auth was pinned to by the
 			// multi-path plan_type probe. Probe and real dispatch MUST
 			// travel through the same node because OpenAI's plan_type
@@ -129,6 +143,12 @@ func ResolveWithHealth(cfg *config.Config, auth *coreauth.Auth, manager *HealthM
 
 func selectPoolEntry(pool *config.ProxyPool, auth *coreauth.Auth) (config.ProxyPoolEntry, bool) {
 	return selectPoolEntryWithHealth(pool, auth, nil)
+}
+
+// SelectPoolEntryWithHealth returns the stable hash-selected pool entry after
+// filtering out disabled or currently unusable entries.
+func SelectPoolEntryWithHealth(pool *config.ProxyPool, auth *coreauth.Auth, manager *HealthManager) (config.ProxyPoolEntry, bool) {
+	return selectPoolEntryWithHealth(pool, auth, manager)
 }
 
 func selectPoolEntryWithHealth(pool *config.ProxyPool, auth *coreauth.Auth, manager *HealthManager) (config.ProxyPoolEntry, bool) {

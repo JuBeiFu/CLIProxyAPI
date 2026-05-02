@@ -723,6 +723,7 @@ func (m *Manager) SetConfig(cfg *internalconfig.Config) {
 	m.runtimeConfig.Store(cfg)
 	m.SetResponseCompactLimits(cfg.ResponseCompact.MaxBytes, cfg.ResponseCompact.MaxEntryBytes, cfg.ResponseCompact.MaxEntries)
 	m.rebuildAPIKeyModelAliasFromRuntimeConfig()
+	m.reconcileIPv6BindLeases(context.Background(), cfg)
 }
 
 // SetResponseCompactLimits updates compact transcript cache limits and evicts
@@ -1493,8 +1494,10 @@ func (m *Manager) Register(ctx context.Context, auth *Auth) (*Auth, error) {
 		auth.ID = uuid.NewString()
 	}
 	auth.EnsureIndex()
-	authClone := auth.Clone()
+	cfg, _ := m.runtimeConfig.Load().(*internalconfig.Config)
 	m.mu.Lock()
+	_ = m.ensureIPv6BindLeaseForAuthLocked(cfg, auth)
+	authClone := auth.Clone()
 	m.auths[auth.ID] = authClone
 	m.mu.Unlock()
 	m.rebuildAPIKeyModelAliasFromRuntimeConfig()
@@ -1523,12 +1526,14 @@ func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 	if hasRevokedAuthTombstoneMemory(auth, time.Now()) {
 		return auth.Clone(), nil
 	}
+	cfg, _ := m.runtimeConfig.Load().(*internalconfig.Config)
 	m.mu.Lock()
 	if existing, ok := m.auths[auth.ID]; ok && existing != nil {
 		if !auth.indexAssigned && auth.Index == "" {
 			auth.Index = existing.Index
 			auth.indexAssigned = existing.indexAssigned
 		}
+		preserveIPv6BindLeaseIfMissing(auth, existing)
 		if !existing.Disabled && existing.Status != StatusDisabled && !auth.Disabled && auth.Status != StatusDisabled {
 			if len(auth.ModelStates) == 0 && len(existing.ModelStates) > 0 {
 				auth.ModelStates = existing.ModelStates
@@ -1537,6 +1542,7 @@ func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 		}
 	}
 	auth.EnsureIndex()
+	_ = m.ensureIPv6BindLeaseForAuthLocked(cfg, auth)
 	authClone := auth.Clone()
 	m.auths[auth.ID] = authClone
 	m.mu.Unlock()
@@ -1644,6 +1650,7 @@ func (m *Manager) Load(ctx context.Context) error {
 	m.rebuildAPIKeyModelAliasLocked(cfg)
 	m.mu.Unlock()
 	m.syncScheduler()
+	m.reconcileIPv6BindLeases(ctx, cfg)
 	return nil
 }
 
@@ -4515,6 +4522,7 @@ func applyTerminalAuthDisabledState(auth *Auth, resultErr *Error, reason string,
 	if auth == nil {
 		return
 	}
+	ClearIPv6BindLease(auth)
 	auth.Disabled = true
 	auth.Unavailable = false
 	auth.Status = StatusDisabled
@@ -4544,7 +4552,14 @@ func (m *Manager) deleteRevokedAuth(auth *Auth, warning string, source string) {
 	if source == "" {
 		source = "request"
 	}
+	ClearIPv6BindLease(auth)
 	RegisterRevokedAuthTombstone(auth, warning, time.Now())
+	m.mu.Lock()
+	if current := m.auths[authID]; current != nil {
+		ClearIPv6BindLease(current)
+		delete(m.auths, authID)
+	}
+	m.mu.Unlock()
 	if m.scheduler != nil {
 		m.scheduler.removeAuth(authID)
 	}

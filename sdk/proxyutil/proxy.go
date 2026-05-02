@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 
 	"golang.org/x/net/proxy"
 )
@@ -14,6 +15,8 @@ import (
 const (
 	defaultMaxIdleConns        = 4096
 	defaultMaxIdleConnsPerHost = 1024
+	defaultDialTimeout         = 30 * time.Second
+	defaultDialKeepAlive       = 30 * time.Second
 )
 
 // Mode describes how a proxy setting should be interpreted.
@@ -26,6 +29,8 @@ const (
 	ModeDirect
 	// ModeProxy means a concrete proxy URL was configured.
 	ModeProxy
+	// ModeBind means outbound requests should bind to a local source IP.
+	ModeBind
 	// ModeInvalid means the proxy setting is present but malformed or unsupported.
 	ModeInvalid
 )
@@ -65,6 +70,10 @@ func Parse(raw string) (Setting, error) {
 	switch parsedURL.Scheme {
 	case "socks5", "socks5h", "http", "https":
 		setting.Mode = ModeProxy
+		setting.URL = parsedURL
+		return setting, nil
+	case "bind":
+		setting.Mode = ModeBind
 		setting.URL = parsedURL
 		return setting, nil
 	default:
@@ -130,6 +139,25 @@ func BuildHTTPTransport(raw string) (*http.Transport, Mode, error) {
 		transport := cloneDefaultTransport()
 		transport.Proxy = http.ProxyURL(setting.URL)
 		return transport, setting.Mode, nil
+	case ModeBind:
+		localAddr, errBind := bindLocalAddr(setting.URL)
+		if errBind != nil {
+			return nil, setting.Mode, errBind
+		}
+		transport := cloneDefaultTransport()
+		transport.Proxy = nil
+		transport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+			dialer := &net.Dialer{
+				Timeout:   defaultDialTimeout,
+				KeepAlive: defaultDialKeepAlive,
+				LocalAddr: localAddr,
+			}
+			if control := bindDialerControl(localAddr); control != nil {
+				dialer.Control = control
+			}
+			return dialer.DialContext(ctx, network, addr)
+		}
+		return transport, setting.Mode, nil
 	default:
 		return nil, setting.Mode, nil
 	}
@@ -153,7 +181,44 @@ func BuildDialer(raw string) (proxy.Dialer, Mode, error) {
 			return nil, setting.Mode, fmt.Errorf("create proxy dialer failed: %w", errDialer)
 		}
 		return dialer, setting.Mode, nil
+	case ModeBind:
+		localAddr, errBind := bindLocalAddr(setting.URL)
+		if errBind != nil {
+			return nil, setting.Mode, errBind
+		}
+		dialer := &net.Dialer{
+			Timeout:   defaultDialTimeout,
+			KeepAlive: defaultDialKeepAlive,
+			LocalAddr: localAddr,
+		}
+		if control := bindDialerControl(localAddr); control != nil {
+			dialer.Control = control
+		}
+		return dialer, setting.Mode, nil
 	default:
 		return nil, setting.Mode, nil
 	}
+}
+
+func bindLocalAddr(settingURL *url.URL) (net.Addr, error) {
+	if settingURL == nil {
+		return nil, fmt.Errorf("bind URL is nil")
+	}
+	host := strings.TrimSpace(settingURL.Hostname())
+	if host == "" {
+		return nil, fmt.Errorf("bind URL missing host")
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return nil, fmt.Errorf("bind URL host is not a valid IP: %s", host)
+	}
+	port := 0
+	if rawPort := strings.TrimSpace(settingURL.Port()); rawPort != "" {
+		parsedPort, errPort := net.LookupPort("tcp", rawPort)
+		if errPort != nil {
+			return nil, fmt.Errorf("bind URL port is invalid: %w", errPort)
+		}
+		port = parsedPort
+	}
+	return &net.TCPAddr{IP: ip, Port: port}, nil
 }
