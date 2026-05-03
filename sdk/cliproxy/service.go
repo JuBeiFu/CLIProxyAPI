@@ -1359,7 +1359,7 @@ func filterCodexSparkModelsByPlan(models []*ModelInfo, planType string) []*Model
 
 func codexPlanAllowsSparkModels(planType string) bool {
 	switch normalizedCodexPlanTypeKey(planType) {
-	case "pro", "plus", "prolite":
+	case "pro", "prolite":
 		return true
 	default:
 		return false

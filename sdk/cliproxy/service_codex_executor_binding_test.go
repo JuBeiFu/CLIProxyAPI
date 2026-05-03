@@ -170,6 +170,42 @@ func TestRegisterModelsForAuth_CodexTeamEntitlementsFilterSpark(t *testing.T) {
 	}
 }
 
+func TestRegisterModelsForAuth_CodexPlusEntitlementsFilterSpark(t *testing.T) {
+	service := &Service{
+		cfg:         &config.Config{},
+		coreManager: coreauth.NewManager(nil, nil, nil),
+	}
+	auth := &coreauth.Auth{
+		ID:       "codex-plus-spark-entitlements-auth",
+		Provider: "codex",
+		Status:   coreauth.StatusActive,
+		Attributes: map[string]string{
+			"plan_type":                "plus",
+			"supported_models":         "gpt-5.3-codex-spark,gpt-5.4",
+			"supported_models_source":  "codex_entitlements",
+			"supported_models_updated": "2026-05-03T00:00:00Z",
+		},
+	}
+	t.Cleanup(func() {
+		registry.GetGlobalRegistry().UnregisterClient(auth.ID)
+	})
+
+	service.registerModelsForAuth(auth)
+	models := registry.GetGlobalRegistry().GetModelsForClient(auth.ID)
+	ids := make(map[string]struct{}, len(models))
+	for _, model := range models {
+		if model != nil {
+			ids[model.ID] = struct{}{}
+		}
+	}
+	if _, ok := ids["gpt-5.3-codex-spark"]; ok {
+		t.Fatalf("registered Spark model for plus auth: %+v", ids)
+	}
+	if _, ok := ids["gpt-5.4"]; !ok {
+		t.Fatalf("registered models missing gpt-5.4 after Spark filter: %+v", ids)
+	}
+}
+
 func TestRegisterModelsForAuth_CodexUnknownPlanFallbackFiltersSpark(t *testing.T) {
 	service := &Service{
 		cfg:         &config.Config{},

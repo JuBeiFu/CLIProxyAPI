@@ -26,6 +26,7 @@ type WhamUsageInfo struct {
 	PlanType        string
 	SupportedModels []string
 	FiveHourQuota   *WhamQuotaWindow
+	WeeklyQuota     *WhamQuotaWindow
 }
 
 type WhamQuotaWindow struct {
@@ -112,6 +113,7 @@ func (o *CodexAuth) FetchWhamUsageInfo(ctx context.Context, accessToken string) 
 		PlanType:        strings.TrimSpace(gjson.GetBytes(body, "plan_type").String()),
 		SupportedModels: extractWhamUsageSupportedModels(body),
 		FiveHourQuota:   extractWhamUsageFiveHourQuota(body),
+		WeeklyQuota:     extractWhamUsageWeeklyQuota(body),
 	}, nil
 }
 
@@ -166,6 +168,10 @@ func extractWhamUsageFiveHourQuota(body []byte) *WhamQuotaWindow {
 	return ParseWhamUsageFiveHourQuota(body)
 }
 
+func extractWhamUsageWeeklyQuota(body []byte) *WhamQuotaWindow {
+	return ParseWhamUsageWeeklyQuota(body)
+}
+
 func ParseWhamUsageFiveHourQuota(body []byte) *WhamQuotaWindow {
 	var root any
 	if err := json.Unmarshal(body, &root); err != nil {
@@ -189,6 +195,29 @@ func ParseWhamUsageFiveHourQuota(body []byte) *WhamQuotaWindow {
 	return best
 }
 
+func ParseWhamUsageWeeklyQuota(body []byte) *WhamQuotaWindow {
+	var root any
+	if err := json.Unmarshal(body, &root); err != nil {
+		return nil
+	}
+	if quota := preferredWhamWeeklyQuota(root); quota != nil {
+		return quota
+	}
+	var best *WhamQuotaWindow
+	walkWhamUsageObjects(root, "", func(path string, obj map[string]any) {
+		if best != nil {
+			return
+		}
+		if !looksLikeWeeklyWindow(path, obj) {
+			return
+		}
+		if quota := quotaWindowFromObject(obj); quota != nil {
+			best = quota
+		}
+	})
+	return best
+}
+
 func preferredWhamFiveHourQuota(root any) *WhamQuotaWindow {
 	obj, ok := root.(map[string]any)
 	if !ok {
@@ -202,6 +231,29 @@ func preferredWhamFiveHourQuota(root any) *WhamQuotaWindow {
 		for _, windowKey := range []string{"primary_window", "primaryWindow"} {
 			window, ok := childWhamObject(rateLimit, windowKey)
 			if !ok || !looksLikeFiveHourWindow("rate_limit."+windowKey, window) {
+				continue
+			}
+			if quota := quotaWindowFromObject(window); quota != nil {
+				return quota
+			}
+		}
+	}
+	return nil
+}
+
+func preferredWhamWeeklyQuota(root any) *WhamQuotaWindow {
+	obj, ok := root.(map[string]any)
+	if !ok {
+		return nil
+	}
+	for _, rateLimitKey := range []string{"rate_limit", "rateLimit"} {
+		rateLimit, ok := childWhamObject(obj, rateLimitKey)
+		if !ok {
+			continue
+		}
+		for _, windowKey := range []string{"weekly_window", "weeklyWindow", "week_window", "weekWindow"} {
+			window, ok := childWhamObject(rateLimit, windowKey)
+			if !ok || !looksLikeWeeklyWindow("rate_limit."+windowKey, window) {
 				continue
 			}
 			if quota := quotaWindowFromObject(window); quota != nil {
@@ -273,11 +325,58 @@ func looksLikeFiveHourWindow(path string, obj map[string]any) bool {
 	return false
 }
 
+func looksLikeWeeklyWindow(path string, obj map[string]any) bool {
+	if containsWeeklyMarker(path) {
+		return true
+	}
+	for key, value := range obj {
+		if containsWeeklyMarker(key) {
+			return true
+		}
+		if s, ok := value.(string); ok && containsWeeklyMarker(s) {
+			return true
+		}
+		n, ok := numericValue(value)
+		if !ok {
+			continue
+		}
+		keyNorm := normalizeWhamKey(key)
+		switch {
+		case strings.Contains(keyNorm, "windowseconds") || strings.Contains(keyNorm, "periodseconds") || strings.Contains(keyNorm, "durationseconds"):
+			if math.Abs(n-604800) < 0.001 {
+				return true
+			}
+		case strings.Contains(keyNorm, "windowminutes") || strings.Contains(keyNorm, "periodminutes") || strings.Contains(keyNorm, "durationminutes"):
+			if math.Abs(n-10080) < 0.001 {
+				return true
+			}
+		case strings.Contains(keyNorm, "windowhours") || strings.Contains(keyNorm, "periodhours") || strings.Contains(keyNorm, "durationhours"):
+			if math.Abs(n-168) < 0.001 {
+				return true
+			}
+		case strings.Contains(keyNorm, "windowdays") || strings.Contains(keyNorm, "perioddays") || strings.Contains(keyNorm, "durationdays"):
+			if math.Abs(n-7) < 0.001 {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func containsFiveHourMarker(value string) bool {
 	norm := normalizeWhamKey(value)
 	return strings.Contains(norm, "5h") ||
 		strings.Contains(norm, "5hour") ||
 		strings.Contains(norm, "fivehour")
+}
+
+func containsWeeklyMarker(value string) bool {
+	norm := normalizeWhamKey(value)
+	return strings.Contains(norm, "week") ||
+		strings.Contains(norm, "weekly") ||
+		strings.Contains(norm, "7d") ||
+		strings.Contains(norm, "7day") ||
+		strings.Contains(norm, "sevenday")
 }
 
 func quotaWindowFromObject(obj map[string]any) *WhamQuotaWindow {

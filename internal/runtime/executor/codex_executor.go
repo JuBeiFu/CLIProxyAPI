@@ -1009,7 +1009,7 @@ func (e *CodexExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*
 	// sees the same node and OpenAI's cache decision is self-consistent.
 	// Header note: Chatgpt-Account-Id has no observable effect on the
 	// response (verified 2026-04-20 across 5 egress paths); we omit it.
-	realPlan, boundEntry, supportedModels, fiveHourQuota, probeOK, probeErr := helps.ProbeCodexPlanAcrossPool(ctx, e.cfg, auth, accessToken)
+	realPlan, boundEntry, supportedModels, fiveHourQuota, weeklyQuota, probeOK, probeErr := helps.ProbeCodexPlanAcrossPool(ctx, e.cfg, auth, accessToken)
 	if probeErr != nil {
 		return nil, probeErr
 	}
@@ -1020,6 +1020,7 @@ func (e *CodexExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*
 	if probeOK {
 		applyCodexSupportedModels(auth, supportedModels, now)
 		applyCodexFiveHourQuotaMetadata(auth, fiveHourQuota, now)
+		applyCodexWeeklyQuotaMetadata(auth, weeklyQuota, now)
 		if boundEntry != "" {
 			// Found a path reporting paid plan; pin the auth so later
 			// dispatches go through the same node.
@@ -1142,6 +1143,40 @@ func applyCodexFiveHourQuotaMetadata(auth *cliproxyauth.Auth, quota *codexauth.W
 		auth.Metadata[cliproxyauth.MetadataCodexFiveHourQuotaResetAtKey] = quota.ResetAt.UTC().Format(time.RFC3339)
 	} else {
 		delete(auth.Metadata, cliproxyauth.MetadataCodexFiveHourQuotaResetAtKey)
+	}
+}
+
+func applyCodexWeeklyQuotaMetadata(auth *cliproxyauth.Auth, quota *codexauth.WhamQuotaWindow, now time.Time) {
+	if auth == nil {
+		return
+	}
+	if auth.Metadata == nil {
+		auth.Metadata = make(map[string]any)
+	}
+	if quota == nil {
+		delete(auth.Metadata, cliproxyauth.MetadataCodexWeeklyQuotaRemainingRatioKey)
+		delete(auth.Metadata, cliproxyauth.MetadataCodexWeeklyQuotaResetAtKey)
+		delete(auth.Metadata, cliproxyauth.MetadataCodexWeeklyQuotaLimitKey)
+		delete(auth.Metadata, cliproxyauth.MetadataCodexWeeklyQuotaRemainingKey)
+		auth.Metadata[cliproxyauth.MetadataCodexWeeklyQuotaUpdatedAtKey] = now.UTC().Format(time.RFC3339)
+		return
+	}
+	auth.Metadata[cliproxyauth.MetadataCodexWeeklyQuotaRemainingRatioKey] = quota.RemainingRatio
+	auth.Metadata[cliproxyauth.MetadataCodexWeeklyQuotaUpdatedAtKey] = now.UTC().Format(time.RFC3339)
+	if quota.Limit > 0 {
+		auth.Metadata[cliproxyauth.MetadataCodexWeeklyQuotaLimitKey] = quota.Limit
+	} else {
+		delete(auth.Metadata, cliproxyauth.MetadataCodexWeeklyQuotaLimitKey)
+	}
+	if quota.Remaining > 0 {
+		auth.Metadata[cliproxyauth.MetadataCodexWeeklyQuotaRemainingKey] = quota.Remaining
+	} else {
+		delete(auth.Metadata, cliproxyauth.MetadataCodexWeeklyQuotaRemainingKey)
+	}
+	if !quota.ResetAt.IsZero() {
+		auth.Metadata[cliproxyauth.MetadataCodexWeeklyQuotaResetAtKey] = quota.ResetAt.UTC().Format(time.RFC3339)
+	} else {
+		delete(auth.Metadata, cliproxyauth.MetadataCodexWeeklyQuotaResetAtKey)
 	}
 }
 

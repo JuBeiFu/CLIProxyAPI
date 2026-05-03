@@ -1973,7 +1973,7 @@ func TestManager_MarkResult_CodexSparkUsageLimitOnlyBlocksSpark(t *testing.T) {
 		Provider: "codex",
 		Status:   StatusActive,
 		Attributes: map[string]string{
-			"plan_type": "plus",
+			"plan_type": "pro",
 		},
 		ModelStates: map[string]*ModelState{
 			"gpt-5.4": {
@@ -2031,7 +2031,7 @@ func TestManager_MarkResult_GenericSparkUsageLimitOnlyBlocksSpark(t *testing.T) 
 		Provider: "codex",
 		Status:   StatusActive,
 		Attributes: map[string]string{
-			"plan_type": "plus",
+			"plan_type": "prolite",
 		},
 		ModelStates: map[string]*ModelState{
 			"gpt-5.4": {
@@ -2128,6 +2128,47 @@ func TestManager_MarkResult_CodexStandardUsageLimitOnlyBlocksNonSparkModels(t *t
 	}
 	if blocked, reason, next := isAuthBlockedForModel(got, "gpt-5.3-codex-spark", time.Now()); blocked {
 		t.Fatalf("Spark unexpectedly blocked by standard usage limit, reason=%v next=%v auth=%+v", reason, next, got)
+	}
+}
+
+func TestManager_MarkResult_PlusUsageLimitBlocksWholeAuth(t *testing.T) {
+	m := NewManager(nil, nil, nil)
+	auth := &Auth{
+		ID:       "auth-plus-weekly-limit",
+		Provider: "codex",
+		Status:   StatusActive,
+		Attributes: map[string]string{
+			"plan_type": "plus",
+		},
+		ModelStates: map[string]*ModelState{},
+	}
+	if _, errRegister := m.Register(context.Background(), auth); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+
+	m.MarkResult(context.Background(), Result{
+		AuthID:   auth.ID,
+		Provider: auth.Provider,
+		Model:    "gpt-5.5",
+		Success:  false,
+		Error: &Error{
+			Message:    `{"error":{"type":"usage_limit_reached","message":"The usage limit has been reached","resets_in_seconds":324000}}`,
+			HTTPStatus: http.StatusTooManyRequests,
+		},
+	})
+
+	got, ok := m.GetByID(auth.ID)
+	if !ok {
+		t.Fatal("auth not found after MarkResult")
+	}
+	if !got.Unavailable || !got.Quota.Exceeded {
+		t.Fatalf("expected plus usage limit to block whole auth, unavailable=%v quota=%+v", got.Unavailable, got.Quota)
+	}
+	if got.Quota.Reason != "usage_limit" {
+		t.Fatalf("quota reason = %q, want usage_limit", got.Quota.Reason)
+	}
+	if got.NextRetryAfter.IsZero() {
+		t.Fatal("expected auth-level NextRetryAfter")
 	}
 }
 

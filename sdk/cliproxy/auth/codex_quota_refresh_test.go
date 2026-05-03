@@ -151,6 +151,46 @@ func TestManager_RefreshAuth_RestsCodexAuthWhenFiveHourQuotaBelowThreshold(t *te
 	}
 }
 
+func TestManager_RefreshAuth_RestsCodexAuthWhenWeeklyQuotaExhausted(t *testing.T) {
+	ctx := context.Background()
+	mgr := NewManager(nil, nil, nil)
+	resetAt := time.Now().Add(4 * 24 * time.Hour).UTC()
+	exec := &codexQuotaRefreshExecutor{updated: &Auth{Metadata: map[string]any{
+		MetadataCodexFiveHourQuotaRemainingRatioKey: 0.8,
+		MetadataCodexWeeklyQuotaRemainingRatioKey:   0.0,
+		MetadataCodexWeeklyQuotaResetAtKey:          resetAt.Format(time.RFC3339),
+	}}}
+	mgr.RegisterExecutor(exec)
+	auth := &Auth{
+		ID:       "codex-weekly-quota",
+		Provider: "codex",
+		Status:   StatusActive,
+		Metadata: map[string]any{"type": "codex", "access_token": "tok"},
+	}
+	if _, err := mgr.Register(ctx, auth); err != nil {
+		t.Fatalf("Register returned error: %v", err)
+	}
+
+	mgr.refreshAuth(ctx, auth.ID)
+
+	stored, ok := mgr.GetByID(auth.ID)
+	if !ok {
+		t.Fatal("expected auth to remain registered")
+	}
+	if stored.Disabled {
+		t.Fatal("expected weekly quota rest to keep auth registered and operator-enabled")
+	}
+	if !stored.Unavailable || !stored.Quota.Exceeded {
+		t.Fatalf("expected auth to enter weekly quota rest, unavailable=%v quota=%+v", stored.Unavailable, stored.Quota)
+	}
+	if stored.Quota.Reason != codexWeeklyQuotaLowReason {
+		t.Fatalf("Quota.Reason = %q, want %q", stored.Quota.Reason, codexWeeklyQuotaLowReason)
+	}
+	if stored.NextRetryAfter.Before(resetAt.Add(-time.Second)) || stored.NextRetryAfter.After(resetAt.Add(time.Second)) {
+		t.Fatalf("NextRetryAfter = %s, want near %s", stored.NextRetryAfter, resetAt)
+	}
+}
+
 func TestManager_RefreshAuth_ClearsCodexQuotaRestWhenRecovered(t *testing.T) {
 	ctx := context.Background()
 	mgr := NewManager(nil, nil, nil)
@@ -184,6 +224,42 @@ func TestManager_RefreshAuth_ClearsCodexQuotaRestWhenRecovered(t *testing.T) {
 	}
 	if stored.Unavailable || stored.Quota.Exceeded || stored.Status != StatusActive {
 		t.Fatalf("expected quota rest to clear, status=%q unavailable=%v quota=%+v", stored.Status, stored.Unavailable, stored.Quota)
+	}
+}
+
+func TestManager_RefreshAuth_ClearsCodexWeeklyQuotaRestWhenRecovered(t *testing.T) {
+	ctx := context.Background()
+	mgr := NewManager(nil, nil, nil)
+	exec := &codexQuotaRefreshExecutor{updated: &Auth{Metadata: map[string]any{
+		MetadataCodexWeeklyQuotaRemainingRatioKey: 0.5,
+	}}}
+	mgr.RegisterExecutor(exec)
+	auth := &Auth{
+		ID:             "codex-recovered-weekly-quota",
+		Provider:       "codex",
+		Status:         StatusError,
+		StatusMessage:  "codex_weekly_quota_low: remaining_ratio=0.00",
+		Unavailable:    true,
+		NextRetryAfter: time.Now().Add(4 * 24 * time.Hour),
+		Quota: QuotaState{
+			Exceeded:      true,
+			Reason:        codexWeeklyQuotaLowReason,
+			NextRecoverAt: time.Now().Add(4 * 24 * time.Hour),
+		},
+		Metadata: map[string]any{"type": "codex", "access_token": "tok"},
+	}
+	if _, err := mgr.Register(ctx, auth); err != nil {
+		t.Fatalf("Register returned error: %v", err)
+	}
+
+	mgr.refreshAuth(ctx, auth.ID)
+
+	stored, ok := mgr.GetByID(auth.ID)
+	if !ok {
+		t.Fatal("expected auth to remain registered")
+	}
+	if stored.Unavailable || stored.Quota.Exceeded || stored.Status != StatusActive {
+		t.Fatalf("expected weekly quota rest to clear, status=%q unavailable=%v quota=%+v", stored.Status, stored.Unavailable, stored.Quota)
 	}
 }
 

@@ -63,7 +63,7 @@ func TestProbeCodexPlanAcrossPoolPrefersExistingBoundEntryWhenStillPaid(t *testi
 	}
 	cliproxyauth.SetBoundProxyEntry(auth, "bound-node")
 
-	plan, bound, _, _, ok, err := ProbeCodexPlanAcrossPool(context.Background(), cfg, auth, "token")
+	plan, bound, _, _, _, ok, err := ProbeCodexPlanAcrossPool(context.Background(), cfg, auth, "token")
 	if err != nil {
 		t.Fatalf("ProbeCodexPlanAcrossPool error = %v", err)
 	}
@@ -122,7 +122,7 @@ func TestProbeCodexPlanAcrossPoolFallsBackWhenExistingBoundEntryIsFree(t *testin
 	}
 	cliproxyauth.SetBoundProxyEntry(auth, "bound-node")
 
-	plan, bound, _, _, ok, err := ProbeCodexPlanAcrossPool(context.Background(), cfg, auth, "token")
+	plan, bound, _, _, _, ok, err := ProbeCodexPlanAcrossPool(context.Background(), cfg, auth, "token")
 	if err != nil {
 		t.Fatalf("ProbeCodexPlanAcrossPool error = %v", err)
 	}
@@ -154,7 +154,7 @@ func TestProbeCodexPlanAcrossPoolReturnsSupportedModelsFromPaidPath(t *testing.T
 		}, nil
 	}
 
-	plan, _, models, _, ok, err := ProbeCodexPlanAcrossPool(context.Background(), &config.Config{}, &cliproxyauth.Auth{Provider: "codex"}, "token")
+	plan, _, models, _, _, ok, err := ProbeCodexPlanAcrossPool(context.Background(), &config.Config{}, &cliproxyauth.Auth{Provider: "codex"}, "token")
 	if err != nil {
 		t.Fatalf("ProbeCodexPlanAcrossPool error = %v", err)
 	}
@@ -169,6 +169,33 @@ func TestProbeCodexPlanAcrossPoolReturnsSupportedModelsFromPaidPath(t *testing.T
 	}
 }
 
+func TestProbeCodexPlanAcrossPoolReturnsWeeklyQuotaFromPaidPath(t *testing.T) {
+	orig := fetchUsageInfoWithProxy
+	defer func() { fetchUsageInfoWithProxy = orig }()
+
+	weeklyQuota := &codexauth.WhamQuotaWindow{RemainingRatio: 0}
+	fetchUsageInfoWithProxy = func(ctx context.Context, proxyURL, accessToken string) (codexauth.WhamUsageInfo, error) {
+		return codexauth.WhamUsageInfo{
+			PlanType:    "plus",
+			WeeklyQuota: weeklyQuota,
+		}, nil
+	}
+
+	plan, _, _, _, gotWeeklyQuota, ok, err := ProbeCodexPlanAcrossPool(context.Background(), &config.Config{}, &cliproxyauth.Auth{Provider: "codex"}, "token")
+	if err != nil {
+		t.Fatalf("ProbeCodexPlanAcrossPool error = %v", err)
+	}
+	if !ok {
+		t.Fatal("probeOK = false, want true")
+	}
+	if plan != "plus" {
+		t.Fatalf("plan = %q, want plus", plan)
+	}
+	if gotWeeklyQuota != weeklyQuota {
+		t.Fatalf("weekly quota = %+v, want %+v", gotWeeklyQuota, weeklyQuota)
+	}
+}
+
 func TestProbeCodexPlanAcrossPoolReturnsTerminalAuthErrorWhenAllPathsUnauthorized(t *testing.T) {
 	orig := fetchUsageInfoWithProxy
 	defer func() { fetchUsageInfoWithProxy = orig }()
@@ -180,7 +207,7 @@ func TestProbeCodexPlanAcrossPoolReturnsTerminalAuthErrorWhenAllPathsUnauthorize
 		}
 	}
 
-	_, _, _, _, ok, err := ProbeCodexPlanAcrossPool(context.Background(), &config.Config{}, &cliproxyauth.Auth{Provider: "codex"}, "token")
+	_, _, _, _, _, ok, err := ProbeCodexPlanAcrossPool(context.Background(), &config.Config{}, &cliproxyauth.Auth{Provider: "codex"}, "token")
 	if ok {
 		t.Fatalf("probeOK = true, want false")
 	}
@@ -227,7 +254,7 @@ func TestProbeCodexPlanAcrossPoolReturnsTerminalAuthErrorWithMixedProbeFailures(
 		},
 	}
 
-	_, _, _, _, ok, err := ProbeCodexPlanAcrossPool(context.Background(), cfg, &cliproxyauth.Auth{Provider: "codex", ProxyPool: "free-egress"}, "token")
+	_, _, _, _, _, ok, err := ProbeCodexPlanAcrossPool(context.Background(), cfg, &cliproxyauth.Auth{Provider: "codex", ProxyPool: "free-egress"}, "token")
 	if ok {
 		t.Fatalf("probeOK = true, want false")
 	}
@@ -279,7 +306,7 @@ func TestProbeCodexPlanAcrossPoolStartsWithStablePreferredEntryWhenUnbound(t *te
 		return codexauth.WhamUsageInfo{PlanType: "free"}, nil
 	}
 
-	plan, bound, _, _, ok, err := ProbeCodexPlanAcrossPool(context.Background(), cfg, auth, "token")
+	plan, bound, _, _, _, ok, err := ProbeCodexPlanAcrossPool(context.Background(), cfg, auth, "token")
 	if err != nil {
 		t.Fatalf("ProbeCodexPlanAcrossPool error = %v", err)
 	}
@@ -341,7 +368,7 @@ func TestProbeCodexPlanAcrossPoolStartsWithIPv6BindLease(t *testing.T) {
 		URL:       "bind://[2602:294:0:eb::42]",
 	})
 
-	plan, bound, _, _, ok, err := ProbeCodexPlanAcrossPool(context.Background(), cfg, auth, "token")
+	plan, bound, _, _, _, ok, err := ProbeCodexPlanAcrossPool(context.Background(), cfg, auth, "token")
 	if err != nil {
 		t.Fatalf("ProbeCodexPlanAcrossPool error = %v", err)
 	}
@@ -400,7 +427,7 @@ func TestProbeCodexPlanAcrossPoolWithIPv6BindLeaseDoesNotProbePoolEntries(t *tes
 		URL:       "bind://[2602:294:0:eb::42]",
 	})
 
-	plan, bound, _, _, ok, err := ProbeCodexPlanAcrossPool(context.Background(), cfg, auth, "token")
+	plan, bound, _, _, _, ok, err := ProbeCodexPlanAcrossPool(context.Background(), cfg, auth, "token")
 	if err != nil {
 		t.Fatalf("ProbeCodexPlanAcrossPool error = %v", err)
 	}

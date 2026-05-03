@@ -82,6 +82,7 @@ const (
 	codexFrequentActivityThreshold  = 3
 	codexFiveHourQuotaRestThreshold = 0.20
 	codexFiveHourQuotaLowReason     = "codex_5h_quota_low"
+	codexWeeklyQuotaLowReason       = "codex_weekly_quota_low"
 	codexSparkUsageLimitReason      = "codex_spark_usage_limit"
 	codexStandardUsageLimitReason   = "codex_standard_usage_limit"
 )
@@ -1592,6 +1593,9 @@ func shouldPreserveRuntimeUsageLimit(auth, existing *Auth, now time.Time) bool {
 		return false
 	}
 	if !isCodexAuth(existing) {
+		return false
+	}
+	if auth.Quota.Exceeded && (auth.Quota.Reason == codexFiveHourQuotaLowReason || auth.Quota.Reason == codexWeeklyQuotaLowReason) {
 		return false
 	}
 	if !existing.Quota.Exceeded || existing.Quota.Reason != "usage_limit" {
@@ -3836,7 +3840,7 @@ func clearAggregatedAvailability(auth *Auth) {
 	if auth == nil {
 		return
 	}
-	if auth.Quota.Exceeded && auth.Quota.Reason == codexFiveHourQuotaLowReason {
+	if auth.Quota.Exceeded && (auth.Quota.Reason == codexFiveHourQuotaLowReason || auth.Quota.Reason == codexWeeklyQuotaLowReason) {
 		return
 	}
 	auth.Unavailable = false
@@ -3868,7 +3872,7 @@ func clearAuthStateOnSuccess(auth *Auth, now time.Time) {
 	if auth == nil {
 		return
 	}
-	if auth.Quota.Exceeded && auth.Quota.Reason == codexFiveHourQuotaLowReason {
+	if auth.Quota.Exceeded && (auth.Quota.Reason == codexFiveHourQuotaLowReason || auth.Quota.Reason == codexWeeklyQuotaLowReason) {
 		auth.UpdatedAt = now
 		return
 	}
@@ -4071,7 +4075,7 @@ func codexPlanTypeForAuth(auth *Auth) string {
 
 func codexPlanAllowsSparkModels(planType string) bool {
 	switch normalizedPlanTypeKey(planType) {
-	case "pro", "plus", "prolite":
+	case "pro", "prolite":
 		return true
 	default:
 		return false
@@ -4716,11 +4720,25 @@ func applyCodexFiveHourQuotaRest(auth *Auth, now time.Time) {
 	if auth == nil || !isCodexAuth(auth) {
 		return
 	}
-	ratio, ok := codexFiveHourRemainingRatio(auth)
-	if !ok {
+	if ratio, okWeekly := codexWeeklyRemainingRatio(auth); okWeekly && ratio <= 0 {
+		next := codexWeeklyResetAt(auth)
+		if next.IsZero() || !next.After(now) {
+			next = now.Add(codexColdRefreshInterval)
+		}
+		auth.Unavailable = true
+		auth.Status = StatusError
+		auth.StatusMessage = "codex_weekly_quota_low: remaining_ratio=" + strconv.FormatFloat(ratio, 'f', 2, 64)
+		auth.NextRetryAfter = next
+		auth.Quota = QuotaState{
+			Exceeded:      true,
+			Reason:        codexWeeklyQuotaLowReason,
+			NextRecoverAt: next,
+			UpdatedAt:     now,
+		}
 		return
 	}
-	if ratio < codexFiveHourQuotaRestThreshold {
+	ratio, ok := codexFiveHourRemainingRatio(auth)
+	if ok && ratio < codexFiveHourQuotaRestThreshold {
 		next := codexFiveHourResetAt(auth)
 		if next.IsZero() || !next.After(now) {
 			next = now.Add(codexColdRefreshInterval)
@@ -4747,11 +4765,14 @@ func applyCodexFiveHourQuotaRest(auth *Auth, now time.Time) {
 }
 
 func codexQuotaRefreshRecoveredState(auth *Auth, hasFiveHourRatio bool, now time.Time) bool {
-	if auth == nil || !hasFiveHourRatio {
+	if auth == nil {
 		return false
 	}
-	if auth.Quota.Exceeded && auth.Quota.Reason == codexFiveHourQuotaLowReason {
+	if auth.Quota.Exceeded && auth.Quota.Reason == codexWeeklyQuotaLowReason {
 		return true
+	}
+	if auth.Quota.Exceeded && auth.Quota.Reason == codexFiveHourQuotaLowReason {
+		return hasFiveHourRatio
 	}
 	if auth.Quota.Exceeded && auth.Quota.Reason == "usage_limit" {
 		next := auth.Quota.NextRecoverAt
@@ -4784,6 +4805,35 @@ func codexFiveHourResetAt(auth *Auth) time.Time {
 		"codex_5h_reset_at",
 		"five_hour_reset_at",
 		"5h_reset_at",
+	); ok {
+		return ts
+	}
+	return time.Time{}
+}
+
+func codexWeeklyRemainingRatio(auth *Auth) (float64, bool) {
+	if auth == nil || len(auth.Metadata) == 0 {
+		return 0, false
+	}
+	return floatFromMetadata(auth.Metadata,
+		MetadataCodexWeeklyQuotaRemainingRatioKey,
+		"codex_weekly_remaining_ratio",
+		"weekly_remaining_ratio",
+		"week_remaining_ratio",
+		"7d_remaining_ratio",
+	)
+}
+
+func codexWeeklyResetAt(auth *Auth) time.Time {
+	if auth == nil || len(auth.Metadata) == 0 {
+		return time.Time{}
+	}
+	if ts, ok := lookupMetadataTime(auth.Metadata,
+		MetadataCodexWeeklyQuotaResetAtKey,
+		"codex_weekly_reset_at",
+		"weekly_reset_at",
+		"week_reset_at",
+		"7d_reset_at",
 	); ok {
 		return ts
 	}

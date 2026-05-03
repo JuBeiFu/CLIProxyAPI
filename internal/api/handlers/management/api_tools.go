@@ -292,12 +292,14 @@ func (h *Handler) captureCodexWhamUsageSnapshot(ctx context.Context, auth *corea
 	}
 
 	now := time.Now()
-	quota := codexauth.ParseWhamUsageFiveHourQuota(body)
-	if quota == nil {
-		log.Debug("codex wham usage response did not include parseable 5h quota snapshot")
+	fiveHourQuota := codexauth.ParseWhamUsageFiveHourQuota(body)
+	weeklyQuota := codexauth.ParseWhamUsageWeeklyQuota(body)
+	if fiveHourQuota == nil && weeklyQuota == nil {
+		log.Debug("codex wham usage response did not include parseable quota snapshot")
 		return
 	}
-	applyCodexFiveHourQuotaMetadataForManagement(auth, quota, now)
+	applyCodexFiveHourQuotaMetadataForManagement(auth, fiveHourQuota, now)
+	applyCodexWeeklyQuotaMetadataForManagement(auth, weeklyQuota, now)
 	auth.UpdatedAt = now
 	if _, err := h.authManager.Update(ctx, auth); err != nil {
 		log.WithError(err).Debug("failed to persist codex wham usage quota snapshot")
@@ -310,6 +312,14 @@ func applyCodexFiveHourQuotaMetadataForManagement(auth *coreauth.Auth, quota *co
 	}
 	if auth.Metadata == nil {
 		auth.Metadata = make(map[string]any)
+	}
+	if quota == nil {
+		delete(auth.Metadata, coreauth.MetadataCodexFiveHourQuotaRemainingRatioKey)
+		delete(auth.Metadata, coreauth.MetadataCodexFiveHourQuotaResetAtKey)
+		delete(auth.Metadata, coreauth.MetadataCodexFiveHourQuotaLimitKey)
+		delete(auth.Metadata, coreauth.MetadataCodexFiveHourQuotaRemainingKey)
+		auth.Metadata[coreauth.MetadataCodexFiveHourQuotaUpdatedAtKey] = now.UTC().Format(time.RFC3339)
+		return
 	}
 	auth.Metadata[coreauth.MetadataCodexFiveHourQuotaRemainingRatioKey] = quota.RemainingRatio
 	auth.Metadata[coreauth.MetadataCodexFiveHourQuotaUpdatedAtKey] = now.UTC().Format(time.RFC3339)
@@ -327,6 +337,40 @@ func applyCodexFiveHourQuotaMetadataForManagement(auth *coreauth.Auth, quota *co
 		auth.Metadata[coreauth.MetadataCodexFiveHourQuotaResetAtKey] = quota.ResetAt.UTC().Format(time.RFC3339)
 	} else {
 		delete(auth.Metadata, coreauth.MetadataCodexFiveHourQuotaResetAtKey)
+	}
+}
+
+func applyCodexWeeklyQuotaMetadataForManagement(auth *coreauth.Auth, quota *codexauth.WhamQuotaWindow, now time.Time) {
+	if auth == nil {
+		return
+	}
+	if auth.Metadata == nil {
+		auth.Metadata = make(map[string]any)
+	}
+	if quota == nil {
+		delete(auth.Metadata, coreauth.MetadataCodexWeeklyQuotaRemainingRatioKey)
+		delete(auth.Metadata, coreauth.MetadataCodexWeeklyQuotaResetAtKey)
+		delete(auth.Metadata, coreauth.MetadataCodexWeeklyQuotaLimitKey)
+		delete(auth.Metadata, coreauth.MetadataCodexWeeklyQuotaRemainingKey)
+		auth.Metadata[coreauth.MetadataCodexWeeklyQuotaUpdatedAtKey] = now.UTC().Format(time.RFC3339)
+		return
+	}
+	auth.Metadata[coreauth.MetadataCodexWeeklyQuotaRemainingRatioKey] = quota.RemainingRatio
+	auth.Metadata[coreauth.MetadataCodexWeeklyQuotaUpdatedAtKey] = now.UTC().Format(time.RFC3339)
+	if quota.Limit > 0 {
+		auth.Metadata[coreauth.MetadataCodexWeeklyQuotaLimitKey] = quota.Limit
+	} else {
+		delete(auth.Metadata, coreauth.MetadataCodexWeeklyQuotaLimitKey)
+	}
+	if quota.Remaining > 0 {
+		auth.Metadata[coreauth.MetadataCodexWeeklyQuotaRemainingKey] = quota.Remaining
+	} else {
+		delete(auth.Metadata, coreauth.MetadataCodexWeeklyQuotaRemainingKey)
+	}
+	if !quota.ResetAt.IsZero() {
+		auth.Metadata[coreauth.MetadataCodexWeeklyQuotaResetAtKey] = quota.ResetAt.UTC().Format(time.RFC3339)
+	} else {
+		delete(auth.Metadata, coreauth.MetadataCodexWeeklyQuotaResetAtKey)
 	}
 }
 

@@ -850,6 +850,11 @@ func authFilesSignature(auths []*coreauth.Auth) string {
 			metadataSignatureValue(auth.Metadata, coreauth.MetadataCodexFiveHourQuotaLimitKey),
 			metadataSignatureValue(auth.Metadata, coreauth.MetadataCodexFiveHourQuotaRemainingKey),
 			metadataSignatureValue(auth.Metadata, coreauth.MetadataCodexFiveHourQuotaUpdatedAtKey),
+			metadataSignatureValue(auth.Metadata, coreauth.MetadataCodexWeeklyQuotaRemainingRatioKey),
+			metadataSignatureValue(auth.Metadata, coreauth.MetadataCodexWeeklyQuotaResetAtKey),
+			metadataSignatureValue(auth.Metadata, coreauth.MetadataCodexWeeklyQuotaLimitKey),
+			metadataSignatureValue(auth.Metadata, coreauth.MetadataCodexWeeklyQuotaRemainingKey),
+			metadataSignatureValue(auth.Metadata, coreauth.MetadataCodexWeeklyQuotaUpdatedAtKey),
 		}, "\x00"))
 	}
 	sort.Strings(parts)
@@ -876,26 +881,54 @@ func codexQuotaSnapshot(auth *coreauth.Auth) gin.H {
 		return nil
 	}
 
-	snapshot := gin.H{"window": "5h"}
+	fiveHourSnapshot := gin.H{"window": "5h"}
 	if raw, ok := auth.Metadata[coreauth.MetadataCodexFiveHourQuotaRemainingRatioKey]; ok {
-		snapshot["remaining_ratio"] = raw
+		fiveHourSnapshot["remaining_ratio"] = raw
 	}
 	if raw, ok := auth.Metadata[coreauth.MetadataCodexFiveHourQuotaLimitKey]; ok {
-		snapshot["limit"] = raw
+		fiveHourSnapshot["limit"] = raw
 	}
 	if raw, ok := auth.Metadata[coreauth.MetadataCodexFiveHourQuotaRemainingKey]; ok {
-		snapshot["remaining"] = raw
+		fiveHourSnapshot["remaining"] = raw
 	}
 	if raw, ok := auth.Metadata[coreauth.MetadataCodexFiveHourQuotaResetAtKey]; ok {
-		snapshot["reset_at"] = raw
+		fiveHourSnapshot["reset_at"] = raw
 	}
 	if raw, ok := auth.Metadata[coreauth.MetadataCodexFiveHourQuotaUpdatedAtKey]; ok {
-		snapshot["updated_at"] = raw
+		fiveHourSnapshot["updated_at"] = raw
 	}
-	if len(snapshot) == 1 {
+	weeklySnapshot := gin.H{"window": "week"}
+	if raw, ok := auth.Metadata[coreauth.MetadataCodexWeeklyQuotaRemainingRatioKey]; ok {
+		weeklySnapshot["remaining_ratio"] = raw
+	}
+	if raw, ok := auth.Metadata[coreauth.MetadataCodexWeeklyQuotaLimitKey]; ok {
+		weeklySnapshot["limit"] = raw
+	}
+	if raw, ok := auth.Metadata[coreauth.MetadataCodexWeeklyQuotaRemainingKey]; ok {
+		weeklySnapshot["remaining"] = raw
+	}
+	if raw, ok := auth.Metadata[coreauth.MetadataCodexWeeklyQuotaResetAtKey]; ok {
+		weeklySnapshot["reset_at"] = raw
+	}
+	if raw, ok := auth.Metadata[coreauth.MetadataCodexWeeklyQuotaUpdatedAtKey]; ok {
+		weeklySnapshot["updated_at"] = raw
+	}
+	if len(fiveHourSnapshot) == 1 && len(weeklySnapshot) == 1 {
 		return nil
 	}
-	return snapshot
+	if len(weeklySnapshot) == 1 {
+		return fiveHourSnapshot
+	}
+	if len(fiveHourSnapshot) == 1 {
+		return weeklySnapshot
+	}
+	return gin.H{
+		"window": "combined",
+		"windows": []gin.H{
+			fiveHourSnapshot,
+			weeklySnapshot,
+		},
+	}
 }
 
 func extractCodexIDTokenClaims(auth *coreauth.Auth) gin.H {

@@ -205,13 +205,14 @@ func TestFetchWhamUsageInfoExtractsSupportedModels(t *testing.T) {
 func TestFetchWhamUsageInfoExtractsFiveHourQuota(t *testing.T) {
 	t.Parallel()
 	resetAt := time.Now().Add(2 * time.Hour).UTC().Unix()
+	weeklyResetAt := time.Now().Add(4 * 24 * time.Hour).UTC().Unix()
 	auth := &CodexAuth{
 		httpClient: &http.Client{
 			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 				return &http.Response{
 					StatusCode: http.StatusOK,
 					Body: io.NopCloser(strings.NewReader(
-						`{"plan_type":"plus","rate_limits":[{"window":"5h","limit":100,"remaining":19,"resets_at":` + strconv.FormatInt(resetAt, 10) + `}]}`)),
+						`{"plan_type":"plus","rate_limits":[{"window":"5h","limit":100,"remaining":19,"resets_at":` + strconv.FormatInt(resetAt, 10) + `},{"window":"week","limit":200,"remaining":0,"resets_at":` + strconv.FormatInt(weeklyResetAt, 10) + `}]}`)),
 					Header:  make(http.Header),
 					Request: req,
 				}, nil
@@ -231,6 +232,15 @@ func TestFetchWhamUsageInfoExtractsFiveHourQuota(t *testing.T) {
 	if got.FiveHourQuota.ResetAt.IsZero() || got.FiveHourQuota.ResetAt.Unix() != resetAt {
 		t.Fatalf("ResetAt = %s, want unix %d", got.FiveHourQuota.ResetAt, resetAt)
 	}
+	if got.WeeklyQuota == nil {
+		t.Fatal("WeeklyQuota = nil, want parsed quota")
+	}
+	if got.WeeklyQuota.RemainingRatio != 0 {
+		t.Fatalf("Weekly RemainingRatio = %v, want 0", got.WeeklyQuota.RemainingRatio)
+	}
+	if got.WeeklyQuota.ResetAt.IsZero() || got.WeeklyQuota.ResetAt.Unix() != weeklyResetAt {
+		t.Fatalf("Weekly ResetAt = %s, want unix %d", got.WeeklyQuota.ResetAt, weeklyResetAt)
+	}
 }
 
 func TestParseWhamUsageFiveHourQuota(t *testing.T) {
@@ -245,6 +255,24 @@ func TestParseWhamUsageFiveHourQuota(t *testing.T) {
 	}
 	if got.RemainingRatio != 0.19 {
 		t.Fatalf("RemainingRatio = %v, want 0.19", got.RemainingRatio)
+	}
+}
+
+func TestParseWhamUsageWeeklyQuota(t *testing.T) {
+	t.Parallel()
+
+	resetAt := time.Now().Add(4 * 24 * time.Hour).UTC().Unix()
+	got := ParseWhamUsageWeeklyQuota([]byte(
+		`{"rate_limits":[{"window":"5h","limit":100,"remaining":19},{"window":"week","limit":200,"remaining":0,"resets_at":` + strconv.FormatInt(resetAt, 10) + `}]}`,
+	))
+	if got == nil {
+		t.Fatal("ParseWhamUsageWeeklyQuota = nil, want quota")
+	}
+	if got.RemainingRatio != 0 {
+		t.Fatalf("RemainingRatio = %v, want 0", got.RemainingRatio)
+	}
+	if got.ResetAt.IsZero() || got.ResetAt.Unix() != resetAt {
+		t.Fatalf("ResetAt = %s, want unix %d", got.ResetAt, resetAt)
 	}
 }
 

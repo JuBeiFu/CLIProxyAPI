@@ -59,6 +59,15 @@ const (
 	MetadataCodexFiveHourQuotaRemainingKey = "cliproxy_codex_5h_remaining"
 	MetadataCodexFiveHourQuotaUpdatedAtKey = "cliproxy_codex_5h_updated_at"
 
+	// MetadataCodexWeeklyQuota* stores the longer Codex account quota window
+	// returned by /wham/usage. This catches Plus weekly exhaustion even when
+	// the rolling 5-hour window still has remaining quota.
+	MetadataCodexWeeklyQuotaRemainingRatioKey = "cliproxy_codex_weekly_remaining_ratio"
+	MetadataCodexWeeklyQuotaResetAtKey        = "cliproxy_codex_weekly_reset_at"
+	MetadataCodexWeeklyQuotaLimitKey          = "cliproxy_codex_weekly_limit"
+	MetadataCodexWeeklyQuotaRemainingKey      = "cliproxy_codex_weekly_remaining"
+	MetadataCodexWeeklyQuotaUpdatedAtKey      = "cliproxy_codex_weekly_updated_at"
+
 	MetadataCodexForceTokenRefreshKey = "cliproxy_codex_force_token_refresh"
 
 	// BoundProxyEntryDirect is the sentinel value stored in
