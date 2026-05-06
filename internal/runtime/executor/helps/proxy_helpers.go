@@ -37,7 +37,7 @@ func NewProxyAwareHTTPClientWithResolution(ctx context.Context, cfg *config.Conf
 	}
 
 	// Priority 1/2: explicit auth/global proxy-url or proxy-pool selection.
-	if transport, resolution := proxypool.BuildHTTPRoundTripper(cfg, auth); transport != nil {
+	if transport, resolution := proxypool.BuildHTTPRoundTripperWithContext(ctx, cfg, auth); transport != nil {
 		httpClient.Transport = transport
 		return httpClient, resolution
 	}

@@ -1,6 +1,7 @@
 package proxypool
 
 import (
+	"context"
 	"hash/fnv"
 	"strconv"
 	"strings"
@@ -20,12 +21,51 @@ type Resolution struct {
 
 // Resolve applies proxy-url / proxy-pool precedence for one auth.
 func Resolve(cfg *config.Config, auth *coreauth.Auth) Resolution {
-	return ResolveWithHealth(cfg, auth, DefaultHealthManager())
+	return ResolveWithContext(context.Background(), cfg, auth, DefaultHealthManager())
 }
 
 // ResolveWithHealth applies proxy-url / proxy-pool precedence while skipping
 // pool entries that have been actively marked unhealthy by the health manager.
 func ResolveWithHealth(cfg *config.Config, auth *coreauth.Auth, manager *HealthManager) Resolution {
+	return ResolveWithContext(context.Background(), cfg, auth, manager)
+}
+
+func ResolveWithContext(ctx context.Context, cfg *config.Config, auth *coreauth.Auth, manager *HealthManager) Resolution {
+	if route, ok := RequestRouteFromContext(ctx); ok {
+		poolName := strings.TrimSpace(route.Pool)
+		if poolName == "" {
+			if auth != nil {
+				poolName = strings.TrimSpace(auth.ProxyPool)
+			}
+			if poolName == "" && cfg != nil {
+				poolName = strings.TrimSpace(cfg.DefaultProxyPool)
+			}
+		}
+		if route.Direct {
+			return Resolution{
+				ProxyPool:        poolName,
+				ProxyName:        strings.TrimSpace(route.Entry),
+				Source:           "request-route-direct",
+				FallbackToDirect: true,
+			}
+		}
+		if entry, okEntry := findPoolEntryByName(cfg, poolName, route.Entry); okEntry {
+			fallbackToDirect := false
+			if cfg != nil {
+				if pool := cfg.ProxyPoolByName(poolName); pool != nil {
+					fallbackToDirect = pool.FallbackToDirect
+				}
+			}
+			return Resolution{
+				ProxyURL:         entry.URL,
+				ProxyPool:        poolName,
+				ProxyName:        entry.Name,
+				Source:           "request-route",
+				FallbackToDirect: fallbackToDirect,
+			}
+		}
+	}
+
 	if auth != nil {
 		if proxyURL := strings.TrimSpace(auth.ProxyURL); proxyURL != "" {
 			return Resolution{
@@ -139,6 +179,23 @@ func ResolveWithHealth(cfg *config.Config, auth *coreauth.Auth, manager *HealthM
 	}
 
 	return Resolution{Source: "direct"}
+}
+
+func findPoolEntryByName(cfg *config.Config, poolName, entryName string) (config.ProxyPoolEntry, bool) {
+	if cfg == nil {
+		return config.ProxyPoolEntry{}, false
+	}
+	pool := cfg.ProxyPoolByName(strings.TrimSpace(poolName))
+	if pool == nil {
+		return config.ProxyPoolEntry{}, false
+	}
+	needle := strings.TrimSpace(entryName)
+	for _, entry := range pool.Entries {
+		if strings.EqualFold(strings.TrimSpace(entry.Name), needle) {
+			return entry, true
+		}
+	}
+	return config.ProxyPoolEntry{}, false
 }
 
 func selectPoolEntry(pool *config.ProxyPool, auth *coreauth.Auth) (config.ProxyPoolEntry, bool) {

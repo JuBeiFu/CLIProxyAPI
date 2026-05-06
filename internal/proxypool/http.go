@@ -2,6 +2,7 @@ package proxypool
 
 import (
 	"bytes"
+	"context"
 	"io"
 	"net/http"
 	"sync"
@@ -17,7 +18,11 @@ var httpRoundTripperCache sync.Map
 // BuildHTTPRoundTripper resolves the effective proxy selection and returns a
 // round tripper that optionally falls back to direct mode.
 func BuildHTTPRoundTripper(cfg *config.Config, auth *coreauth.Auth) (http.RoundTripper, Resolution) {
-	resolution := Resolve(cfg, auth)
+	return BuildHTTPRoundTripperWithContext(context.Background(), cfg, auth)
+}
+
+func BuildHTTPRoundTripperWithContext(ctx context.Context, cfg *config.Config, auth *coreauth.Auth) (http.RoundTripper, Resolution) {
+	resolution := ResolveWithContext(ctx, cfg, auth, DefaultHealthManager())
 	return BuildHTTPRoundTripperForResolution(resolution), resolution
 }
 
