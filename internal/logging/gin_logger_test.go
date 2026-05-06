@@ -58,3 +58,30 @@ func TestGinLogrusRecoveryHandlesRegularPanic(t *testing.T) {
 		t.Fatalf("expected 500, got %d", recorder.Code)
 	}
 }
+
+func TestGinLogrusLoggerPrefersInboundOneAPIRequestID(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	engine := gin.New()
+	engine.Use(GinLogrusLogger())
+
+	const inbound = "oneapi-req-123"
+	engine.POST("/v1/responses", func(c *gin.Context) {
+		if got := GetGinRequestID(c); got != inbound {
+			t.Fatalf("gin request id = %q, want %q", got, inbound)
+		}
+		if got := GetRequestID(c.Request.Context()); got != inbound {
+			t.Fatalf("context request id = %q, want %q", got, inbound)
+		}
+		c.Status(http.StatusNoContent)
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	req.Header.Set("X-Oneapi-Request-Id", inbound)
+	recorder := httptest.NewRecorder()
+
+	engine.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusNoContent {
+		t.Fatalf("expected 204, got %d", recorder.Code)
+	}
+}

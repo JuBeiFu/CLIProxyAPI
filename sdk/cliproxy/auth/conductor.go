@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/codexroute"
 	internalconfig "github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/performance"
@@ -181,8 +182,17 @@ type PerformanceScorer interface {
 	ScoreCandidates(candidates []performance.ScoreCandidate, cfg performance.Config) []performance.Score
 }
 
+type CodexRouteController interface {
+	RoutePlan(authID string) (codexroute.AuthRoutePlan, bool)
+	MarkHedgeWinner(authID string, route codexroute.RouteDescriptor, checkedAt time.Time)
+}
+
 type performanceScorerHolder struct {
 	scorer PerformanceScorer
+}
+
+type codexRouteControllerHolder struct {
+	controller CodexRouteController
 }
 
 // Hook captures lifecycle callbacks for observing auth changes.
@@ -241,6 +251,7 @@ type Manager struct {
 	// performanceRoutingConfig stores the latest auth performance routing controls.
 	performanceRoutingConfig atomic.Value
 	performanceScorer        atomic.Value
+	codexRouteController     atomic.Value
 
 	responseBindingsMu sync.Mutex
 	responseBindings   map[string]string
@@ -301,6 +312,7 @@ func NewManager(store Store, selector Selector, hook Hook) *Manager {
 	performanceCfg := performance.DefaultConfig()
 	manager.performanceRoutingConfig.Store(performanceCfg)
 	manager.performanceScorer.Store(performanceScorerHolder{})
+	manager.codexRouteController.Store(codexRouteControllerHolder{})
 	manager.apiKeyModelAlias.Store(apiKeyModelAliasTable(nil))
 	manager.scheduler = newAuthScheduler(selector)
 	manager.scheduler.setPerformanceRoutingConfig(performanceCfg)
@@ -696,6 +708,21 @@ func (m *Manager) SetPerformanceScorer(scorer PerformanceScorer) {
 	if m.scheduler != nil {
 		m.scheduler.setPerformanceScorer(scorer)
 	}
+}
+
+func (m *Manager) SetCodexRouteController(controller CodexRouteController) {
+	if m == nil {
+		return
+	}
+	m.codexRouteController.Store(codexRouteControllerHolder{controller: controller})
+}
+
+func (m *Manager) codexRouteControllerValue() CodexRouteController {
+	if m == nil {
+		return nil
+	}
+	holder, _ := m.codexRouteController.Load().(codexRouteControllerHolder)
+	return holder.controller
 }
 
 // SetStore swaps the underlying persistence store.
@@ -1206,6 +1233,191 @@ func (m *Manager) wrapStreamResult(ctx context.Context, auth *Auth, provider, re
 	return &cliproxyexecutor.StreamResult{Headers: headers, Chunks: out}
 }
 
+type hedgedStreamBootstrapResult struct {
+	route    codexroute.RouteDescriptor
+	result   *cliproxyexecutor.StreamResult
+	buffered []cliproxyexecutor.StreamChunk
+	closed   bool
+	err      error
+}
+
+func streamBootstrapReady(result hedgedStreamBootstrapResult) bool {
+	return result.err == nil && !(result.closed && len(result.buffered) == 0)
+}
+
+func (m *Manager) startStreamBootstrapAttempt(ctx context.Context, executor ProviderExecutor, auth *Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, route codexroute.RouteDescriptor) (context.CancelFunc, <-chan hedgedStreamBootstrapResult) {
+	attemptCtx, cancel := context.WithCancel(ctx)
+	attemptCtx = codexroute.WithRequestRoute(attemptCtx, route.RequestRoute())
+	out := make(chan hedgedStreamBootstrapResult, 1)
+	go func() {
+		defer close(out)
+		result, errStream := executor.ExecuteStream(attemptCtx, auth, req, opts)
+		if errStream != nil {
+			out <- hedgedStreamBootstrapResult{route: route, err: errStream}
+			return
+		}
+		buffered, closed, bootstrapErr := readStreamBootstrap(attemptCtx, result.Chunks)
+		out <- hedgedStreamBootstrapResult{
+			route:    route,
+			result:   result,
+			buffered: buffered,
+			closed:   closed,
+			err:      bootstrapErr,
+		}
+	}()
+	return cancel, out
+}
+
+func discardHedgedAttempt(result *hedgedStreamBootstrapResult) {
+	if result == nil || result.result == nil || result.result.Chunks == nil {
+		return
+	}
+	discardStreamChunks(result.result.Chunks)
+}
+
+func (m *Manager) finalizeStreamAttempt(ctx context.Context, auth *Auth, provider, resultModel string, requestPayload []byte, lease *inflightLease, attempt hedgedStreamBootstrapResult) (*cliproxyexecutor.StreamResult, error) {
+	if attempt.err != nil {
+		if errCtx := ctx.Err(); errCtx != nil {
+			discardHedgedAttempt(&attempt)
+			lease.Release()
+			return nil, errCtx
+		}
+		rerr := &Error{Message: attempt.err.Error()}
+		if se, ok := errors.AsType[cliproxyexecutor.StatusError](attempt.err); ok && se != nil {
+			rerr.HTTPStatus = se.StatusCode()
+		}
+		result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr, RequestPayload: bytes.Clone(requestPayload)}
+		result.RetryAfter = retryAfterFromError(attempt.err)
+		m.MarkResult(ctx, result)
+		discardHedgedAttempt(&attempt)
+		lease.Release()
+		return nil, newStreamBootstrapError(attempt.err, attempt.resultHeaders())
+	}
+	if attempt.closed && len(attempt.buffered) == 0 {
+		emptyErr := &Error{Code: "empty_stream", Message: "upstream stream closed before first payload", Retryable: true}
+		result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: emptyErr, RequestPayload: bytes.Clone(requestPayload)}
+		m.MarkResult(ctx, result)
+		lease.Release()
+		return nil, newStreamBootstrapError(emptyErr, attempt.resultHeaders())
+	}
+	remaining := attempt.result.Chunks
+	if attempt.closed {
+		closedCh := make(chan cliproxyexecutor.StreamChunk)
+		close(closedCh)
+		remaining = closedCh
+	}
+	return m.wrapStreamResult(ctx, auth.Clone(), provider, resultModel, requestPayload, attempt.result.Headers, attempt.buffered, remaining, lease), nil
+}
+
+func (r hedgedStreamBootstrapResult) resultHeaders() http.Header {
+	if r.result == nil {
+		return nil
+	}
+	return r.result.Headers
+}
+
+func (m *Manager) codexRouteHedgeSettings(auth *Auth, provider string, execModels []string) (codexroute.AuthRoutePlan, time.Duration, bool) {
+	if m == nil || !isCodexAuth(auth) || !strings.EqualFold(strings.TrimSpace(provider), "codex") || len(execModels) != 1 {
+		return codexroute.AuthRoutePlan{}, 0, false
+	}
+	cfg, _ := m.runtimeConfig.Load().(*internalconfig.Config)
+	if cfg == nil || !cfg.CodexRouteManagement.Enabled || cfg.CodexRouteManagement.FirstPayloadHedgeAfter <= 0 {
+		return codexroute.AuthRoutePlan{}, 0, false
+	}
+	controller := m.codexRouteControllerValue()
+	if controller == nil {
+		return codexroute.AuthRoutePlan{}, 0, false
+	}
+	plan, ok := controller.RoutePlan(auth.ID)
+	if !ok {
+		return codexroute.AuthRoutePlan{}, 0, false
+	}
+	if strings.EqualFold(strings.TrimSpace(plan.Primary.Entry), strings.TrimSpace(plan.Standby.Entry)) && strings.EqualFold(strings.TrimSpace(plan.Primary.Pool), strings.TrimSpace(plan.Standby.Pool)) {
+		return codexroute.AuthRoutePlan{}, 0, false
+	}
+	return plan, cfg.CodexRouteManagement.FirstPayloadHedgeAfter, true
+}
+
+func (m *Manager) executeStreamWithCodexRouteHedge(ctx context.Context, executor ProviderExecutor, auth *Auth, provider, resultModel string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, lease *inflightLease, plan codexroute.AuthRoutePlan, hedgeAfter time.Duration) (*cliproxyexecutor.StreamResult, error) {
+	primaryCancel, primaryCh := m.startStreamBootstrapAttempt(ctx, executor, auth, req, opts, plan.Primary)
+
+	timer := time.NewTimer(hedgeAfter)
+	defer timer.Stop()
+	timerCh := timer.C
+
+	var primaryResult *hedgedStreamBootstrapResult
+	var standbyResult *hedgedStreamBootstrapResult
+	var standbyCancel context.CancelFunc
+	var standbyCh <-chan hedgedStreamBootstrapResult
+
+	startStandby := func() {
+		if standbyCh != nil {
+			return
+		}
+		standbyCancel, standbyCh = m.startStreamBootstrapAttempt(ctx, executor, auth, req, opts, plan.Standby)
+	}
+
+	cancelPending := func() {
+		primaryCancel()
+		if standbyCancel != nil {
+			standbyCancel()
+		}
+		discardHedgedAttempt(primaryResult)
+		discardHedgedAttempt(standbyResult)
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			cancelPending()
+			lease.Release()
+			return nil, ctx.Err()
+		case result, ok := <-primaryCh:
+			if !ok {
+				primaryCh = nil
+				continue
+			}
+			primaryCh = nil
+			primaryResult = &result
+			if streamBootstrapReady(result) {
+				if standbyCancel != nil {
+					standbyCancel()
+				}
+				discardHedgedAttempt(standbyResult)
+				return m.finalizeStreamAttempt(ctx, auth, provider, resultModel, req.Payload, lease, result)
+			}
+			startStandby()
+		case <-timerCh:
+			timerCh = nil
+			startStandby()
+		case result, ok := <-standbyCh:
+			if !ok {
+				standbyCh = nil
+				continue
+			}
+			standbyCh = nil
+			standbyResult = &result
+			if streamBootstrapReady(result) {
+				primaryCancel()
+				discardHedgedAttempt(primaryResult)
+				if controller := m.codexRouteControllerValue(); controller != nil {
+					controller.MarkHedgeWinner(auth.ID, plan.Standby, time.Now())
+				}
+				return m.finalizeStreamAttempt(ctx, auth, provider, resultModel, req.Payload, lease, result)
+			}
+		}
+		if primaryResult != nil && standbyCh == nil && standbyResult == nil && timerCh == nil {
+			return m.finalizeStreamAttempt(ctx, auth, provider, resultModel, req.Payload, lease, *primaryResult)
+		}
+		if primaryResult != nil && standbyResult != nil {
+			if standbyResult.err != nil {
+				return m.finalizeStreamAttempt(ctx, auth, provider, resultModel, req.Payload, lease, *primaryResult)
+			}
+			return m.finalizeStreamAttempt(ctx, auth, provider, resultModel, req.Payload, lease, *standbyResult)
+		}
+	}
+}
+
 func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor ProviderExecutor, auth *Auth, provider string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, routeModel string, execModels []string, pooled bool, lease *inflightLease) (*cliproxyexecutor.StreamResult, error) {
 	if executor == nil {
 		lease.Release()
@@ -1216,6 +1428,9 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 		resultModel := resultModelForOptions(opts, m.stateModelForExecution(auth, routeModel, execModel, pooled))
 		execReq := req
 		execReq.Model = execModel
+		if routePlan, hedgeAfter, ok := m.codexRouteHedgeSettings(auth, provider, execModels); ok {
+			return m.executeStreamWithCodexRouteHedge(ctx, executor, auth, provider, resultModel, execReq, opts, lease, routePlan, hedgeAfter)
+		}
 		streamResult, errStream := executor.ExecuteStream(ctx, auth, execReq, opts)
 		if errStream != nil {
 			if errCtx := ctx.Err(); errCtx != nil {

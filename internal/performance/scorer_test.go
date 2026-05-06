@@ -100,6 +100,19 @@ func TestScoreCandidatesPreservesInputOrderOnTies(t *testing.T) {
 	}
 }
 
+func TestScoreCandidatesPenalizesExtremeGPT54LatencyMoreAggressively(t *testing.T) {
+	scorer := NewScorer(NewTracker(DefaultConfig()))
+	candidates := []ScoreCandidate{
+		{Provider: "codex", AuthID: "extreme-latency", Model: "gpt-5.4", OutputTPSEWMA: 45, LatencyMsEWMA: 260000, SampleReady: true},
+		{Provider: "codex", AuthID: "healthy", Model: "gpt-5.4", OutputTPSEWMA: 20, LatencyMsEWMA: 20000, SampleReady: true},
+	}
+
+	scores := scorer.ScoreCandidates(candidates, DefaultConfig())
+	if scores[0].AuthID != "healthy" {
+		t.Fatalf("top auth = %s, want healthy; scores=%+v", scores[0].AuthID, scores)
+	}
+}
+
 func findScore(scores []Score, authID string) (Score, bool) {
 	for _, score := range scores {
 		if score.AuthID == authID {

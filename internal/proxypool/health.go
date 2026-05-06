@@ -58,11 +58,18 @@ const (
 	DefaultPassiveSlowBytesPerSecond    = 20 * 1024
 	DefaultPassiveSlowStrikes           = 2
 	DefaultPassiveSlowCooldown          = 5 * time.Minute
+	DefaultPassiveAggressiveCooldown    = 15 * time.Minute
 	DefaultPassiveSuccessTotal          = 20 * time.Second
 	DefaultPassiveSuccessBytesPerSecond = 40 * 1024
+
+	codexPassiveSlowFirstByteThreshold       = 10 * time.Second
+	codexPassiveCoolingFirstByteThreshold    = 30 * time.Second
+	codexPassiveQuarantineFirstByteThreshold = 60 * time.Second
 )
 
 type PassiveOutcome struct {
+	Model         string
+	Endpoint      string
 	Total         time.Duration
 	FirstByte     time.Duration
 	ReadBody      time.Duration
@@ -226,6 +233,14 @@ func (m *HealthManager) ReportPassiveOutcome(poolName, entryName string, outcome
 		Latency:    outcome.Total,
 		CheckedAt:  outcome.CheckedAt,
 		Passive:    true,
+	}
+	if passiveOutcomeNeedsAggressiveIsolation(outcome) {
+		next.SlowStrikes = maxPassiveSlowStrikes(previous.SlowStrikes+DefaultPassiveSlowStrikes, DefaultPassiveSlowStrikes)
+		next.Healthy = false
+		next.Error = passiveAggressiveError(outcome, next.SlowStrikes)
+		next.UnhealthyUntil = outcome.CheckedAt.Add(DefaultPassiveAggressiveCooldown)
+		m.entries[poolKey][entryKey] = next
+		return
 	}
 	if passiveOutcomeIsSlow(outcome) {
 		next.SlowStrikes = previous.SlowStrikes + 1
@@ -584,6 +599,9 @@ func expectedStatusCodesForPool(pool config.ProxyPool) []int {
 }
 
 func passiveOutcomeIsSlow(outcome PassiveOutcome) bool {
+	if passiveOutcomeNeedsCodexTailPenalty(outcome) && outcome.FirstByte >= codexPassiveSlowFirstByteThreshold {
+		return true
+	}
 	if outcome.Error != "" && outcome.StatusCode == 0 {
 		return true
 	}
@@ -632,6 +650,38 @@ func passiveOutcomeIsFastSuccess(outcome PassiveOutcome) bool {
 	return bytesPerSecond(outcome.ResponseBytes, duration) >= DefaultPassiveSuccessBytesPerSecond
 }
 
+func passiveOutcomeNeedsAggressiveIsolation(outcome PassiveOutcome) bool {
+	if passiveOutcomeNeedsCodexTailPenalty(outcome) && outcome.FirstByte >= codexPassiveCoolingFirstByteThreshold {
+		return true
+	}
+	if !passiveOutcomeNeedsCodexTailPenalty(outcome) {
+		return false
+	}
+	errText := strings.ToLower(strings.TrimSpace(outcome.Error))
+	duration := outcome.ReadBody
+	if duration <= 0 {
+		duration = outcome.Total
+	}
+	if outcome.FirstByte >= codexPassiveQuarantineFirstByteThreshold {
+		return true
+	}
+	if strings.Contains(errText, "internal_error") {
+		return true
+	}
+	if strings.Contains(errText, "context canceled") || strings.Contains(errText, "client disconnected") || strings.Contains(errText, "client closed") {
+		return duration >= 180*time.Second
+	}
+	return duration >= 240*time.Second
+}
+
+func passiveOutcomeNeedsCodexTailPenalty(outcome PassiveOutcome) bool {
+	model := strings.ToLower(strings.TrimSpace(outcome.Model))
+	if !strings.HasPrefix(model, "gpt-5.4") && !strings.HasPrefix(model, "gpt-5.5") {
+		return false
+	}
+	return strings.EqualFold(strings.TrimSpace(outcome.Endpoint), "responses_stream")
+}
+
 func passiveSlowError(outcome PassiveOutcome, strikes int) string {
 	if strings.TrimSpace(outcome.Error) != "" {
 		return fmt.Sprintf("passive proxy error after %d strike(s): %s", strikes, strings.TrimSpace(outcome.Error))
@@ -645,6 +695,23 @@ func passiveSlowError(outcome PassiveOutcome, strikes int) string {
 		throughput = int64(bytesPerSecond(outcome.ResponseBytes, duration))
 	}
 	return fmt.Sprintf("passive proxy slow after %d strike(s): total=%s read_body=%s bytes=%d bps=%d status=%d", strikes, outcome.Total.Round(time.Millisecond), outcome.ReadBody.Round(time.Millisecond), outcome.ResponseBytes, throughput, outcome.StatusCode)
+}
+
+func passiveAggressiveError(outcome PassiveOutcome, strikes int) string {
+	base := passiveSlowError(outcome, strikes)
+	model := strings.TrimSpace(outcome.Model)
+	endpoint := strings.TrimSpace(outcome.Endpoint)
+	if model == "" && endpoint == "" {
+		return base
+	}
+	return fmt.Sprintf("%s model=%s endpoint=%s", base, model, endpoint)
+}
+
+func maxPassiveSlowStrikes(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }
 
 func bytesPerSecond(bytes int64, duration time.Duration) float64 {

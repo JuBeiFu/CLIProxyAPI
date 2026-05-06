@@ -131,6 +131,19 @@ routing:
   performance-weight-failure: 2.0
   performance-weight-inflight: 0.5
 
+# Codex auth -> proxy route maintenance and same-auth standby hedge.
+codex-route-management:
+  enabled: false
+  first-payload-hedge-after: 4s
+  keepalive-probe-interval: 5m
+  degraded-probe-interval: 45s
+  recovering-probe-interval: 30s
+  slow-first-byte-threshold: 4s
+  heavy-first-byte-threshold: 10s
+  cooling-first-byte-threshold: 30s
+  quarantine-first-byte-threshold: 60s
+  promotion-win-threshold: 2
+
 # When true, enable authentication for the WebSocket API (/v1/ws).
 ws-auth: false
 

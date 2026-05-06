@@ -114,3 +114,30 @@ func TestPluginIgnoresClientCanceledFailure(t *testing.T) {
 		t.Fatalf("client cancellation polluted auth performance: %+v", got)
 	}
 }
+
+func TestPluginKeepsLongLivedGPT54ClientCanceledFailure(t *testing.T) {
+	tracker := NewTracker(Config{Window: time.Minute, MinSamples: 1, EWMAAlpha: 1})
+	plugin := NewPlugin(tracker)
+	now := time.Date(2026, 5, 1, 2, 33, 0, 0, time.UTC)
+
+	plugin.HandleUsage(context.Background(), coreusage.Record{
+		Provider:    "codex",
+		Model:       "gpt-5.4",
+		AuthID:      "auth-a",
+		RequestedAt: now,
+		Latency:     5*time.Minute + 5*time.Second,
+		Failed:      true,
+		Detail: coreusage.Detail{
+			ErrorMessage: "context canceled",
+		},
+	})
+
+	snapshots := tracker.Snapshot(SnapshotFilter{}, now)
+	if len(snapshots) != 1 {
+		t.Fatalf("snapshot count = %d, want 1", len(snapshots))
+	}
+	got := snapshots[0]
+	if got.FailureCount != 1 {
+		t.Fatalf("FailureCount = %d, want 1", got.FailureCount)
+	}
+}

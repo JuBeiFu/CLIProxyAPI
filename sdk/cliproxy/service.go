@@ -372,10 +372,12 @@ func routingPerformanceConfigFromAppConfig(cfg *config.Config) performance.Confi
 func (s *Service) applyPerformanceRoutingConfig(cfg *config.Config) {
 	perfCfg := routingPerformanceConfigFromAppConfig(cfg)
 	performance.ConfigureDefault(perfCfg)
-	proxypool.SetDefaultCodexRouteRegistry(proxypool.NewCodexRouteRegistry(proxypool.CodexRouteConfigFromRuntimeConfig(cfg)))
+	reg := proxypool.NewCodexRouteRegistry(proxypool.CodexRouteConfigFromRuntimeConfig(cfg))
+	proxypool.SetDefaultCodexRouteRegistry(reg)
 	if s == nil || s.coreManager == nil {
 		return
 	}
+	s.coreManager.SetCodexRouteController(reg)
 	s.coreManager.SetPerformanceScorer(performance.NewScorer(performance.DefaultTracker()))
 	s.coreManager.SetPerformanceRoutingConfig(perfCfg)
 }

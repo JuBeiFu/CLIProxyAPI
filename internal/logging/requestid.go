@@ -4,6 +4,8 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"net/http"
+	"strings"
 
 	"github.com/gin-gonic/gin"
 )
@@ -14,6 +16,13 @@ type requestIDKey struct{}
 // ginRequestIDKey is the Gin context key for request IDs.
 const ginRequestIDKey = "__request_id__"
 
+var preferredRequestIDHeaders = []string{
+	"X-Oneapi-Request-Id",
+	"X-Newapi-Request-Id",
+	"X-Request-Id",
+	"X-Request-ID",
+}
+
 // GenerateRequestID creates a new 8-character hex request ID.
 func GenerateRequestID() string {
 	b := make([]byte, 4)
@@ -21,6 +30,19 @@ func GenerateRequestID() string {
 		return "00000000"
 	}
 	return hex.EncodeToString(b)
+}
+
+// RequestIDFromHeaders returns the first non-empty preferred correlation header.
+func RequestIDFromHeaders(header http.Header) string {
+	if header == nil {
+		return ""
+	}
+	for _, name := range preferredRequestIDHeaders {
+		if value := strings.TrimSpace(header.Get(name)); value != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 // WithRequestID returns a new context with the request ID attached.

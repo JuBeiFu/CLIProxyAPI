@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"strings"
+	"time"
 
 	coreusage "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/usage"
 )
@@ -59,6 +60,9 @@ func shouldSkipAuthPerformanceRecord(record coreusage.Record) bool {
 	statusCode := record.Detail.StatusCode
 	message := authPerformanceFailureText(record.Detail)
 	if isAuthPerformanceClientCancel(message) {
+		if shouldKeepAuthPerformanceClientCancel(record) {
+			return false
+		}
 		return true
 	}
 	if isAuthPerformanceSafetyBlock(message) {
@@ -74,6 +78,13 @@ func shouldSkipAuthPerformanceRecord(record coreusage.Record) bool {
 	default:
 		return false
 	}
+}
+
+func shouldKeepAuthPerformanceClientCancel(record coreusage.Record) bool {
+	if normalize(record.Provider) != "codex" || normalizeModel(record.Model) != "gpt-5.4" {
+		return false
+	}
+	return record.Latency >= 3*time.Minute
 }
 
 func authPerformanceFailureText(detail coreusage.Detail) string {

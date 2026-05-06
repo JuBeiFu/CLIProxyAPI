@@ -90,10 +90,51 @@ func TestLogSlowCodexUpstreamTimingSkipsFastRequests(t *testing.T) {
 		startedAt: time.Now().Add(-5 * time.Second),
 		httpDo:    4 * time.Second,
 		readBody:  500 * time.Millisecond,
+		streamCompleted: true,
 	})
 
 	if got := buf.String(); got != "" {
 		t.Fatalf("expected no log output for fast request, got %s", got)
+	}
+}
+
+func TestLogSlowCodexUpstreamTimingLogsFastIncompleteStreamFailures(t *testing.T) {
+	var buf bytes.Buffer
+	origOut := log.StandardLogger().Out
+	origLevel := log.StandardLogger().Level
+	log.SetOutput(&buf)
+	log.SetLevel(log.InfoLevel)
+	defer log.SetOutput(origOut)
+	defer log.SetLevel(origLevel)
+
+	ctx := logging.WithRequestID(context.Background(), "req-timing-fast-fail")
+	logSlowCodexUpstreamTiming(ctx, codexUpstreamTiming{
+		endpoint:        "responses_stream",
+		model:           "gpt-5.5",
+		authID:          "auth-fast-fail-1",
+		proxySource:     "proxy-pool",
+		proxyPool:       "free-egress",
+		proxyName:       "free-proxy-3",
+		status:          200,
+		startedAt:       time.Now().Add(-6 * time.Second),
+		httpDo:          5 * time.Second,
+		readBody:        400 * time.Millisecond,
+		traceFirstByte:  2 * time.Second,
+		streamErrText:   "stream error: stream disconnected before completion: stream closed before response.completed",
+		streamCompleted: false,
+	})
+
+	out := buf.String()
+	for _, part := range []string{
+		"codex upstream timing",
+		"request_id=req-timing-fast-fail",
+		"auth_id=auth-fast-fail-1",
+		"stream_completed=false",
+		"stream_err=stream error: stream disconnected before completion: stream closed before response.completed",
+	} {
+		if !strings.Contains(out, part) {
+			t.Fatalf("log output missing %q: %s", part, out)
+		}
 	}
 }
 
@@ -163,5 +204,70 @@ func TestRecordCodexProxyPassiveOutcomeIgnoresCompactFirstByte(t *testing.T) {
 	recordCodexProxyPassiveOutcome(timing, manager)
 	if !manager.IsUsableAt("free-egress", "free-proxy-10", now) {
 		t.Fatal("expected compact first-byte latency to stay out of passive proxy health")
+	}
+}
+
+func TestRecordCodexProxyPassiveOutcomeAggressivelyPenalizesLongGPT54Cancel(t *testing.T) {
+	manager := proxypool.NewHealthManager()
+	now := time.Now()
+	timing := codexUpstreamTiming{
+		endpoint:      "responses_stream",
+		model:         "gpt-5.4",
+		proxyPool:     "free-egress",
+		proxyName:     "free-proxy-14",
+		status:        200,
+		bytesRead:     1700000,
+		startedAt:     now.Add(-5 * time.Minute),
+		readBody:      4*time.Minute + 50*time.Second,
+		traceFirstByte: 900 * time.Millisecond,
+		streamErrText: "context canceled",
+	}
+
+	recordCodexProxyPassiveOutcome(timing, manager)
+	if manager.IsUsableAt("free-egress", "free-proxy-14", now) {
+		t.Fatal("expected long-lived gpt-5.4 cancellation to mark proxy unusable immediately")
+	}
+}
+
+func TestRecordCodexProxyPassiveOutcomeAggressivelyPenalizesGPT54InternalError(t *testing.T) {
+	manager := proxypool.NewHealthManager()
+	now := time.Now()
+	timing := codexUpstreamTiming{
+		endpoint:       "responses_stream",
+		model:          "gpt-5.4",
+		proxyPool:      "free-egress",
+		proxyName:      "free-proxy-13",
+		status:         200,
+		bytesRead:      1800000,
+		startedAt:      now.Add(-4 * time.Minute),
+		readBody:       3*time.Minute + 50*time.Second,
+		traceFirstByte: 800 * time.Millisecond,
+		streamErrText:  "stream error: stream ID 2889; INTERNAL_ERROR; received from peer",
+	}
+
+	recordCodexProxyPassiveOutcome(timing, manager)
+	if manager.IsUsableAt("free-egress", "free-proxy-13", now) {
+		t.Fatal("expected gpt-5.4 INTERNAL_ERROR to mark proxy unusable immediately")
+	}
+}
+
+func TestRecordCodexProxyPassiveOutcomeAggressivelyPenalizesVeryLongGPT54Success(t *testing.T) {
+	manager := proxypool.NewHealthManager()
+	now := time.Now()
+	timing := codexUpstreamTiming{
+		endpoint:       "responses_stream",
+		model:          "gpt-5.4",
+		proxyPool:      "free-egress",
+		proxyName:      "free-proxy-8",
+		status:         200,
+		bytesRead:      700000,
+		startedAt:      now.Add(-4*time.Minute - 10*time.Second),
+		readBody:       4 * time.Minute,
+		traceFirstByte: 700 * time.Millisecond,
+	}
+
+	recordCodexProxyPassiveOutcome(timing, manager)
+	if manager.IsUsableAt("free-egress", "free-proxy-8", now) {
+		t.Fatal("expected very long gpt-5.4 stream to mark proxy unusable immediately")
 	}
 }

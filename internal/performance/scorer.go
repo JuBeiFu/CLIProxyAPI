@@ -85,6 +85,7 @@ func (s *Scorer) ScoreCandidates(candidates []ScoreCandidate, cfg Config) []Scor
 			normalizedTPS := normalizeRange(candidate.OutputTPSEWMA, minTPS, maxTPS)
 			normalizedLatency := normalizeRange(candidate.LatencyMsEWMA, minLatency, maxLatency)
 			score.Score = normalizedTPS*cfg.WeightTPS - normalizedLatency*cfg.WeightLatency - candidate.FailureRateEWMA*cfg.WeightFailure - float64(candidate.Inflight)*cfg.WeightInflight
+			score.Score -= codexGPT54AggressivePenalty(candidate)
 			readyScores = append(readyScores, score.Score)
 		}
 		out = append(out, score)
@@ -99,6 +100,22 @@ func (s *Scorer) ScoreCandidates(candidates []ScoreCandidate, cfg Config) []Scor
 		return out[i].Score > out[j].Score
 	})
 	return out
+}
+
+func codexGPT54AggressivePenalty(candidate ScoreCandidate) float64 {
+	if normalize(candidate.Provider) != "codex" || normalizeModel(candidate.Model) != "gpt-5.4" {
+		return 0
+	}
+	switch {
+	case candidate.LatencyMsEWMA >= 240_000:
+		return 1.25
+	case candidate.LatencyMsEWMA >= 180_000:
+		return 0.8
+	case candidate.LatencyMsEWMA >= 120_000:
+		return 0.35
+	default:
+		return 0
+	}
 }
 
 func sanitizeScoreCandidate(candidate ScoreCandidate) ScoreCandidate {

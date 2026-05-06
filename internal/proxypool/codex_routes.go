@@ -5,6 +5,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/codexroute"
 	internalconfig "github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 )
 
@@ -19,11 +20,7 @@ const (
 	RouteStateQuarantined
 )
 
-type RouteDescriptor struct {
-	Pool   string
-	Entry  string
-	Direct bool
-}
+type RouteDescriptor = codexroute.RouteDescriptor
 
 type RoutePassiveOutcome struct {
 	CheckedAt  time.Time
@@ -33,9 +30,12 @@ type RoutePassiveOutcome struct {
 }
 
 type CodexRouteConfig struct {
+	CoolingFirstByteThreshold    time.Duration
 	PromotionWinThreshold        int
 	QuarantineFirstByteThreshold time.Duration
 }
+
+type AuthRoutePlan = codexroute.AuthRoutePlan
 
 type codexRouteEntry struct {
 	route       RouteDescriptor
@@ -63,6 +63,9 @@ func NewCodexRouteRegistry(cfg CodexRouteConfig) *CodexRouteRegistry {
 	if cfg.PromotionWinThreshold <= 0 {
 		cfg.PromotionWinThreshold = internalconfig.DefaultCodexRoutePromotionWinThreshold
 	}
+	if cfg.CoolingFirstByteThreshold <= 0 {
+		cfg.CoolingFirstByteThreshold = time.Duration(internalconfig.DefaultCodexRouteCoolingFirstByteThresholdSecs) * time.Second
+	}
 	if cfg.QuarantineFirstByteThreshold <= 0 {
 		cfg.QuarantineFirstByteThreshold = time.Duration(internalconfig.DefaultCodexRouteQuarantineThresholdSecs) * time.Second
 	}
@@ -77,6 +80,7 @@ func CodexRouteConfigFromRuntimeConfig(cfg *internalconfig.Config) CodexRouteCon
 		return CodexRouteConfig{}
 	}
 	return CodexRouteConfig{
+		CoolingFirstByteThreshold:    cfg.CodexRouteManagement.CoolingFirstByteThreshold,
 		PromotionWinThreshold:        cfg.CodexRouteManagement.PromotionWinThreshold,
 		QuarantineFirstByteThreshold: cfg.CodexRouteManagement.QuarantineFirstByteThreshold,
 	}
@@ -98,7 +102,7 @@ func (r *CodexRouteRegistry) UpsertCertifiedRoute(authID string, route RouteDesc
 		return
 	}
 	authKey := normalizeRouteAuthID(authID)
-	routeKey := route.key()
+	routeKey := routeDescriptorKey(route)
 	if authKey == "" || routeKey == "" {
 		return
 	}
@@ -139,7 +143,7 @@ func (r *CodexRouteRegistry) MarkHedgeWinner(authID string, route RouteDescripto
 		return
 	}
 	authKey := normalizeRouteAuthID(authID)
-	routeKey := route.key()
+	routeKey := routeDescriptorKey(route)
 	if authKey == "" || routeKey == "" {
 		return
 	}
@@ -208,12 +212,20 @@ func (r *CodexRouteRegistry) PrimaryAndStandby(authID string) (RouteDescriptor, 
 	return primary.route, standby.route, true
 }
 
+func (r *CodexRouteRegistry) RoutePlan(authID string) (AuthRoutePlan, bool) {
+	primary, standby, ok := r.PrimaryAndStandby(authID)
+	if !ok {
+		return AuthRoutePlan{}, false
+	}
+	return AuthRoutePlan{Primary: primary, Standby: standby}, true
+}
+
 func (r *CodexRouteRegistry) RecordPassiveOutcome(authID string, route RouteDescriptor, outcome RoutePassiveOutcome) {
 	if r == nil {
 		return
 	}
 	authKey := normalizeRouteAuthID(authID)
-	routeKey := route.key()
+	routeKey := routeDescriptorKey(route)
 	if authKey == "" || routeKey == "" {
 		return
 	}
@@ -234,13 +246,11 @@ func (r *CodexRouteRegistry) RecordPassiveOutcome(authID string, route RouteDesc
 	entry.lastChecked = outcome.CheckedAt
 	entry.lastError = strings.TrimSpace(outcome.Error)
 	if outcome.FirstByte >= r.cfg.QuarantineFirstByteThreshold {
-		entry.state = RouteStateQuarantined
-		if authRoutes.primaryKey == routeKey {
-			authRoutes.primaryKey = ""
-		}
-		if authRoutes.standbyKey == routeKey {
-			authRoutes.standbyKey = ""
-		}
+		r.demoteRouteLocked(authRoutes, routeKey, RouteStateQuarantined)
+		return
+	}
+	if outcome.FirstByte >= r.cfg.CoolingFirstByteThreshold || (!outcome.Successful && entry.lastError != "") {
+		r.demoteRouteLocked(authRoutes, routeKey, RouteStateCooling)
 		return
 	}
 	if authRoutes.primaryKey == routeKey {
@@ -267,7 +277,7 @@ func (r *CodexRouteRegistry) RouteState(authID string, route RouteDescriptor) Ro
 	if !ok || authRoutes == nil {
 		return RouteStateUnknown
 	}
-	if entry := authRoutes.routes[route.key()]; entry != nil {
+	if entry := authRoutes.routes[routeDescriptorKey(route)]; entry != nil {
 		return entry.state
 	}
 	return RouteStateUnknown
@@ -278,7 +288,7 @@ func (r *CodexRouteRegistry) ApplyProbeOutcome(authID string, route RouteDescrip
 		return
 	}
 	authKey := normalizeRouteAuthID(authID)
-	routeKey := route.key()
+	routeKey := routeDescriptorKey(route)
 	if authKey == "" || routeKey == "" {
 		return
 	}
@@ -299,13 +309,7 @@ func (r *CodexRouteRegistry) ApplyProbeOutcome(authID string, route RouteDescrip
 	entry.lastChecked = outcome.CheckedAt
 	entry.lastError = strings.TrimSpace(outcome.TerminalReason)
 	if !outcome.RouteConsistent {
-		entry.state = RouteStateQuarantined
-		if authRoutes.primaryKey == routeKey {
-			authRoutes.primaryKey = ""
-		}
-		if authRoutes.standbyKey == routeKey {
-			authRoutes.standbyKey = ""
-		}
+		r.demoteRouteLocked(authRoutes, routeKey, RouteStateQuarantined)
 		return
 	}
 	if authRoutes.primaryKey == routeKey {
@@ -327,7 +331,65 @@ func (r *CodexRouteRegistry) authRoutesLocked(authID string) *codexAuthRoutes {
 	return authRoutes
 }
 
-func (r RouteDescriptor) key() string {
+func (r *CodexRouteRegistry) demoteRouteLocked(authRoutes *codexAuthRoutes, routeKey string, state RouteState) {
+	if authRoutes == nil {
+		return
+	}
+	entry := authRoutes.routes[routeKey]
+	if entry == nil {
+		return
+	}
+	entry.state = state
+	if authRoutes.primaryKey == routeKey {
+		authRoutes.primaryKey = ""
+	}
+	if authRoutes.standbyKey == routeKey {
+		authRoutes.standbyKey = ""
+	}
+	r.repairRouteAssignmentsLocked(authRoutes)
+}
+
+func (r *CodexRouteRegistry) repairRouteAssignmentsLocked(authRoutes *codexAuthRoutes) {
+	if authRoutes == nil {
+		return
+	}
+	if authRoutes.primaryKey == "" {
+		if candidate := nextAssignableRouteKey(authRoutes, ""); candidate != "" {
+			authRoutes.primaryKey = candidate
+			if entry := authRoutes.routes[candidate]; entry != nil {
+				entry.state = RouteStatePrimary
+			}
+		}
+	}
+	if authRoutes.standbyKey == authRoutes.primaryKey {
+		authRoutes.standbyKey = ""
+	}
+	if authRoutes.standbyKey == "" {
+		if candidate := nextAssignableRouteKey(authRoutes, authRoutes.primaryKey); candidate != "" {
+			authRoutes.standbyKey = candidate
+			if candidate != authRoutes.primaryKey {
+				if entry := authRoutes.routes[candidate]; entry != nil {
+					entry.state = RouteStateStandby
+				}
+			}
+		}
+	}
+}
+
+func nextAssignableRouteKey(authRoutes *codexAuthRoutes, exclude string) string {
+	for key, entry := range authRoutes.routes {
+		if key == exclude || entry == nil {
+			continue
+		}
+		if entry.state == RouteStateCooling || entry.state == RouteStateQuarantined {
+			continue
+		}
+		return key
+	}
+	return ""
+}
+
+func routeDescriptorKey(r RouteDescriptor) string {
 	if r.Direct {
 		return normalizeRoutePart(r.Pool) + "|direct"
 	}

@@ -71,20 +71,21 @@ type codexUpstreamTiming struct {
 	traceIdleTime   time.Duration
 	streamLines     int
 	streamChunks    int
+	streamCompleted bool
 	streamErrText   string
 }
 
 func logSlowCodexUpstreamTiming(ctx context.Context, timing codexUpstreamTiming) {
 	total := time.Since(timing.startedAt)
-	if total < codexSlowTimingThreshold {
+	errText := strings.TrimSpace(timing.streamErrText)
+	if total < codexSlowTimingThreshold && errText == "" && timing.streamCompleted {
 		return
 	}
-	errText := strings.TrimSpace(timing.streamErrText)
 	if errText == "" {
 		errText = "-"
 	}
 	helps.LogWithRequestID(ctx).Infof(
-		"codex upstream timing endpoint=%s model=%s auth_id=%s proxy_source=%s proxy_pool=%s proxy_name=%s proxy_url=%s proxy_fallback_direct=%t status=%d total=%s prepare=%s http_do=%s read_body=%s translate=%s http_conn=%s http_tls=%s http_wrote_req=%s http_first_byte=%s http_conn_reused=%t http_conn_was_idle=%t http_conn_idle=%s response_bytes=%d stream_lines=%d stream_chunks=%d stream_err=%s",
+		"codex upstream timing endpoint=%s model=%s auth_id=%s proxy_source=%s proxy_pool=%s proxy_name=%s proxy_url=%s proxy_fallback_direct=%t status=%d total=%s prepare=%s http_do=%s read_body=%s translate=%s http_conn=%s http_tls=%s http_wrote_req=%s http_first_byte=%s http_conn_reused=%t http_conn_was_idle=%t http_conn_idle=%s response_bytes=%d stream_lines=%d stream_chunks=%d stream_completed=%t stream_err=%s",
 		timing.endpoint,
 		timing.model,
 		strings.TrimSpace(timing.authID),
@@ -109,6 +110,7 @@ func logSlowCodexUpstreamTiming(ctx context.Context, timing codexUpstreamTiming)
 		timing.bytesRead,
 		timing.streamLines,
 		timing.streamChunks,
+		timing.streamCompleted,
 		errText,
 	)
 }
@@ -125,6 +127,8 @@ func recordCodexProxyPassiveOutcome(timing codexUpstreamTiming, manager *proxypo
 		return
 	}
 	manager.ReportPassiveOutcome(timing.proxyPool, timing.proxyName, proxypool.PassiveOutcome{
+		Model:         timing.model,
+		Endpoint:      timing.endpoint,
 		Total:         total,
 		FirstByte:     passiveFirstByteForCodexTiming(timing),
 		ReadBody:      timing.readBody,
@@ -132,6 +136,28 @@ func recordCodexProxyPassiveOutcome(timing codexUpstreamTiming, manager *proxypo
 		StatusCode:    timing.status,
 		Error:         timing.streamErrText,
 		CheckedAt:     time.Now(),
+	})
+}
+
+func recordCodexRoutePassiveOutcome(timing codexUpstreamTiming, registry *proxypool.CodexRouteRegistry) {
+	if registry == nil {
+		return
+	}
+	if strings.TrimSpace(timing.authID) == "" || strings.TrimSpace(timing.proxyPool) == "" || strings.TrimSpace(timing.proxyName) == "" {
+		return
+	}
+	total := time.Since(timing.startedAt)
+	if total <= 0 {
+		return
+	}
+	registry.RecordPassiveOutcome(timing.authID, proxypool.RouteDescriptor{
+		Pool:  timing.proxyPool,
+		Entry: timing.proxyName,
+	}, proxypool.RoutePassiveOutcome{
+		CheckedAt:  time.Now(),
+		FirstByte:  passiveFirstByteForCodexTiming(timing),
+		Successful: timing.streamErrText == "" && timing.status >= http.StatusOK && timing.status < http.StatusMultipleChoices && timing.streamCompleted,
+		Error:      timing.streamErrText,
 	})
 }
 
@@ -144,6 +170,7 @@ func passiveFirstByteForCodexTiming(timing codexUpstreamTiming) time.Duration {
 
 func finishCodexUpstreamTiming(ctx context.Context, timing codexUpstreamTiming) {
 	recordCodexProxyPassiveOutcome(timing, proxypool.DefaultHealthManager())
+	recordCodexRoutePassiveOutcome(timing, proxypool.DefaultCodexRouteRegistry())
 	logSlowCodexUpstreamTiming(ctx, timing)
 }
 
@@ -414,6 +441,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 		if eventType != "response.completed" {
 			continue
 		}
+		timing.streamCompleted = true
 
 		if detail, ok := helps.ParseCodexUsage(eventData); ok {
 			reporter.Publish(ctx, detail)
@@ -562,6 +590,7 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 	helps.AppendAPIResponseChunk(ctx, e.cfg, data)
 	reporter.Publish(ctx, helps.ParseOpenAIUsage(data))
 	reporter.EnsurePublished(ctx)
+	timing.streamCompleted = true
 	var param any
 	translateStarted := time.Now()
 	out := sdktranslator.TranslateNonStream(ctx, to, from, req.Model, originalPayload, body, data, &param)
@@ -747,6 +776,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 				}
 				eventType := gjson.GetBytes(data, "type").String()
 				if eventType == "response.completed" {
+					timing.streamCompleted = true
 					if detail, ok := helps.ParseCodexUsage(data); ok {
 						reporter.Publish(ctx, detail)
 					}
@@ -768,6 +798,14 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 			reporter.PublishFailureWithError(ctx, errScan)
 			timing.streamErrText = errScan.Error()
 			_ = sendChunk(cliproxyexecutor.StreamChunk{Err: errScan})
+			return
+		}
+		if !timing.streamCompleted {
+			errIncomplete := statusErr{code: http.StatusRequestTimeout, msg: "stream error: stream disconnected before completion: stream closed before response.completed"}
+			helps.RecordAPIResponseError(ctx, e.cfg, errIncomplete)
+			reporter.PublishFailureWithError(ctx, errIncomplete)
+			timing.streamErrText = errIncomplete.Error()
+			_ = sendChunk(cliproxyexecutor.StreamChunk{Err: errIncomplete})
 		}
 	}()
 	return &cliproxyexecutor.StreamResult{Headers: httpResp.Header.Clone(), Chunks: out}, nil
