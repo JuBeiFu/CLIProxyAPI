@@ -313,6 +313,45 @@ func TestResolveCodexUsesLegacyBoundProxyOnlyForAssistedRequests(t *testing.T) {
 	}
 }
 
+func TestResolveCodexAssistedPrefersIPv6BindLeaseOverLegacyBoundProxy(t *testing.T) {
+	t.Parallel()
+
+	cfg := &config.Config{
+		SDKConfig: config.SDKConfig{
+			DefaultProxyPool: "free-egress",
+			ProxyPools: []config.ProxyPool{
+				{
+					Name:             "free-egress",
+					FallbackToDirect: true,
+					IPv6BindLeaseRanges: []config.IPv6BindLeaseRange{
+						{CIDR: "2602:294:0:eb::/64"},
+					},
+					Entries: []config.ProxyPoolEntry{
+						{Name: "proxy-1", URL: "socks5://127.0.0.1:10001"},
+					},
+				},
+			},
+		},
+	}
+	auth := &coreauth.Auth{Provider: "codex", ProxyPool: "free-egress"}
+	coreauth.SetBoundProxyEntry(auth, "proxy-1")
+	coreauth.SetIPv6BindLease(auth, coreauth.IPv6BindLeaseInfo{
+		Pool:      "free-egress",
+		EntryName: "lease-a",
+		IP:        "2602:294:0:eb::42",
+		URL:       "bind://[2602:294:0:eb::42]",
+	})
+	ctx := WithRequestRoute(context.Background(), RequestRoute{Assisted: true})
+
+	got := ResolveWithContext(ctx, cfg, auth, nil)
+	if got.Source != "ipv6-bind-lease" {
+		t.Fatalf("Source = %q, want %q", got.Source, "ipv6-bind-lease")
+	}
+	if got.ProxyURL != "bind://[2602:294:0:eb::42]" {
+		t.Fatalf("ProxyURL = %q, want bind lease URL", got.ProxyURL)
+	}
+}
+
 func TestResolveCodexBoundSkipsPassivelyUnhealthyBinding(t *testing.T) {
 	t.Parallel()
 
