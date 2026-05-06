@@ -251,7 +251,7 @@ func TestRecordCodexProxyPassiveOutcomeAggressivelyPenalizesGPT54InternalError(t
 	}
 }
 
-func TestRecordCodexProxyPassiveOutcomeAggressivelyPenalizesVeryLongGPT54Success(t *testing.T) {
+func TestRecordCodexProxyPassiveOutcomeKeepsVeryLongGPT54SuccessUsable(t *testing.T) {
 	manager := proxypool.NewHealthManager()
 	now := time.Now()
 	timing := codexUpstreamTiming{
@@ -264,10 +264,33 @@ func TestRecordCodexProxyPassiveOutcomeAggressivelyPenalizesVeryLongGPT54Success
 		startedAt:      now.Add(-4*time.Minute - 10*time.Second),
 		readBody:       4 * time.Minute,
 		traceFirstByte: 700 * time.Millisecond,
+		streamCompleted: true,
+	}
+
+	recordCodexProxyPassiveOutcome(timing, manager)
+	if !manager.IsUsableAt("free-egress", "free-proxy-8", now) {
+		t.Fatal("expected very long completed gpt-5.4 stream to stay usable")
+	}
+}
+
+func TestRecordCodexProxyPassiveOutcomeAggressivelyPenalizesVeryLongIncompleteGPT54Stream(t *testing.T) {
+	manager := proxypool.NewHealthManager()
+	now := time.Now()
+	timing := codexUpstreamTiming{
+		endpoint:       "responses_stream",
+		model:          "gpt-5.4",
+		proxyPool:      "free-egress",
+		proxyName:      "free-proxy-8",
+		status:         200,
+		bytesRead:      700000,
+		startedAt:      now.Add(-4*time.Minute - 10*time.Second),
+		readBody:       4 * time.Minute,
+		traceFirstByte: 700 * time.Millisecond,
+		streamErrText:  `{"error":{"code":"server_is_overloaded","message":"Our servers are currently overloaded. Please try again later."}}`,
 	}
 
 	recordCodexProxyPassiveOutcome(timing, manager)
 	if manager.IsUsableAt("free-egress", "free-proxy-8", now) {
-		t.Fatal("expected very long gpt-5.4 stream to mark proxy unusable immediately")
+		t.Fatal("expected very long incomplete gpt-5.4 stream to mark proxy unusable immediately")
 	}
 }

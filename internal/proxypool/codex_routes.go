@@ -26,6 +26,9 @@ type RouteDescriptor = codexroute.RouteDescriptor
 type RoutePassiveOutcome struct {
 	CheckedAt  time.Time
 	FirstByte  time.Duration
+	Total      time.Duration
+	ReadBody   time.Duration
+	StatusCode int
 	Successful bool
 	Error      string
 }
@@ -260,11 +263,11 @@ func (r *CodexRouteRegistry) RecordPassiveOutcome(authID string, route RouteDesc
 	entry.route = route
 	entry.lastChecked = outcome.CheckedAt
 	entry.lastError = strings.TrimSpace(outcome.Error)
-	if outcome.FirstByte >= r.cfg.QuarantineFirstByteThreshold {
+	if routePassiveNeedsQuarantine(outcome, r.cfg) {
 		r.demoteRouteLocked(authRoutes, routeKey, RouteStateQuarantined)
 		return
 	}
-	if outcome.FirstByte >= r.cfg.CoolingFirstByteThreshold || (!outcome.Successful && entry.lastError != "") {
+	if routePassiveNeedsCooling(outcome, r.cfg) {
 		r.demoteRouteLocked(authRoutes, routeKey, RouteStateCooling)
 		return
 	}
@@ -279,6 +282,69 @@ func (r *CodexRouteRegistry) RecordPassiveOutcome(authID string, route RouteDesc
 	if entry.state == RouteStateUnknown {
 		entry.state = RouteStateStandby
 	}
+}
+
+func routePassiveNeedsQuarantine(outcome RoutePassiveOutcome, cfg CodexRouteConfig) bool {
+	if outcome.FirstByte >= cfg.QuarantineFirstByteThreshold {
+		return true
+	}
+	if routePassiveShouldIgnoreFailure(outcome) || routePassiveWasSuccessful(outcome) {
+		return false
+	}
+	duration := routePassiveDuration(outcome)
+	errText := strings.ToLower(strings.TrimSpace(outcome.Error))
+	if strings.Contains(errText, "internal_error") {
+		return true
+	}
+	if strings.Contains(errText, "context canceled") || strings.Contains(errText, "client disconnected") || strings.Contains(errText, "client closed") {
+		return duration >= 180*time.Second
+	}
+	return duration >= 240*time.Second
+}
+
+func routePassiveNeedsCooling(outcome RoutePassiveOutcome, cfg CodexRouteConfig) bool {
+	if outcome.FirstByte >= cfg.CoolingFirstByteThreshold {
+		return true
+	}
+	if routePassiveShouldIgnoreFailure(outcome) || routePassiveWasSuccessful(outcome) {
+		return false
+	}
+	duration := routePassiveDuration(outcome)
+	errText := strings.ToLower(strings.TrimSpace(outcome.Error))
+	if outcome.StatusCode >= 500 {
+		return true
+	}
+	if strings.Contains(errText, "server_is_overloaded") {
+		return duration >= 10*time.Second
+	}
+	if strings.TrimSpace(outcome.Error) != "" {
+		return duration >= 30*time.Second
+	}
+	return duration >= 60*time.Second
+}
+
+func routePassiveShouldIgnoreFailure(outcome RoutePassiveOutcome) bool {
+	return outcome.StatusCode >= 400 && outcome.StatusCode < 500
+}
+
+func routePassiveWasSuccessful(outcome RoutePassiveOutcome) bool {
+	if outcome.Successful {
+		return true
+	}
+	if strings.TrimSpace(outcome.Error) != "" {
+		return false
+	}
+	if outcome.StatusCode == 0 {
+		return false
+	}
+	return outcome.StatusCode >= 200 && outcome.StatusCode < 300
+}
+
+func routePassiveDuration(outcome RoutePassiveOutcome) time.Duration {
+	if outcome.ReadBody > 0 {
+		return outcome.ReadBody
+	}
+	return outcome.Total
 }
 
 func (r *CodexRouteRegistry) RouteState(authID string, route RouteDescriptor) RouteState {

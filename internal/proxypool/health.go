@@ -75,6 +75,7 @@ type PassiveOutcome struct {
 	ReadBody      time.Duration
 	ResponseBytes int64
 	StatusCode    int
+	Successful    bool
 	Error         string
 	CheckedAt     time.Time
 }
@@ -602,6 +603,9 @@ func passiveOutcomeIsSlow(outcome PassiveOutcome) bool {
 	if passiveOutcomeNeedsCodexTailPenalty(outcome) && outcome.FirstByte >= codexPassiveSlowFirstByteThreshold {
 		return true
 	}
+	if passiveOutcomeNeedsCodexTailPenalty(outcome) && passiveOutcomeNeedsCodexCooling(outcome) {
+		return true
+	}
 	if outcome.Error != "" && outcome.StatusCode == 0 {
 		return true
 	}
@@ -658,10 +662,7 @@ func passiveOutcomeNeedsAggressiveIsolation(outcome PassiveOutcome) bool {
 		return false
 	}
 	errText := strings.ToLower(strings.TrimSpace(outcome.Error))
-	duration := outcome.ReadBody
-	if duration <= 0 {
-		duration = outcome.Total
-	}
+	duration := passiveOutcomeDuration(outcome)
 	if outcome.FirstByte >= codexPassiveQuarantineFirstByteThreshold {
 		return true
 	}
@@ -671,7 +672,10 @@ func passiveOutcomeNeedsAggressiveIsolation(outcome PassiveOutcome) bool {
 	if strings.Contains(errText, "context canceled") || strings.Contains(errText, "client disconnected") || strings.Contains(errText, "client closed") {
 		return duration >= 180*time.Second
 	}
-	return duration >= 240*time.Second
+	if !passiveOutcomeWasSuccessful(outcome) {
+		return duration >= 240*time.Second
+	}
+	return false
 }
 
 func passiveOutcomeNeedsCodexTailPenalty(outcome PassiveOutcome) bool {
@@ -680,6 +684,47 @@ func passiveOutcomeNeedsCodexTailPenalty(outcome PassiveOutcome) bool {
 		return false
 	}
 	return strings.EqualFold(strings.TrimSpace(outcome.Endpoint), "responses_stream")
+}
+
+func passiveOutcomeNeedsCodexCooling(outcome PassiveOutcome) bool {
+	if passiveOutcomeWasSuccessful(outcome) {
+		return false
+	}
+	if outcome.StatusCode >= http.StatusBadRequest && outcome.StatusCode < http.StatusInternalServerError {
+		return false
+	}
+	duration := passiveOutcomeDuration(outcome)
+	errText := strings.ToLower(strings.TrimSpace(outcome.Error))
+	if outcome.StatusCode >= http.StatusInternalServerError {
+		return true
+	}
+	if strings.Contains(errText, "server_is_overloaded") {
+		return duration >= 10*time.Second
+	}
+	if errText != "" {
+		return duration >= 30*time.Second
+	}
+	return duration >= 60*time.Second
+}
+
+func passiveOutcomeWasSuccessful(outcome PassiveOutcome) bool {
+	if outcome.Successful {
+		return true
+	}
+	if strings.TrimSpace(outcome.Error) != "" {
+		return false
+	}
+	if outcome.StatusCode == 0 {
+		return false
+	}
+	return outcome.StatusCode >= http.StatusOK && outcome.StatusCode < http.StatusMultipleChoices
+}
+
+func passiveOutcomeDuration(outcome PassiveOutcome) time.Duration {
+	if outcome.ReadBody > 0 {
+		return outcome.ReadBody
+	}
+	return outcome.Total
 }
 
 func passiveSlowError(outcome PassiveOutcome, strikes int) string {

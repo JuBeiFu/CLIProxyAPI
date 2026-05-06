@@ -134,6 +134,7 @@ func recordCodexProxyPassiveOutcome(timing codexUpstreamTiming, manager *proxypo
 		ReadBody:      timing.readBody,
 		ResponseBytes: int64(timing.bytesRead),
 		StatusCode:    timing.status,
+		Successful:    timing.streamErrText == "" && timing.status >= http.StatusOK && timing.status < http.StatusMultipleChoices && timing.streamCompleted,
 		Error:         timing.streamErrText,
 		CheckedAt:     time.Now(),
 	})
@@ -156,6 +157,9 @@ func recordCodexRoutePassiveOutcome(timing codexUpstreamTiming, registry *proxyp
 	}, proxypool.RoutePassiveOutcome{
 		CheckedAt:  time.Now(),
 		FirstByte:  passiveFirstByteForCodexTiming(timing),
+		Total:      total,
+		ReadBody:   timing.readBody,
+		StatusCode: timing.status,
 		Successful: timing.streamErrText == "" && timing.status >= http.StatusOK && timing.status < http.StatusMultipleChoices && timing.streamCompleted,
 		Error:      timing.streamErrText,
 	})

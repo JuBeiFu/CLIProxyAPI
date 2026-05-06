@@ -148,3 +148,67 @@ func TestRouteRegistryRepairPrefersExistingStandbyThenStableCandidate(t *testing
 		t.Fatalf("standby = %q, want %q", gotStandby.Entry, "proxy-1")
 	}
 }
+
+func TestRouteRegistryIgnoresNon2xxPassiveFailures(t *testing.T) {
+	t.Parallel()
+
+	reg := NewCodexRouteRegistry(CodexRouteConfig{
+		CoolingFirstByteThreshold:    30 * time.Second,
+		PromotionWinThreshold:        2,
+		QuarantineFirstByteThreshold: 60 * time.Second,
+	})
+	now := time.Now()
+	primary := RouteDescriptor{Pool: "pool-a", Entry: "proxy-1"}
+	standby := RouteDescriptor{Pool: "pool-a", Entry: "proxy-2"}
+
+	reg.UpsertCertifiedRoute("auth-1", primary, now)
+	reg.UpsertCertifiedRoute("auth-1", standby, now.Add(time.Second))
+	reg.RecordPassiveOutcome("auth-1", primary, RoutePassiveOutcome{
+		CheckedAt:  now.Add(2 * time.Second),
+		StatusCode: 429,
+		Successful: false,
+		Error:      `{"error":{"type":"usage_limit_reached"}}`,
+	})
+
+	gotPrimary, gotStandby, ok := reg.PrimaryAndStandby("auth-1")
+	if !ok {
+		t.Fatal("PrimaryAndStandby returned ok=false")
+	}
+	if gotPrimary.Entry != "proxy-1" {
+		t.Fatalf("primary = %q, want %q", gotPrimary.Entry, "proxy-1")
+	}
+	if gotStandby.Entry != "proxy-2" {
+		t.Fatalf("standby = %q, want %q", gotStandby.Entry, "proxy-2")
+	}
+}
+
+func TestRouteRegistryQuarantinesLongIncompleteTail(t *testing.T) {
+	t.Parallel()
+
+	reg := NewCodexRouteRegistry(CodexRouteConfig{
+		CoolingFirstByteThreshold:    30 * time.Second,
+		PromotionWinThreshold:        2,
+		QuarantineFirstByteThreshold: 60 * time.Second,
+	})
+	now := time.Now()
+	primary := RouteDescriptor{Pool: "pool-a", Entry: "proxy-1"}
+	standby := RouteDescriptor{Pool: "pool-a", Entry: "proxy-2"}
+
+	reg.UpsertCertifiedRoute("auth-1", primary, now)
+	reg.UpsertCertifiedRoute("auth-1", standby, now.Add(time.Second))
+	reg.RecordPassiveOutcome("auth-1", primary, RoutePassiveOutcome{
+		CheckedAt:  now.Add(2 * time.Second),
+		FirstByte:  900 * time.Millisecond,
+		ReadBody:   5*time.Minute + 10*time.Second,
+		StatusCode: 200,
+		Successful: false,
+		Error:      "stream error: stream ID 1173; INTERNAL_ERROR; received from peer",
+	})
+
+	if got := reg.RouteState("auth-1", primary); got != RouteStateQuarantined {
+		t.Fatalf("primary state = %v, want %v", got, RouteStateQuarantined)
+	}
+	if got := reg.RouteState("auth-1", standby); got != RouteStatePrimary {
+		t.Fatalf("standby state = %v, want %v", got, RouteStatePrimary)
+	}
+}
