@@ -182,6 +182,29 @@ func TestRouteRegistryIgnoresNon2xxPassiveFailures(t *testing.T) {
 	}
 }
 
+func TestRouteRegistryIgnoresContextLengthExceededForAssistedPenalty(t *testing.T) {
+	t.Parallel()
+
+	reg := NewCodexRouteRegistry(CodexRouteConfig{})
+	route := RouteDescriptor{Pool: "pool-a", Entry: "proxy-1"}
+	now := time.Now()
+	reg.UpsertCertifiedRoute("auth-1", route, now)
+
+	reg.RecordPassiveOutcome("auth-1", route, RoutePassiveOutcome{
+		CheckedAt:  now.Add(time.Second),
+		FirstByte:  500 * time.Millisecond,
+		Total:      95 * time.Second,
+		ReadBody:   90 * time.Second,
+		StatusCode: 200,
+		Successful: false,
+		Error:      `{"error":{"code":"context_length_exceeded"}}`,
+	})
+
+	if got := reg.RouteState("auth-1", route); got != RouteStatePrimary {
+		t.Fatalf("RouteState = %v, want %v", got, RouteStatePrimary)
+	}
+}
+
 func TestRouteRegistryQuarantinesLongIncompleteTail(t *testing.T) {
 	t.Parallel()
 

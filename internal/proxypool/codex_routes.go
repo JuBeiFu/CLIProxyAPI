@@ -324,7 +324,16 @@ func routePassiveNeedsCooling(outcome RoutePassiveOutcome, cfg CodexRouteConfig)
 }
 
 func routePassiveShouldIgnoreFailure(outcome RoutePassiveOutcome) bool {
-	return outcome.StatusCode >= 400 && outcome.StatusCode < 500
+	if outcome.StatusCode >= 400 && outcome.StatusCode < 500 {
+		return true
+	}
+	errText := strings.ToLower(strings.TrimSpace(outcome.Error))
+	if errText == "" || errText == "-" {
+		return false
+	}
+	return strings.Contains(errText, "context_length_exceeded") ||
+		strings.Contains(errText, "usage_limit_reached") ||
+		strings.Contains(errText, "rate limit exceeded")
 }
 
 func routePassiveWasSuccessful(outcome RoutePassiveOutcome) bool {
