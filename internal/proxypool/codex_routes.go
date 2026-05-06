@@ -273,6 +273,51 @@ func (r *CodexRouteRegistry) RouteState(authID string, route RouteDescriptor) Ro
 	return RouteStateUnknown
 }
 
+func (r *CodexRouteRegistry) ApplyProbeOutcome(authID string, route RouteDescriptor, outcome ProbeOutcome) {
+	if r == nil {
+		return
+	}
+	authKey := normalizeRouteAuthID(authID)
+	routeKey := route.key()
+	if authKey == "" || routeKey == "" {
+		return
+	}
+	if outcome.CheckedAt.IsZero() {
+		outcome.CheckedAt = time.Now()
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	authRoutes := r.authRoutesLocked(authKey)
+	entry := authRoutes.routes[routeKey]
+	if entry == nil {
+		entry = &codexRouteEntry{route: route, state: RouteStateUnknown}
+		authRoutes.routes[routeKey] = entry
+	}
+	entry.route = route
+	entry.lastChecked = outcome.CheckedAt
+	entry.lastError = strings.TrimSpace(outcome.TerminalReason)
+	if !outcome.RouteConsistent {
+		entry.state = RouteStateQuarantined
+		if authRoutes.primaryKey == routeKey {
+			authRoutes.primaryKey = ""
+		}
+		if authRoutes.standbyKey == routeKey {
+			authRoutes.standbyKey = ""
+		}
+		return
+	}
+	if authRoutes.primaryKey == routeKey {
+		entry.state = RouteStatePrimary
+		entry.lastError = ""
+		return
+	}
+	authRoutes.standbyKey = routeKey
+	entry.state = RouteStateStandby
+	entry.lastError = ""
+}
+
 func (r *CodexRouteRegistry) authRoutesLocked(authID string) *codexAuthRoutes {
 	authRoutes := r.auths[authID]
 	if authRoutes == nil {
