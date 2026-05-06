@@ -84,8 +84,14 @@ func logSlowCodexUpstreamTiming(ctx context.Context, timing codexUpstreamTiming)
 	if errText == "" {
 		errText = "-"
 	}
+	runtimeMode := "assisted"
+	switch strings.TrimSpace(timing.proxySource) {
+	case "direct", "direct-primary", "bound-direct", "request-route-direct", "assisted-direct-fallback":
+		runtimeMode = "direct"
+	}
+	legacyBound := strings.TrimSpace(timing.proxySource) == "bound-assisted"
 	helps.LogWithRequestID(ctx).Infof(
-		"codex upstream timing endpoint=%s model=%s auth_id=%s proxy_source=%s proxy_pool=%s proxy_name=%s proxy_url=%s proxy_fallback_direct=%t status=%d total=%s prepare=%s http_do=%s read_body=%s translate=%s http_conn=%s http_tls=%s http_wrote_req=%s http_first_byte=%s http_conn_reused=%t http_conn_was_idle=%t http_conn_idle=%s response_bytes=%d stream_lines=%d stream_chunks=%d stream_completed=%t stream_err=%s",
+		"codex upstream timing endpoint=%s model=%s auth_id=%s proxy_source=%s proxy_pool=%s proxy_name=%s proxy_url=%s proxy_fallback_direct=%t runtime_egress_mode=%s legacy_bound_proxy_used=%t resolution_source=%s status=%d total=%s prepare=%s http_do=%s read_body=%s translate=%s http_conn=%s http_tls=%s http_wrote_req=%s http_first_byte=%s http_conn_reused=%t http_conn_was_idle=%t http_conn_idle=%s response_bytes=%d stream_lines=%d stream_chunks=%d stream_completed=%t stream_err=%s",
 		timing.endpoint,
 		timing.model,
 		strings.TrimSpace(timing.authID),
@@ -94,6 +100,9 @@ func logSlowCodexUpstreamTiming(ctx context.Context, timing codexUpstreamTiming)
 		strings.TrimSpace(timing.proxyName),
 		strings.TrimSpace(timing.proxyURL),
 		timing.proxyFallback,
+		runtimeMode,
+		legacyBound,
+		strings.TrimSpace(timing.proxySource),
 		timing.status,
 		total.Round(time.Millisecond),
 		timing.prepare.Round(time.Millisecond),

@@ -83,13 +83,13 @@ func TestLogSlowCodexUpstreamTimingSkipsFastRequests(t *testing.T) {
 	defer log.SetLevel(origLevel)
 
 	logSlowCodexUpstreamTiming(context.Background(), codexUpstreamTiming{
-		endpoint:  "responses",
-		model:     "gpt-5.4",
-		authID:    "auth-fast-1",
-		status:    200,
-		startedAt: time.Now().Add(-5 * time.Second),
-		httpDo:    4 * time.Second,
-		readBody:  500 * time.Millisecond,
+		endpoint:        "responses",
+		model:           "gpt-5.4",
+		authID:          "auth-fast-1",
+		status:          200,
+		startedAt:       time.Now().Add(-5 * time.Second),
+		httpDo:          4 * time.Second,
+		readBody:        500 * time.Millisecond,
 		streamCompleted: true,
 	})
 
@@ -131,6 +131,43 @@ func TestLogSlowCodexUpstreamTimingLogsFastIncompleteStreamFailures(t *testing.T
 		"auth_id=auth-fast-fail-1",
 		"stream_completed=false",
 		"stream_err=stream error: stream disconnected before completion: stream closed before response.completed",
+	} {
+		if !strings.Contains(out, part) {
+			t.Fatalf("log output missing %q: %s", part, out)
+		}
+	}
+}
+
+func TestLogSlowCodexUpstreamTimingIncludesRuntimeEgressMode(t *testing.T) {
+	var buf bytes.Buffer
+	origOut := log.StandardLogger().Out
+	origLevel := log.StandardLogger().Level
+	log.SetOutput(&buf)
+	log.SetLevel(log.InfoLevel)
+	defer log.SetOutput(origOut)
+	defer log.SetLevel(origLevel)
+
+	ctx := logging.WithRequestID(context.Background(), "req-egress-1")
+	logSlowCodexUpstreamTiming(ctx, codexUpstreamTiming{
+		endpoint:        "responses_stream",
+		model:           "gpt-5.5",
+		authID:          "auth-egress-1",
+		proxySource:     "direct-primary",
+		proxyPool:       "free-egress",
+		status:          200,
+		startedAt:       time.Now().Add(-20 * time.Second),
+		httpDo:          2 * time.Second,
+		readBody:        17 * time.Second,
+		traceFirstByte:  1500 * time.Millisecond,
+		streamCompleted: false,
+		streamErrText:   "context canceled",
+	})
+
+	out := buf.String()
+	for _, part := range []string{
+		"runtime_egress_mode=direct",
+		"legacy_bound_proxy_used=false",
+		"resolution_source=direct-primary",
 	} {
 		if !strings.Contains(out, part) {
 			t.Fatalf("log output missing %q: %s", part, out)
@@ -211,16 +248,16 @@ func TestRecordCodexProxyPassiveOutcomeAggressivelyPenalizesLongGPT54Cancel(t *t
 	manager := proxypool.NewHealthManager()
 	now := time.Now()
 	timing := codexUpstreamTiming{
-		endpoint:      "responses_stream",
-		model:         "gpt-5.4",
-		proxyPool:     "free-egress",
-		proxyName:     "free-proxy-14",
-		status:        200,
-		bytesRead:     1700000,
-		startedAt:     now.Add(-5 * time.Minute),
-		readBody:      4*time.Minute + 50*time.Second,
+		endpoint:       "responses_stream",
+		model:          "gpt-5.4",
+		proxyPool:      "free-egress",
+		proxyName:      "free-proxy-14",
+		status:         200,
+		bytesRead:      1700000,
+		startedAt:      now.Add(-5 * time.Minute),
+		readBody:       4*time.Minute + 50*time.Second,
 		traceFirstByte: 900 * time.Millisecond,
-		streamErrText: "context canceled",
+		streamErrText:  "context canceled",
 	}
 
 	recordCodexProxyPassiveOutcome(timing, manager)
@@ -255,15 +292,15 @@ func TestRecordCodexProxyPassiveOutcomeKeepsVeryLongGPT54SuccessUsable(t *testin
 	manager := proxypool.NewHealthManager()
 	now := time.Now()
 	timing := codexUpstreamTiming{
-		endpoint:       "responses_stream",
-		model:          "gpt-5.4",
-		proxyPool:      "free-egress",
-		proxyName:      "free-proxy-8",
-		status:         200,
-		bytesRead:      700000,
-		startedAt:      now.Add(-4*time.Minute - 10*time.Second),
-		readBody:       4 * time.Minute,
-		traceFirstByte: 700 * time.Millisecond,
+		endpoint:        "responses_stream",
+		model:           "gpt-5.4",
+		proxyPool:       "free-egress",
+		proxyName:       "free-proxy-8",
+		status:          200,
+		bytesRead:       700000,
+		startedAt:       now.Add(-4*time.Minute - 10*time.Second),
+		readBody:        4 * time.Minute,
+		traceFirstByte:  700 * time.Millisecond,
 		streamCompleted: true,
 	}
 

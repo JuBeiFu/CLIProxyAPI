@@ -22,6 +22,8 @@ type hedgeTestExecutor struct {
 	hedgeStarted bool
 }
 
+const hedgeDirectRouteKey = "__direct__"
+
 type hedgeRouteBehavior struct {
 	delay            time.Duration
 	secondChunkDelay time.Duration
@@ -49,8 +51,9 @@ func (e *hedgeTestExecutor) ExecuteStream(ctx context.Context, auth *coreauth.Au
 	if !ok {
 		return nil, &coreauth.Error{Code: "missing_route_override", Message: "missing request route override"}
 	}
-	behavior := e.behaviorFor(route.Entry)
-	if route.Entry == e.standbyRoute {
+	routeKey := hedgeRouteKey(route)
+	behavior := e.behaviorFor(routeKey)
+	if routeKey == e.standbyRoute {
 		e.mu.Lock()
 		e.hedgeStarted = true
 		e.mu.Unlock()
@@ -69,7 +72,7 @@ func (e *hedgeTestExecutor) ExecuteStream(ctx context.Context, auth *coreauth.Au
 			return
 		case <-timer.C:
 		}
-		e.recordWinner(route.Entry)
+		e.recordWinner(routeKey)
 		out <- cliproxyexecutor.StreamChunk{Payload: []byte("data: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\n")}
 		if behavior.secondChunkDelay <= 0 {
 			return
@@ -83,7 +86,7 @@ func (e *hedgeTestExecutor) ExecuteStream(ctx context.Context, auth *coreauth.Au
 		}
 		out <- cliproxyexecutor.StreamChunk{Payload: []byte("data: {\"type\":\"response.output_text.delta\",\"delta\":\"next\"}\n\n")}
 	}()
-	return &cliproxyexecutor.StreamResult{Headers: http.Header{"X-Route": []string{route.Entry}}, Chunks: out}, nil
+	return &cliproxyexecutor.StreamResult{Headers: http.Header{"X-Route": []string{routeKey}}, Chunks: out}, nil
 }
 
 func (e *hedgeTestExecutor) Refresh(_ context.Context, auth *coreauth.Auth) (*coreauth.Auth, error) {
@@ -138,6 +141,13 @@ func (e *hedgeTestExecutor) HedgeStarted() bool {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	return e.hedgeStarted
+}
+
+func hedgeRouteKey(route proxypool.RequestRoute) string {
+	if route.Direct {
+		return hedgeDirectRouteKey
+	}
+	return route.Entry
 }
 
 func TestExecuteStreamHedgeUsesStandbyAfterThreshold(t *testing.T) {
@@ -248,7 +258,52 @@ func TestExecuteStreamFastPrimaryFailureFallsBackToStandby(t *testing.T) {
 	}
 }
 
+func TestExecuteStreamHedgeCanFallFromDirectPrimaryToAssistedStandby(t *testing.T) {
+	t.Parallel()
+
+	manager, fake := newHedgeTestManagerWithPlan(
+		t,
+		proxypool.RouteDescriptor{Pool: "pool-a", Direct: true},
+		proxypool.RouteDescriptor{Pool: "pool-a", Entry: "proxy-standby"},
+		0,
+		10*time.Millisecond,
+		200*time.Millisecond,
+	)
+	fake.SetRouteError(hedgeDirectRouteKey, &coreauth.Error{Code: "primary_failed", Message: "primary failed", Retryable: true})
+
+	stream, err := manager.ExecuteStream(context.Background(), []string{"codex"}, cliproxyexecutor.Request{
+		Model: "gpt-5.5",
+	}, cliproxyexecutor.Options{})
+	if err != nil {
+		t.Fatalf("ExecuteStream returned error: %v", err)
+	}
+
+	first, ok := <-stream.Chunks
+	if !ok {
+		t.Fatal("first chunk channel closed")
+	}
+	if first.Err != nil {
+		t.Fatalf("first chunk err = %v", first.Err)
+	}
+	if got := fake.WinningRoute(); got != "proxy-standby" {
+		t.Fatalf("WinningRoute = %q, want %q", got, "proxy-standby")
+	}
+}
+
 func newHedgeTestManager(t *testing.T, primaryDelay, standbyDelay, hedgeAfter time.Duration) (*coreauth.Manager, *hedgeTestExecutor) {
+	t.Helper()
+
+	return newHedgeTestManagerWithPlan(
+		t,
+		proxypool.RouteDescriptor{Pool: "pool-a", Entry: "proxy-primary"},
+		proxypool.RouteDescriptor{Pool: "pool-a", Entry: "proxy-standby"},
+		primaryDelay,
+		standbyDelay,
+		hedgeAfter,
+	)
+}
+
+func newHedgeTestManagerWithPlan(t *testing.T, primaryRoute, standbyRoute proxypool.RouteDescriptor, primaryDelay, standbyDelay, hedgeAfter time.Duration) (*coreauth.Manager, *hedgeTestExecutor) {
 	t.Helper()
 
 	cfg := &internalconfig.Config{}
@@ -256,7 +311,13 @@ func newHedgeTestManager(t *testing.T, primaryDelay, standbyDelay, hedgeAfter ti
 	cfg.CodexRouteManagement.Enabled = true
 	cfg.CodexRouteManagement.FirstPayloadHedgeAfter = hedgeAfter
 
-	executor := newHedgeTestExecutor(primaryDelay, standbyDelay)
+	executor := &hedgeTestExecutor{
+		behaviors: map[string]hedgeRouteBehavior{
+			hedgeRouteKey(primaryRoute.RequestRoute()): {delay: primaryDelay},
+			hedgeRouteKey(standbyRoute.RequestRoute()): {delay: standbyDelay},
+		},
+		standbyRoute: hedgeRouteKey(standbyRoute.RequestRoute()),
+	}
 	manager := coreauth.NewManager(nil, &coreauth.RoundRobinSelector{}, nil)
 	manager.SetConfig(cfg)
 	manager.RegisterExecutor(executor)
@@ -281,8 +342,8 @@ func newHedgeTestManager(t *testing.T, primaryDelay, standbyDelay, hedgeAfter ti
 		PromotionWinThreshold:        2,
 		QuarantineFirstByteThreshold: 60 * time.Second,
 	})
-	routeRegistry.UpsertCertifiedRoute(auth.ID, proxypool.RouteDescriptor{Pool: "pool-a", Entry: "proxy-primary"}, time.Now())
-	routeRegistry.UpsertCertifiedRoute(auth.ID, proxypool.RouteDescriptor{Pool: "pool-a", Entry: "proxy-standby"}, time.Now())
+	routeRegistry.UpsertCertifiedRoute(auth.ID, primaryRoute, time.Now())
+	routeRegistry.UpsertCertifiedRoute(auth.ID, standbyRoute, time.Now())
 	manager.SetCodexRouteController(routeRegistry)
 	previousRegistry := proxypool.DefaultCodexRouteRegistry()
 	proxypool.SetDefaultCodexRouteRegistry(routeRegistry)
