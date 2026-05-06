@@ -7,8 +7,11 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
+
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/codexroute"
 )
 
 type ProbeTarget struct {
@@ -34,6 +37,13 @@ type CodexProbeRunner struct {
 	cfg CodexProbeConfig
 }
 
+const (
+	codexProbeAuthIDHeader     = "X-CLIProxy-Probe-Auth-ID"
+	codexProbeProxyPoolHeader  = "X-CLIProxy-Probe-Proxy-Pool"
+	codexProbeProxyEntryHeader = "X-CLIProxy-Probe-Proxy-Entry"
+	codexProbeDirectHeader     = "X-CLIProxy-Probe-Direct"
+)
+
 func NewCodexProbeRunner(cfg CodexProbeConfig) *CodexProbeRunner {
 	return &CodexProbeRunner{cfg: cfg}
 }
@@ -49,17 +59,28 @@ func (r *CodexProbeRunner) Probe(ctx context.Context, target ProbeTarget) (Probe
 	payload := map[string]any{
 		"model": "gpt-5.4",
 		"input": "ping",
+		"metadata": map[string]any{
+			"codex_probe_auth_id":     strings.TrimSpace(target.AuthID),
+			"codex_probe_proxy_pool":  strings.TrimSpace(target.Route.Pool),
+			"codex_probe_proxy_entry": strings.TrimSpace(target.Route.Entry),
+			"codex_probe_direct":      target.Route.Direct,
+		},
 	}
 	body, errMarshal := json.Marshal(payload)
 	if errMarshal != nil {
 		return ProbeOutcome{}, errMarshal
 	}
 
-	req, errReq := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimSpace(r.cfg.ProbeURL), bytes.NewReader(body))
+	reqCtx := codexroute.WithRequestRoute(ctx, target.Route.RequestRoute())
+	req, errReq := http.NewRequestWithContext(reqCtx, http.MethodPost, strings.TrimSpace(r.cfg.ProbeURL), bytes.NewReader(body))
 	if errReq != nil {
 		return ProbeOutcome{}, errReq
 	}
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set(codexProbeAuthIDHeader, strings.TrimSpace(target.AuthID))
+	req.Header.Set(codexProbeProxyPoolHeader, strings.TrimSpace(target.Route.Pool))
+	req.Header.Set(codexProbeProxyEntryHeader, strings.TrimSpace(target.Route.Entry))
+	req.Header.Set(codexProbeDirectHeader, strconv.FormatBool(target.Route.Direct))
 
 	client := r.cfg.Client
 	if client == nil {

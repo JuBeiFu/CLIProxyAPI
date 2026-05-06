@@ -8,6 +8,7 @@ import (
 
 	internalconfig "github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/performance"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/proxypool"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
@@ -102,5 +103,44 @@ func TestServiceAppliesPerformanceRoutingConfigToManagerSelection(t *testing.T) 
 	}
 	if got := string(resp.Payload); got != "service-perf-auth-b" {
 		t.Fatalf("selected auth = %q, want service-perf-auth-b", got)
+	}
+}
+
+func TestServiceApplyPerformanceRoutingConfigPreservesCodexRouteRegistryState(t *testing.T) {
+	t.Parallel()
+
+	manager := coreauth.NewManager(nil, &coreauth.RoundRobinSelector{}, nil)
+	svc := &Service{coreManager: manager}
+	cfg := &sdkconfig.Config{}
+	cfg.CodexRouteManagement.Enabled = true
+
+	previousRegistry := proxypool.DefaultCodexRouteRegistry()
+	t.Cleanup(func() {
+		proxypool.SetDefaultCodexRouteRegistry(previousRegistry)
+	})
+
+	svc.applyPerformanceRoutingConfig(cfg)
+	reg := proxypool.DefaultCodexRouteRegistry()
+	if reg == nil {
+		t.Fatal("DefaultCodexRouteRegistry returned nil")
+	}
+
+	now := time.Now()
+	reg.UpsertCertifiedRoute("auth-1", proxypool.RouteDescriptor{Pool: "pool-a", Entry: "proxy-1"}, now)
+	reg.UpsertCertifiedRoute("auth-1", proxypool.RouteDescriptor{Pool: "pool-a", Entry: "proxy-2"}, now.Add(time.Second))
+
+	cfg.CodexRouteManagement.PromotionWinThreshold = 3
+	svc.applyPerformanceRoutingConfig(cfg)
+
+	regAfter := proxypool.DefaultCodexRouteRegistry()
+	if regAfter != reg {
+		t.Fatal("applyPerformanceRoutingConfig replaced codex route registry")
+	}
+	primary, standby, ok := regAfter.PrimaryAndStandby("auth-1")
+	if !ok {
+		t.Fatal("PrimaryAndStandby returned ok=false after reload")
+	}
+	if primary.Entry != "proxy-1" || standby.Entry != "proxy-2" {
+		t.Fatalf("primary=%q standby=%q, want proxy-1/proxy-2", primary.Entry, standby.Entry)
 	}
 }

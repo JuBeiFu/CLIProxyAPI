@@ -86,6 +86,9 @@ type Service struct {
 	// coreManager handles core authentication and execution.
 	coreManager *coreauth.Manager
 
+	// codexRouteRegistry preserves learned Codex primary/standby route state across config reloads.
+	codexRouteRegistry *proxypool.CodexRouteRegistry
+
 	// shutdownOnce ensures shutdown is called only once.
 	shutdownOnce sync.Once
 
@@ -372,7 +375,19 @@ func routingPerformanceConfigFromAppConfig(cfg *config.Config) performance.Confi
 func (s *Service) applyPerformanceRoutingConfig(cfg *config.Config) {
 	perfCfg := routingPerformanceConfigFromAppConfig(cfg)
 	performance.ConfigureDefault(perfCfg)
-	reg := proxypool.NewCodexRouteRegistry(proxypool.CodexRouteConfigFromRuntimeConfig(cfg))
+	routeCfg := proxypool.CodexRouteConfigFromRuntimeConfig(cfg)
+	var reg *proxypool.CodexRouteRegistry
+	if s != nil {
+		reg = s.codexRouteRegistry
+	}
+	if reg == nil {
+		reg = proxypool.NewCodexRouteRegistry(routeCfg)
+		if s != nil {
+			s.codexRouteRegistry = reg
+		}
+	} else {
+		reg.UpdateConfig(routeCfg)
+	}
 	proxypool.SetDefaultCodexRouteRegistry(reg)
 	if s == nil || s.coreManager == nil {
 		return

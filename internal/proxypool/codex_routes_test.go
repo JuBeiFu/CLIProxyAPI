@@ -113,3 +113,38 @@ func TestRouteRegistryPromotesStandbyWhenProbeQuarantinesPrimary(t *testing.T) {
 		t.Fatalf("standby state = %v, want %v", got, RouteStatePrimary)
 	}
 }
+
+func TestRouteRegistryRepairPrefersExistingStandbyThenStableCandidate(t *testing.T) {
+	t.Parallel()
+
+	reg := NewCodexRouteRegistry(CodexRouteConfig{
+		CoolingFirstByteThreshold:    30 * time.Second,
+		PromotionWinThreshold:        2,
+		QuarantineFirstByteThreshold: 60 * time.Second,
+	})
+	now := time.Now()
+	primary := RouteDescriptor{Pool: "pool-a", Entry: "proxy-2"}
+	standby := RouteDescriptor{Pool: "pool-a", Entry: "proxy-3"}
+	extra := RouteDescriptor{Pool: "pool-a", Entry: "proxy-1"}
+
+	reg.UpsertCertifiedRoute("auth-1", primary, now)
+	reg.UpsertCertifiedRoute("auth-1", standby, now.Add(time.Second))
+	reg.UpsertCertifiedRoute("auth-1", extra, now.Add(2*time.Second))
+
+	reg.RecordPassiveOutcome("auth-1", primary, RoutePassiveOutcome{
+		CheckedAt:  now.Add(3 * time.Second),
+		FirstByte:  45 * time.Second,
+		Successful: true,
+	})
+
+	gotPrimary, gotStandby, ok := reg.PrimaryAndStandby("auth-1")
+	if !ok {
+		t.Fatal("PrimaryAndStandby returned ok=false")
+	}
+	if gotPrimary.Entry != "proxy-3" {
+		t.Fatalf("primary = %q, want %q", gotPrimary.Entry, "proxy-3")
+	}
+	if gotStandby.Entry != "proxy-1" {
+		t.Fatalf("standby = %q, want %q", gotStandby.Entry, "proxy-1")
+	}
+}
