@@ -12,6 +12,7 @@ import (
 	"os"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	log "github.com/sirupsen/logrus"
@@ -32,6 +33,18 @@ const (
 	DefaultRoutingPerformanceWeightLatency  = 0.25
 	DefaultRoutingPerformanceWeightFailure  = 2.0
 	DefaultRoutingPerformanceWeightInflight = 0.5
+)
+
+const (
+	DefaultCodexRouteFirstPayloadHedgeAfter        = 4
+	DefaultCodexRouteKeepaliveProbeIntervalSecs    = 300
+	DefaultCodexRouteDegradedProbeIntervalSecs     = 45
+	DefaultCodexRouteRecoveringProbeIntervalSecs   = 30
+	DefaultCodexRouteSlowFirstByteThresholdSecs    = 4
+	DefaultCodexRouteHeavyFirstByteThresholdSecs   = 10
+	DefaultCodexRouteCoolingFirstByteThresholdSecs = 30
+	DefaultCodexRouteQuarantineThresholdSecs       = 60
+	DefaultCodexRoutePromotionWinThreshold         = 2
 )
 
 // Config represents the application's configuration, loaded from a YAML file.
@@ -91,6 +104,9 @@ type Config struct {
 
 	// Routing controls credential selection behavior.
 	Routing RoutingConfig `yaml:"routing" json:"routing"`
+
+	// CodexRouteManagement controls same-auth primary/standby route maintenance.
+	CodexRouteManagement CodexRouteManagementConfig `yaml:"codex-route-management,omitempty" json:"codex-route-management,omitempty"`
 
 	// ResponseCompact controls the in-memory compact transcript cache used to
 	// expand responses/compact follow-up requests.
@@ -239,6 +255,19 @@ type RoutingConfig struct {
 	PerformanceWeightInflight float64 `yaml:"performance-weight-inflight,omitempty" json:"performance-weight-inflight,omitempty"`
 }
 
+type CodexRouteManagementConfig struct {
+	Enabled                      bool          `yaml:"enabled,omitempty" json:"enabled,omitempty"`
+	FirstPayloadHedgeAfter       time.Duration `yaml:"first-payload-hedge-after,omitempty" json:"first-payload-hedge-after,omitempty"`
+	KeepaliveProbeInterval       time.Duration `yaml:"keepalive-probe-interval,omitempty" json:"keepalive-probe-interval,omitempty"`
+	DegradedProbeInterval        time.Duration `yaml:"degraded-probe-interval,omitempty" json:"degraded-probe-interval,omitempty"`
+	RecoveringProbeInterval      time.Duration `yaml:"recovering-probe-interval,omitempty" json:"recovering-probe-interval,omitempty"`
+	SlowFirstByteThreshold       time.Duration `yaml:"slow-first-byte-threshold,omitempty" json:"slow-first-byte-threshold,omitempty"`
+	HeavyFirstByteThreshold      time.Duration `yaml:"heavy-first-byte-threshold,omitempty" json:"heavy-first-byte-threshold,omitempty"`
+	CoolingFirstByteThreshold    time.Duration `yaml:"cooling-first-byte-threshold,omitempty" json:"cooling-first-byte-threshold,omitempty"`
+	QuarantineFirstByteThreshold time.Duration `yaml:"quarantine-first-byte-threshold,omitempty" json:"quarantine-first-byte-threshold,omitempty"`
+	PromotionWinThreshold        int           `yaml:"promotion-win-threshold,omitempty" json:"promotion-win-threshold,omitempty"`
+}
+
 // ResponseCompactConfig controls the in-memory compact transcript cache.
 type ResponseCompactConfig struct {
 	MaxBytes      int `yaml:"max-bytes,omitempty" json:"max-bytes,omitempty"`
@@ -307,6 +336,40 @@ func (c *Config) ApplyRoutingPerformanceDefaults() {
 	}
 	if !c.routingPerformanceShadowLogSet {
 		c.Routing.PerformanceShadowLog = true
+	}
+	c.applyCodexRouteManagementDefaults()
+}
+
+func (c *Config) applyCodexRouteManagementDefaults() {
+	if c == nil {
+		return
+	}
+	if c.CodexRouteManagement.FirstPayloadHedgeAfter <= 0 {
+		c.CodexRouteManagement.FirstPayloadHedgeAfter = time.Duration(DefaultCodexRouteFirstPayloadHedgeAfter) * time.Second
+	}
+	if c.CodexRouteManagement.KeepaliveProbeInterval <= 0 {
+		c.CodexRouteManagement.KeepaliveProbeInterval = time.Duration(DefaultCodexRouteKeepaliveProbeIntervalSecs) * time.Second
+	}
+	if c.CodexRouteManagement.DegradedProbeInterval <= 0 {
+		c.CodexRouteManagement.DegradedProbeInterval = time.Duration(DefaultCodexRouteDegradedProbeIntervalSecs) * time.Second
+	}
+	if c.CodexRouteManagement.RecoveringProbeInterval <= 0 {
+		c.CodexRouteManagement.RecoveringProbeInterval = time.Duration(DefaultCodexRouteRecoveringProbeIntervalSecs) * time.Second
+	}
+	if c.CodexRouteManagement.SlowFirstByteThreshold <= 0 {
+		c.CodexRouteManagement.SlowFirstByteThreshold = time.Duration(DefaultCodexRouteSlowFirstByteThresholdSecs) * time.Second
+	}
+	if c.CodexRouteManagement.HeavyFirstByteThreshold <= 0 {
+		c.CodexRouteManagement.HeavyFirstByteThreshold = time.Duration(DefaultCodexRouteHeavyFirstByteThresholdSecs) * time.Second
+	}
+	if c.CodexRouteManagement.CoolingFirstByteThreshold <= 0 {
+		c.CodexRouteManagement.CoolingFirstByteThreshold = time.Duration(DefaultCodexRouteCoolingFirstByteThresholdSecs) * time.Second
+	}
+	if c.CodexRouteManagement.QuarantineFirstByteThreshold <= 0 {
+		c.CodexRouteManagement.QuarantineFirstByteThreshold = time.Duration(DefaultCodexRouteQuarantineThresholdSecs) * time.Second
+	}
+	if c.CodexRouteManagement.PromotionWinThreshold <= 0 {
+		c.CodexRouteManagement.PromotionWinThreshold = DefaultCodexRoutePromotionWinThreshold
 	}
 }
 
@@ -1572,6 +1635,8 @@ func isKnownDefaultValue(path []string, node *yaml.Node) bool {
 			return node.Value == fmt.Sprintf("%d", DefaultRoutingPerformanceWindowSeconds)
 		case "routing.performance-min-samples":
 			return node.Value == fmt.Sprintf("%d", DefaultRoutingPerformanceMinSamples)
+		case "codex-route-management.promotion-win-threshold":
+			return node.Value == fmt.Sprintf("%d", DefaultCodexRoutePromotionWinThreshold)
 		}
 	}
 
@@ -1579,6 +1644,27 @@ func isKnownDefaultValue(path []string, node *yaml.Node) bool {
 		switch fullPath {
 		case "routing.performance-shadow-log":
 			return node.Value == "true"
+		}
+	}
+
+	if node.Kind == yaml.ScalarNode && node.Tag == "!!str" {
+		switch fullPath {
+		case "codex-route-management.first-payload-hedge-after":
+			return node.Value == (time.Duration(DefaultCodexRouteFirstPayloadHedgeAfter) * time.Second).String()
+		case "codex-route-management.keepalive-probe-interval":
+			return node.Value == (time.Duration(DefaultCodexRouteKeepaliveProbeIntervalSecs) * time.Second).String()
+		case "codex-route-management.degraded-probe-interval":
+			return node.Value == (time.Duration(DefaultCodexRouteDegradedProbeIntervalSecs) * time.Second).String()
+		case "codex-route-management.recovering-probe-interval":
+			return node.Value == (time.Duration(DefaultCodexRouteRecoveringProbeIntervalSecs) * time.Second).String()
+		case "codex-route-management.slow-first-byte-threshold":
+			return node.Value == (time.Duration(DefaultCodexRouteSlowFirstByteThresholdSecs) * time.Second).String()
+		case "codex-route-management.heavy-first-byte-threshold":
+			return node.Value == (time.Duration(DefaultCodexRouteHeavyFirstByteThresholdSecs) * time.Second).String()
+		case "codex-route-management.cooling-first-byte-threshold":
+			return node.Value == (time.Duration(DefaultCodexRouteCoolingFirstByteThresholdSecs) * time.Second).String()
+		case "codex-route-management.quarantine-first-byte-threshold":
+			return node.Value == (time.Duration(DefaultCodexRouteQuarantineThresholdSecs) * time.Second).String()
 		}
 	}
 
