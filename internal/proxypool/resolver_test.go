@@ -1,6 +1,7 @@
 package proxypool
 
 import (
+	"context"
 	"testing"
 	"time"
 
@@ -161,8 +162,8 @@ func TestResolveAllUnhealthyUsesDirectFallback(t *testing.T) {
 // probe-validated binding is missing or unhealthy. Doing so would send the
 // request through a node that OpenAI may report as free for this specific
 // account (the region cache is per-(client_IP, account_id)), burning free
-// quota. Expected behavior: return direct egress so forced_refresh's sweep
-// can re-bind on the next tick.
+// quota. Expected behavior: default to direct-primary egress, leaving any
+// legacy bound proxy to assisted-only paths.
 func TestResolveCodexUnboundSkipsFNVAndReturnsDirect(t *testing.T) {
 	t.Parallel()
 
@@ -183,14 +184,14 @@ func TestResolveCodexUnboundSkipsFNVAndReturnsDirect(t *testing.T) {
 	}
 	auth := &coreauth.Auth{ID: "codex-unbound", Provider: "codex"}
 	got := ResolveWithHealth(cfg, auth, nil)
-	if got.Source != "codex-awaiting-rebind" {
-		t.Fatalf("expected Source=codex-awaiting-rebind, got %q", got.Source)
+	if got.Source != "direct-primary" {
+		t.Fatalf("expected Source=direct-primary, got %q", got.Source)
 	}
 	if got.ProxyURL != "" || got.ProxyName != "" {
 		t.Fatalf("expected no proxy selection, got URL=%q name=%q", got.ProxyURL, got.ProxyName)
 	}
 	if !got.FallbackToDirect {
-		t.Fatal("expected FallbackToDirect=true for awaiting-rebind")
+		t.Fatal("expected FallbackToDirect=true for direct-primary")
 	}
 }
 
@@ -223,9 +224,9 @@ func TestResolveNonCodexUnboundUsesFNVHash(t *testing.T) {
 	}
 }
 
-// Codex auth with a valid bound entry still routes through the bound entry —
-// the new short-circuit only kicks in when the binding is missing/unhealthy.
-func TestResolveCodexBoundStillUsesBinding(t *testing.T) {
+// Codex auth keeps its legacy bound entry around for assisted mode, but the
+// normal primary path should stay on direct egress.
+func TestResolveCodexBoundStillUsesDirectPrimary(t *testing.T) {
 	t.Parallel()
 
 	cfg := &config.Config{
@@ -245,11 +246,70 @@ func TestResolveCodexBoundStillUsesBinding(t *testing.T) {
 	auth := &coreauth.Auth{ID: "codex-bound", Provider: "codex"}
 	coreauth.SetBoundProxyEntry(auth, "proxy-b")
 	got := ResolveWithHealth(cfg, auth, nil)
-	if got.Source != "bound" {
-		t.Fatalf("expected Source=bound, got %q", got.Source)
+	if got.Source != "direct-primary" {
+		t.Fatalf("expected Source=direct-primary, got %q", got.Source)
 	}
-	if got.ProxyName != "proxy-b" {
-		t.Fatalf("expected ProxyName=proxy-b, got %q", got.ProxyName)
+	if got.ProxyName != "" || got.ProxyURL != "" {
+		t.Fatalf("expected direct path without proxy selection, got URL=%q name=%q", got.ProxyURL, got.ProxyName)
+	}
+}
+
+func TestResolveCodexDefaultsToDirectPrimaryEvenWhenBoundProxyExists(t *testing.T) {
+	t.Parallel()
+
+	cfg := &config.Config{
+		SDKConfig: config.SDKConfig{
+			DefaultProxyPool: "free-egress",
+			ProxyPools: []config.ProxyPool{
+				{
+					Name:             "free-egress",
+					FallbackToDirect: true,
+					Entries: []config.ProxyPoolEntry{
+						{Name: "proxy-1", URL: "socks5://127.0.0.1:10001"},
+					},
+				},
+			},
+		},
+	}
+	auth := &coreauth.Auth{Provider: "codex", ProxyPool: "free-egress"}
+	coreauth.SetBoundProxyEntry(auth, "proxy-1")
+
+	got := ResolveWithContext(context.Background(), cfg, auth, nil)
+	if got.Source != "direct-primary" {
+		t.Fatalf("Source = %q, want %q", got.Source, "direct-primary")
+	}
+	if got.ProxyURL != "" {
+		t.Fatalf("ProxyURL = %q, want empty direct path", got.ProxyURL)
+	}
+}
+
+func TestResolveCodexUsesLegacyBoundProxyOnlyForAssistedRequests(t *testing.T) {
+	t.Parallel()
+
+	cfg := &config.Config{
+		SDKConfig: config.SDKConfig{
+			DefaultProxyPool: "free-egress",
+			ProxyPools: []config.ProxyPool{
+				{
+					Name:             "free-egress",
+					FallbackToDirect: true,
+					Entries: []config.ProxyPoolEntry{
+						{Name: "proxy-1", URL: "socks5://127.0.0.1:10001"},
+					},
+				},
+			},
+		},
+	}
+	auth := &coreauth.Auth{Provider: "codex", ProxyPool: "free-egress"}
+	coreauth.SetBoundProxyEntry(auth, "proxy-1")
+	ctx := WithRequestRoute(context.Background(), RequestRoute{Assisted: true})
+
+	got := ResolveWithContext(ctx, cfg, auth, nil)
+	if got.Source != "bound-assisted" {
+		t.Fatalf("Source = %q, want %q", got.Source, "bound-assisted")
+	}
+	if got.ProxyName != "proxy-1" {
+		t.Fatalf("ProxyName = %q, want %q", got.ProxyName, "proxy-1")
 	}
 }
 
@@ -286,14 +346,59 @@ func TestResolveCodexBoundSkipsPassivelyUnhealthyBinding(t *testing.T) {
 	}
 
 	got := ResolveWithHealth(cfg, auth, manager)
-	if got.Source != "codex-awaiting-rebind" {
-		t.Fatalf("expected Source=codex-awaiting-rebind, got %q", got.Source)
+	if got.Source != "direct-primary" {
+		t.Fatalf("expected Source=direct-primary, got %q", got.Source)
 	}
 	if got.ProxyURL != "" || got.ProxyName != "" {
-		t.Fatalf("expected no proxy while awaiting rebind, got URL=%q name=%q", got.ProxyURL, got.ProxyName)
+		t.Fatalf("expected no proxy on direct-primary path, got URL=%q name=%q", got.ProxyURL, got.ProxyName)
 	}
 	if !got.FallbackToDirect {
-		t.Fatal("expected direct fallback while awaiting rebind")
+		t.Fatal("expected direct fallback on direct-primary path")
+	}
+}
+
+func TestResolveCodexAssistedSkipsPassivelyUnhealthyBinding(t *testing.T) {
+	t.Parallel()
+
+	cfg := &config.Config{
+		SDKConfig: config.SDKConfig{
+			DefaultProxyPool: "free-egress",
+			ProxyPools: []config.ProxyPool{
+				{
+					Name:             "free-egress",
+					FallbackToDirect: true,
+					Entries: []config.ProxyPoolEntry{
+						{Name: "proxy-a", URL: "socks5://a.local:1080"},
+						{Name: "proxy-b", URL: "socks5://b.local:1080"},
+					},
+				},
+			},
+		},
+	}
+	auth := &coreauth.Auth{ID: "codex-bound", Provider: "codex"}
+	coreauth.SetBoundProxyEntry(auth, "proxy-a")
+	manager := NewHealthManager()
+	now := time.Now()
+	for i := 0; i < DefaultPassiveSlowStrikes; i++ {
+		manager.ReportPassiveOutcome("free-egress", "proxy-a", PassiveOutcome{
+			Total:         2 * time.Minute,
+			ReadBody:      100 * time.Second,
+			ResponseBytes: 64 * 1024,
+			StatusCode:    200,
+			CheckedAt:     now.Add(time.Duration(i) * time.Second),
+		})
+	}
+
+	ctx := WithRequestRoute(context.Background(), RequestRoute{Assisted: true})
+	got := ResolveWithContext(ctx, cfg, auth, manager)
+	if got.Source != "assisted-direct-fallback" {
+		t.Fatalf("expected Source=assisted-direct-fallback, got %q", got.Source)
+	}
+	if got.ProxyURL != "" || got.ProxyName != "" {
+		t.Fatalf("expected no proxy on assisted direct fallback, got URL=%q name=%q", got.ProxyURL, got.ProxyName)
+	}
+	if !got.FallbackToDirect {
+		t.Fatal("expected direct fallback for assisted request")
 	}
 }
 
@@ -325,7 +430,8 @@ func TestResolveUsesPersistedIPv6BindLeaseBeforePoolBinding(t *testing.T) {
 		URL:       "bind://[2602:294:0:eb::42]",
 	})
 
-	got := ResolveWithHealth(cfg, auth, nil)
+	ctx := WithRequestRoute(context.Background(), RequestRoute{Assisted: true})
+	got := ResolveWithContext(ctx, cfg, auth, nil)
 	if got.Source != "ipv6-bind-lease" {
 		t.Fatalf("expected Source=ipv6-bind-lease, got %q", got.Source)
 	}

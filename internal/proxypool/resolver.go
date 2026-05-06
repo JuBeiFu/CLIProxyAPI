@@ -31,6 +31,7 @@ func ResolveWithHealth(cfg *config.Config, auth *coreauth.Auth, manager *HealthM
 }
 
 func ResolveWithContext(ctx context.Context, cfg *config.Config, auth *coreauth.Auth, manager *HealthManager) Resolution {
+	requestRoute, hasRequestRoute := RequestRouteFromContext(ctx)
 	if route, ok := RequestRouteFromContext(ctx); ok {
 		poolName := strings.TrimSpace(route.Pool)
 		if poolName == "" {
@@ -84,69 +85,64 @@ func ResolveWithContext(ctx context.Context, cfg *config.Config, auth *coreauth.
 	}
 	if cfg != nil && poolName != "" {
 		if pool := cfg.ProxyPoolByName(poolName); pool != nil {
-			if lease := coreauth.IPv6BindLease(auth); lease.URL != "" && lease.IP != "" {
-				leasePool := strings.TrimSpace(lease.Pool)
-				if leasePool == "" || strings.EqualFold(leasePool, pool.Name) {
-					if config.IPv6BindLeasePoolContains(pool, lease.IP) {
-						return Resolution{
-							ProxyURL:         lease.URL,
-							ProxyPool:        pool.Name,
-							ProxyName:        lease.EntryName,
-							Source:           "ipv6-bind-lease",
-							FallbackToDirect: pool.FallbackToDirect,
+			isCodex := auth != nil && strings.EqualFold(strings.TrimSpace(auth.Provider), "codex")
+			assisted := hasRequestRoute && requestRoute.Assisted
+			if isCodex {
+				bound := coreauth.BoundProxyEntry(auth)
+				if assisted {
+					if lease := coreauth.IPv6BindLease(auth); lease.URL != "" && lease.IP != "" {
+						leasePool := strings.TrimSpace(lease.Pool)
+						if leasePool == "" || strings.EqualFold(leasePool, pool.Name) {
+							if config.IPv6BindLeasePoolContains(pool, lease.IP) {
+								return Resolution{
+									ProxyURL:         lease.URL,
+									ProxyPool:        pool.Name,
+									ProxyName:        lease.EntryName,
+									Source:           "ipv6-bind-lease",
+									FallbackToDirect: pool.FallbackToDirect,
+								}
+							}
 						}
 					}
-				}
-			}
-			// Prefer the pool entry the auth was pinned to by the
-			// multi-path plan_type probe. Probe and real dispatch MUST
-			// travel through the same node because OpenAI's plan_type
-			// cache is per-edge: mixing nodes between probe and dispatch
-			// means the cached "paid" decision from the probe could be
-			// contradicted by the node the dispatch happens to land on.
-			bound := coreauth.BoundProxyEntry(auth)
-			if bound != "" && bound != coreauth.BoundProxyEntryDirect {
-				for _, entry := range pool.Entries {
-					if entry.Disabled || strings.TrimSpace(entry.URL) == "" {
-						continue
-					}
-					if entry.Name != bound {
-						continue
-					}
-					if manager != nil && !manager.IsUsable(pool.Name, entry.Name) {
-						break
+					if bound != "" && bound != coreauth.BoundProxyEntryDirect {
+						for _, entry := range pool.Entries {
+							if entry.Disabled || strings.TrimSpace(entry.URL) == "" {
+								continue
+							}
+							if entry.Name != bound {
+								continue
+							}
+							if manager != nil && !manager.IsUsable(pool.Name, entry.Name) {
+								break
+							}
+							return Resolution{
+								ProxyURL:         entry.URL,
+								ProxyPool:        pool.Name,
+								ProxyName:        entry.Name,
+								Source:           "bound-assisted",
+								FallbackToDirect: pool.FallbackToDirect,
+							}
+						}
 					}
 					return Resolution{
-						ProxyURL:         entry.URL,
 						ProxyPool:        pool.Name,
-						ProxyName:        entry.Name,
-						Source:           "bound",
-						FallbackToDirect: pool.FallbackToDirect,
+						Source:           "assisted-direct-fallback",
+						FallbackToDirect: true,
 					}
 				}
-			} else if bound == coreauth.BoundProxyEntryDirect {
-				// Auth was explicitly pinned to direct egress because
-				// every pool entry reported free but direct reported
-				// paid. Honor that.
-				return Resolution{
-					ProxyPool:        pool.Name,
-					Source:           "bound-direct",
-					FallbackToDirect: true,
+				if bound == coreauth.BoundProxyEntryDirect {
+					// Auth was explicitly pinned to direct egress because
+					// every pool entry reported free but direct reported
+					// paid. Honor that.
+					return Resolution{
+						ProxyPool:        pool.Name,
+						Source:           "bound-direct",
+						FallbackToDirect: true,
+					}
 				}
-			}
-			// For codex auths the FNV hash fallback is UNSAFE: OpenAI's
-			// plan_type cache is per-region, routed by (client_IP,
-			// account_id). Probing via one path and dispatching through a
-			// randomly hashed other path means the dispatch can land on a
-			// region that reports this account as free — causing the auth
-			// to hit free quota even though cached probed=paid. Short-circuit
-			// to direct egress until forced_refresh restores a valid binding
-			// (<=5min via shouldForceRefresh "unbound" / "unhealthy-bound"
-			// rules). Non-codex providers keep the hash-pick fallback.
-			if auth != nil && strings.EqualFold(strings.TrimSpace(auth.Provider), "codex") {
 				return Resolution{
 					ProxyPool:        pool.Name,
-					Source:           "codex-awaiting-rebind",
+					Source:           "direct-primary",
 					FallbackToDirect: true,
 				}
 			}

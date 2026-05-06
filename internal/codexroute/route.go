@@ -6,9 +6,10 @@ import (
 )
 
 type RequestRoute struct {
-	Pool   string
-	Entry  string
-	Direct bool
+	Pool     string
+	Entry    string
+	Direct   bool
+	Assisted bool
 }
 
 type RouteDescriptor struct {
@@ -41,8 +42,9 @@ func RequestRouteFromContext(ctx context.Context) (RequestRoute, bool) {
 
 func (r RouteDescriptor) RequestRoute() RequestRoute {
 	return RequestRoute{
-		Pool:   strings.TrimSpace(r.Pool),
-		Entry:  strings.TrimSpace(r.Entry),
-		Direct: r.Direct,
+		Pool:     strings.TrimSpace(r.Pool),
+		Entry:    strings.TrimSpace(r.Entry),
+		Direct:   r.Direct,
+		Assisted: !r.Direct,
 	}
 }

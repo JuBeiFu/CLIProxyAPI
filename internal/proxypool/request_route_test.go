@@ -25,6 +25,24 @@ func TestRequestRouteContextRoundTrip(t *testing.T) {
 	}
 }
 
+func TestRequestRouteContextCarriesAssistedIntent(t *testing.T) {
+	t.Parallel()
+
+	ctx := WithRequestRoute(context.Background(), RequestRoute{
+		Pool:     "pool-a",
+		Entry:    "proxy-2",
+		Assisted: true,
+	})
+
+	route, ok := RequestRouteFromContext(ctx)
+	if !ok {
+		t.Fatal("RequestRouteFromContext returned ok=false")
+	}
+	if !route.Assisted {
+		t.Fatal("expected Assisted=true on round trip")
+	}
+}
+
 func TestResolveHonorsRequestLocalRouteOverride(t *testing.T) {
 	t.Parallel()
 
