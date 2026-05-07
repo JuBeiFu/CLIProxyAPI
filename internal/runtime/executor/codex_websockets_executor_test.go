@@ -321,6 +321,25 @@ func TestNewProxyAwareWebsocketDialerDirectDisablesProxy(t *testing.T) {
 	}
 }
 
+func TestNewProxyAwareWebsocketDialerBindUsesCustomDialer(t *testing.T) {
+	t.Parallel()
+
+	dialer, resolution := newProxyAwareWebsocketDialerWithResolution(
+		&config.Config{},
+		&cliproxyauth.Auth{ProxyURL: "bind://[2602:294:0:eb::100]"},
+	)
+
+	if dialer.Proxy != nil {
+		t.Fatal("expected websocket proxy function to be nil for bind mode")
+	}
+	if dialer.NetDialContext == nil {
+		t.Fatal("expected websocket bind mode to install NetDialContext")
+	}
+	if resolution.ProxyURL != "bind://[2602:294:0:eb::100]" {
+		t.Fatalf("resolution.ProxyURL = %q, want bind URL", resolution.ProxyURL)
+	}
+}
+
 func TestEnrichCodexWebsocketBridgeFollowupRequestPreservesToolConfig(t *testing.T) {
 	lastRequest := []byte(`{"model":"gpt-5.4","stream":true,"instructions":"be helpful","tools":[{"type":"function","name":"ping","description":"Return pong","parameters":{"type":"object","properties":{},"additionalProperties":false}}],"tool_choice":"auto","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"start"}]}]}`)
 	body := []byte(`{"model":"gpt-5.4","stream":true,"previous_response_id":"resp-1","input":[{"type":"function_call_output","call_id":"call-1","output":"pong"}]}`)

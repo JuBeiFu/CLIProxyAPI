@@ -5,6 +5,7 @@ import (
 	"hash/fnv"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
@@ -50,6 +51,19 @@ func ResolveWithContext(ctx context.Context, cfg *config.Config, auth *coreauth.
 				FallbackToDirect: true,
 			}
 		}
+		if auth != nil {
+			if lease := DefaultCodexFailoverManager().CurrentIPv6Lease(auth); lease.URL != "" && lease.IP != "" {
+				if strings.EqualFold(strings.TrimSpace(lease.Pool), poolName) && strings.EqualFold(strings.TrimSpace(lease.EntryName), strings.TrimSpace(route.Entry)) {
+					return Resolution{
+						ProxyURL:         lease.URL,
+						ProxyPool:        poolName,
+						ProxyName:        lease.EntryName,
+						Source:           "ipv6-bind-lease",
+						FallbackToDirect: false,
+					}
+				}
+			}
+		}
 		if entry, okEntry := findPoolEntryByName(cfg, poolName, route.Entry); okEntry {
 			fallbackToDirect := false
 			if cfg != nil {
@@ -88,6 +102,9 @@ func ResolveWithContext(ctx context.Context, cfg *config.Config, auth *coreauth.
 			isCodex := auth != nil && strings.EqualFold(strings.TrimSpace(auth.Provider), "codex")
 			assisted := hasRequestRoute && requestRoute.Assisted
 			if isCodex {
+				if resolution, ok := resolveCodexFailoverPreference(cfg, auth, pool, manager); ok {
+					return resolution
+				}
 				bound := coreauth.BoundProxyEntry(auth)
 				if assisted {
 					if lease := coreauth.IPv6BindLease(auth); lease.URL != "" && lease.IP != "" {
@@ -175,6 +192,78 @@ func ResolveWithContext(ctx context.Context, cfg *config.Config, auth *coreauth.
 	}
 
 	return Resolution{Source: "direct"}
+}
+
+func resolveCodexFailoverPreference(cfg *config.Config, auth *coreauth.Auth, pool *config.ProxyPool, manager *HealthManager) (Resolution, bool) {
+	if auth == nil || pool == nil {
+		return Resolution{}, false
+	}
+	mode := DefaultCodexFailoverManager().PreferredMode(cfg, auth.ID, time.Now())
+	switch mode {
+	case CodexFailoverModeDirectV6:
+		if lease := DefaultCodexFailoverManager().CurrentIPv6Lease(auth); lease.URL != "" && lease.IP != "" {
+			leasePool := strings.TrimSpace(lease.Pool)
+			if leasePool == "" || strings.EqualFold(leasePool, pool.Name) {
+				if config.IPv6BindLeasePoolContains(pool, lease.IP) {
+					return Resolution{
+						ProxyURL:         lease.URL,
+						ProxyPool:        pool.Name,
+						ProxyName:        lease.EntryName,
+						Source:           "direct-v6-sticky",
+						FallbackToDirect: false,
+					}, true
+				}
+			}
+		}
+		DefaultCodexFailoverManager().Clear(auth.ID)
+	case CodexFailoverModeProxy:
+		if entry, ok := selectNonBindProxyEntryWithHealth(pool, auth, manager); ok {
+			return Resolution{
+				ProxyURL:         entry.URL,
+				ProxyPool:        pool.Name,
+				ProxyName:        entry.Name,
+				Source:           "proxy-pool-fallback",
+				FallbackToDirect: pool.FallbackToDirect,
+			}, true
+		}
+		DefaultCodexFailoverManager().Clear(auth.ID)
+	}
+	return Resolution{}, false
+}
+
+func selectNonBindProxyEntryWithHealth(pool *config.ProxyPool, auth *coreauth.Auth, manager *HealthManager) (config.ProxyPoolEntry, bool) {
+	if pool == nil || len(pool.Entries) == 0 {
+		return config.ProxyPoolEntry{}, false
+	}
+
+	weighted := make([]config.ProxyPoolEntry, 0, len(pool.Entries))
+	for _, entry := range pool.Entries {
+		url := strings.TrimSpace(entry.URL)
+		if entry.Disabled || url == "" || strings.HasPrefix(strings.ToLower(url), "bind://") {
+			continue
+		}
+		if manager != nil && !manager.IsUsable(pool.Name, entry.Name) {
+			continue
+		}
+		weight := entry.Weight
+		if weight <= 0 {
+			weight = 1
+		}
+		for i := 0; i < weight; i++ {
+			weighted = append(weighted, entry)
+		}
+	}
+	if len(weighted) == 0 {
+		return config.ProxyPoolEntry{}, false
+	}
+
+	seed := authSeed(auth)
+	hash := fnv.New64a()
+	_, _ = hash.Write([]byte(pool.Name))
+	_, _ = hash.Write([]byte{0})
+	_, _ = hash.Write([]byte(seed))
+	index := int(hash.Sum64() % uint64(len(weighted)))
+	return weighted[index], true
 }
 
 func findPoolEntryByName(cfg *config.Config, poolName, entryName string) (config.ProxyPoolEntry, bool) {

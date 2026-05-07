@@ -1107,6 +1107,17 @@ func newProxyAwareWebsocketDialerWithResolution(cfg *config.Config, auth *clipro
 	case proxyutil.ModeDirect:
 		dialer.Proxy = nil
 		return dialer, resolution
+	case proxyutil.ModeBind:
+		dialer.Proxy = nil
+		bindDialer, _, errBuild := proxyutil.BuildDialer(proxyURL)
+		if errBuild != nil {
+			log.Errorf("codex websockets executor: create bind dialer failed: %v", errBuild)
+			return dialer, resolution
+		}
+		dialer.NetDialContext = func(_ context.Context, network, addr string) (net.Conn, error) {
+			return bindDialer.Dial(network, addr)
+		}
+		return dialer, resolution
 	case proxyutil.ModeProxy:
 	default:
 		return dialer, resolution

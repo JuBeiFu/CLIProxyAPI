@@ -5,8 +5,10 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptrace"
 	"regexp"
@@ -55,6 +57,12 @@ type codexUpstreamTiming struct {
 	proxyName       string
 	proxyURL        string
 	proxyFallback   bool
+	runtimeMode     string
+	directBindIP    string
+	failoverState   string
+	failoverReason  string
+	stickyAuthID    string
+	stickyLease     string
 	status          int
 	bytesRead       int
 	startedAt       time.Time
@@ -84,14 +92,19 @@ func logSlowCodexUpstreamTiming(ctx context.Context, timing codexUpstreamTiming)
 	if errText == "" {
 		errText = "-"
 	}
-	runtimeMode := "assisted"
-	switch strings.TrimSpace(timing.proxySource) {
-	case "direct", "direct-primary", "bound-direct", "request-route-direct", "assisted-direct-fallback":
-		runtimeMode = "direct"
+	runtimeMode := strings.TrimSpace(timing.runtimeMode)
+	if runtimeMode == "" {
+		runtimeMode = proxypool.CodexResolutionTelemetryFor(nil, proxypool.Resolution{
+			ProxyURL: timing.proxyURL,
+			Source:   timing.proxySource,
+		}, time.Now()).RuntimeEgressMode
+		if runtimeMode == "" {
+			runtimeMode = "assisted"
+		}
 	}
 	legacyBound := strings.TrimSpace(timing.proxySource) == "bound-assisted"
 	helps.LogWithRequestID(ctx).Infof(
-		"codex upstream timing endpoint=%s model=%s auth_id=%s proxy_source=%s proxy_pool=%s proxy_name=%s proxy_url=%s proxy_fallback_direct=%t runtime_egress_mode=%s legacy_bound_proxy_used=%t resolution_source=%s status=%d total=%s prepare=%s http_do=%s read_body=%s translate=%s http_conn=%s http_tls=%s http_wrote_req=%s http_first_byte=%s http_conn_reused=%t http_conn_was_idle=%t http_conn_idle=%s response_bytes=%d stream_lines=%d stream_chunks=%d stream_completed=%t stream_err=%s",
+		"codex upstream timing endpoint=%s model=%s auth_id=%s proxy_source=%s proxy_pool=%s proxy_name=%s proxy_url=%s proxy_fallback_direct=%t runtime_egress_mode=%s direct_bind_ip=%s failover_state=%s failover_reason=%s sticky_auth_id=%s sticky_lease=%s legacy_bound_proxy_used=%t resolution_source=%s status=%d total=%s prepare=%s http_do=%s read_body=%s translate=%s http_conn=%s http_tls=%s http_wrote_req=%s http_first_byte=%s http_conn_reused=%t http_conn_was_idle=%t http_conn_idle=%s response_bytes=%d stream_lines=%d stream_chunks=%d stream_completed=%t stream_err=%s",
 		timing.endpoint,
 		timing.model,
 		strings.TrimSpace(timing.authID),
@@ -101,6 +114,11 @@ func logSlowCodexUpstreamTiming(ctx context.Context, timing codexUpstreamTiming)
 		strings.TrimSpace(timing.proxyURL),
 		timing.proxyFallback,
 		runtimeMode,
+		strings.TrimSpace(timing.directBindIP),
+		strings.TrimSpace(timing.failoverState),
+		strings.TrimSpace(timing.failoverReason),
+		strings.TrimSpace(timing.stickyAuthID),
+		strings.TrimSpace(timing.stickyLease),
 		legacyBound,
 		strings.TrimSpace(timing.proxySource),
 		timing.status,
@@ -122,6 +140,24 @@ func logSlowCodexUpstreamTiming(ctx context.Context, timing codexUpstreamTiming)
 		timing.streamCompleted,
 		errText,
 	)
+}
+
+func applyCodexResolutionTiming(timing *codexUpstreamTiming, auth *cliproxyauth.Auth, resolution proxypool.Resolution) {
+	if timing == nil {
+		return
+	}
+	timing.proxySource = resolution.Source
+	timing.proxyPool = resolution.ProxyPool
+	timing.proxyName = resolution.ProxyName
+	timing.proxyURL = resolution.ProxyURL
+	timing.proxyFallback = resolution.FallbackToDirect
+	telemetry := proxypool.CodexResolutionTelemetryFor(auth, resolution, time.Now())
+	timing.runtimeMode = telemetry.RuntimeEgressMode
+	timing.directBindIP = telemetry.DirectBindIP
+	timing.failoverState = telemetry.FailoverState
+	timing.failoverReason = telemetry.FailoverReason
+	timing.stickyAuthID = telemetry.StickyAuthID
+	timing.stickyLease = telemetry.StickyLease
 }
 
 func recordCodexProxyPassiveOutcome(timing codexUpstreamTiming, manager *proxypool.HealthManager) {
@@ -379,21 +415,40 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 		AuthValue: authValue,
 	})
 	httpClient, resolution := helps.NewProxyAwareHTTPClientWithResolution(ctx, e.cfg, auth, 0)
-	timing.proxySource = resolution.Source
-	timing.proxyPool = resolution.ProxyPool
-	timing.proxyName = resolution.ProxyName
-	timing.proxyURL = resolution.ProxyURL
-	timing.proxyFallback = resolution.FallbackToDirect
+	applyCodexResolutionTiming(&timing, auth, resolution)
 	timing.prepare = time.Since(prepareStarted)
 	traceCtx := withCodexHTTPTrace(httpReq.Context(), &timing)
 	httpStarted := time.Now()
 	httpResp, err := httpClient.Do(httpReq.WithContext(traceCtx))
 	timing.httpDo = time.Since(httpStarted)
 	if err != nil {
+		if retryResp, retryResolution, retryErr, retried := e.retryCodexHTTPRequestWithFailover(ctx, auth, httpReq, &timing, resolution, err, 0); retried {
+			httpResp = retryResp
+			resolution = retryResolution
+			err = retryErr
+		}
+	}
+	if err != nil {
 		helps.RecordAPIResponseError(ctx, e.cfg, err)
 		return resp, err
 	}
 	timing.status = httpResp.StatusCode
+	if codexShouldFailoverForStatus(httpResp.StatusCode) {
+		if errClose := httpResp.Body.Close(); errClose != nil {
+			log.Errorf("codex executor: close response body error: %v", errClose)
+		}
+		retryResp, retryResolution, retryErr, retried := e.retryCodexHTTPRequestWithFailover(ctx, auth, httpReq, &timing, resolution, nil, httpResp.StatusCode)
+		if retried {
+			httpResp = retryResp
+			resolution = retryResolution
+			err = retryErr
+			if err != nil {
+				helps.RecordAPIResponseError(ctx, e.cfg, err)
+				return resp, err
+			}
+			timing.status = httpResp.StatusCode
+		}
+	}
 	defer func() {
 		if errClose := httpResp.Body.Close(); errClose != nil {
 			log.Errorf("codex executor: close response body error: %v", errClose)
@@ -487,6 +542,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 		translateStarted := time.Now()
 		out := sdktranslator.TranslateNonStream(ctx, to, from, req.Model, originalPayload, body, completedData, &param)
 		timing.translate += time.Since(translateStarted)
+		proxypool.DefaultCodexFailoverManager().MarkSuccess(authID, codexResolutionMode(auth, resolution))
 		resp = cliproxyexecutor.Response{Payload: out, Headers: httpResp.Header.Clone()}
 		return resp, nil
 	}
@@ -561,21 +617,40 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 		AuthValue: authValue,
 	})
 	httpClient, resolution := helps.NewProxyAwareHTTPClientWithResolution(ctx, e.cfg, auth, 0)
-	timing.proxySource = resolution.Source
-	timing.proxyPool = resolution.ProxyPool
-	timing.proxyName = resolution.ProxyName
-	timing.proxyURL = resolution.ProxyURL
-	timing.proxyFallback = resolution.FallbackToDirect
+	applyCodexResolutionTiming(&timing, auth, resolution)
 	timing.prepare = time.Since(prepareStarted)
 	traceCtx := withCodexHTTPTrace(httpReq.Context(), &timing)
 	httpStarted := time.Now()
 	httpResp, err := httpClient.Do(httpReq.WithContext(traceCtx))
 	timing.httpDo = time.Since(httpStarted)
 	if err != nil {
+		if retryResp, retryResolution, retryErr, retried := e.retryCodexHTTPRequestWithFailover(ctx, auth, httpReq, &timing, resolution, err, 0); retried {
+			httpResp = retryResp
+			resolution = retryResolution
+			err = retryErr
+		}
+	}
+	if err != nil {
 		helps.RecordAPIResponseError(ctx, e.cfg, err)
 		return resp, err
 	}
 	timing.status = httpResp.StatusCode
+	if codexShouldFailoverForStatus(httpResp.StatusCode) {
+		if errClose := httpResp.Body.Close(); errClose != nil {
+			log.Errorf("codex executor: close response body error: %v", errClose)
+		}
+		retryResp, retryResolution, retryErr, retried := e.retryCodexHTTPRequestWithFailover(ctx, auth, httpReq, &timing, resolution, nil, httpResp.StatusCode)
+		if retried {
+			httpResp = retryResp
+			resolution = retryResolution
+			err = retryErr
+			if err != nil {
+				helps.RecordAPIResponseError(ctx, e.cfg, err)
+				return resp, err
+			}
+			timing.status = httpResp.StatusCode
+		}
+	}
 	defer func() {
 		if errClose := httpResp.Body.Close(); errClose != nil {
 			log.Errorf("codex executor: close response body error: %v", errClose)
@@ -608,6 +683,7 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 	translateStarted := time.Now()
 	out := sdktranslator.TranslateNonStream(ctx, to, from, req.Model, originalPayload, body, data, &param)
 	timing.translate = time.Since(translateStarted)
+	proxypool.DefaultCodexFailoverManager().MarkSuccess(authID, codexResolutionMode(auth, resolution))
 	resp = cliproxyexecutor.Response{Payload: out, Headers: httpResp.Header.Clone()}
 	return resp, nil
 }
@@ -628,6 +704,157 @@ func compactRequestHasInlineInput(body []byte) bool {
 	default:
 		return strings.TrimSpace(input.Raw) != "" && input.Raw != "null"
 	}
+}
+
+func (e *CodexExecutor) retryCodexHTTPRequestWithFailover(ctx context.Context, auth *cliproxyauth.Auth, httpReq *http.Request, timing *codexUpstreamTiming, resolution proxypool.Resolution, requestErr error, statusCode int) (*http.Response, proxypool.Resolution, error, bool) {
+	if auth == nil || timing == nil {
+		return nil, resolution, requestErr, false
+	}
+	if requestErr != nil && !codexShouldFailoverForError(requestErr) {
+		return nil, resolution, requestErr, false
+	}
+	if requestErr == nil && !codexShouldFailoverForStatus(statusCode) {
+		return nil, resolution, requestErr, false
+	}
+	if !advanceCodexFailoverState(e.cfg, auth, resolution, codexFailoverReason(requestErr, statusCode)) {
+		return nil, resolution, requestErr, false
+	}
+
+	retryReq, errClone := cloneHTTPRequestForRetry(httpReq)
+	if errClone != nil {
+		return nil, resolution, requestErr, false
+	}
+	httpClient, retryResolution := helps.NewProxyAwareHTTPClientWithResolution(ctx, e.cfg, auth, 0)
+	applyCodexResolutionTiming(timing, auth, retryResolution)
+	traceCtx := withCodexHTTPTrace(retryReq.Context(), timing)
+	httpStarted := time.Now()
+	retryResp, retryErr := httpClient.Do(retryReq.WithContext(traceCtx))
+	timing.httpDo += time.Since(httpStarted)
+	return retryResp, retryResolution, retryErr, true
+}
+
+func cloneHTTPRequestForRetry(req *http.Request) (*http.Request, error) {
+	if req == nil {
+		return nil, nil
+	}
+	cloned := req.Clone(req.Context())
+	if req.Body == nil {
+		return cloned, nil
+	}
+	if req.GetBody != nil {
+		body, err := req.GetBody()
+		if err != nil {
+			return nil, err
+		}
+		cloned.Body = body
+		return cloned, nil
+	}
+	data, err := io.ReadAll(req.Body)
+	if err != nil {
+		return nil, err
+	}
+	_ = req.Body.Close()
+	req.Body = io.NopCloser(bytes.NewReader(data))
+	req.ContentLength = int64(len(data))
+	cloned.Body = io.NopCloser(bytes.NewReader(data))
+	cloned.ContentLength = int64(len(data))
+	return cloned, nil
+}
+
+func advanceCodexFailoverState(cfg *config.Config, auth *cliproxyauth.Auth, resolution proxypool.Resolution, reason string) bool {
+	if auth == nil {
+		return false
+	}
+	now := time.Now()
+	reason = strings.TrimSpace(reason)
+	switch codexResolutionMode(auth, resolution) {
+	case proxypool.CodexFailoverModeDirectV4:
+		if lease := proxypool.DefaultCodexFailoverManager().CurrentIPv6Lease(auth); strings.TrimSpace(lease.URL) != "" {
+			proxypool.DefaultCodexFailoverManager().PreferDirectV6WithReason(cfg, auth.ID, reason, now)
+			return true
+		}
+	case proxypool.CodexFailoverModeDirectV6:
+		if proxypool.DefaultCodexFailoverManager().RotateToNextIPv6Lease(cfg, auth, now) {
+			proxypool.DefaultCodexFailoverManager().NoteReason(auth.ID, reason)
+			return true
+		}
+		proxypool.DefaultCodexFailoverManager().PreferProxyPoolWithReason(cfg, auth.ID, reason, now)
+		return true
+	}
+	return false
+}
+
+func codexFailoverReason(requestErr error, statusCode int) string {
+	if requestErr != nil {
+		text := strings.ToLower(strings.TrimSpace(requestErr.Error()))
+		switch {
+		case strings.Contains(text, "server misbehaving"):
+			return "dns-server-misbehaving"
+		case strings.Contains(text, "no such host"):
+			return "dns-no-such-host"
+		case strings.Contains(text, "network is unreachable"):
+			return "network-unreachable"
+		case strings.Contains(text, "no route to host"):
+			return "no-route-to-host"
+		case strings.Contains(text, "connection reset"):
+			return "connection-reset"
+		case strings.Contains(text, "broken pipe"):
+			return "broken-pipe"
+		case strings.Contains(text, "tls handshake"):
+			return "tls-handshake"
+		case strings.Contains(text, "eof"):
+			return "eof"
+		case strings.Contains(text, "timeout"):
+			return "connect-timeout"
+		default:
+			return "transport-error"
+		}
+	}
+	switch statusCode {
+	case http.StatusBadGateway:
+		return "http-502"
+	case http.StatusServiceUnavailable:
+		return "http-503"
+	default:
+		return ""
+	}
+}
+
+func codexResolutionMode(auth *cliproxyauth.Auth, resolution proxypool.Resolution) string {
+	switch strings.TrimSpace(resolution.Source) {
+	case "direct-v6-sticky":
+		return proxypool.CodexFailoverModeDirectV6
+	case "proxy-pool-fallback":
+		return proxypool.CodexFailoverModeProxy
+	}
+	if auth != nil && strings.EqualFold(strings.TrimSpace(auth.Provider), "codex") {
+		return proxypool.CodexFailoverModeDirectV4
+	}
+	return ""
+}
+
+func codexShouldFailoverForStatus(statusCode int) bool {
+	return statusCode == http.StatusBadGateway || statusCode == http.StatusServiceUnavailable
+}
+
+func codexShouldFailoverForError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return true
+	}
+	text := strings.ToLower(strings.TrimSpace(err.Error()))
+	return strings.Contains(text, "timeout") ||
+		strings.Contains(text, "no such host") ||
+		strings.Contains(text, "server misbehaving") ||
+		strings.Contains(text, "network is unreachable") ||
+		strings.Contains(text, "no route to host") ||
+		strings.Contains(text, "connection reset") ||
+		strings.Contains(text, "broken pipe") ||
+		strings.Contains(text, "tls handshake") ||
+		strings.Contains(text, "eof")
 }
 
 func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (_ *cliproxyexecutor.StreamResult, err error) {
@@ -708,12 +935,37 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 	httpResp, err := httpClient.Do(httpReq.WithContext(traceCtx))
 	timing.httpDo = time.Since(httpStarted)
 	if err != nil {
+		if retryResp, retryResolution, retryErr, retried := e.retryCodexHTTPRequestWithFailover(ctx, auth, httpReq, &timing, resolution, err, 0); retried {
+			httpResp = retryResp
+			resolution = retryResolution
+			err = retryErr
+		}
+	}
+	if err != nil {
 		helps.RecordAPIResponseError(ctx, e.cfg, err)
 		timing.streamErrText = err.Error()
 		finishCodexUpstreamTiming(ctx, timing)
 		return nil, err
 	}
 	timing.status = httpResp.StatusCode
+	if codexShouldFailoverForStatus(httpResp.StatusCode) {
+		if errClose := httpResp.Body.Close(); errClose != nil {
+			log.Errorf("codex executor: close response body error: %v", errClose)
+		}
+		retryResp, retryResolution, retryErr, retried := e.retryCodexHTTPRequestWithFailover(ctx, auth, httpReq, &timing, resolution, nil, httpResp.StatusCode)
+		if retried {
+			httpResp = retryResp
+			resolution = retryResolution
+			err = retryErr
+			if err != nil {
+				helps.RecordAPIResponseError(ctx, e.cfg, err)
+				timing.streamErrText = err.Error()
+				finishCodexUpstreamTiming(ctx, timing)
+				return nil, err
+			}
+			timing.status = httpResp.StatusCode
+		}
+	}
 	helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
 		readStarted := time.Now()
@@ -793,6 +1045,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 					if detail, ok := helps.ParseCodexUsage(data); ok {
 						reporter.Publish(ctx, detail)
 					}
+					proxypool.DefaultCodexFailoverManager().MarkSuccess(authID, codexResolutionMode(auth, resolution))
 				}
 			}
 

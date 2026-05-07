@@ -481,3 +481,102 @@ func TestResolveUsesPersistedIPv6BindLeaseBeforePoolBinding(t *testing.T) {
 		t.Fatalf("ProxyName = %q, want lease entry name", got.ProxyName)
 	}
 }
+
+func TestResolveCodexFailoverManagerPrefersDirectV6Lease(t *testing.T) {
+	t.Parallel()
+
+	cfg := &config.Config{
+		SDKConfig: config.SDKConfig{
+			DefaultProxyPool: "dedicated-v6",
+			ProxyPools: []config.ProxyPool{{
+				Name: "dedicated-v6",
+				IPv6BindLeaseRanges: []config.IPv6BindLeaseRange{
+					{CIDR: "2602:294:0:eb::/64"},
+				},
+				Entries: []config.ProxyPoolEntry{
+					{Name: "proxy-a", URL: "socks5://a.local:1080"},
+				},
+			}},
+		},
+	}
+	auth := &coreauth.Auth{ID: "auth-v6", Provider: "codex"}
+	coreauth.SetIPv6BindLease(auth, coreauth.IPv6BindLeaseInfo{
+		Pool:      "dedicated-v6",
+		EntryName: "acct-v6-auth",
+		IP:        "2602:294:0:eb::42",
+		URL:       "bind://[2602:294:0:eb::42]",
+	})
+	manager := DefaultCodexFailoverManager()
+	manager.PreferDirectV6(cfg, auth.ID, time.Now())
+	t.Cleanup(func() { manager.Clear(auth.ID) })
+
+	got := ResolveWithHealth(cfg, auth, nil)
+	if got.Source != "direct-v6-sticky" {
+		t.Fatalf("expected Source=direct-v6-sticky, got %q", got.Source)
+	}
+	if got.ProxyURL != "bind://[2602:294:0:eb::42]" {
+		t.Fatalf("ProxyURL = %q, want bind lease URL", got.ProxyURL)
+	}
+}
+
+func TestResolveCodexFailoverManagerPrefersProxyFallback(t *testing.T) {
+	t.Parallel()
+
+	cfg := &config.Config{
+		SDKConfig: config.SDKConfig{
+			DefaultProxyPool: "shared",
+			ProxyPools: []config.ProxyPool{{
+				Name: "shared",
+				Entries: []config.ProxyPoolEntry{
+					{Name: "bind-a", URL: "bind://[2602:294:0:eb::42]"},
+					{Name: "proxy-a", URL: "socks5://a.local:1080"},
+				},
+			}},
+		},
+	}
+	auth := &coreauth.Auth{ID: "auth-proxy", Provider: "codex"}
+	manager := DefaultCodexFailoverManager()
+	manager.PreferProxyPool(cfg, auth.ID, time.Now())
+	t.Cleanup(func() { manager.Clear(auth.ID) })
+
+	got := ResolveWithHealth(cfg, auth, nil)
+	if got.Source != "proxy-pool-fallback" {
+		t.Fatalf("expected Source=proxy-pool-fallback, got %q", got.Source)
+	}
+	if got.ProxyName != "proxy-a" {
+		t.Fatalf("ProxyName = %q, want proxy-a", got.ProxyName)
+	}
+}
+
+func TestCodexFailoverManagerRotatesToNextIPv6Lease(t *testing.T) {
+	t.Parallel()
+
+	cfg := &config.Config{
+		SDKConfig: config.SDKConfig{
+			DefaultProxyPool: "dedicated-v6",
+			ProxyPools: []config.ProxyPool{{
+				Name: "dedicated-v6",
+				IPv6BindLeaseRanges: []config.IPv6BindLeaseRange{
+					{CIDR: "2602:294:0:eb::/126"},
+				},
+			}},
+		},
+	}
+	auth := &coreauth.Auth{ID: "auth-rotate", Index: "idx-1", Provider: "codex"}
+	coreauth.SetIPv6BindLease(auth, coreauth.IPv6BindLeaseInfo{
+		Pool:      "dedicated-v6",
+		EntryName: "acct-v6-auth",
+		IP:        "2602:294:0:eb::",
+		URL:       "bind://[2602:294:0:eb::]",
+	})
+	manager := DefaultCodexFailoverManager()
+	t.Cleanup(func() { manager.Clear(auth.ID) })
+
+	if !manager.RotateToNextIPv6Lease(cfg, auth, time.Now()) {
+		t.Fatal("expected RotateToNextIPv6Lease to succeed")
+	}
+	lease := manager.CurrentIPv6Lease(auth)
+	if lease.IP == "" || lease.IP == "2602:294:0:eb::" {
+		t.Fatalf("expected rotated lease IP, got %q", lease.IP)
+	}
+}

@@ -7,8 +7,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/proxypool"
+	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -165,13 +167,57 @@ func TestLogSlowCodexUpstreamTimingIncludesRuntimeEgressMode(t *testing.T) {
 
 	out := buf.String()
 	for _, part := range []string{
-		"runtime_egress_mode=direct",
+		"runtime_egress_mode=direct-v4",
 		"legacy_bound_proxy_used=false",
 		"resolution_source=direct-primary",
 	} {
 		if !strings.Contains(out, part) {
 			t.Fatalf("log output missing %q: %s", part, out)
 		}
+	}
+}
+
+func TestApplyCodexResolutionTimingIncludesDirectV6Details(t *testing.T) {
+	manager := proxypool.DefaultCodexFailoverManager()
+	authID := "auth-egress-v6"
+	manager.Clear(authID)
+	defer manager.Clear(authID)
+
+	cfg := &config.Config{}
+	auth := &cliproxyauth.Auth{ID: authID, Provider: "codex"}
+	cliproxyauth.SetIPv6BindLease(auth, cliproxyauth.IPv6BindLeaseInfo{
+		Pool:      "free-egress",
+		EntryName: "lease-a",
+		IP:        "2602:294:0:eb::42",
+		URL:       "bind://[2602:294:0:eb::42]",
+	})
+	manager.PreferDirectV6WithReason(cfg, authID, "connect-timeout", time.Now())
+
+	var timing codexUpstreamTiming
+	applyCodexResolutionTiming(&timing, auth, proxypool.Resolution{
+		ProxyURL:  "bind://[2602:294:0:eb::42]",
+		ProxyPool: "free-egress",
+		ProxyName: "lease-a",
+		Source:    "direct-v6-sticky",
+	})
+
+	if timing.runtimeMode != "direct-v6" {
+		t.Fatalf("runtimeMode = %q, want direct-v6", timing.runtimeMode)
+	}
+	if timing.directBindIP != "2602:294:0:eb::42" {
+		t.Fatalf("directBindIP = %q, want 2602:294:0:eb::42", timing.directBindIP)
+	}
+	if timing.failoverState != proxypool.CodexFailoverModeDirectV6 {
+		t.Fatalf("failoverState = %q, want %q", timing.failoverState, proxypool.CodexFailoverModeDirectV6)
+	}
+	if timing.failoverReason != "connect-timeout" {
+		t.Fatalf("failoverReason = %q, want connect-timeout", timing.failoverReason)
+	}
+	if timing.stickyAuthID != authID {
+		t.Fatalf("stickyAuthID = %q, want %q", timing.stickyAuthID, authID)
+	}
+	if timing.stickyLease != "bind://[2602:294:0:eb::42]" {
+		t.Fatalf("stickyLease = %q, want bind lease URL", timing.stickyLease)
 	}
 }
 
