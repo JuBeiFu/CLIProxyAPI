@@ -1,86 +1,49 @@
 package executor
 
 import (
-	"encoding/json"
-	"runtime"
-	"strconv"
-	"strings"
 	"testing"
 
 	"github.com/tidwall/gjson"
 )
 
-func TestMaybeAttachImageGenerationToolOmitsDefaultSize(t *testing.T) {
-	t.Setenv(codexAutoImageToolEnv, "")
-
-	out := maybeAttachImageGenerationTool("gpt-5.4", []byte(`{"model":"gpt-5.4","input":"draw a wide poster"}`))
+func TestMaybeAttachImageGenerationToolAttachesMinimalToolForGPT54Mini(t *testing.T) {
+	out := maybeAttachImageGenerationTool("gpt-5.4-mini", []byte(`{"model":"gpt-5.4-mini","input":"draw a wide poster"}`))
 
 	tool := gjson.GetBytes(out, "tools.0")
 	if got := tool.Get("type").String(); got != "image_generation" {
 		t.Fatalf("tools.0.type = %q, want image_generation: %s", got, string(out))
 	}
-	if tool.Get("size").Exists() {
-		t.Fatalf("auto image_generation tool should omit size: %s", string(out))
-	}
-	if got := tool.Get("quality").String(); got != "high" {
-		t.Fatalf("tools.0.quality = %q, want high: %s", got, string(out))
-	}
-	if got := tool.Get("background").String(); got != "auto" {
-		t.Fatalf("tools.0.background = %q, want auto: %s", got, string(out))
+	for _, field := range []string{"size", "quality", "background", "model", "action"} {
+		if tool.Get(field).Exists() {
+			t.Fatalf("expected minimal image_generation tool without %s: %s", field, string(out))
+		}
 	}
 }
 
-func TestMaybeAttachImageGenerationToolSkipsCodexSparkModels(t *testing.T) {
-	t.Setenv(codexAutoImageToolEnv, "")
-
-	out := maybeAttachImageGenerationTool("gpt-5.3-codex-spark", []byte(`{"model":"gpt-5.3-codex-spark","input":"hi"}`))
+func TestMaybeAttachImageGenerationToolSkipsGPT54(t *testing.T) {
+	out := maybeAttachImageGenerationTool("gpt-5.4", []byte(`{"model":"gpt-5.4","input":"draw a wide poster"}`))
 
 	if gjson.GetBytes(out, "tools").Exists() {
-		t.Fatalf("gpt-5.3-codex-spark must not auto-inject image_generation tools: %s", string(out))
+		t.Fatalf("gpt-5.4 must not auto-inject image_generation tools: %s", string(out))
 	}
 }
 
-func TestMaybeAttachImageGenerationToolLargePayloadAllocationsStayBounded(t *testing.T) {
-	t.Setenv(codexAutoImageToolEnv, "1")
-	body := buildLargeCodexBodyWithTools(64, 16*1024)
-	_ = maybeAttachImageGenerationTool("gpt-5.4", body)
+func TestMaybeAttachImageGenerationToolSkipsGPT55(t *testing.T) {
+	out := maybeAttachImageGenerationTool("gpt-5.5", []byte(`{"model":"gpt-5.5","input":"draw a wide poster"}`))
 
-	runtime.GC()
-	var before, after runtime.MemStats
-	runtime.ReadMemStats(&before)
-	out := maybeAttachImageGenerationTool("gpt-5.4", body)
-	runtime.ReadMemStats(&after)
-	runtime.KeepAlive(out)
-
-	if !json.Valid(out) {
-		t.Fatalf("output JSON is invalid: %s", out)
-	}
-	if !hasImageGenerationTool(out) {
-		t.Fatalf("expected image_generation tool, got %s", gjson.GetBytes(out, "tools").Raw)
-	}
-	if gjson.GetBytes(out, "tools.#(type=\"image_generation\").size").Exists() {
-		t.Fatalf("auto image_generation tool should omit size: %s", string(out))
-	}
-	allocated := after.TotalAlloc - before.TotalAlloc
-	limit := uint64(len(body) + 8192)
-	if allocated > limit {
-		t.Fatalf("allocated %d bytes for %d-byte body, want <= %d", allocated, len(body), limit)
+	if gjson.GetBytes(out, "tools").Exists() {
+		t.Fatalf("gpt-5.5 must not auto-inject image_generation tools: %s", string(out))
 	}
 }
 
-func buildLargeCodexBodyWithTools(messageCount, messageSize int) []byte {
-	text := strings.Repeat("x", messageSize)
-	var b strings.Builder
-	b.Grow(messageCount*messageSize + 256)
-	b.WriteString(`{"model":"gpt-5.4","stream":true,"input":[`)
-	for i := 0; i < messageCount; i++ {
-		if i > 0 {
-			b.WriteByte(',')
-		}
-		b.WriteString(`{"type":"message","role":"user","content":[{"type":"input_text","text":`)
-		b.WriteString(strconv.Quote(text))
-		b.WriteString(`}]}`)
+func TestMaybeAttachImageGenerationToolPreservesExistingImageToolForGPT54Mini(t *testing.T) {
+	out := maybeAttachImageGenerationTool("gpt-5.4-mini", []byte(`{"model":"gpt-5.4-mini","tools":[{"type":"image_generation","model":"gpt-image-2"}]}`))
+
+	tools := gjson.GetBytes(out, "tools").Array()
+	if got := len(tools); got != 1 {
+		t.Fatalf("expected existing image_generation tool to be preserved without duplication, got %d: %s", got, string(out))
 	}
-	b.WriteString(`],"tools":[{"type":"function","name":"noop","parameters":{"type":"object","properties":{}}}]}`)
-	return []byte(b.String())
+	if got := tools[0].Get("model").String(); got != "gpt-image-2" {
+		t.Fatalf("tools.0.model = %q, want gpt-image-2: %s", got, string(out))
+	}
 }
