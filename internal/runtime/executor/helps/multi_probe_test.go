@@ -386,7 +386,7 @@ func TestProbeCodexPlanAcrossPoolStartsWithIPv6BindLease(t *testing.T) {
 	}
 }
 
-func TestProbeCodexPlanAcrossPoolWithIPv6BindLeaseDoesNotProbePoolEntries(t *testing.T) {
+func TestProbeCodexPlanAcrossPoolWithIPv6BindLeaseFallsBackToPoolEntries(t *testing.T) {
 	orig := fetchUsageInfoWithProxy
 	defer func() { fetchUsageInfoWithProxy = orig }()
 
@@ -434,13 +434,84 @@ func TestProbeCodexPlanAcrossPoolWithIPv6BindLeaseDoesNotProbePoolEntries(t *tes
 	if !ok {
 		t.Fatal("probeOK = false, want true")
 	}
-	if plan != "free" {
-		t.Fatalf("plan = %q, want free", plan)
+	if plan != "plus" {
+		t.Fatalf("plan = %q, want plus", plan)
 	}
-	if bound != "" {
-		t.Fatalf("bound = %q, want empty", bound)
+	if bound != "proxy-a" {
+		t.Fatalf("bound = %q, want proxy-a", bound)
 	}
-	if len(requests) != 1 {
-		t.Fatalf("requests = %v, want only lease probe", requests)
+	if len(requests) != 2 {
+		t.Fatalf("requests = %v, want lease then pool probe", requests)
+	}
+	if requests[0] != "bind://[2602:294:0:eb::42]" || requests[1] != "http://proxy-a" {
+		t.Fatalf("requests = %v, want [lease pool-entry]", requests)
+	}
+}
+
+func TestProbeCodexPlanAcrossPoolWithBrokenIPv6BindLeaseFallsBackToDirect(t *testing.T) {
+	orig := fetchUsageInfoWithProxy
+	defer func() { fetchUsageInfoWithProxy = orig }()
+
+	var requests []string
+	fetchUsageInfoWithProxy = func(ctx context.Context, proxyURL, accessToken string) (codexauth.WhamUsageInfo, error) {
+		requests = append(requests, proxyURL)
+		switch proxyURL {
+		case "bind://[2602:294:0:eb::42]":
+			return codexauth.WhamUsageInfo{}, fmt.Errorf("network is unreachable")
+		case "http://proxy-a":
+			return codexauth.WhamUsageInfo{}, fmt.Errorf("proxy timeout")
+		case "":
+			return codexauth.WhamUsageInfo{PlanType: "plus"}, nil
+		default:
+			return codexauth.WhamUsageInfo{}, fmt.Errorf("unexpected proxyURL %q", proxyURL)
+		}
+	}
+
+	cfg := &config.Config{
+		SDKConfig: config.SDKConfig{
+			DefaultProxyPool: "dedicated-v6",
+			ProxyPools: []config.ProxyPool{
+				{
+					Name: "dedicated-v6",
+					IPv6BindLeaseRanges: []config.IPv6BindLeaseRange{
+						{CIDR: "2602:294:0:eb::/64"},
+					},
+					Entries: []config.ProxyPoolEntry{
+						{Name: "proxy-a", URL: "http://proxy-a"},
+					},
+				},
+			},
+		},
+	}
+	auth := &cliproxyauth.Auth{
+		ID:       "auth-ipv6-lease-broken",
+		Provider: "codex",
+		Metadata: map[string]any{},
+	}
+	cliproxyauth.SetIPv6BindLease(auth, cliproxyauth.IPv6BindLeaseInfo{
+		Pool:      "dedicated-v6",
+		EntryName: "acct-v6-auth",
+		IP:        "2602:294:0:eb::42",
+		URL:       "bind://[2602:294:0:eb::42]",
+	})
+
+	plan, bound, _, _, _, ok, err := ProbeCodexPlanAcrossPool(context.Background(), cfg, auth, "token")
+	if err != nil {
+		t.Fatalf("ProbeCodexPlanAcrossPool error = %v", err)
+	}
+	if !ok {
+		t.Fatal("probeOK = false, want true")
+	}
+	if plan != "plus" {
+		t.Fatalf("plan = %q, want plus", plan)
+	}
+	if bound != cliproxyauth.BoundProxyEntryDirect {
+		t.Fatalf("bound = %q, want %q", bound, cliproxyauth.BoundProxyEntryDirect)
+	}
+	if len(requests) != 3 {
+		t.Fatalf("requests = %v, want lease then pool then direct", requests)
+	}
+	if requests[0] != "bind://[2602:294:0:eb::42]" || requests[1] != "http://proxy-a" || requests[2] != "" {
+		t.Fatalf("requests = %v, want [lease pool-entry direct]", requests)
 	}
 }

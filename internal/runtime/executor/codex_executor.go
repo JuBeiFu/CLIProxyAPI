@@ -48,6 +48,33 @@ const codexSlowTimingThreshold = 30 * time.Second
 
 var codexRetryAfterPhrasePattern = regexp.MustCompile(`(?i)please try again in ([0-9]+(?:\.[0-9]+)?)(ms|milliseconds?|s|sec|secs|seconds?)`)
 
+func isPaidCodexPlanType(plan string) bool {
+	switch strings.ToLower(strings.TrimSpace(plan)) {
+	case "plus", "pro", "team", "enterprise":
+		return true
+	}
+	return false
+}
+
+func syncCodexProbeRoutingState(auth *cliproxyauth.Auth, realPlan, boundEntry string) {
+	if auth == nil {
+		return
+	}
+	lease := cliproxyauth.IPv6BindLease(auth)
+	paidViaLease := lease.URL != "" && lease.IP != "" && boundEntry == "" && isPaidCodexPlanType(realPlan)
+	if !paidViaLease && strings.TrimSpace(boundEntry) != "" && lease.URL != "" && lease.IP != "" {
+		// Resolver precedence is IPv6 lease > bound proxy entry. If the paid
+		// path was discovered on a pool entry or direct fallback, keeping a stale
+		// lease would route the real request back onto the broken path.
+		cliproxyauth.ClearIPv6BindLease(auth)
+	}
+	if strings.TrimSpace(boundEntry) != "" {
+		cliproxyauth.SetBoundProxyEntry(auth, boundEntry)
+		return
+	}
+	cliproxyauth.SetBoundProxyEntry(auth, "")
+}
+
 type codexUpstreamTiming struct {
 	endpoint        string
 	model           string
@@ -1338,16 +1365,7 @@ func (e *CodexExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*
 		applyCodexSupportedModels(auth, supportedModels, now)
 		applyCodexFiveHourQuotaMetadata(auth, fiveHourQuota, now)
 		applyCodexWeeklyQuotaMetadata(auth, weeklyQuota, now)
-		if boundEntry != "" {
-			// Found a path reporting paid plan; pin the auth so later
-			// dispatches go through the same node.
-			cliproxyauth.SetBoundProxyEntry(auth, boundEntry)
-		} else {
-			// Every path reported free. Clear any previous binding so the
-			// next probe tries afresh (e.g., after the account finishes
-			// upgrade on OpenAI's side).
-			cliproxyauth.SetBoundProxyEntry(auth, "")
-		}
+		syncCodexProbeRoutingState(auth, realPlan, boundEntry)
 	}
 	if auth.Disabled && strings.HasPrefix(auth.StatusMessage, "codex_downgrade_detected: ") {
 		log.Warnf("codex executor: auth %s disabled by downgrade detection: %s", auth.ID, auth.StatusMessage)

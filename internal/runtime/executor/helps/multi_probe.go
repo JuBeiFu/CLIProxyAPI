@@ -61,43 +61,49 @@ func ProbeCodexPlanAcrossPool(
 		entryName string // "" maps to BoundProxyEntryDirect at bind time
 		proxyURL  string // "" means direct
 	}
-	ordered := make([]probeCandidate, 0, len(candidates)+1)
-	hasLeaseCandidate := false
+	ordered := make([]probeCandidate, 0, len(candidates)+2)
+	seenCandidates := make(map[string]struct{}, len(candidates)+2)
+	appendCandidate := func(candidate probeCandidate) {
+		key := candidate.entryName + "\x00" + strings.TrimSpace(candidate.proxyURL)
+		if _, exists := seenCandidates[key]; exists {
+			return
+		}
+		seenCandidates[key] = struct{}{}
+		ordered = append(ordered, candidate)
+	}
 	if lease := cliproxyauth.IPv6BindLease(auth); lease.URL != "" && lease.IP != "" {
 		if pool != nil && config.IPv6BindLeasePoolContains(pool, lease.IP) {
 			// A per-auth IPv6 lease is already the binding. Return an empty
 			// boundEntry on success so callers clear stale legacy pool-entry
 			// bindings instead of persisting a synthetic lease name there.
-			ordered = append(ordered, probeCandidate{entryName: "", proxyURL: lease.URL})
-			hasLeaseCandidate = true
+			appendCandidate(probeCandidate{entryName: "", proxyURL: lease.URL})
 		}
 	}
-	if !hasLeaseCandidate {
-		if boundPreferredName != "" && boundPreferredName != cliproxyauth.BoundProxyEntryDirect {
-			for _, e := range candidates {
-				if e.Name != boundPreferredName {
-					continue
-				}
-				ordered = append(ordered, probeCandidate{entryName: e.Name, proxyURL: e.URL})
-				break
-			}
-		}
-		if boundPreferredName == "" {
-			if preferred, ok := proxypool.SelectPoolEntryWithHealth(pool, auth, proxypool.DefaultHealthManager()); ok {
-				ordered = append(ordered, probeCandidate{entryName: preferred.Name, proxyURL: preferred.URL})
-				candidates = removeProxyPoolEntryByName(candidates, preferred.Name)
-			}
-		}
-		secureShuffle(candidates)
+	if boundPreferredName != "" && boundPreferredName != cliproxyauth.BoundProxyEntryDirect {
 		for _, e := range candidates {
-			if boundPreferredName != "" && e.Name == boundPreferredName {
+			if e.Name != boundPreferredName {
 				continue
 			}
-			ordered = append(ordered, probeCandidate{entryName: e.Name, proxyURL: e.URL})
+			appendCandidate(probeCandidate{entryName: e.Name, proxyURL: e.URL})
+			candidates = removeProxyPoolEntryByName(candidates, e.Name)
+			break
 		}
-		// Direct egress is always appended as last-resort fallback.
-		ordered = append(ordered, probeCandidate{entryName: cliproxyauth.BoundProxyEntryDirect, proxyURL: ""})
 	}
+	if boundPreferredName == "" {
+		if preferred, ok := proxypool.SelectPoolEntryWithHealth(pool, auth, proxypool.DefaultHealthManager()); ok {
+			appendCandidate(probeCandidate{entryName: preferred.Name, proxyURL: preferred.URL})
+			candidates = removeProxyPoolEntryByName(candidates, preferred.Name)
+		}
+	}
+	secureShuffle(candidates)
+	for _, e := range candidates {
+		if boundPreferredName != "" && e.Name == boundPreferredName {
+			continue
+		}
+		appendCandidate(probeCandidate{entryName: e.Name, proxyURL: e.URL})
+	}
+	// Direct egress is always appended as last-resort fallback.
+	appendCandidate(probeCandidate{entryName: cliproxyauth.BoundProxyEntryDirect, proxyURL: ""})
 
 	var lastFreePlan string
 	var anySucceeded bool
