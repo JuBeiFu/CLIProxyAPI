@@ -645,11 +645,19 @@ func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
 	if name == "" {
 		name = auth.ID
 	}
+	entryType := strings.TrimSpace(auth.Provider)
+	if auth != nil && auth.Metadata != nil {
+		if rawType, ok := auth.Metadata["type"].(string); ok {
+			if trimmed := strings.TrimSpace(rawType); trimmed != "" {
+				entryType = trimmed
+			}
+		}
+	}
 	entry := gin.H{
 		"id":             auth.ID,
 		"auth_index":     auth.Index,
 		"name":           name,
-		"type":           strings.TrimSpace(auth.Provider),
+		"type":           entryType,
 		"provider":       strings.TrimSpace(auth.Provider),
 		"label":          auth.Label,
 		"status":         auth.Status,
@@ -980,6 +988,13 @@ func codexPlanType(auth *coreauth.Auth) string {
 			return planType
 		}
 	}
+	if auth.Metadata != nil {
+		if planType, ok := auth.Metadata["plan_type"].(string); ok {
+			if trimmed := strings.TrimSpace(planType); trimmed != "" {
+				return trimmed
+			}
+		}
+	}
 	claims := extractCodexIDTokenClaims(auth)
 	if claims == nil {
 		return ""
@@ -995,9 +1010,11 @@ func codexChatGPTAccountID(auth *coreauth.Auth) string {
 		return ""
 	}
 	if auth.Metadata != nil {
-		if accountID, ok := auth.Metadata["account_id"].(string); ok {
-			if trimmed := strings.TrimSpace(accountID); trimmed != "" {
-				return trimmed
+		for _, key := range []string{"account_id", "chatgpt_account_id"} {
+			if accountID, ok := auth.Metadata[key].(string); ok {
+				if trimmed := strings.TrimSpace(accountID); trimmed != "" {
+					return trimmed
+				}
 			}
 		}
 	}
@@ -1503,6 +1520,7 @@ func (h *Handler) buildAuthFromFileData(path string, data []byte) (*coreauth.Aut
 	if provider == "" {
 		provider = "unknown"
 	}
+	provider = codex.NormalizeProviderName(provider)
 	label := provider
 	if email, ok := metadata["email"].(string); ok && email != "" {
 		label = email
@@ -1531,27 +1549,9 @@ func (h *Handler) buildAuthFromFileData(path string, data []byte) (*coreauth.Aut
 	if hasLastRefresh {
 		auth.LastRefreshedAt = lastRefresh
 	}
-	if strings.EqualFold(strings.TrimSpace(provider), "codex") {
-		// Priority ladder for plan_type: live /wham/usage probe result
-		// (cliproxy_codex_probed_plan_type, authoritative) > JWT claim (stale
-		// snapshot). Without this guard, every file reload would clobber the
-		// probed value back to the JWT's cached plan claim, defeating
-		// downgrade detection.
-		planType := ""
-		if probed, ok := metadata[coreauth.MetadataProbedPlanTypeKey].(string); ok {
-			planType = strings.TrimSpace(probed)
-		}
-		if idTokenRaw, ok := metadata["id_token"].(string); ok {
-			if claims, errParse := codex.ParseJWTToken(idTokenRaw); errParse == nil && claims != nil {
-				if planType == "" {
-					planType = strings.TrimSpace(claims.CodexAuthInfo.ChatgptPlanType)
-				}
-				if accountID := strings.TrimSpace(claims.CodexAuthInfo.ChatgptAccountID); accountID != "" {
-					metadata["account_id"] = accountID
-				}
-			}
-		}
-		if planType != "" {
+	if codex.IsProviderName(provider) {
+		codex.ApplyMetadataAliases(metadata)
+		if planType := codex.ResolveMetadataPlanType(metadata); planType != "" {
 			auth.Attributes["plan_type"] = planType
 		}
 	}

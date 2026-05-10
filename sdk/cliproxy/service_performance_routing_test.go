@@ -106,6 +106,45 @@ func TestServiceAppliesPerformanceRoutingConfigToManagerSelection(t *testing.T) 
 	}
 }
 
+func TestServiceApplyPerformanceRoutingConfigKeepsSelectionDeterministicWhenDisabled(t *testing.T) {
+	const model = "service-performance-routing-disabled-gpt-5.4"
+	manager := coreauth.NewManager(nil, &coreauth.FillFirstSelector{}, nil)
+	manager.RegisterExecutor(servicePerformanceTestExecutor{})
+	reg := registry.GetGlobalRegistry()
+	reg.RegisterClient("service-perf-disabled-auth-a", "codex", []*registry.ModelInfo{{ID: model}})
+	reg.RegisterClient("service-perf-disabled-auth-b", "codex", []*registry.ModelInfo{{ID: model}})
+	t.Cleanup(func() {
+		reg.UnregisterClient("service-perf-disabled-auth-a")
+		reg.UnregisterClient("service-perf-disabled-auth-b")
+	})
+	if _, errRegister := manager.Register(context.Background(), &coreauth.Auth{ID: "service-perf-disabled-auth-a", Provider: "codex"}); errRegister != nil {
+		t.Fatalf("Register(auth-a) error = %v", errRegister)
+	}
+	if _, errRegister := manager.Register(context.Background(), &coreauth.Auth{ID: "service-perf-disabled-auth-b", Provider: "codex"}); errRegister != nil {
+		t.Fatalf("Register(auth-b) error = %v", errRegister)
+	}
+	manager.RefreshSchedulerEntry("service-perf-disabled-auth-a")
+	manager.RefreshSchedulerEntry("service-perf-disabled-auth-b")
+
+	now := time.Now()
+	performance.DefaultTracker().Record(performance.Sample{Provider: "codex", AuthID: "service-perf-disabled-auth-a", Model: model, RequestedAt: now, Latency: time.Second, OutputTokens: 10})
+	performance.DefaultTracker().Record(performance.Sample{Provider: "codex", AuthID: "service-perf-disabled-auth-b", Model: model, RequestedAt: now, Latency: time.Second, OutputTokens: 60})
+	svc := &Service{coreManager: manager}
+	cfg := &sdkconfig.Config{}
+	cfg.Routing.PerformanceAware = false
+	cfg.Routing.PerformanceShadowLog = false
+
+	svc.applyPerformanceRoutingConfig(cfg)
+
+	resp, errExecute := manager.Execute(context.Background(), []string{"codex"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
+	if errExecute != nil {
+		t.Fatalf("Execute() error = %v", errExecute)
+	}
+	if got := string(resp.Payload); got != "service-perf-disabled-auth-a" {
+		t.Fatalf("selected auth = %q, want service-perf-disabled-auth-a", got)
+	}
+}
+
 func TestServiceApplyPerformanceRoutingConfigPreservesCodexRouteRegistryState(t *testing.T) {
 	t.Parallel()
 

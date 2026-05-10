@@ -36,6 +36,34 @@ func TestBuildAuthFromFileData_CodexExtractsPlanTypeAttribute(t *testing.T) {
 	}
 }
 
+func TestBuildAuthFromFileData_CodexSessionUsesTopLevelPlanAndAccountID(t *testing.T) {
+	t.Parallel()
+
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, nil)
+	authPath := filepath.Join(t.TempDir(), "codex-session-user@example.com-plus.json")
+	data := []byte(`{"type":"codex_session","email":"codex-session-user@example.com","plan_type":"plus","account_id":"acct_session_123"}`)
+
+	auth, err := h.buildAuthFromFileData(authPath, data)
+	if err != nil {
+		t.Fatalf("buildAuthFromFileData returned error: %v", err)
+	}
+	if auth == nil {
+		t.Fatal("expected auth")
+	}
+	if got := strings.TrimSpace(auth.Provider); got != "codex" {
+		t.Fatalf("provider = %q, want %q", got, "codex")
+	}
+	if got := strings.TrimSpace(auth.Attributes["plan_type"]); got != "plus" {
+		t.Fatalf("attributes.plan_type = %q, want %q", got, "plus")
+	}
+	if got, _ := auth.Metadata["account_id"].(string); got != "acct_session_123" {
+		t.Fatalf("metadata.account_id = %q, want %q", got, "acct_session_123")
+	}
+	if got, _ := auth.Metadata["chatgpt_account_id"].(string); got != "acct_session_123" {
+		t.Fatalf("metadata.chatgpt_account_id = %q, want %q", got, "acct_session_123")
+	}
+}
+
 func TestBuildAuthFileEntry_CodexPromotesPlanTypeToTopLevel(t *testing.T) {
 	t.Parallel()
 
@@ -73,6 +101,44 @@ func TestBuildAuthFileEntry_CodexPromotesPlanTypeToTopLevel(t *testing.T) {
 	}
 	if got, _ := idToken["plan_type"].(string); got != "plus" {
 		t.Fatalf("entry.id_token.plan_type = %q, want %q", got, "plus")
+	}
+}
+
+func TestBuildAuthFileEntry_CodexSessionPreservesTypeAndExposesAccountID(t *testing.T) {
+	t.Parallel()
+
+	auth := &coreauth.Auth{
+		ID:       "codex-session-user@example.com-plus.json",
+		FileName: "codex-session-user@example.com-plus.json",
+		Provider: "codex",
+		Attributes: map[string]string{
+			"path":      `C:\auths\codex-session-user@example.com-plus.json`,
+			"plan_type": "plus",
+		},
+		Metadata: map[string]any{
+			"type":       "codex_session",
+			"email":      "codex-session-user@example.com",
+			"plan_type":  "plus",
+			"account_id": "acct_session_123",
+		},
+	}
+
+	h := &Handler{}
+	entry := h.buildAuthFileEntry(auth)
+	if entry == nil {
+		t.Fatal("expected entry")
+	}
+	if got, _ := entry["type"].(string); got != "codex_session" {
+		t.Fatalf("entry.type = %q, want %q", got, "codex_session")
+	}
+	if got, _ := entry["provider"].(string); got != "codex" {
+		t.Fatalf("entry.provider = %q, want %q", got, "codex")
+	}
+	if got, _ := entry["chatgpt_account_id"].(string); got != "acct_session_123" {
+		t.Fatalf("entry.chatgpt_account_id = %q, want %q", got, "acct_session_123")
+	}
+	if got, _ := entry["plan_type"].(string); got != "plus" {
+		t.Fatalf("entry.plan_type = %q, want %q", got, "plus")
 	}
 }
 

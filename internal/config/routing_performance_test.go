@@ -16,8 +16,8 @@ func TestRoutingPerformanceDefaults(t *testing.T) {
 	if cfg.Routing.PerformanceAware {
 		t.Fatalf("PerformanceAware = true, want false")
 	}
-	if !cfg.Routing.PerformanceShadowLog {
-		t.Fatalf("PerformanceShadowLog = false, want true")
+	if cfg.Routing.PerformanceShadowLog {
+		t.Fatalf("PerformanceShadowLog = true, want false")
 	}
 	if cfg.Routing.PerformanceWindowSeconds != 300 {
 		t.Fatalf("PerformanceWindowSeconds = %d, want 300", cfg.Routing.PerformanceWindowSeconds)

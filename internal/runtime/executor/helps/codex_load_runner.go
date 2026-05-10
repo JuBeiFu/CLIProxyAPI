@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/router-for-me/CLIProxyAPI/v6/sdk/proxyutil"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
@@ -35,35 +36,42 @@ type CodexLoadRunnerOptions struct {
 
 // CodexLoadRunnerSummary summarizes one load run.
 type CodexLoadRunnerSummary struct {
-	StartedAt           time.Time     `json:"started_at"`
-	EndedAt             time.Time     `json:"ended_at"`
-	Requests            int64         `json:"requests"`
-	Successes           int64         `json:"successes"`
-	Failures            int64         `json:"failures"`
-	CompletedResponses  int64         `json:"completed_responses"`
-	ZeroOutputResponses int64         `json:"zero_output_responses"`
-	ClientCanceled      int64         `json:"client_canceled"`
-	FirstByteSamples    int64         `json:"first_byte_samples"`
-	Status2xx           int64         `json:"status_2xx"`
-	Status4xx           int64         `json:"status_4xx"`
-	Status5xx           int64         `json:"status_5xx"`
-	AvgFirstByte        time.Duration `json:"avg_first_byte"`
-	P95FirstByte        time.Duration `json:"p95_first_byte"`
-	AvgTotal            time.Duration `json:"avg_total"`
-	P95Total            time.Duration `json:"p95_total"`
-	ErrorSamples        []string      `json:"error_samples,omitempty"`
+	StartedAt                   time.Time     `json:"started_at"`
+	EndedAt                     time.Time     `json:"ended_at"`
+	Requests                    int64         `json:"requests"`
+	Successes                   int64         `json:"successes"`
+	Failures                    int64         `json:"failures"`
+	CompletedResponses          int64         `json:"completed_responses"`
+	ZeroOutputResponses         int64         `json:"zero_output_responses"`
+	ClientCanceled              int64         `json:"client_canceled"`
+	FirstByteSamples            int64         `json:"first_byte_samples"`
+	FirstVisibleOutputSamples   int64         `json:"first_visible_output_samples"`
+	Status2xx                   int64         `json:"status_2xx"`
+	Status4xx                   int64         `json:"status_4xx"`
+	Status5xx                   int64         `json:"status_5xx"`
+	AvgFirstByte                time.Duration `json:"avg_first_byte"`
+	P95FirstByte                time.Duration `json:"p95_first_byte"`
+	AvgFirstVisibleOutput       time.Duration `json:"avg_first_visible_output"`
+	P95FirstVisibleOutput       time.Duration `json:"p95_first_visible_output"`
+	AvgVisibleAfterFirstByteGap time.Duration `json:"avg_visible_after_first_byte_gap"`
+	P95VisibleAfterFirstByteGap time.Duration `json:"p95_visible_after_first_byte_gap"`
+	AvgTotal                    time.Duration `json:"avg_total"`
+	P95Total                    time.Duration `json:"p95_total"`
+	ErrorSamples                []string      `json:"error_samples,omitempty"`
 }
 
 type codexLoadRunnerResult struct {
-	statusCode   int
-	firstByte    time.Duration
-	total        time.Duration
-	hasFirstByte bool
-	success      bool
-	completed    bool
-	zeroOutput   bool
-	canceled     bool
-	errText      string
+	statusCode            int
+	firstByte             time.Duration
+	firstVisibleOutput    time.Duration
+	total                 time.Duration
+	hasFirstByte          bool
+	hasFirstVisibleOutput bool
+	success               bool
+	completed             bool
+	zeroOutput            bool
+	canceled              bool
+	errText               string
 }
 
 // BuildCodexLoadRunnerRequestBody builds a minimal OpenAI Responses-style request body.
@@ -130,7 +138,7 @@ func RunCodexLoad(ctx context.Context, opts CodexLoadRunnerOptions) (CodexLoadRu
 		return summary, err
 	}
 
-	client := &http.Client{}
+	client := &http.Client{Transport: proxyutil.NewInheritedTransport()}
 	results := make(chan codexLoadRunnerResult, opts.Requests)
 	jobs := make(chan int)
 	var workers sync.WaitGroup
@@ -155,6 +163,8 @@ func RunCodexLoad(ctx context.Context, opts CodexLoadRunnerOptions) (CodexLoadRu
 	}()
 
 	var firstBytes []time.Duration
+	var firstVisibleOutputs []time.Duration
+	var visibleAfterFirstByteGaps []time.Duration
 	var totals []time.Duration
 	for result := range results {
 		summary.Requests++
@@ -187,12 +197,21 @@ func RunCodexLoad(ctx context.Context, opts CodexLoadRunnerOptions) (CodexLoadRu
 			summary.FirstByteSamples++
 			firstBytes = append(firstBytes, result.firstByte)
 		}
+		if result.hasFirstVisibleOutput {
+			summary.FirstVisibleOutputSamples++
+			firstVisibleOutputs = append(firstVisibleOutputs, result.firstVisibleOutput)
+			if result.hasFirstByte && result.firstVisibleOutput >= result.firstByte {
+				visibleAfterFirstByteGaps = append(visibleAfterFirstByteGaps, result.firstVisibleOutput-result.firstByte)
+			}
+		}
 		if result.total > 0 {
 			totals = append(totals, result.total)
 		}
 	}
 
 	summary.AvgFirstByte, summary.P95FirstByte = summarizeDurations(firstBytes)
+	summary.AvgFirstVisibleOutput, summary.P95FirstVisibleOutput = summarizeDurations(firstVisibleOutputs)
+	summary.AvgVisibleAfterFirstByteGap, summary.P95VisibleAfterFirstByteGap = summarizeDurations(visibleAfterFirstByteGaps)
 	summary.AvgTotal, summary.P95Total = summarizeDurations(totals)
 	summary.EndedAt = time.Now()
 	return summary, nil
@@ -270,6 +289,10 @@ func finishCodexLoadStreamResult(startedAt time.Time, resp *http.Response, resul
 		}
 		if eventHasUserOutput([]byte(data)) {
 			sawUserOutput = true
+			if !result.hasFirstVisibleOutput {
+				result.firstVisibleOutput = time.Since(startedAt)
+				result.hasFirstVisibleOutput = true
+			}
 		}
 		if isCompletedEvent([]byte(data)) {
 			result.completed = true
@@ -311,6 +334,10 @@ func finishCodexLoadNonStreamResult(startedAt time.Time, resp *http.Response, re
 
 	result.completed = strings.EqualFold(strings.TrimSpace(gjson.GetBytes(body, "status").String()), "completed")
 	result.zeroOutput = !nonStreamBodyHasVisibleOutput(body)
+	if !result.zeroOutput {
+		result.firstVisibleOutput = result.total
+		result.hasFirstVisibleOutput = true
+	}
 	result.success = true
 	return result
 }

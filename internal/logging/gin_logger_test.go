@@ -1,12 +1,15 @@
 package logging
 
 import (
+	"bytes"
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/gin-gonic/gin"
+	log "github.com/sirupsen/logrus"
 )
 
 func TestGinLogrusRecoveryRepanicsErrAbortHandler(t *testing.T) {
@@ -83,5 +86,48 @@ func TestGinLogrusLoggerPrefersInboundOneAPIRequestID(t *testing.T) {
 	engine.ServeHTTP(recorder, req)
 	if recorder.Code != http.StatusNoContent {
 		t.Fatalf("expected 204, got %d", recorder.Code)
+	}
+}
+
+func TestGinLogrusLoggerSuccessfulAIRequestsLogAtDebug(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	logger := log.StandardLogger()
+	prevOut := logger.Out
+	prevFormatter := logger.Formatter
+	prevLevel := logger.GetLevel()
+	prevReportCaller := logger.ReportCaller
+
+	var buffer bytes.Buffer
+	logger.SetOutput(&buffer)
+	logger.SetFormatter(&log.TextFormatter{DisableTimestamp: true, DisableQuote: true})
+	logger.SetLevel(log.DebugLevel)
+	logger.SetReportCaller(false)
+	defer func() {
+		logger.SetOutput(prevOut)
+		logger.SetFormatter(prevFormatter)
+		logger.SetLevel(prevLevel)
+		logger.SetReportCaller(prevReportCaller)
+	}()
+
+	engine := gin.New()
+	engine.Use(GinLogrusLogger())
+	engine.POST("/v1/responses", func(c *gin.Context) {
+		c.Status(http.StatusNoContent)
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	recorder := httptest.NewRecorder()
+	engine.ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusNoContent {
+		t.Fatalf("expected 204, got %d", recorder.Code)
+	}
+	output := buffer.String()
+	if !strings.Contains(output, "level=debug") {
+		t.Fatalf("expected debug log level, output=%q", output)
+	}
+	if strings.Contains(output, "level=info") {
+		t.Fatalf("unexpected info log level, output=%q", output)
 	}
 }

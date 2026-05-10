@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"strings"
 	"sync"
@@ -211,6 +212,84 @@ func TestSchedulerPick_FillFirstSticksToFirstReady(t *testing.T) {
 		if got.ID != "a" {
 			t.Fatalf("pickSingle() #%d auth.ID = %q, want %q", index, got.ID, "a")
 		}
+	}
+}
+
+func TestReadyViewPickRoundRobin_BoundsLoadSamplingWindow(t *testing.T) {
+	t.Parallel()
+
+	entries := make([]*scheduledAuth, 0, 64)
+	for i := 0; i < 64; i++ {
+		auth := &Auth{ID: fmt.Sprintf("auth-%02d", i), Provider: "gemini"}
+		entries = append(entries, &scheduledAuth{
+			auth: auth,
+			meta: &scheduledAuthMeta{auth: auth, providerKey: "gemini"},
+		})
+	}
+	view := buildReadyView(entries)
+
+	loadCalls := 0
+	got := view.pickRoundRobin(
+		func(*scheduledAuth) bool { return true },
+		func(*scheduledAuth) int {
+			loadCalls++
+			return 1
+		},
+	)
+	if got == nil {
+		t.Fatal("pickRoundRobin() auth = nil")
+	}
+	if loadCalls > defaultRoundRobinCandidateWindow {
+		t.Fatalf("load callback invoked %d times, want at most %d", loadCalls, defaultRoundRobinCandidateWindow)
+	}
+}
+
+func TestReadyViewPickRoundRobin_FullScansSmallBuckets(t *testing.T) {
+	t.Parallel()
+
+	entries := make([]*scheduledAuth, 0, defaultRoundRobinFullScanThreshold)
+	for i := 0; i < defaultRoundRobinFullScanThreshold; i++ {
+		auth := &Auth{ID: fmt.Sprintf("auth-%02d", i), Provider: "gemini"}
+		entries = append(entries, &scheduledAuth{
+			auth: auth,
+			meta: &scheduledAuthMeta{auth: auth, providerKey: "gemini"},
+		})
+	}
+	view := buildReadyView(entries)
+
+	loadCalls := 0
+	got := view.pickRoundRobin(
+		func(*scheduledAuth) bool { return true },
+		func(*scheduledAuth) int {
+			loadCalls++
+			return 1
+		},
+	)
+	if got == nil {
+		t.Fatal("pickRoundRobin() auth = nil")
+	}
+	if loadCalls != defaultRoundRobinFullScanThreshold {
+		t.Fatalf("load callback invoked %d times, want %d for small bucket full scan", loadCalls, defaultRoundRobinFullScanThreshold)
+	}
+}
+
+func TestProviderMayNeedRouteAwareSelection_RecomputesAfterAuthChanges(t *testing.T) {
+	t.Parallel()
+
+	manager := NewManager(nil, &RoundRobinSelector{}, nil)
+
+	if _, err := manager.Register(context.Background(), &Auth{ID: "plain-auth", Provider: "gemini"}); err != nil {
+		t.Fatalf("Register(plain-auth) error = %v", err)
+	}
+	if got := manager.providerMayNeedRouteAwareSelection("gemini"); got {
+		t.Fatalf("providerMayNeedRouteAwareSelection() = true, want false for plain auth")
+	}
+
+	if _, err := manager.Register(context.Background(), &Auth{ID: "prefixed-auth", Provider: "gemini", Prefix: "tenant"}); err != nil {
+		t.Fatalf("Register(prefixed-auth) error = %v", err)
+	}
+	if got := manager.providerMayNeedRouteAwareSelection("gemini"); !got {
+		t.Fatalf("providerMayNeedRouteAwareSelection() = false, want true after route-aware auth register")
 	}
 }
 
@@ -1103,6 +1182,26 @@ func TestManager_SchedulerTracksMarkResultCooldownAndRecovery(t *testing.T) {
 		Success:  true,
 	})
 
+	providerState := manager.scheduler.loadProvider("gemini")
+	if providerState == nil {
+		t.Fatal("expected provider scheduler after recovery")
+	}
+	providerState.mu.Lock()
+	shard := providerState.ensureModelLocked("test-model", time.Now())
+	if shard == nil {
+		providerState.mu.Unlock()
+		t.Fatal("expected model shard after recovery")
+	}
+	if got := len(shard.readyByPriority[0].all.flat); got != 2 {
+		providerState.mu.Unlock()
+		t.Fatalf("ready flat len after recovery = %d, want 2", got)
+	}
+	if got := len(shard.blocked); got != 0 {
+		providerState.mu.Unlock()
+		t.Fatalf("blocked cooldown len after recovery = %d, want 0", got)
+	}
+	providerState.mu.Unlock()
+
 	seen := make(map[string]struct{}, 2)
 	for index := 0; index < 2; index++ {
 		got, errPick = manager.scheduler.pickSingle(context.Background(), "gemini", "test-model", cliproxyexecutor.Options{}, nil)
@@ -1117,6 +1216,321 @@ func TestManager_SchedulerTracksMarkResultCooldownAndRecovery(t *testing.T) {
 	if len(seen) != 2 {
 		t.Fatalf("len(seen) = %d, want %d", len(seen), 2)
 	}
+}
+
+func TestModelSchedulerRemoveEntryDefersRebuildUntilNextSelection(t *testing.T) {
+	t.Parallel()
+
+	registerSchedulerModels(t, "gemini", "test-model", "deferred-remove-a", "deferred-remove-b")
+	scheduler := newSchedulerForTest(
+		&RoundRobinSelector{},
+		&Auth{ID: "deferred-remove-a", Provider: "gemini"},
+		&Auth{ID: "deferred-remove-b", Provider: "gemini"},
+	)
+
+	providerState := scheduler.loadProvider("gemini")
+	if providerState == nil {
+		t.Fatal("expected provider scheduler")
+	}
+
+	var shard *modelScheduler
+	providerState.mu.Lock()
+	shard = providerState.ensureModelLocked("test-model", time.Now())
+	if shard == nil {
+		providerState.mu.Unlock()
+		t.Fatal("expected model shard")
+	}
+	if got := len(shard.readyByPriority[0].all.flat); got != 2 {
+		providerState.mu.Unlock()
+		t.Fatalf("initial ready flat len = %d, want 2", got)
+	}
+	shard.removeEntryLocked("deferred-remove-a")
+	if got := len(shard.readyByPriority[0].all.flat); got != 2 {
+		providerState.mu.Unlock()
+		t.Fatalf("ready flat len immediately after remove = %d, want deferred 2", got)
+	}
+	providerState.mu.Unlock()
+
+	got, errPick := scheduler.pickSingle(context.Background(), "gemini", "test-model", cliproxyexecutor.Options{}, nil)
+	if errPick != nil {
+		t.Fatalf("pickSingle() error = %v", errPick)
+	}
+	if got == nil || got.ID != "deferred-remove-b" {
+		t.Fatalf("pickSingle() auth = %v, want deferred-remove-b", got)
+	}
+
+	providerState.mu.Lock()
+	defer providerState.mu.Unlock()
+	if got := len(shard.readyByPriority[0].all.flat); got != 1 {
+		t.Fatalf("ready flat len after selection-triggered rebuild = %d, want 1", got)
+	}
+}
+
+func TestModelSchedulerUpsertEntryDefersRebuildUntilNextSelection(t *testing.T) {
+	t.Parallel()
+
+	registerSchedulerModels(t, "gemini", "test-model", "deferred-add-a", "deferred-add-b")
+	scheduler := newSchedulerForTest(
+		&RoundRobinSelector{},
+		&Auth{ID: "deferred-add-a", Provider: "gemini"},
+	)
+
+	providerState := scheduler.loadProvider("gemini")
+	if providerState == nil {
+		t.Fatal("expected provider scheduler")
+	}
+
+	newAuth := &Auth{ID: "deferred-add-b", Provider: "gemini"}
+	var shard *modelScheduler
+	providerState.mu.Lock()
+	shard = providerState.ensureModelLocked("test-model", time.Now())
+	if shard == nil {
+		providerState.mu.Unlock()
+		t.Fatal("expected model shard")
+	}
+	if got := len(shard.readyByPriority[0].all.flat); got != 1 {
+		providerState.mu.Unlock()
+		t.Fatalf("initial ready flat len = %d, want 1", got)
+	}
+	shard.upsertEntryLocked(buildScheduledAuthMeta(newAuth), time.Now())
+	if got := len(shard.readyByPriority[0].all.flat); got != 1 {
+		providerState.mu.Unlock()
+		t.Fatalf("ready flat len immediately after add = %d, want deferred 1", got)
+	}
+	providerState.mu.Unlock()
+
+	seen := make(map[string]struct{}, 2)
+	for index := 0; index < 2; index++ {
+		got, errPick := scheduler.pickSingle(context.Background(), "gemini", "test-model", cliproxyexecutor.Options{}, nil)
+		if errPick != nil {
+			t.Fatalf("pickSingle() #%d error = %v", index, errPick)
+		}
+		if got == nil {
+			t.Fatalf("pickSingle() #%d auth = nil", index)
+		}
+		seen[got.ID] = struct{}{}
+	}
+	if len(seen) != 2 {
+		t.Fatalf("len(seen) = %d, want 2", len(seen))
+	}
+
+	providerState.mu.Lock()
+	defer providerState.mu.Unlock()
+	if got := len(shard.readyByPriority[0].all.flat); got != 2 {
+		t.Fatalf("ready flat len after selection-triggered rebuild = %d, want 2", got)
+	}
+}
+
+func TestModelSchedulerUpsertEntryStateTransitionUpdatesReadyViewImmediately(t *testing.T) {
+	t.Parallel()
+
+	registerSchedulerModels(t, "gemini", "test-model", "state-toggle-a", "state-toggle-b")
+	scheduler := newSchedulerForTest(
+		&RoundRobinSelector{},
+		&Auth{ID: "state-toggle-a", Provider: "gemini"},
+		&Auth{ID: "state-toggle-b", Provider: "gemini"},
+	)
+
+	providerState := scheduler.loadProvider("gemini")
+	if providerState == nil {
+		t.Fatal("expected provider scheduler")
+	}
+
+	now := time.Now()
+	providerState.mu.Lock()
+	shard := providerState.ensureModelLocked("test-model", now)
+	if shard == nil {
+		providerState.mu.Unlock()
+		t.Fatal("expected model shard")
+	}
+	if got := len(shard.readyByPriority[0].all.flat); got != 2 {
+		providerState.mu.Unlock()
+		t.Fatalf("initial ready flat len = %d, want 2", got)
+	}
+
+	shard.upsertEntryLocked(buildScheduledAuthMeta(&Auth{
+		ID:       "state-toggle-a",
+		Provider: "gemini",
+		Disabled: true,
+		Status:   StatusDisabled,
+	}), now.Add(time.Second))
+	if shard.dirty {
+		providerState.mu.Unlock()
+		t.Fatal("expected state-only disable transition to avoid deferred rebuild")
+	}
+	if got := len(shard.readyByPriority[0].all.flat); got != 1 {
+		providerState.mu.Unlock()
+		t.Fatalf("ready flat len after disable transition = %d, want 1", got)
+	}
+	if got := len(shard.blocked); got != 0 {
+		providerState.mu.Unlock()
+		t.Fatalf("blocked cooldown len after disable transition = %d, want 0", got)
+	}
+	providerState.mu.Unlock()
+
+	got, errPick := scheduler.pickSingle(context.Background(), "gemini", "test-model", cliproxyexecutor.Options{}, nil)
+	if errPick != nil {
+		t.Fatalf("pickSingle() after disable error = %v", errPick)
+	}
+	if got == nil || got.ID != "state-toggle-b" {
+		t.Fatalf("pickSingle() after disable auth = %v, want state-toggle-b", got)
+	}
+
+	providerState.mu.Lock()
+	shard.upsertEntryLocked(buildScheduledAuthMeta(&Auth{
+		ID:       "state-toggle-a",
+		Provider: "gemini",
+	}), now.Add(2*time.Second))
+	if shard.dirty {
+		providerState.mu.Unlock()
+		t.Fatal("expected state-only enable transition to avoid deferred rebuild")
+	}
+	if got := len(shard.readyByPriority[0].all.flat); got != 2 {
+		providerState.mu.Unlock()
+		t.Fatalf("ready flat len after enable transition = %d, want 2", got)
+	}
+	providerState.mu.Unlock()
+
+	seen := make(map[string]struct{}, 2)
+	for index := 0; index < 2; index++ {
+		got, errPick = scheduler.pickSingle(context.Background(), "gemini", "test-model", cliproxyexecutor.Options{}, nil)
+		if errPick != nil {
+			t.Fatalf("pickSingle() after enable #%d error = %v", index, errPick)
+		}
+		if got == nil {
+			t.Fatalf("pickSingle() after enable #%d auth = nil", index)
+		}
+		seen[got.ID] = struct{}{}
+	}
+	if len(seen) != 2 {
+		t.Fatalf("len(seen) after enable = %d, want 2", len(seen))
+	}
+}
+
+func TestAuthSchedulerUpsertDisabledPreservesShardEntries(t *testing.T) {
+	t.Parallel()
+
+	registerSchedulerModels(t, "gemini", "test-model", "disabled-top-a", "disabled-top-b")
+	scheduler := newSchedulerForTest(
+		&RoundRobinSelector{},
+		&Auth{ID: "disabled-top-a", Provider: "gemini"},
+		&Auth{ID: "disabled-top-b", Provider: "gemini"},
+	)
+
+	providerState := scheduler.loadProvider("gemini")
+	if providerState == nil {
+		t.Fatal("expected provider scheduler")
+	}
+
+	now := time.Now()
+	providerState.mu.Lock()
+	shard := providerState.ensureModelLocked("test-model", now)
+	if shard == nil {
+		providerState.mu.Unlock()
+		t.Fatal("expected model shard")
+	}
+	if got := len(providerState.auths); got != 2 {
+		providerState.mu.Unlock()
+		t.Fatalf("initial provider auth count = %d, want 2", got)
+	}
+	if got := len(shard.entries); got != 2 {
+		providerState.mu.Unlock()
+		t.Fatalf("initial shard entry count = %d, want 2", got)
+	}
+	providerState.mu.Unlock()
+
+	scheduler.upsertAuth(&Auth{
+		ID:       "disabled-top-a",
+		Provider: "gemini",
+		Disabled: true,
+		Status:   StatusDisabled,
+	})
+
+	providerState.mu.Lock()
+	defer providerState.mu.Unlock()
+	shard = providerState.ensureModelLocked("test-model", now.Add(time.Second))
+	if shard == nil {
+		t.Fatal("expected model shard after disable")
+	}
+	if got := len(providerState.auths); got != 2 {
+		t.Fatalf("provider auth count after disable = %d, want 2", got)
+	}
+	if got := len(shard.entries); got != 2 {
+		t.Fatalf("shard entry count after disable = %d, want 2", got)
+	}
+	if shard.dirty {
+		t.Fatal("expected disable upsert to avoid deferred rebuild")
+	}
+	if got := len(shard.readyByPriority[0].all.flat); got != 1 {
+		t.Fatalf("ready flat len after disable upsert = %d, want 1", got)
+	}
+}
+
+func TestModelSchedulerCooldownTransitionPromotesBackIntoReadyView(t *testing.T) {
+	t.Parallel()
+
+	registerSchedulerModels(t, "gemini", "test-model", "cooldown-toggle-a", "cooldown-toggle-b")
+	scheduler := newSchedulerForTest(
+		&RoundRobinSelector{},
+		&Auth{ID: "cooldown-toggle-a", Provider: "gemini"},
+		&Auth{ID: "cooldown-toggle-b", Provider: "gemini"},
+	)
+
+	providerState := scheduler.loadProvider("gemini")
+	if providerState == nil {
+		t.Fatal("expected provider scheduler")
+	}
+
+	now := time.Now()
+	providerState.mu.Lock()
+	shard := providerState.ensureModelLocked("test-model", now)
+	if shard == nil {
+		providerState.mu.Unlock()
+		t.Fatal("expected model shard")
+	}
+
+	cooldownUntil := now.Add(5 * time.Second)
+	shard.upsertEntryLocked(buildScheduledAuthMeta(&Auth{
+		ID:          "cooldown-toggle-a",
+		Provider:    "gemini",
+		Status:      StatusError,
+		Unavailable: true,
+		ModelStates: map[string]*ModelState{
+			"test-model": {
+				Status:         StatusError,
+				Unavailable:    true,
+				NextRetryAfter: cooldownUntil,
+				Quota: QuotaState{
+					Exceeded:      true,
+					Reason:        "rate_limit",
+					NextRecoverAt: cooldownUntil,
+				},
+			},
+		},
+	}), now.Add(time.Second))
+	if shard.dirty {
+		providerState.mu.Unlock()
+		t.Fatal("expected cooldown transition to avoid deferred rebuild")
+	}
+	if got := len(shard.readyByPriority[0].all.flat); got != 1 {
+		providerState.mu.Unlock()
+		t.Fatalf("ready flat len after cooldown transition = %d, want 1", got)
+	}
+	if got := len(shard.blocked); got != 1 {
+		providerState.mu.Unlock()
+		t.Fatalf("blocked cooldown len after cooldown transition = %d, want 1", got)
+	}
+
+	shard.promoteExpiredLocked(cooldownUntil.Add(time.Second))
+	if got := len(shard.readyByPriority[0].all.flat); got != 2 {
+		providerState.mu.Unlock()
+		t.Fatalf("ready flat len after cooldown promotion = %d, want 2", got)
+	}
+	if got := len(shard.blocked); got != 0 {
+		providerState.mu.Unlock()
+		t.Fatalf("blocked cooldown len after cooldown promotion = %d, want 0", got)
+	}
+	providerState.mu.Unlock()
 }
 
 func TestManagerExecute_PrefersIdleAuthWhileAnotherAuthIsStillInflight(t *testing.T) {

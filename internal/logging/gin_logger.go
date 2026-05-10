@@ -92,6 +92,11 @@ func GinLogrusLogger() gin.HandlerFunc {
 			entry.Error(logLine)
 		case statusCode >= http.StatusBadRequest:
 			entry.Warn(logLine)
+		case isAIAPIPath(path):
+			// Successful AI API calls are the highest-volume path in production.
+			// Keep them at debug level so default info logging does not serialize
+			// every 2xx request through the global log sink.
+			entry.Debug(logLine)
 		default:
 			entry.Info(logLine)
 		}

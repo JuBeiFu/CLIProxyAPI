@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -38,6 +39,28 @@ func (serverPerformanceTestExecutor) CountTokens(ctx context.Context, auth *core
 
 func (serverPerformanceTestExecutor) HttpRequest(ctx context.Context, auth *coreauth.Auth, req *http.Request) (*http.Response, error) {
 	return nil, nil
+}
+
+type countingPerformanceScorer struct {
+	mu        sync.Mutex
+	snapshots int
+}
+
+func (s *countingPerformanceScorer) SnapshotCandidate(provider, authID, model string, inflight int) performance.ScoreCandidate {
+	s.mu.Lock()
+	s.snapshots++
+	s.mu.Unlock()
+	return performance.ScoreCandidate{Provider: provider, AuthID: authID, Model: model, Inflight: inflight}
+}
+
+func (s *countingPerformanceScorer) ScoreCandidates(candidates []performance.ScoreCandidate, cfg performance.Config) []performance.Score {
+	return performance.NewScorer(nil).ScoreCandidates(candidates, cfg)
+}
+
+func (s *countingPerformanceScorer) SnapshotCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.snapshots
 }
 
 func TestRoutingPerformanceConfigFromServerConfig(t *testing.T) {
@@ -107,5 +130,37 @@ func TestNewServerAppliesPerformanceRoutingConfigToAuthManager(t *testing.T) {
 	}
 	if got := string(resp.Payload); got != "server-perf-auth-b" {
 		t.Fatalf("selected auth = %q, want server-perf-auth-b", got)
+	}
+}
+
+func TestNewServerSkipsPerformanceScorerWhenRoutingPerformanceDisabled(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	const model = "server-disabled-performance-gpt-5.4"
+	manager := coreauth.NewManager(nil, &coreauth.RoundRobinSelector{}, nil)
+	manager.RegisterExecutor(serverPerformanceTestExecutor{})
+	scorer := &countingPerformanceScorer{}
+	manager.SetPerformanceScorer(scorer)
+	reg := registry.GetGlobalRegistry()
+	reg.RegisterClient("server-disabled-auth-a", "codex", []*registry.ModelInfo{{ID: model}})
+	reg.RegisterClient("server-disabled-auth-b", "codex", []*registry.ModelInfo{{ID: model}})
+	t.Cleanup(func() {
+		reg.UnregisterClient("server-disabled-auth-a")
+		reg.UnregisterClient("server-disabled-auth-b")
+	})
+	if _, errRegister := manager.Register(context.Background(), &coreauth.Auth{ID: "server-disabled-auth-a", Provider: "codex"}); errRegister != nil {
+		t.Fatalf("Register(auth-a) error = %v", errRegister)
+	}
+	if _, errRegister := manager.Register(context.Background(), &coreauth.Auth{ID: "server-disabled-auth-b", Provider: "codex"}); errRegister != nil {
+		t.Fatalf("Register(auth-b) error = %v", errRegister)
+	}
+	cfg := &config.Config{AuthDir: t.TempDir()}
+
+	_ = NewServer(cfg, manager, sdkaccess.NewManager(), filepath.Join(t.TempDir(), "config.yaml"))
+
+	if _, errExecute := manager.Execute(context.Background(), []string{"codex"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{}); errExecute != nil {
+		t.Fatalf("Execute() error = %v", errExecute)
+	}
+	if got := scorer.SnapshotCount(); got != 0 {
+		t.Fatalf("SnapshotCandidate calls = %d, want 0 when performance routing is disabled", got)
 	}
 }

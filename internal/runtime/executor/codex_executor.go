@@ -21,6 +21,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/misc"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/proxypool"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/executor/helps"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
@@ -40,6 +41,7 @@ const (
 	codexUserAgent                  = "codex-tui/0.125.0 (Mac OS 26.3.1; arm64) iTerm.app/3.6.9 (codex-tui; 0.125.0)"
 	codexOriginator                 = "codex-tui"
 	newAPIDownstreamTransportHeader = "X-NewAPI-Downstream-Transport"
+	codexGPT55ContextLength         = 258000
 )
 
 var dataTag = []byte("data:")
@@ -417,6 +419,9 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	body, _ = sjson.DeleteBytes(body, "stream_options")
 	body = normalizeCodexInstructions(body)
 	body = maybeAttachImageGenerationTool(baseModel, body)
+	if err = validateCodexRequestContext(baseModel, body); err != nil {
+		return resp, err
+	}
 
 	url := strings.TrimSuffix(baseURL, "/") + "/responses"
 	httpReq, err := e.cacheHelper(ctx, from, url, req, body)
@@ -573,7 +578,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 		resp = cliproxyexecutor.Response{Payload: out, Headers: httpResp.Header.Clone()}
 		return resp, nil
 	}
-	err = statusErr{code: 408, msg: "stream error: stream disconnected before completion: stream closed before response.completed"}
+	err = newCodexIncompleteStreamErr()
 	return resp, err
 }
 
@@ -619,6 +624,9 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 		body, _ = sjson.DeleteBytes(body, "previous_response_id")
 	}
 	body = normalizeCodexInstructions(body)
+	if err = validateCodexRequestContext(baseModel, body); err != nil {
+		return resp, err
+	}
 
 	url := strings.TrimSuffix(baseURL, "/") + "/responses/compact"
 	httpReq, err := e.cacheHelper(ctx, from, url, req, body)
@@ -938,6 +946,9 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 	body, _ = sjson.SetBytes(body, "model", baseModel)
 	body = normalizeCodexInstructions(body)
 	body = maybeAttachImageGenerationTool(baseModel, body)
+	if err = validateCodexRequestContext(baseModel, body); err != nil {
+		return nil, err
+	}
 
 	url := strings.TrimSuffix(baseURL, "/") + "/responses"
 	httpReq, err := e.cacheHelper(ctx, from, url, req, body)
@@ -1107,7 +1118,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 			return
 		}
 		if !timing.streamCompleted {
-			errIncomplete := statusErr{code: http.StatusRequestTimeout, msg: "stream error: stream disconnected before completion: stream closed before response.completed"}
+			errIncomplete := newCodexIncompleteStreamErr()
 			helps.RecordAPIResponseError(ctx, e.cfg, errIncomplete)
 			reporter.PublishFailureWithError(ctx, errIncomplete)
 			timing.streamErrText = errIncomplete.Error()
@@ -1311,6 +1322,114 @@ func countCodexInputTokens(enc tokenizer.Codec, body []byte) (int64, error) {
 		return 0, err
 	}
 	return int64(count), nil
+}
+
+func validateCodexRequestContext(model string, body []byte) error {
+	contextLimit, _ := codexContextWindowLimits(model)
+	if contextLimit <= 0 {
+		return nil
+	}
+
+	enc, err := tokenizerForCodexModel(model)
+	if err != nil {
+		return fmt.Errorf("codex executor: tokenizer init failed: %w", err)
+	}
+
+	inputTokens, err := countCodexInputTokens(enc, body)
+	if err != nil {
+		return fmt.Errorf("codex executor: token counting failed: %w", err)
+	}
+	if inputTokens <= 0 {
+		return nil
+	}
+
+	requestedOutput := codexRequestedOutputTokens(body)
+	if inputTokens > contextLimit {
+		return newCodexContextLengthExceededErr(model, inputTokens, requestedOutput, contextLimit)
+	}
+	if requestedOutput > 0 && inputTokens+requestedOutput > contextLimit {
+		return newCodexContextLengthExceededErr(model, inputTokens, requestedOutput, contextLimit)
+	}
+	return nil
+}
+
+func codexContextWindowLimits(model string) (int64, int64) {
+	info := registry.LookupModelInfo(model, "codex")
+	var contextLimit int64
+	var maxCompletion int64
+	if info != nil {
+		contextLimit = int64(info.ContextLength)
+		maxCompletion = int64(info.MaxCompletionTokens)
+	}
+	if hardLimit, ok := codexHardContextWindowLimit(model); ok && (contextLimit <= 0 || contextLimit > hardLimit) {
+		contextLimit = hardLimit
+	}
+	return contextLimit, maxCompletion
+}
+
+func codexHardContextWindowLimit(model string) (int64, bool) {
+	switch strings.ToLower(strings.TrimSpace(model)) {
+	case "gpt-5.5", "gpt-5.5-codex":
+		return codexGPT55ContextLength, true
+	default:
+		return 0, false
+	}
+}
+
+func codexRequestedOutputTokens(body []byte) int64 {
+	for _, path := range []string{"max_output_tokens", "max_completion_tokens"} {
+		value := gjson.GetBytes(body, path)
+		if !value.Exists() {
+			continue
+		}
+		if parsed := value.Int(); parsed > 0 {
+			return parsed
+		}
+		text := strings.TrimSpace(value.String())
+		if text == "" {
+			continue
+		}
+		parsed, err := strconv.ParseInt(text, 10, 64)
+		if err == nil && parsed > 0 {
+			return parsed
+		}
+	}
+	return 0
+}
+
+func newCodexContextLengthExceededErr(model string, inputTokens, requestedOutput, contextLimit int64) statusErr {
+	message := fmt.Sprintf(
+		"This model's maximum context length is %d tokens. However, your request used %d input tokens.",
+		contextLimit,
+		inputTokens,
+	)
+	if requestedOutput > 0 {
+		message = fmt.Sprintf(
+			"This model's maximum context length is %d tokens. However, your request used %d input tokens and requested %d output tokens (%d total).",
+			contextLimit,
+			inputTokens,
+			requestedOutput,
+			inputTokens+requestedOutput,
+		)
+	}
+	if trimmedModel := strings.TrimSpace(model); trimmedModel != "" {
+		message += " Model: " + trimmedModel + "."
+	}
+	message += " Please reduce the request size or lower max_output_tokens."
+	body := fmt.Sprintf(
+		`{"error":{"code":"context_length_exceeded","message":%q,"type":"invalid_request_error"}}`,
+		message,
+	)
+	return statusErr{code: http.StatusBadRequest, msg: body}
+}
+
+func newCodexIncompleteStreamErr() *cliproxyauth.Error {
+	return &cliproxyauth.Error{
+		Code:       "request_scoped_auth_unavailable",
+		Message:    "stream error: stream disconnected before completion: stream closed before response.completed",
+		Retryable:  true,
+		HTTPStatus: http.StatusRequestTimeout,
+	}
 }
 
 func (e *CodexExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*cliproxyauth.Auth, error) {

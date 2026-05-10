@@ -1309,6 +1309,61 @@ func TestRefreshAuthStateDispatchesRuntimeAuths(t *testing.T) {
 	}
 }
 
+func TestPrimeCurrentAuthsSuppressesStartupReplay(t *testing.T) {
+	originalSnapshot := snapshotCoreAuthsFunc
+	defer func() {
+		snapshotCoreAuthsFunc = originalSnapshot
+	}()
+
+	snapshotCoreAuthsFunc = func(_ *config.Config, _ string) []*coreauth.Auth {
+		return []*coreauth.Auth{
+			{ID: "file-auth", Provider: "codex"},
+			{ID: "config-auth", Provider: "gemini"},
+		}
+	}
+
+	queue := make(chan AuthUpdate, 8)
+	w := &Watcher{
+		authDir:        t.TempDir(),
+		lastAuthHashes: make(map[string]string),
+	}
+	w.SetConfig(&config.Config{AuthDir: w.authDir})
+	w.PrimeCurrentAuths([]*coreauth.Auth{{ID: "file-auth", Provider: "codex"}})
+	w.SetAuthUpdateQueue(queue)
+	defer w.stopDispatch()
+
+	w.refreshAuthState(false)
+
+	var updates []AuthUpdate
+	deadline := time.After(500 * time.Millisecond)
+	for {
+		select {
+		case update := <-queue:
+			updates = append(updates, update)
+		case <-deadline:
+			goto done
+		}
+	}
+
+done:
+	if len(updates) != 1 {
+		t.Fatalf("expected exactly one startup update, got %d: %+v", len(updates), updates)
+	}
+	update := updates[0]
+	if update.Action != AuthUpdateActionAdd || update.ID != "config-auth" {
+		t.Fatalf("unexpected startup update: %+v", update)
+	}
+
+	w.clientsMutex.RLock()
+	defer w.clientsMutex.RUnlock()
+	if _, ok := w.currentAuths["file-auth"]; !ok {
+		t.Fatal("expected primed file auth to remain in watcher state")
+	}
+	if _, ok := w.currentAuths["config-auth"]; !ok {
+		t.Fatal("expected new synthesized auth to be added to watcher state")
+	}
+}
+
 func TestAddOrUpdateClientEdgeCases(t *testing.T) {
 	tmpDir := t.TempDir()
 	authDir := tmpDir

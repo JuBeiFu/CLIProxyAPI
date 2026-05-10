@@ -1459,7 +1459,7 @@
       "display_name": "GPT 5.5",
       "version": "gpt-5.5",
       "description": "Stable version of GPT 5.5",
-      "context_length": 1050000,
+      "context_length": 258000,
       "max_completion_tokens": 128000,
       "supported_parameters": [
         "tools"
@@ -1505,7 +1505,7 @@
       "display_name": "GPT 5.5 Codex",
       "version": "gpt-5.5",
       "description": "Stable version of GPT 5.5 Codex, The best model for coding and agentic tasks across domains.",
-      "context_length": 400000,
+      "context_length": 258000,
       "max_completion_tokens": 128000,
       "supported_parameters": [
         "tools"
@@ -1803,7 +1803,7 @@
       "display_name": "GPT 5.5",
       "version": "gpt-5.5",
       "description": "Stable version of GPT 5.5",
-      "context_length": 1050000,
+      "context_length": 258000,
       "max_completion_tokens": 128000,
       "supported_parameters": [
         "tools"
@@ -1849,7 +1849,7 @@
       "display_name": "GPT 5.5 Codex",
       "version": "gpt-5.5",
       "description": "Stable version of GPT 5.5 Codex, The best model for coding and agentic tasks across domains.",
-      "context_length": 400000,
+      "context_length": 258000,
       "max_completion_tokens": 128000,
       "supported_parameters": [
         "tools"
@@ -2193,7 +2193,7 @@
       "display_name": "GPT 5.5",
       "version": "gpt-5.5",
       "description": "Stable version of GPT 5.5",
-      "context_length": 1050000,
+      "context_length": 258000,
       "max_completion_tokens": 128000,
       "supported_parameters": [
         "tools"
@@ -2239,7 +2239,7 @@
       "display_name": "GPT 5.5 Codex",
       "version": "gpt-5.5",
       "description": "Stable version of GPT 5.5 Codex, The best model for coding and agentic tasks across domains.",
-      "context_length": 400000,
+      "context_length": 258000,
       "max_completion_tokens": 128000,
       "supported_parameters": [
         "tools"
@@ -2583,7 +2583,7 @@
       "display_name": "GPT 5.5",
       "version": "gpt-5.5",
       "description": "Stable version of GPT 5.5",
-      "context_length": 1050000,
+      "context_length": 258000,
       "max_completion_tokens": 128000,
       "supported_parameters": [
         "tools"
@@ -2629,7 +2629,7 @@
       "display_name": "GPT 5.5 Codex",
       "version": "gpt-5.5",
       "description": "Stable version of GPT 5.5 Codex, The best model for coding and agentic tasks across domains.",
-      "context_length": 400000,
+      "context_length": 258000,
       "max_completion_tokens": 128000,
       "supported_parameters": [
         "tools"

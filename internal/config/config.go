@@ -335,7 +335,7 @@ func (c *Config) ApplyRoutingPerformanceDefaults() {
 		c.Routing.PerformanceWeightInflight = DefaultRoutingPerformanceWeightInflight
 	}
 	if !c.routingPerformanceShadowLogSet {
-		c.Routing.PerformanceShadowLog = true
+		c.Routing.PerformanceShadowLog = false
 	}
 	c.applyCodexRouteManagementDefaults()
 }

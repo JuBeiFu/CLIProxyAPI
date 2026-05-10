@@ -86,6 +86,7 @@ type WatcherWrapper struct {
 	stop  func() error
 
 	setConfig             func(cfg *config.Config)
+	primeAuthState        func(auths []*coreauth.Auth)
 	snapshotAuths         func() []*coreauth.Auth
 	setUpdateQueue        func(queue chan<- watcher.AuthUpdate)
 	dispatchRuntimeUpdate func(update watcher.AuthUpdate) bool
@@ -113,6 +114,15 @@ func (w *WatcherWrapper) SetConfig(cfg *config.Config) {
 		return
 	}
 	w.setConfig(cfg)
+}
+
+// PrimeAuthState seeds the watcher with auths that already exist in runtime
+// state so startup scans only emit genuinely new auths.
+func (w *WatcherWrapper) PrimeAuthState(auths []*coreauth.Auth) {
+	if w == nil || w.primeAuthState == nil {
+		return
+	}
+	w.primeAuthState(auths)
 }
 
 // DispatchRuntimeAuthUpdate forwards runtime auth updates (e.g., websocket providers)

@@ -154,6 +154,28 @@ func (w *Watcher) DispatchRuntimeAuthUpdate(update AuthUpdate) bool {
 	return w.dispatchRuntimeAuthUpdate(update)
 }
 
+// PrimeCurrentAuths seeds the watcher's current auth snapshot with auths that
+// were already loaded by the runtime before the filesystem watcher starts.
+// This prevents the initial auth-directory scan from replaying identical file
+// auths back into the core manager while still allowing config-derived auths to
+// appear as normal add events.
+func (w *Watcher) PrimeCurrentAuths(auths []*coreauth.Auth) {
+	if w == nil || len(auths) == 0 {
+		return
+	}
+	w.clientsMutex.Lock()
+	defer w.clientsMutex.Unlock()
+	if w.currentAuths == nil {
+		w.currentAuths = make(map[string]*coreauth.Auth, len(auths))
+	}
+	for _, auth := range auths {
+		if auth == nil || auth.ID == "" {
+			continue
+		}
+		w.currentAuths[auth.ID] = auth.Clone()
+	}
+}
+
 // SnapshotCoreAuths converts current clients snapshot into core auth entries.
 func (w *Watcher) SnapshotCoreAuths() []*coreauth.Auth {
 	w.clientsMutex.RLock()

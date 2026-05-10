@@ -89,6 +89,41 @@ func TestSchedulerPerformanceShadowKeepsRoundRobinSelection(t *testing.T) {
 	}
 }
 
+func TestSchedulerPerformanceDisabledSkipsScorer(t *testing.T) {
+	model := "gpt-5.4"
+	registerSchedulerModels(t, "codex", model, "auth-a", "auth-b")
+	scorer := &fakePerformanceScorer{
+		candidates: map[string]performance.ScoreCandidate{
+			"auth-a": {OutputTPSEWMA: 10, LatencyMsEWMA: 100, SampleReady: true},
+			"auth-b": {OutputTPSEWMA: 40, LatencyMsEWMA: 40, SampleReady: true},
+		},
+	}
+	scheduler := newSchedulerForTest(
+		&RoundRobinSelector{},
+		&Auth{ID: "auth-a", Provider: "codex"},
+		&Auth{ID: "auth-b", Provider: "codex"},
+	)
+	cfg := performance.DefaultConfig()
+	cfg.Enabled = false
+	cfg.ShadowLog = false
+	scheduler.setPerformanceRoutingConfig(cfg)
+	scheduler.setPerformanceScorer(scorer)
+
+	got, errPick := scheduler.pickSingle(context.Background(), "codex", model, cliproxyexecutor.Options{}, nil)
+	if errPick != nil {
+		t.Fatalf("pickSingle() error = %v", errPick)
+	}
+	if got == nil || got.ID != "auth-a" {
+		t.Fatalf("pickSingle() auth = %v, want auth-a", got)
+	}
+	if count := scorer.snapshotCount(); count != 0 {
+		t.Fatalf("snapshot count = %d, want 0", count)
+	}
+	if gotIDs := scorer.scoredAuthIDs(); len(gotIDs) != 0 {
+		t.Fatalf("scored auth IDs = %v, want empty", gotIDs)
+	}
+}
+
 func TestSchedulerPerformanceEnabledSelectsFasterSamePriorityAuth(t *testing.T) {
 	model := "gpt-5.4"
 	registerSchedulerModels(t, "codex", model, "auth-a", "auth-b")

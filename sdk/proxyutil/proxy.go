@@ -98,6 +98,13 @@ func cloneDefaultTransport() *http.Transport {
 	return clone
 }
 
+// NewInheritedTransport returns a transport cloned from http.DefaultTransport
+// while preserving environment-proxy behavior and increasing idle connection
+// limits for high-concurrency steady-state workloads.
+func NewInheritedTransport() *http.Transport {
+	return cloneDefaultTransport()
+}
+
 // NewDirectTransport returns a transport that bypasses environment proxies.
 func NewDirectTransport() *http.Transport {
 	clone := cloneDefaultTransport()

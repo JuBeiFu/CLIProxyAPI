@@ -231,15 +231,18 @@ func TestCodexExecutorExecuteStreamErrorsWhenStreamClosesBeforeCompleted(t *test
 	if gotErr == nil {
 		t.Fatal("expected terminal stream error when response.completed is missing")
 	}
-	statusCoder, ok := gotErr.(interface{ StatusCode() int })
+	errResult, ok := gotErr.(*cliproxyauth.Error)
 	if !ok {
-		t.Fatalf("expected status coder error, got %T: %v", gotErr, gotErr)
+		t.Fatalf("expected *cliproxyauth.Error, got %T: %v", gotErr, gotErr)
 	}
-	if got := statusCoder.StatusCode(); got != http.StatusRequestTimeout {
+	if errResult.Code != "request_scoped_auth_unavailable" {
+		t.Fatalf("Code = %q, want request_scoped_auth_unavailable", errResult.Code)
+	}
+	if got := errResult.StatusCode(); got != http.StatusRequestTimeout {
 		t.Fatalf("StatusCode = %d, want %d", got, http.StatusRequestTimeout)
 	}
-	if !bytes.Contains([]byte(gotErr.Error()), []byte("stream disconnected before completion")) {
-		t.Fatalf("unexpected error message: %v", gotErr)
+	if !bytes.Contains([]byte(errResult.Message), []byte("stream disconnected before completion")) {
+		t.Fatalf("unexpected error message: %v", errResult.Message)
 	}
 }
 

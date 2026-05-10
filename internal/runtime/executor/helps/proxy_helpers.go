@@ -8,7 +8,10 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/proxypool"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
+	"github.com/router-for-me/CLIProxyAPI/v6/sdk/proxyutil"
 )
+
+var sharedInheritedHTTPTransport http.RoundTripper = proxyutil.NewInheritedTransport()
 
 // NewProxyAwareHTTPClient creates an HTTP client with proper proxy configuration priority:
 // 1. Use auth.ProxyURL if configured (highest priority)
@@ -37,7 +40,8 @@ func NewProxyAwareHTTPClientWithResolution(ctx context.Context, cfg *config.Conf
 	}
 
 	// Priority 1/2: explicit auth/global proxy-url or proxy-pool selection.
-	if transport, resolution := proxypool.BuildHTTPRoundTripperWithContext(ctx, cfg, auth); transport != nil {
+	transport, resolution := proxypool.BuildHTTPRoundTripperWithContext(ctx, cfg, auth)
+	if transport != nil {
 		httpClient.Transport = transport
 		return httpClient, resolution
 	}
@@ -45,7 +49,9 @@ func NewProxyAwareHTTPClientWithResolution(ctx context.Context, cfg *config.Conf
 	// Priority 3: Use RoundTripper from context (typically from RoundTripperFor)
 	if rt, ok := ctx.Value("cliproxy.roundtripper").(http.RoundTripper); ok && rt != nil {
 		httpClient.Transport = rt
+		return httpClient, proxypool.Resolution{}
 	}
 
-	return httpClient, proxypool.Resolution{}
+	httpClient.Transport = sharedInheritedHTTPTransport
+	return httpClient, resolution
 }

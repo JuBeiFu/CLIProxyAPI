@@ -13,6 +13,9 @@ const RequestedModelMetadataKey = "requested_model"
 const (
 	// PinnedAuthMetadataKey locks execution to a specific auth ID.
 	PinnedAuthMetadataKey = "pinned_auth_id"
+	// AuthSessionMetadataKey groups related requests so auth selection can reuse
+	// the same credential across a long-lived polling or conversation session.
+	AuthSessionMetadataKey = "auth_session_id"
 	// ImageGenerationRequestMetadataKey marks image generation requests for scheduling.
 	ImageGenerationRequestMetadataKey = "image_generation_request"
 	// ImageGenerationModelMetadataKey stores the image_generation tool model used for quota tracking.

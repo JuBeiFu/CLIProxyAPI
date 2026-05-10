@@ -303,6 +303,7 @@ type authFallbackExecutor struct {
 	streamCalls       []string
 	executeErrors     map[string]error
 	streamFirstErrors map[string]error
+	streamPayloadErrs map[string]error
 }
 
 func (e *authFallbackExecutor) Identifier() string {
@@ -324,15 +325,19 @@ func (e *authFallbackExecutor) ExecuteStream(_ context.Context, auth *Auth, _ cl
 	e.mu.Lock()
 	e.streamCalls = append(e.streamCalls, auth.ID)
 	err := e.streamFirstErrors[auth.ID]
+	payloadErr := e.streamPayloadErrs[auth.ID]
 	e.mu.Unlock()
 
-	ch := make(chan cliproxyexecutor.StreamChunk, 1)
+	ch := make(chan cliproxyexecutor.StreamChunk, 2)
 	if err != nil {
 		ch <- cliproxyexecutor.StreamChunk{Err: err}
 		close(ch)
 		return &cliproxyexecutor.StreamResult{Headers: http.Header{"X-Auth": {auth.ID}}, Chunks: ch}, nil
 	}
 	ch <- cliproxyexecutor.StreamChunk{Payload: []byte(auth.ID)}
+	if payloadErr != nil {
+		ch <- cliproxyexecutor.StreamChunk{Err: payloadErr}
+	}
 	close(ch)
 	return &cliproxyexecutor.StreamResult{Headers: http.Header{"X-Auth": {auth.ID}}, Chunks: ch}, nil
 }
@@ -1802,6 +1807,45 @@ func TestManager_MarkResult_RequestScopedBadRequestDoesNotCooldownAuth(t *testin
 	}
 }
 
+func TestManager_MarkResult_RequestScopedAuthUnavailableDoesNotCooldownAuth(t *testing.T) {
+	m := NewManager(nil, nil, nil)
+
+	auth := &Auth{
+		ID:       "auth-1",
+		Provider: "codex",
+	}
+	if _, errRegister := m.Register(context.Background(), auth); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+
+	model := "gpt-5.4"
+	m.MarkResult(context.Background(), Result{
+		AuthID:   auth.ID,
+		Provider: auth.Provider,
+		Model:    model,
+		Success:  false,
+		Error: &Error{
+			Code:       "request_scoped_auth_unavailable",
+			HTTPStatus: http.StatusServiceUnavailable,
+			Message:    "transient local failover",
+		},
+	})
+
+	updated, ok := m.GetByID(auth.ID)
+	if !ok || updated == nil {
+		t.Fatalf("expected auth to be present")
+	}
+	if updated.Unavailable {
+		t.Fatalf("expected request-scoped auth_unavailable to keep auth available")
+	}
+	if !updated.NextRetryAfter.IsZero() {
+		t.Fatalf("expected request-scoped auth_unavailable to keep auth cooldown unset, got %v", updated.NextRetryAfter)
+	}
+	if state := updated.ModelStates[model]; state != nil {
+		t.Fatalf("expected request-scoped auth_unavailable to avoid model cooldown state, got %#v", state)
+	}
+}
+
 func TestManager_RequestScopedNotFoundStopsRetryWithoutSuspendingAuth(t *testing.T) {
 	m := NewManager(nil, nil, nil)
 	executor := &authFallbackExecutor{
@@ -1872,6 +1916,217 @@ func TestManager_RequestScopedNotFoundStopsRetryWithoutSuspendingAuth(t *testing
 	}
 	if state := updatedBad.ModelStates[model]; state != nil {
 		t.Fatalf("expected request-scoped 404 to avoid bad auth model cooldown state, got %#v", state)
+	}
+}
+
+func TestManager_RequestScopedAuthUnavailableFallsBackWithoutSuspendingAuth(t *testing.T) {
+	m := NewManager(nil, nil, nil)
+	executor := &authFallbackExecutor{
+		id: "openai",
+		executeErrors: map[string]error{
+			"aa-bad-auth": &Error{
+				Code:       "request_scoped_auth_unavailable",
+				HTTPStatus: http.StatusServiceUnavailable,
+				Message:    "transient local failover",
+			},
+		},
+	}
+	m.RegisterExecutor(executor)
+
+	model := "gpt-4.1"
+	badAuth := &Auth{ID: "aa-bad-auth", Provider: "openai"}
+	goodAuth := &Auth{ID: "bb-good-auth", Provider: "openai"}
+
+	reg := registry.GetGlobalRegistry()
+	reg.RegisterClient(badAuth.ID, "openai", []*registry.ModelInfo{{ID: model}})
+	reg.RegisterClient(goodAuth.ID, "openai", []*registry.ModelInfo{{ID: model}})
+	t.Cleanup(func() {
+		reg.UnregisterClient(badAuth.ID)
+		reg.UnregisterClient(goodAuth.ID)
+	})
+
+	if _, errRegister := m.Register(context.Background(), badAuth); errRegister != nil {
+		t.Fatalf("register bad auth: %v", errRegister)
+	}
+	if _, errRegister := m.Register(context.Background(), goodAuth); errRegister != nil {
+		t.Fatalf("register good auth: %v", errRegister)
+	}
+
+	resp, errExecute := m.Execute(context.Background(), []string{"openai"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
+	if errExecute != nil {
+		t.Fatalf("Execute returned error: %v", errExecute)
+	}
+	if got := string(resp.Payload); got != goodAuth.ID {
+		t.Fatalf("payload = %q, want %q", got, goodAuth.ID)
+	}
+
+	got := executor.ExecuteCalls()
+	want := []string{badAuth.ID, goodAuth.ID}
+	if len(got) != len(want) {
+		t.Fatalf("execute calls = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("execute call %d auth = %q, want %q", i, got[i], want[i])
+		}
+	}
+
+	updatedBad, ok := m.GetByID(badAuth.ID)
+	if !ok || updatedBad == nil {
+		t.Fatalf("expected bad auth to remain registered")
+	}
+	if updatedBad.Unavailable {
+		t.Fatalf("expected request-scoped auth_unavailable to keep bad auth available")
+	}
+	if !updatedBad.NextRetryAfter.IsZero() {
+		t.Fatalf("expected request-scoped auth_unavailable to keep bad auth cooldown unset, got %v", updatedBad.NextRetryAfter)
+	}
+	if state := updatedBad.ModelStates[model]; state != nil {
+		t.Fatalf("expected request-scoped auth_unavailable to avoid bad auth model cooldown state, got %#v", state)
+	}
+}
+
+func TestManager_ExecuteStream_RequestScopedAuthUnavailableFallsBackWithoutSuspendingAuth(t *testing.T) {
+	m := NewManager(nil, nil, nil)
+	executor := &authFallbackExecutor{
+		id: "codex",
+		streamFirstErrors: map[string]error{
+			"aa-bad-auth": &Error{
+				Code:       "request_scoped_auth_unavailable",
+				HTTPStatus: http.StatusRequestTimeout,
+				Message:    "stream error: stream disconnected before completion: stream closed before response.completed",
+			},
+		},
+	}
+	m.RegisterExecutor(executor)
+
+	model := "gpt-5.5"
+	badAuth := &Auth{ID: "aa-bad-auth", Provider: "codex"}
+	goodAuth := &Auth{ID: "bb-good-auth", Provider: "codex"}
+
+	reg := registry.GetGlobalRegistry()
+	reg.RegisterClient(badAuth.ID, "codex", []*registry.ModelInfo{{ID: model}})
+	reg.RegisterClient(goodAuth.ID, "codex", []*registry.ModelInfo{{ID: model}})
+	t.Cleanup(func() {
+		reg.UnregisterClient(badAuth.ID)
+		reg.UnregisterClient(goodAuth.ID)
+	})
+
+	if _, errRegister := m.Register(context.Background(), badAuth); errRegister != nil {
+		t.Fatalf("register bad auth: %v", errRegister)
+	}
+	if _, errRegister := m.Register(context.Background(), goodAuth); errRegister != nil {
+		t.Fatalf("register good auth: %v", errRegister)
+	}
+
+	streamResult, errExecute := m.ExecuteStream(context.Background(), []string{"codex"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
+	if errExecute != nil {
+		t.Fatalf("ExecuteStream returned error: %v", errExecute)
+	}
+	var payload []byte
+	for chunk := range streamResult.Chunks {
+		if chunk.Err != nil {
+			t.Fatalf("stream chunk error = %v, want nil", chunk.Err)
+		}
+		payload = append(payload, chunk.Payload...)
+	}
+	if got := string(payload); got != goodAuth.ID {
+		t.Fatalf("payload = %q, want %q", got, goodAuth.ID)
+	}
+
+	calls := executor.StreamCalls()
+	wantCalls := []string{badAuth.ID, goodAuth.ID}
+	if len(calls) != len(wantCalls) {
+		t.Fatalf("stream calls = %v, want %v", calls, wantCalls)
+	}
+	for i := range wantCalls {
+		if calls[i] != wantCalls[i] {
+			t.Fatalf("stream call %d auth = %q, want %q", i, calls[i], wantCalls[i])
+		}
+	}
+
+	updatedBad, ok := m.GetByID(badAuth.ID)
+	if !ok || updatedBad == nil {
+		t.Fatalf("expected bad auth to remain registered")
+	}
+	if updatedBad.Unavailable {
+		t.Fatalf("expected request-scoped stream auth_unavailable to keep bad auth available")
+	}
+	if !updatedBad.NextRetryAfter.IsZero() {
+		t.Fatalf("expected request-scoped stream auth_unavailable to keep bad auth cooldown unset, got %v", updatedBad.NextRetryAfter)
+	}
+	if state := updatedBad.ModelStates[model]; state != nil {
+		t.Fatalf("expected request-scoped stream auth_unavailable to avoid bad auth model cooldown state, got %#v", state)
+	}
+}
+
+func TestManager_ExecuteStream_RequestScopedLateErrorDoesNotCooldownAuth(t *testing.T) {
+	m := NewManager(nil, nil, nil)
+	executor := &authFallbackExecutor{
+		id: "codex",
+		streamPayloadErrs: map[string]error{
+			"aa-late-auth": &Error{
+				Code:       "request_scoped_auth_unavailable",
+				HTTPStatus: http.StatusRequestTimeout,
+				Message:    "stream error: stream disconnected before completion: stream closed before response.completed",
+			},
+		},
+	}
+	m.RegisterExecutor(executor)
+
+	model := "gpt-5.5"
+	auth := &Auth{ID: "aa-late-auth", Provider: "codex"}
+
+	reg := registry.GetGlobalRegistry()
+	reg.RegisterClient(auth.ID, "codex", []*registry.ModelInfo{{ID: model}})
+	t.Cleanup(func() {
+		reg.UnregisterClient(auth.ID)
+	})
+
+	if _, errRegister := m.Register(context.Background(), auth); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+
+	streamResult, errExecute := m.ExecuteStream(context.Background(), []string{"codex"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
+	if errExecute != nil {
+		t.Fatalf("ExecuteStream returned error: %v", errExecute)
+	}
+
+	var payload []byte
+	var gotErr error
+	for chunk := range streamResult.Chunks {
+		if chunk.Err != nil {
+			gotErr = chunk.Err
+			continue
+		}
+		payload = append(payload, chunk.Payload...)
+	}
+	if got := string(payload); got != auth.ID {
+		t.Fatalf("payload = %q, want %q", got, auth.ID)
+	}
+	if gotErr == nil {
+		t.Fatal("expected terminal late stream error")
+	}
+	errResult, ok := gotErr.(*Error)
+	if !ok {
+		t.Fatalf("expected *Error, got %T", gotErr)
+	}
+	if errResult.Code != "request_scoped_auth_unavailable" {
+		t.Fatalf("error code = %q, want request_scoped_auth_unavailable", errResult.Code)
+	}
+
+	updated, ok := m.GetByID(auth.ID)
+	if !ok || updated == nil {
+		t.Fatalf("expected auth to remain registered")
+	}
+	if updated.Unavailable {
+		t.Fatalf("expected request-scoped late stream error to keep auth available")
+	}
+	if !updated.NextRetryAfter.IsZero() {
+		t.Fatalf("expected request-scoped late stream error to keep auth cooldown unset, got %v", updated.NextRetryAfter)
+	}
+	if state := updated.ModelStates[model]; state != nil {
+		t.Fatalf("expected request-scoped late stream error to avoid auth model cooldown state, got %#v", state)
 	}
 }
 

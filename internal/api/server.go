@@ -355,7 +355,11 @@ func applyPerformanceRoutingConfigToAuthManager(cfg *config.Config, authManager 
 	if authManager == nil {
 		return
 	}
-	authManager.SetPerformanceScorer(performance.NewScorer(performance.DefaultTracker()))
+	if perfCfg.Enabled || perfCfg.ShadowLog {
+		authManager.SetPerformanceScorer(performance.NewScorer(performance.DefaultTracker()))
+	} else {
+		authManager.SetPerformanceScorer(nil)
+	}
 	authManager.SetPerformanceRoutingConfig(perfCfg)
 }
 

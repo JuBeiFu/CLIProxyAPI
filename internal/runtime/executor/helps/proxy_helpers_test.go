@@ -9,6 +9,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/proxypool"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	sdkconfig "github.com/router-for-me/CLIProxyAPI/v6/sdk/config"
+	"github.com/router-for-me/CLIProxyAPI/v6/sdk/proxyutil"
 )
 
 func TestNewProxyAwareHTTPClientDirectBypassesGlobalProxy(t *testing.T) {
@@ -161,5 +162,53 @@ func TestNewProxyAwareHTTPClientWithResolutionHonorsRequestRouteOverride(t *test
 	}
 	if proxyURL == nil || proxyURL.String() != "http://proxy-b.local:8080" {
 		t.Fatalf("proxy URL = %v, want http://proxy-b.local:8080", proxyURL)
+	}
+}
+
+func TestNewProxyAwareHTTPClientWithResolutionUsesSharedInheritedTransportForDirect(t *testing.T) {
+	t.Parallel()
+
+	client, resolution := NewProxyAwareHTTPClientWithResolution(
+		context.Background(),
+		&config.Config{},
+		&cliproxyauth.Auth{ID: "auth-direct"},
+		0,
+	)
+
+	if resolution.Source != "direct" {
+		t.Fatalf("resolution.Source = %q, want %q", resolution.Source, "direct")
+	}
+	if client.Transport == nil {
+		t.Fatal("client.Transport = nil, want shared inherited transport")
+	}
+	if client.Transport != sharedInheritedHTTPTransport {
+		t.Fatal("expected shared inherited transport to be reused")
+	}
+	transport, ok := client.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("transport type = %T, want *http.Transport", client.Transport)
+	}
+	if transport.MaxIdleConnsPerHost < 1024 {
+		t.Fatalf("MaxIdleConnsPerHost = %d, want >= 1024", transport.MaxIdleConnsPerHost)
+	}
+}
+
+func TestNewProxyAwareHTTPClientWithResolutionHonorsContextRoundTripperForDirect(t *testing.T) {
+	t.Parallel()
+
+	customTransport := proxyutil.NewDirectTransport()
+	ctx := context.WithValue(context.Background(), "cliproxy.roundtripper", customTransport)
+	client, resolution := NewProxyAwareHTTPClientWithResolution(
+		ctx,
+		&config.Config{},
+		&cliproxyauth.Auth{ID: "auth-direct-context"},
+		0,
+	)
+
+	if resolution.Source != "" {
+		t.Fatalf("resolution.Source = %q, want empty when context roundtripper is used", resolution.Source)
+	}
+	if client.Transport != customTransport {
+		t.Fatal("expected context roundtripper to take precedence")
 	}
 }

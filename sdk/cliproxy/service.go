@@ -333,17 +333,14 @@ func (s *Service) applyCoreAuthRemoval(ctx context.Context, id string) {
 	if s.coreManager == nil {
 		return
 	}
-	GlobalModelRegistry().UnregisterClient(id)
-	if existing, ok := s.coreManager.GetByID(id); ok && existing != nil {
-		existing.Disabled = true
-		existing.Status = coreauth.StatusDisabled
-		if _, err := s.coreManager.Update(ctx, existing); err != nil {
-			log.Errorf("failed to disable auth %s: %v", id, err)
-		}
-		if strings.EqualFold(strings.TrimSpace(existing.Provider), "codex") {
-			executor.CloseCodexWebsocketSessionsForAuthID(existing.ID, "auth_removed")
-			s.ensureExecutorsForAuth(existing)
-		}
+	removed, err := s.coreManager.Remove(coreauth.WithSkipPersist(ctx), id)
+	if err != nil {
+		log.Errorf("failed to remove auth %s: %v", id, err)
+		return
+	}
+	if removed != nil && strings.EqualFold(strings.TrimSpace(removed.Provider), "codex") {
+		executor.CloseCodexWebsocketSessionsForAuthID(removed.ID, "auth_removed")
+		s.ensureExecutorsForAuth(removed)
 	}
 }
 
@@ -393,7 +390,11 @@ func (s *Service) applyPerformanceRoutingConfig(cfg *config.Config) {
 		return
 	}
 	s.coreManager.SetCodexRouteController(reg)
-	s.coreManager.SetPerformanceScorer(performance.NewScorer(performance.DefaultTracker()))
+	if perfCfg.Enabled || perfCfg.ShadowLog {
+		s.coreManager.SetPerformanceScorer(performance.NewScorer(performance.DefaultTracker()))
+	} else {
+		s.coreManager.SetPerformanceScorer(nil)
+	}
 	s.coreManager.SetPerformanceRoutingConfig(perfCfg)
 }
 
@@ -514,6 +515,28 @@ func (s *Service) rebindExecutors() {
 	}
 }
 
+// initializeLoadedAuths performs the startup-only wiring that file-backed auths
+// need after coreManager.Load(). Historically this happened implicitly via the
+// watcher's initial replay; once that replay is suppressed, loaded auths still
+// need their executors rebound, models registered, and scheduler entries
+// refreshed explicitly.
+func (s *Service) initializeLoadedAuths(ctx context.Context) {
+	if s == nil || s.coreManager == nil {
+		return
+	}
+	for _, auth := range s.coreManager.List() {
+		if auth == nil || auth.ID == "" {
+			continue
+		}
+		if !auth.Disabled {
+			s.ensureExecutorsForAuth(auth)
+		}
+		s.registerModelsForAuth(auth)
+		s.coreManager.ReconcileRegistryModelStates(ctx, auth.ID)
+		s.coreManager.RefreshSchedulerEntry(auth.ID)
+	}
+}
+
 // Run starts the service and blocks until the context is cancelled or the server stops.
 // It initializes all components including authentication, file watching, HTTP server,
 // and starts processing requests. The method blocks until the context is cancelled.
@@ -599,6 +622,7 @@ func (s *Service) Run(ctx context.Context) error {
 			log.Debugf("ws-auth disabled; existing websocket sessions remain connected")
 		})
 	}
+	s.initializeLoadedAuths(ctx)
 
 	if s.hooks.OnBeforeStart != nil {
 		s.hooks.OnBeforeStart(s.cfg)
@@ -722,6 +746,9 @@ func (s *Service) Run(ctx context.Context) error {
 		return fmt.Errorf("cliproxy: failed to create watcher: %w", err)
 	}
 	s.watcher = watcherWrapper
+	if s.coreManager != nil {
+		watcherWrapper.PrimeAuthState(s.coreManager.List())
+	}
 	s.ensureAuthUpdateQueue(ctx)
 	if s.authUpdates != nil {
 		watcherWrapper.SetAuthUpdateQueue(s.authUpdates)

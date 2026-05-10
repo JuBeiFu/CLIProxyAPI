@@ -243,6 +243,61 @@ func TestManager_MarkResult_DisablesPersistedAuthOnMessageOnlyInvalidatedToken(t
 	assertPersistedAuthDeleted(t, mgr, store, auth)
 }
 
+func TestManager_DeleteRevokedAuth_InvalidatesRouteAwareProviderCache(t *testing.T) {
+	mgr := NewManager(nil, nil, nil)
+	auth := &Auth{
+		ID:       "route-aware-delete",
+		Provider: "gemini",
+		Prefix:   "tenant-a",
+	}
+
+	if _, err := mgr.Register(WithSkipPersist(context.Background()), auth); err != nil {
+		t.Fatalf("Register returned error: %v", err)
+	}
+	if !mgr.providerMayNeedRouteAwareSelection("gemini") {
+		t.Fatal("expected route-aware provider cache to be populated")
+	}
+
+	mgr.deleteRevokedAuth(auth.Clone(), "test cleanup", "test")
+
+	if mgr.providerMayNeedRouteAwareSelection("gemini") {
+		t.Fatal("expected route-aware provider cache to clear after auth deletion")
+	}
+}
+
+func TestManager_MarkRevokedAuthDisabled_InvalidatesRouteAwareProviderCache(t *testing.T) {
+	mgr := NewManager(nil, nil, nil)
+	auth := &Auth{
+		ID:       "route-aware-disable",
+		Provider: "gemini",
+		Prefix:   "tenant-b",
+	}
+
+	if _, err := mgr.Register(WithSkipPersist(context.Background()), auth); err != nil {
+		t.Fatalf("Register returned error: %v", err)
+	}
+	if !mgr.providerMayNeedRouteAwareSelection("gemini") {
+		t.Fatal("expected route-aware provider cache to be populated")
+	}
+
+	mgr.mu.Lock()
+	current := mgr.auths[auth.ID]
+	if current == nil {
+		mgr.mu.Unlock()
+		t.Fatal("expected auth to be present")
+	}
+	current.Disabled = true
+	current.Status = StatusDisabled
+	snapshot := current.Clone()
+	mgr.mu.Unlock()
+
+	mgr.markRevokedAuthDisabled(snapshot, "test disable", "test")
+
+	if mgr.providerMayNeedRouteAwareSelection("gemini") {
+		t.Fatal("expected route-aware provider cache to clear after auth disable")
+	}
+}
+
 func TestManager_MarkResult_DisablesRuntimeOnlyAuthOnUnauthorized(t *testing.T) {
 	store := &deletingStore{}
 	mgr := NewManager(store, nil, nil)

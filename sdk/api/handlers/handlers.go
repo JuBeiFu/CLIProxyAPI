@@ -323,6 +323,41 @@ func requestExecutionMetadata(ctx context.Context) map[string]any {
 	return meta
 }
 
+func populateAuthSessionMetadata(meta map[string]any, ctx context.Context, rawJSON []byte) {
+	if len(meta) == 0 {
+		return
+	}
+	if raw, ok := meta[coreexecutor.AuthSessionMetadataKey]; ok && raw != nil {
+		if existing, ok := raw.(string); ok && strings.TrimSpace(existing) != "" {
+			return
+		}
+	}
+	if sessionID := requestAuthSessionID(ctx, rawJSON); sessionID != "" {
+		meta[coreexecutor.AuthSessionMetadataKey] = sessionID
+	}
+}
+
+func requestAuthSessionID(ctx context.Context, rawJSON []byte) string {
+	if ctx != nil {
+		if ginCtx, ok := ctx.Value("gin").(*gin.Context); ok && ginCtx != nil && ginCtx.Request != nil {
+			for _, header := range []string{"session_id", "conversation_id"} {
+				if value := strings.TrimSpace(ginCtx.GetHeader(header)); value != "" {
+					return value
+				}
+			}
+		}
+	}
+	if len(rawJSON) == 0 {
+		return ""
+	}
+	for _, path := range []string{"session_id", "conversation_id", "prompt_cache_key"} {
+		if value := strings.TrimSpace(gjson.GetBytes(rawJSON, path).String()); value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
 func bridgeExecutionSessionIDFromHeaders(headers http.Header) string {
 	if headers == nil {
 		return ""
@@ -630,6 +665,7 @@ func (h *BaseAPIHandler) executeWithAuthManager(ctx context.Context, handlerType
 		return nil, nil, errMsg
 	}
 	reqMeta := requestExecutionMetadata(ctx)
+	populateAuthSessionMetadata(reqMeta, ctx, rawJSON)
 	requestedModel = strings.TrimSpace(requestedModel)
 	if requestedModel == "" {
 		requestedModel = normalizedModel
@@ -679,6 +715,7 @@ func (h *BaseAPIHandler) ExecuteCountWithAuthManager(ctx context.Context, handle
 		return nil, nil, errMsg
 	}
 	reqMeta := requestExecutionMetadata(ctx)
+	populateAuthSessionMetadata(reqMeta, ctx, rawJSON)
 	reqMeta[coreexecutor.RequestedModelMetadataKey] = normalizedModel
 	payload := rawJSON
 	if len(payload) == 0 {
@@ -728,6 +765,7 @@ func (h *BaseAPIHandler) ExecuteStreamWithAuthManager(ctx context.Context, handl
 		return nil, nil, errChan
 	}
 	reqMeta := requestExecutionMetadata(ctx)
+	populateAuthSessionMetadata(reqMeta, ctx, rawJSON)
 	reqMeta[coreexecutor.RequestedModelMetadataKey] = normalizedModel
 	payload := rawJSON
 	if len(payload) == 0 {

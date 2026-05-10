@@ -64,6 +64,15 @@ func TestCodexLoadRunnerRunTracksStreamingFirstByteAndCompletion(t *testing.T) {
 	if summary.FirstByteSamples != 1 {
 		t.Fatalf("first_byte_samples = %d, want 1", summary.FirstByteSamples)
 	}
+	if summary.FirstVisibleOutputSamples != 1 {
+		t.Fatalf("first_visible_output_samples = %d, want 1", summary.FirstVisibleOutputSamples)
+	}
+	if summary.AvgFirstVisibleOutput <= summary.AvgFirstByte {
+		t.Fatalf("avg_first_visible_output = %s, want > avg_first_byte %s", summary.AvgFirstVisibleOutput, summary.AvgFirstByte)
+	}
+	if summary.AvgVisibleAfterFirstByteGap <= 0 {
+		t.Fatalf("avg_visible_after_first_byte_gap = %s, want > 0", summary.AvgVisibleAfterFirstByteGap)
+	}
 	if summary.ZeroOutputResponses != 0 {
 		t.Fatalf("zero_output_responses = %d, want 0", summary.ZeroOutputResponses)
 	}

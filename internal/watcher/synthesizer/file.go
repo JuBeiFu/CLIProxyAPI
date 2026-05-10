@@ -79,7 +79,7 @@ func synthesizeFileAuths(ctx *SynthesisContext, fullPath string, data []byte) []
 	if t == "" {
 		return nil
 	}
-	provider := strings.ToLower(t)
+	provider := codex.NormalizeProviderName(t)
 	if provider == "gemini" {
 		provider = "gemini-cli"
 	}
@@ -163,6 +163,11 @@ func synthesizeFileAuths(ctx *SynthesisContext, fullPath string, data []byte) []
 			}
 		}
 	}
+	if baseURL, ok := metadata["base_url"].(string); ok {
+		if trimmed := strings.TrimSpace(baseURL); trimmed != "" {
+			a.Attributes["base_url"] = trimmed
+		}
+	}
 	coreauth.ApplyCustomHeadersFromMetadata(a)
 	ApplyAuthExcludedModelsMeta(a, cfg, perAccountExcluded, "oauth")
 	// For codex auth files, resolve plan_type with priority:
@@ -170,19 +175,9 @@ func synthesizeFileAuths(ctx *SynthesisContext, fullPath string, data []byte) []
 	//   JWT claim (stale snapshot).
 	// Without this guard, file reload would clobber probed=free back to
 	// JWT-claim=plus and defeat downgrade detection.
-	if provider == "codex" {
-		planType := ""
-		if probed, ok := metadata[coreauth.MetadataProbedPlanTypeKey].(string); ok {
-			planType = strings.TrimSpace(probed)
-		}
-		if planType == "" {
-			if idTokenRaw, ok := metadata["id_token"].(string); ok && strings.TrimSpace(idTokenRaw) != "" {
-				if claims, errParse := codex.ParseJWTToken(idTokenRaw); errParse == nil && claims != nil {
-					planType = strings.TrimSpace(claims.CodexAuthInfo.ChatgptPlanType)
-				}
-			}
-		}
-		if planType != "" {
+	if codex.IsProviderName(provider) {
+		codex.ApplyMetadataAliases(metadata)
+		if planType := codex.ResolveMetadataPlanType(metadata); planType != "" {
 			a.Attributes["plan_type"] = planType
 		}
 	}

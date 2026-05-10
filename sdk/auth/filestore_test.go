@@ -115,6 +115,68 @@ func TestFileTokenStoreList_CodexExtractsPlanTypeFromIDToken(t *testing.T) {
 	}
 }
 
+func TestFileTokenStoreList_CodexSessionUsesTopLevelPlanAndAccountID(t *testing.T) {
+	t.Parallel()
+
+	baseDir := t.TempDir()
+	store := NewFileTokenStore()
+	store.SetBaseDir(baseDir)
+
+	path := filepath.Join(baseDir, "codex-session-user@example.com-plus.json")
+	raw := []byte(`{"type":"codex_session","email":"codex-session-user@example.com","plan_type":"plus","account_id":"acct_session_123"}`)
+	if err := os.WriteFile(path, raw, 0o600); err != nil {
+		t.Fatalf("write auth file: %v", err)
+	}
+
+	items, err := store.List(t.Context())
+	if err != nil {
+		t.Fatalf("List returned error: %v", err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("List returned %d items, want 1", len(items))
+	}
+	if got := strings.TrimSpace(items[0].Provider); got != "codex" {
+		t.Fatalf("provider = %q, want %q", got, "codex")
+	}
+	if got := strings.TrimSpace(items[0].Attributes["plan_type"]); got != "plus" {
+		t.Fatalf("attributes.plan_type = %q, want %q", got, "plus")
+	}
+	if got, _ := items[0].Metadata["account_id"].(string); got != "acct_session_123" {
+		t.Fatalf("metadata.account_id = %q, want %q", got, "acct_session_123")
+	}
+	if got, _ := items[0].Metadata["chatgpt_account_id"].(string); got != "acct_session_123" {
+		t.Fatalf("metadata.chatgpt_account_id = %q, want %q", got, "acct_session_123")
+	}
+}
+
+func TestFileTokenStoreList_CodexCarriesBaseURLAttr(t *testing.T) {
+	t.Parallel()
+
+	baseDir := t.TempDir()
+	store := NewFileTokenStore()
+	store.SetBaseDir(baseDir)
+
+	path := filepath.Join(baseDir, "codex-base-url.json")
+	raw := []byte(`{"type":"codex","base_url":"http://127.0.0.1:18080","headers":{"X-Mock-Auth-ID":"auth-0001"}}`)
+	if err := os.WriteFile(path, raw, 0o600); err != nil {
+		t.Fatalf("write auth file: %v", err)
+	}
+
+	items, err := store.List(t.Context())
+	if err != nil {
+		t.Fatalf("List returned error: %v", err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("List returned %d items, want 1", len(items))
+	}
+	if got := strings.TrimSpace(items[0].Attributes["base_url"]); got != "http://127.0.0.1:18080" {
+		t.Fatalf("attributes.base_url = %q, want %q", got, "http://127.0.0.1:18080")
+	}
+	if got := strings.TrimSpace(items[0].Attributes["header:X-Mock-Auth-ID"]); got != "auth-0001" {
+		t.Fatalf("attributes.header:X-Mock-Auth-ID = %q, want %q", got, "auth-0001")
+	}
+}
+
 func testCodexJWTForFileStore(t *testing.T, planType, accountID string) string {
 	t.Helper()
 

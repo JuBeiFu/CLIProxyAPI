@@ -29,6 +29,8 @@ import (
 
 var requestLogID atomic.Uint64
 
+const defaultErrorLogsCleanupInterval = 5 * time.Second
+
 // RequestLogger defines the interface for logging HTTP requests and responses.
 // It provides methods for logging both regular and streaming HTTP request/response cycles.
 type RequestLogger interface {
@@ -148,6 +150,18 @@ type FileRequestLogger struct {
 
 	// errorLogsMaxFiles limits the number of error log files retained.
 	errorLogsMaxFiles int
+
+	// errorLogsCleanupInterval throttles expensive forced error-log cleanup scans.
+	errorLogsCleanupInterval time.Duration
+
+	// errorLogsCleanupNow supplies the current time. Tests override it.
+	errorLogsCleanupNow func() time.Time
+
+	// errorLogsCleanup allows tests to stub the cleanup implementation.
+	errorLogsCleanup func() error
+
+	errorLogsCleanupNextAt  atomic.Int64
+	errorLogsCleanupRunning atomic.Bool
 }
 
 // NewFileRequestLogger creates a new file-based request logger.
@@ -170,9 +184,10 @@ func NewFileRequestLogger(enabled bool, logsDir string, configDir string, errorL
 		}
 	}
 	return &FileRequestLogger{
-		enabled:           enabled,
-		logsDir:           logsDir,
-		errorLogsMaxFiles: errorLogsMaxFiles,
+		enabled:                  enabled,
+		logsDir:                  logsDir,
+		errorLogsMaxFiles:        errorLogsMaxFiles,
+		errorLogsCleanupInterval: defaultErrorLogsCleanupInterval,
 	}
 }
 
@@ -296,7 +311,7 @@ func (l *FileRequestLogger) logRequest(url, method string, requestHeaders map[st
 	}
 
 	if force && !l.enabled {
-		if errCleanup := l.cleanupOldErrorLogs(); errCleanup != nil {
+		if errCleanup := l.maybeCleanupOldErrorLogs(); errCleanup != nil {
 			log.WithError(errCleanup).Warn("failed to clean up old error logs")
 		}
 	}
@@ -458,6 +473,46 @@ func (l *FileRequestLogger) sanitizeForFilename(path string) string {
 	return sanitized
 }
 
+func (l *FileRequestLogger) maybeCleanupOldErrorLogs() error {
+	if l == nil || l.errorLogsMaxFiles <= 0 {
+		return nil
+	}
+	nowFn := l.errorLogsCleanupNow
+	if nowFn == nil {
+		nowFn = time.Now
+	}
+	interval := l.errorLogsCleanupInterval
+	if interval <= 0 {
+		interval = defaultErrorLogsCleanupInterval
+	}
+	now := nowFn()
+	if nextAtUnix := l.errorLogsCleanupNextAt.Load(); nextAtUnix > 0 {
+		nextAt := time.Unix(0, nextAtUnix)
+		if now.Before(nextAt) {
+			return nil
+		}
+	}
+	if !l.errorLogsCleanupRunning.CompareAndSwap(false, true) {
+		return nil
+	}
+	defer l.errorLogsCleanupRunning.Store(false)
+
+	now = nowFn()
+	if nextAtUnix := l.errorLogsCleanupNextAt.Load(); nextAtUnix > 0 {
+		nextAt := time.Unix(0, nextAtUnix)
+		if now.Before(nextAt) {
+			return nil
+		}
+	}
+	l.errorLogsCleanupNextAt.Store(now.Add(interval).UnixNano())
+
+	cleanup := l.errorLogsCleanup
+	if cleanup == nil {
+		cleanup = l.cleanupOldErrorLogs
+	}
+	return cleanup()
+}
+
 // cleanupOldErrorLogs keeps only the newest errorLogsMaxFiles forced error log files.
 func (l *FileRequestLogger) cleanupOldErrorLogs() error {
 	if l.errorLogsMaxFiles <= 0 {
@@ -501,6 +556,9 @@ func (l *FileRequestLogger) cleanupOldErrorLogs() error {
 
 	for _, file := range files[l.errorLogsMaxFiles:] {
 		if errRemove := os.Remove(filepath.Join(l.logsDir, file.name)); errRemove != nil {
+			if os.IsNotExist(errRemove) {
+				continue
+			}
 			log.WithError(errRemove).Warnf("failed to remove old error log: %s", file.name)
 		}
 	}
