@@ -16,7 +16,7 @@ import (
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v6/sdk/translator"
 )
 
-func TestCodexExecutorRejectsOversizedGPT55ContextLocally(t *testing.T) {
+func TestCodexExecutorDoesNotRejectOversizedGPT55ContextLocally(t *testing.T) {
 	var hits atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		hits.Add(1)
@@ -31,28 +31,17 @@ func TestCodexExecutorRejectsOversizedGPT55ContextLocally(t *testing.T) {
 		"api_key":  "test",
 	}}
 
-	hugeInput := strings.Repeat("a ", 300000)
+	hugeInput := strings.Repeat("a ", 450000)
 	_, err := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
 		Model:   "gpt-5.5",
 		Payload: []byte(fmt.Sprintf(`{"model":"gpt-5.5","input":%q,"max_output_tokens":1024}`, hugeInput)),
 	}, cliproxyexecutor.Options{
 		SourceFormat: sdktranslator.FromString("openai-response"),
 	})
-	if err == nil {
-		t.Fatal("expected local context limit error")
+	if err != nil {
+		t.Fatalf("expected oversized request to pass through to upstream, got %v", err)
 	}
-
-	statusCoder, ok := err.(interface{ StatusCode() int })
-	if !ok {
-		t.Fatalf("expected status coder error, got %T: %v", err, err)
-	}
-	if got := statusCoder.StatusCode(); got != http.StatusBadRequest {
-		t.Fatalf("StatusCode = %d, want %d", got, http.StatusBadRequest)
-	}
-	if !strings.Contains(err.Error(), "context_length_exceeded") {
-		t.Fatalf("expected context_length_exceeded error, got %v", err)
-	}
-	if hits.Load() != 0 {
-		t.Fatalf("expected request to be rejected before upstream HTTP call, got %d upstream hits", hits.Load())
+	if hits.Load() != 1 {
+		t.Fatalf("expected request to reach upstream once, got %d upstream hits", hits.Load())
 	}
 }

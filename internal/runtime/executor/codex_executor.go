@@ -41,7 +41,7 @@ const (
 	codexUserAgent                  = "codex-tui/0.125.0 (Mac OS 26.3.1; arm64) iTerm.app/3.6.9 (codex-tui; 0.125.0)"
 	codexOriginator                 = "codex-tui"
 	newAPIDownstreamTransportHeader = "X-NewAPI-Downstream-Transport"
-	codexGPT55ContextLength         = 258000
+	codexGPT55ContextLength         = 400000
 )
 
 var dataTag = []byte("data:")
@@ -419,9 +419,6 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	body, _ = sjson.DeleteBytes(body, "stream_options")
 	body = normalizeCodexInstructions(body)
 	body = maybeAttachImageGenerationTool(baseModel, body)
-	if err = validateCodexRequestContext(baseModel, body); err != nil {
-		return resp, err
-	}
 
 	url := strings.TrimSuffix(baseURL, "/") + "/responses"
 	httpReq, err := e.cacheHelper(ctx, from, url, req, body)
@@ -624,9 +621,6 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 		body, _ = sjson.DeleteBytes(body, "previous_response_id")
 	}
 	body = normalizeCodexInstructions(body)
-	if err = validateCodexRequestContext(baseModel, body); err != nil {
-		return resp, err
-	}
 
 	url := strings.TrimSuffix(baseURL, "/") + "/responses/compact"
 	httpReq, err := e.cacheHelper(ctx, from, url, req, body)
@@ -946,9 +940,6 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 	body, _ = sjson.SetBytes(body, "model", baseModel)
 	body = normalizeCodexInstructions(body)
 	body = maybeAttachImageGenerationTool(baseModel, body)
-	if err = validateCodexRequestContext(baseModel, body); err != nil {
-		return nil, err
-	}
 
 	url := strings.TrimSuffix(baseURL, "/") + "/responses"
 	httpReq, err := e.cacheHelper(ctx, from, url, req, body)
