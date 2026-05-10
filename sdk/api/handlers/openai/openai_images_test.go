@@ -28,6 +28,10 @@ type imageCaptureExecutor struct {
 	metadata     map[string]any
 	deadline     time.Time
 	hasDeadline  bool
+	payloads     [][]byte
+	models       []string
+	metadatas    []map[string]any
+	results      []imageExecutorResult
 }
 
 func (e *imageCaptureExecutor) Identifier() string { return "codex" }
@@ -36,9 +40,23 @@ func (e *imageCaptureExecutor) Execute(ctx context.Context, auth *coreauth.Auth,
 	e.payload = append(e.payload[:0], req.Payload...)
 	e.model = req.Model
 	e.sourceFormat = opts.SourceFormat.String()
-	e.metadata = opts.Metadata
+	e.metadata = cloneImageMetadata(opts.Metadata)
 	e.deadline, e.hasDeadline = ctx.Deadline()
-	return coreexecutor.Response{Payload: []byte(`{"id":"resp_1","object":"response","created_at":1775555723,"model":"gpt-5.4-mini","output":[{"type":"image_generation_call","result":"ZmFrZS1pbWFnZQ==","output_format":"png"}],"usage":{"input_tokens":11,"output_tokens":22,"total_tokens":33}}`)}, nil
+	e.payloads = append(e.payloads, append([]byte(nil), req.Payload...))
+	e.models = append(e.models, req.Model)
+	e.metadatas = append(e.metadatas, cloneImageMetadata(opts.Metadata))
+
+	index := len(e.models) - 1
+	if index < len(e.results) {
+		result := e.results[index]
+		if result.err != nil {
+			return coreexecutor.Response{}, result.err
+		}
+		if len(result.payload) > 0 {
+			return coreexecutor.Response{Payload: append([]byte(nil), result.payload...)}, nil
+		}
+	}
+	return coreexecutor.Response{Payload: []byte(`{"id":"resp_1","object":"response","created_at":1775555723,"model":"gpt-5.5","output":[{"type":"image_generation_call","result":"ZmFrZS1pbWFnZQ==","output_format":"png"}],"usage":{"input_tokens":11,"output_tokens":22,"total_tokens":33}}`)}, nil
 }
 
 func (e *imageCaptureExecutor) ExecuteStream(context.Context, *coreauth.Auth, coreexecutor.Request, coreexecutor.Options) (*coreexecutor.StreamResult, error) {
@@ -55,6 +73,22 @@ func (e *imageCaptureExecutor) CountTokens(context.Context, *coreauth.Auth, core
 
 func (e *imageCaptureExecutor) HttpRequest(context.Context, *coreauth.Auth, *http.Request) (*http.Response, error) {
 	return nil, errors.New("not implemented")
+}
+
+type imageExecutorResult struct {
+	payload []byte
+	err     error
+}
+
+func cloneImageMetadata(src map[string]any) map[string]any {
+	if src == nil {
+		return nil
+	}
+	dst := make(map[string]any, len(src))
+	for key, value := range src {
+		dst[key] = value
+	}
+	return dst
 }
 
 func TestImagesGenerationsConvertsOpenAIRequestToResponsesAndReturnsImage(t *testing.T) {
@@ -130,6 +164,65 @@ func TestImagesGenerationsConvertsOpenAIRequestToResponsesAndReturnsImage(t *tes
 	}
 	if got := gjson.Get(resp.Body.String(), "usage.total_tokens").Int(); got != 33 {
 		t.Fatalf("usage.total_tokens = %d, want 33; body=%s", got, resp.Body.String())
+	}
+}
+
+func TestImagesGenerationsFallsBackToGPT54WhenGPT55Unavailable(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	executor := &imageCaptureExecutor{
+		results: []imageExecutorResult{
+			{
+				err: &coreauth.Error{
+					Code:       "request_scoped_auth_unavailable",
+					Message:    "The requested model is currently unavailable. Please switch model.",
+					Retryable:  true,
+					HTTPStatus: http.StatusServiceUnavailable,
+				},
+			},
+		},
+	}
+	manager := coreauth.NewManager(nil, nil, nil)
+	manager.RegisterExecutor(executor)
+
+	auth := &coreauth.Auth{ID: "image-fallback-auth", Provider: executor.Identifier(), Status: coreauth.StatusActive}
+	if _, err := manager.Register(context.Background(), auth); err != nil {
+		t.Fatalf("Register auth: %v", err)
+	}
+	registry.GetGlobalRegistry().RegisterClient(auth.ID, auth.Provider, []*registry.ModelInfo{{ID: defaultImagesMainModel}, {ID: fallbackImagesMainModel}})
+	t.Cleanup(func() {
+		registry.GetGlobalRegistry().UnregisterClient(auth.ID)
+	})
+
+	base := handlers.NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, manager)
+	h := NewOpenAIAPIHandler(base)
+	router := gin.New()
+	router.POST("/v1/images/generations", h.ImagesGenerations)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/images/generations", strings.NewReader(`{"model":"gpt-image-2","prompt":"draw a cat"}`))
+	req.Header.Set("Content-Type", "application/json")
+	resp := httptest.NewRecorder()
+	router.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", resp.Code, http.StatusOK, resp.Body.String())
+	}
+	if got := len(executor.models); got != 2 {
+		t.Fatalf("attempt count = %d, want 2", got)
+	}
+	if executor.models[0] != defaultImagesMainModel || executor.models[1] != fallbackImagesMainModel {
+		t.Fatalf("models = %v, want [%s %s]", executor.models, defaultImagesMainModel, fallbackImagesMainModel)
+	}
+	if got := gjson.GetBytes(executor.payloads[0], "model").String(); got != defaultImagesMainModel {
+		t.Fatalf("first payload model = %q, want %s; payload=%s", got, defaultImagesMainModel, string(executor.payloads[0]))
+	}
+	if got := gjson.GetBytes(executor.payloads[1], "model").String(); got != fallbackImagesMainModel {
+		t.Fatalf("second payload model = %q, want %s; payload=%s", got, fallbackImagesMainModel, string(executor.payloads[1]))
+	}
+	if got := executor.metadatas[0][coreexecutor.RequestedModelMetadataKey]; got != defaultImagesMainModel {
+		t.Fatalf("first requested model metadata = %#v, want %s", got, defaultImagesMainModel)
+	}
+	if got := executor.metadatas[1][coreexecutor.RequestedModelMetadataKey]; got != fallbackImagesMainModel {
+		t.Fatalf("second requested model metadata = %#v, want %s", got, fallbackImagesMainModel)
 	}
 }
 

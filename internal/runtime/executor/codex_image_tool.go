@@ -7,10 +7,15 @@ import (
 	"github.com/tidwall/sjson"
 )
 
-const codexDefaultImageToolModel = "gpt-5.4-mini"
+var codexDefaultImageToolModels = map[string]struct{}{
+	"gpt-5.4-mini": {},
+	"gpt-5.4":      {},
+	"gpt-5.5":      {},
+}
 
 func shouldAutoAttachImageGenerationTool(model string) bool {
-	return strings.EqualFold(strings.TrimSpace(model), codexDefaultImageToolModel)
+	_, ok := codexDefaultImageToolModels[strings.ToLower(strings.TrimSpace(model))]
+	return ok
 }
 
 func hasImageGenerationTool(body []byte) bool {

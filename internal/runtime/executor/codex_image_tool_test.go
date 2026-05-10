@@ -20,19 +20,21 @@ func TestMaybeAttachImageGenerationToolAttachesMinimalToolForGPT54Mini(t *testin
 	}
 }
 
-func TestMaybeAttachImageGenerationToolSkipsGPT54(t *testing.T) {
+func TestMaybeAttachImageGenerationToolAttachesMinimalToolForGPT54(t *testing.T) {
 	out := maybeAttachImageGenerationTool("gpt-5.4", []byte(`{"model":"gpt-5.4","input":"draw a wide poster"}`))
 
-	if gjson.GetBytes(out, "tools").Exists() {
-		t.Fatalf("gpt-5.4 must not auto-inject image_generation tools: %s", string(out))
+	tool := gjson.GetBytes(out, "tools.0")
+	if got := tool.Get("type").String(); got != "image_generation" {
+		t.Fatalf("tools.0.type = %q, want image_generation: %s", got, string(out))
 	}
 }
 
-func TestMaybeAttachImageGenerationToolSkipsGPT55(t *testing.T) {
+func TestMaybeAttachImageGenerationToolAttachesMinimalToolForGPT55(t *testing.T) {
 	out := maybeAttachImageGenerationTool("gpt-5.5", []byte(`{"model":"gpt-5.5","input":"draw a wide poster"}`))
 
-	if gjson.GetBytes(out, "tools").Exists() {
-		t.Fatalf("gpt-5.5 must not auto-inject image_generation tools: %s", string(out))
+	tool := gjson.GetBytes(out, "tools.0")
+	if got := tool.Get("type").String(); got != "image_generation" {
+		t.Fatalf("tools.0.type = %q, want image_generation: %s", got, string(out))
 	}
 }
 
@@ -45,5 +47,13 @@ func TestMaybeAttachImageGenerationToolPreservesExistingImageToolForGPT54Mini(t 
 	}
 	if got := tools[0].Get("model").String(); got != "gpt-image-2" {
 		t.Fatalf("tools.0.model = %q, want gpt-image-2: %s", got, string(out))
+	}
+}
+
+func TestMaybeAttachImageGenerationToolSkipsOtherModels(t *testing.T) {
+	out := maybeAttachImageGenerationTool("gpt-4.1", []byte(`{"model":"gpt-4.1","input":"draw a wide poster"}`))
+
+	if gjson.GetBytes(out, "tools").Exists() {
+		t.Fatalf("gpt-4.1 must not auto-inject image_generation tools: %s", string(out))
 	}
 }

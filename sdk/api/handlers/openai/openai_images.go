@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -16,14 +17,17 @@ import (
 
 	"github.com/gin-gonic/gin"
 	. "github.com/router-for-me/CLIProxyAPI/v6/internal/constant"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/api/handlers"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
 
 const (
 	defaultImageGenerationSize = "auto"
-	defaultImagesMainModel     = "gpt-5.4-mini"
+	defaultImagesMainModel     = "gpt-5.5"
+	fallbackImagesMainModel    = "gpt-5.4"
 	defaultImagesToolModel     = "gpt-image-2"
 	openAIImagesEndpoint       = "/v1/images/generations"
 	imageGenerationTimeout     = 10 * time.Minute
@@ -117,7 +121,29 @@ func (h *OpenAIAPIHandler) executeImagesResponsesPayload(c *gin.Context, respons
 	cliCtx, timeoutCancel := context.WithTimeout(cliCtx, imageGenerationTimeout)
 	defer timeoutCancel()
 	stopKeepAlive := h.StartNonStreamingKeepAlive(c, cliCtx)
-	resp, upstreamHeaders, errMsg := h.ExecuteWithAuthManagerRequestedModel(cliCtx, OpenaiResponse, routeModelName, responsesJSON, "", requestedModelName)
+	candidates := buildImagesMainModelCandidates(routeModelName, requestedModelName)
+	var (
+		resp            []byte
+		upstreamHeaders http.Header
+		errMsg          *interfaces.ErrorMessage
+	)
+	for index, candidate := range candidates {
+		attemptPayload := setImagesResponsesMainModel(responsesJSON, candidate.routeModelName)
+		resp, upstreamHeaders, errMsg = h.ExecuteWithAuthManagerRequestedModel(
+			cliCtx,
+			OpenaiResponse,
+			candidate.routeModelName,
+			attemptPayload,
+			"",
+			candidate.requestedModelName,
+		)
+		if errMsg == nil {
+			break
+		}
+		if index == len(candidates)-1 || !shouldFallbackImagesMainModel(errMsg) {
+			break
+		}
+	}
 	stopKeepAlive()
 	if errMsg != nil {
 		h.WriteErrorResponse(c, errMsg)
@@ -140,6 +166,90 @@ func (h *OpenAIAPIHandler) executeImagesResponsesPayload(c *gin.Context, respons
 	handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
 	_, _ = c.Writer.Write(imageResp)
 	cliCancel(imageResp)
+}
+
+type imagesMainModelCandidate struct {
+	routeModelName     string
+	requestedModelName string
+}
+
+func buildImagesMainModelCandidates(routeModelName, requestedModelName string) []imagesMainModelCandidate {
+	routeModelName = strings.TrimSpace(routeModelName)
+	if routeModelName == "" {
+		routeModelName = defaultImagesMainModel
+	}
+	requestedModelName = strings.TrimSpace(requestedModelName)
+	if requestedModelName == "" {
+		requestedModelName = routeModelName
+	}
+
+	candidates := []imagesMainModelCandidate{{
+		routeModelName:     routeModelName,
+		requestedModelName: requestedModelName,
+	}}
+	if strings.EqualFold(routeModelName, defaultImagesMainModel) &&
+		!strings.EqualFold(routeModelName, fallbackImagesMainModel) {
+		candidates = append(candidates, imagesMainModelCandidate{
+			routeModelName:     fallbackImagesMainModel,
+			requestedModelName: fallbackImagesMainModel,
+		})
+	}
+	return candidates
+}
+
+func setImagesResponsesMainModel(payload []byte, model string) []byte {
+	model = strings.TrimSpace(model)
+	if model == "" {
+		return payload
+	}
+	updated, err := sjson.SetBytes(payload, "model", model)
+	if err != nil {
+		return payload
+	}
+	return updated
+}
+
+func shouldFallbackImagesMainModel(errMsg *interfaces.ErrorMessage) bool {
+	if errMsg == nil || errMsg.Error == nil {
+		return false
+	}
+
+	var authErr *coreauth.Error
+	if errors.As(errMsg.Error, &authErr) && authErr != nil {
+		switch strings.ToLower(strings.TrimSpace(authErr.Code)) {
+		case "auth_not_found", "auth_unavailable", "request_scoped_auth_unavailable":
+			return true
+		}
+	}
+
+	return isImagesMainModelUnavailableMessage(errMsg.Error.Error())
+}
+
+func isImagesMainModelUnavailableMessage(message string) bool {
+	lower := strings.ToLower(strings.TrimSpace(message))
+	if lower == "" {
+		return false
+	}
+	for _, pattern := range []string{
+		"model_cooldown",
+		"selected model is at capacity",
+		"model is at capacity. please try a different model",
+		"requested model is currently unavailable",
+		"current model is unavailable",
+		"requested model is not supported",
+		"requested model is unsupported",
+		"requested model is unavailable",
+		"model is not supported",
+		"model not supported",
+		"unsupported model",
+		"not available for your plan",
+		"not available for your account",
+	} {
+		if strings.Contains(lower, pattern) {
+			return true
+		}
+	}
+	return strings.Contains(lower, "model unavailable") && strings.Contains(lower, "switch model")
 }
 
 func imageToolModelFromResponsesPayload(payload []byte) string {
