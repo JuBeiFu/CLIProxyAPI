@@ -606,6 +606,9 @@ func passiveOutcomeIsSlow(outcome PassiveOutcome) bool {
 	if passiveOutcomeNeedsCodexTailPenalty(outcome) && passiveOutcomeNeedsCodexCooling(outcome) {
 		return true
 	}
+	if passiveOutcomeNeedsCodexTailPenalty(outcome) && passiveErrorIsIncompleteStream(outcome.Error) && passiveOutcomeDuration(outcome) >= 15*time.Second {
+		return true
+	}
 	if outcome.Error != "" && outcome.StatusCode == 0 {
 		return true
 	}
@@ -661,16 +664,22 @@ func passiveOutcomeNeedsAggressiveIsolation(outcome PassiveOutcome) bool {
 	if !passiveOutcomeNeedsCodexTailPenalty(outcome) {
 		return false
 	}
-	errText := strings.ToLower(strings.TrimSpace(outcome.Error))
+	errText := passiveNormalizedError(outcome.Error)
 	duration := passiveOutcomeDuration(outcome)
+	if passiveErrorIsRouteTransportFailure(errText) {
+		return true
+	}
 	if outcome.FirstByte >= codexPassiveQuarantineFirstByteThreshold {
 		return true
 	}
 	if strings.Contains(errText, "internal_error") {
 		return true
 	}
-	if strings.Contains(errText, "context canceled") || strings.Contains(errText, "client disconnected") || strings.Contains(errText, "client closed") {
+	if passiveErrorIsClientAbort(errText) {
 		return duration >= 180*time.Second
+	}
+	if passiveErrorIsIncompleteStream(errText) {
+		return duration >= 90*time.Second
 	}
 	if !passiveOutcomeWasSuccessful(outcome) {
 		return duration >= 240*time.Second
@@ -694,12 +703,21 @@ func passiveOutcomeNeedsCodexCooling(outcome PassiveOutcome) bool {
 		return false
 	}
 	duration := passiveOutcomeDuration(outcome)
-	errText := strings.ToLower(strings.TrimSpace(outcome.Error))
+	errText := passiveNormalizedError(outcome.Error)
 	if outcome.StatusCode >= http.StatusInternalServerError {
+		return true
+	}
+	if passiveErrorIsRouteTransportFailure(errText) {
 		return true
 	}
 	if strings.Contains(errText, "server_is_overloaded") {
 		return duration >= 10*time.Second
+	}
+	if passiveErrorIsIncompleteStream(errText) {
+		return duration >= 15*time.Second
+	}
+	if passiveErrorIsClientAbort(errText) {
+		return duration >= 90*time.Second || outcome.FirstByte >= codexPassiveCoolingFirstByteThreshold
 	}
 	if errText != "" {
 		return duration >= 30*time.Second

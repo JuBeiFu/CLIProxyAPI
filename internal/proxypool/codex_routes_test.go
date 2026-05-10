@@ -55,6 +55,43 @@ func TestRouteRegistryQuarantinesSevereTail(t *testing.T) {
 	}
 }
 
+func TestRouteRegistryLearnsPrimaryAndStandbyFromSuccessfulPassiveTraffic(t *testing.T) {
+	t.Parallel()
+
+	reg := NewCodexRouteRegistry(CodexRouteConfig{
+		CoolingFirstByteThreshold:    30 * time.Second,
+		PromotionWinThreshold:        2,
+		QuarantineFirstByteThreshold: 60 * time.Second,
+	})
+	now := time.Now()
+	primary := RouteDescriptor{Pool: "pool-a", Entry: "proxy-1"}
+	standby := RouteDescriptor{Pool: "pool-a", Entry: "proxy-2"}
+
+	reg.RecordPassiveOutcome("auth-1", primary, RoutePassiveOutcome{
+		CheckedAt:  now,
+		FirstByte:  900 * time.Millisecond,
+		StatusCode: 200,
+		Successful: true,
+	})
+	reg.RecordPassiveOutcome("auth-1", standby, RoutePassiveOutcome{
+		CheckedAt:  now.Add(time.Second),
+		FirstByte:  800 * time.Millisecond,
+		StatusCode: 200,
+		Successful: true,
+	})
+
+	gotPrimary, gotStandby, ok := reg.PrimaryAndStandby("auth-1")
+	if !ok {
+		t.Fatal("PrimaryAndStandby returned ok=false")
+	}
+	if gotPrimary.Entry != "proxy-1" {
+		t.Fatalf("primary = %q, want %q", gotPrimary.Entry, "proxy-1")
+	}
+	if gotStandby.Entry != "proxy-2" {
+		t.Fatalf("standby = %q, want %q", gotStandby.Entry, "proxy-2")
+	}
+}
+
 func TestRouteRegistryCoolsHeavyTailAndPromotesStandby(t *testing.T) {
 	t.Parallel()
 
@@ -230,6 +267,66 @@ func TestRouteRegistryQuarantinesLongIncompleteTail(t *testing.T) {
 
 	if got := reg.RouteState("auth-1", primary); got != RouteStateQuarantined {
 		t.Fatalf("primary state = %v, want %v", got, RouteStateQuarantined)
+	}
+	if got := reg.RouteState("auth-1", standby); got != RouteStatePrimary {
+		t.Fatalf("standby state = %v, want %v", got, RouteStatePrimary)
+	}
+}
+
+func TestRouteRegistryQuarantinesNetworkUnreachableRoute(t *testing.T) {
+	t.Parallel()
+
+	reg := NewCodexRouteRegistry(CodexRouteConfig{
+		CoolingFirstByteThreshold:    30 * time.Second,
+		PromotionWinThreshold:        2,
+		QuarantineFirstByteThreshold: 60 * time.Second,
+	})
+	now := time.Now()
+	primary := RouteDescriptor{Pool: "pool-a", Entry: "proxy-v6-a"}
+	standby := RouteDescriptor{Pool: "pool-a", Entry: "proxy-v6-b"}
+
+	reg.UpsertCertifiedRoute("auth-1", primary, now)
+	reg.UpsertCertifiedRoute("auth-1", standby, now.Add(time.Second))
+	reg.RecordPassiveOutcome("auth-1", primary, RoutePassiveOutcome{
+		CheckedAt:  now.Add(2 * time.Second),
+		StatusCode: 503,
+		Successful: false,
+		Error:      `Post "https://chatgpt.com/backend-api/codex/responses": dial tcp [2602:294:0:eb::2da]:0->[2a06:98c1:3100::6812:202f]:443: connect: network is unreachable`,
+	})
+
+	if got := reg.RouteState("auth-1", primary); got != RouteStateQuarantined {
+		t.Fatalf("primary state = %v, want %v", got, RouteStateQuarantined)
+	}
+	if got := reg.RouteState("auth-1", standby); got != RouteStatePrimary {
+		t.Fatalf("standby state = %v, want %v", got, RouteStatePrimary)
+	}
+}
+
+func TestRouteRegistryCoolsMediumIncompleteTail(t *testing.T) {
+	t.Parallel()
+
+	reg := NewCodexRouteRegistry(CodexRouteConfig{
+		CoolingFirstByteThreshold:    30 * time.Second,
+		PromotionWinThreshold:        2,
+		QuarantineFirstByteThreshold: 60 * time.Second,
+	})
+	now := time.Now()
+	primary := RouteDescriptor{Pool: "pool-a", Entry: "proxy-1"}
+	standby := RouteDescriptor{Pool: "pool-a", Entry: "proxy-2"}
+
+	reg.UpsertCertifiedRoute("auth-1", primary, now)
+	reg.UpsertCertifiedRoute("auth-1", standby, now.Add(time.Second))
+	reg.RecordPassiveOutcome("auth-1", primary, RoutePassiveOutcome{
+		CheckedAt:  now.Add(2 * time.Second),
+		FirstByte:  900 * time.Millisecond,
+		ReadBody:   20 * time.Second,
+		StatusCode: 200,
+		Successful: false,
+		Error:      "stream error: stream disconnected before completion: stream closed before response.completed",
+	})
+
+	if got := reg.RouteState("auth-1", primary); got != RouteStateCooling {
+		t.Fatalf("primary state = %v, want %v", got, RouteStateCooling)
 	}
 	if got := reg.RouteState("auth-1", standby); got != RouteStatePrimary {
 		t.Fatalf("standby state = %v, want %v", got, RouteStatePrimary)

@@ -271,6 +271,24 @@ func (r *CodexRouteRegistry) RecordPassiveOutcome(authID string, route RouteDesc
 		r.demoteRouteLocked(authRoutes, routeKey, RouteStateCooling)
 		return
 	}
+	if routePassiveWasSuccessful(outcome) {
+		switch {
+		case authRoutes.primaryKey == "":
+			authRoutes.primaryKey = routeKey
+			entry.state = RouteStatePrimary
+			return
+		case authRoutes.primaryKey == routeKey:
+			entry.state = RouteStatePrimary
+			return
+		case authRoutes.standbyKey == "":
+			authRoutes.standbyKey = routeKey
+			entry.state = RouteStateStandby
+			return
+		case authRoutes.standbyKey == routeKey:
+			entry.state = RouteStateStandby
+			return
+		}
+	}
 	if authRoutes.primaryKey == routeKey {
 		entry.state = RouteStatePrimary
 		return
@@ -292,12 +310,18 @@ func routePassiveNeedsQuarantine(outcome RoutePassiveOutcome, cfg CodexRouteConf
 		return false
 	}
 	duration := routePassiveDuration(outcome)
-	errText := strings.ToLower(strings.TrimSpace(outcome.Error))
+	errText := passiveNormalizedError(outcome.Error)
+	if passiveErrorIsRouteTransportFailure(errText) {
+		return true
+	}
 	if strings.Contains(errText, "internal_error") {
 		return true
 	}
-	if strings.Contains(errText, "context canceled") || strings.Contains(errText, "client disconnected") || strings.Contains(errText, "client closed") {
+	if passiveErrorIsClientAbort(errText) {
 		return duration >= 180*time.Second
+	}
+	if passiveErrorIsIncompleteStream(errText) {
+		return duration >= 90*time.Second
 	}
 	return duration >= 240*time.Second
 }
@@ -310,12 +334,21 @@ func routePassiveNeedsCooling(outcome RoutePassiveOutcome, cfg CodexRouteConfig)
 		return false
 	}
 	duration := routePassiveDuration(outcome)
-	errText := strings.ToLower(strings.TrimSpace(outcome.Error))
+	errText := passiveNormalizedError(outcome.Error)
 	if outcome.StatusCode >= 500 {
+		return true
+	}
+	if passiveErrorIsRouteTransportFailure(errText) {
 		return true
 	}
 	if strings.Contains(errText, "server_is_overloaded") {
 		return duration >= 10*time.Second
+	}
+	if passiveErrorIsIncompleteStream(errText) {
+		return duration >= 15*time.Second
+	}
+	if passiveErrorIsClientAbort(errText) {
+		return duration >= 90*time.Second || outcome.FirstByte >= cfg.CoolingFirstByteThreshold
 	}
 	if strings.TrimSpace(outcome.Error) != "" {
 		return duration >= 30*time.Second

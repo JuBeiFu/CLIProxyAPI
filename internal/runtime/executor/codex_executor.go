@@ -774,6 +774,10 @@ func advanceCodexFailoverState(cfg *config.Config, auth *cliproxyauth.Auth, reso
 			return true
 		}
 	case proxypool.CodexFailoverModeDirectV6:
+		if shouldEscalateDirectV6FailureToProxy(reason) {
+			proxypool.DefaultCodexFailoverManager().PreferProxyPoolWithReason(cfg, auth.ID, reason, now)
+			return true
+		}
 		if proxypool.DefaultCodexFailoverManager().RotateToNextIPv6Lease(cfg, auth, now) {
 			proxypool.DefaultCodexFailoverManager().NoteReason(auth.ID, reason)
 			return true
@@ -782,6 +786,15 @@ func advanceCodexFailoverState(cfg *config.Config, auth *cliproxyauth.Auth, reso
 		return true
 	}
 	return false
+}
+
+func shouldEscalateDirectV6FailureToProxy(reason string) bool {
+	switch strings.ToLower(strings.TrimSpace(reason)) {
+	case "network-unreachable", "no-route-to-host", "dns-no-such-host", "dns-server-misbehaving":
+		return true
+	default:
+		return false
+	}
 }
 
 func codexFailoverReason(requestErr error, statusCode int) string {
