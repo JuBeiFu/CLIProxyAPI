@@ -52,4 +52,19 @@ func TestGetContextWithCancel_DoesNotInjectDownstreamWebsocketForSSEBridgeHeader
 	}
 }
 
+func TestRequestExecutionMetadata_IncludesCLIProxyRetryAttempt(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	c.Request.Header.Set("X-NewAPI-CLIProxy-Retry-Attempt", "3")
+
+	ctx := context.WithValue(context.Background(), "gin", c)
+	meta := requestExecutionMetadata(ctx)
+
+	if got, ok := meta[coreexecutor.ExternalRetryAttemptMetadataKey].(int); !ok || got != 3 {
+		t.Fatalf("retry attempt metadata = %#v, want int(3)", meta[coreexecutor.ExternalRetryAttemptMetadataKey])
+	}
+}
+
 var _ interfaces.APIHandler = noopAPIHandler{}

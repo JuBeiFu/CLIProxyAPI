@@ -104,6 +104,7 @@ const (
 const responseBindingPinnedAuthMetadataKey = "__cliproxy_response_binding_pinned_auth"
 const sessionBindingPinnedAuthMetadataKey = "__cliproxy_session_binding_pinned_auth"
 const selectionScopeAuthIDsMetadataKey = "__cliproxy_selection_scope_auth_ids"
+const retryExcludedAuthIDsMetadataKey = "__cliproxy_retry_excluded_auth_ids"
 
 var quotaCooldownDisabled atomic.Bool
 
@@ -2494,6 +2495,9 @@ func ensureResponseBindingMetadata(req cliproxyexecutor.Request, opts cliproxyex
 	if authID == "" {
 		return opts
 	}
+	if externalRetryAttemptFromMetadata(opts.Metadata) > 0 {
+		return appendRetryExcludedAuthMetadata(opts, authID)
+	}
 	if len(opts.Metadata) == 0 {
 		opts.Metadata = map[string]any{
 			cliproxyexecutor.PinnedAuthMetadataKey: authID,
@@ -2525,6 +2529,9 @@ func ensureSessionBindingMetadata(opts cliproxyexecutor.Options, lookup func(str
 	authID := strings.TrimSpace(lookup(sessionID))
 	if authID == "" {
 		return opts
+	}
+	if externalRetryAttemptFromMetadata(opts.Metadata) > 0 {
+		return appendRetryExcludedAuthMetadata(opts, authID)
 	}
 	if len(opts.Metadata) == 0 {
 		opts.Metadata = map[string]any{
@@ -2585,6 +2592,35 @@ func clearSessionBindingPinnedAuthMetadata(opts cliproxyexecutor.Options, authID
 		}
 		meta[k] = v
 	}
+	opts.Metadata = meta
+	return opts
+}
+
+func appendRetryExcludedAuthMetadata(opts cliproxyexecutor.Options, authID string) cliproxyexecutor.Options {
+	authID = strings.TrimSpace(authID)
+	if authID == "" {
+		return opts
+	}
+	if existing := retryExcludedAuthIDsFromMetadata(opts.Metadata); len(existing) > 0 {
+		if _, ok := existing[authID]; ok {
+			return opts
+		}
+	}
+	var meta map[string]any
+	if len(opts.Metadata) == 0 {
+		meta = make(map[string]any, 1)
+	} else {
+		meta = make(map[string]any, len(opts.Metadata)+1)
+		for k, v := range opts.Metadata {
+			meta[k] = v
+		}
+	}
+	excluded := retryExcludedAuthIDsFromMetadata(meta)
+	if len(excluded) == 0 {
+		excluded = make(map[string]struct{}, 1)
+	}
+	excluded[authID] = struct{}{}
+	meta[retryExcludedAuthIDsMetadataKey] = excluded
 	opts.Metadata = meta
 	return opts
 }
@@ -2651,6 +2687,82 @@ func sessionBindingPinnedAuthFromMetadata(meta map[string]any) bool {
 		return strings.EqualFold(strings.TrimSpace(val), "true")
 	default:
 		return false
+	}
+}
+
+func externalRetryAttemptFromMetadata(meta map[string]any) int {
+	if len(meta) == 0 {
+		return 0
+	}
+	raw, ok := meta[cliproxyexecutor.ExternalRetryAttemptMetadataKey]
+	if !ok || raw == nil {
+		return 0
+	}
+	switch v := raw.(type) {
+	case int:
+		if v > 0 {
+			return v
+		}
+	case int32:
+		if v > 0 {
+			return int(v)
+		}
+	case int64:
+		if v > 0 {
+			return int(v)
+		}
+	case float64:
+		if v > 0 {
+			return int(v)
+		}
+	case string:
+		if parsed, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && parsed > 0 {
+			return parsed
+		}
+	}
+	return 0
+}
+
+func retryExcludedAuthIDsFromMetadata(meta map[string]any) map[string]struct{} {
+	if len(meta) == 0 {
+		return nil
+	}
+	raw, ok := meta[retryExcludedAuthIDsMetadataKey]
+	if !ok || raw == nil {
+		return nil
+	}
+	switch v := raw.(type) {
+	case map[string]struct{}:
+		if len(v) == 0 {
+			return nil
+		}
+		return v
+	case []string:
+		out := make(map[string]struct{}, len(v))
+		for _, authID := range v {
+			if trimmed := strings.TrimSpace(authID); trimmed != "" {
+				out[trimmed] = struct{}{}
+			}
+		}
+		if len(out) == 0 {
+			return nil
+		}
+		return out
+	case []any:
+		out := make(map[string]struct{}, len(v))
+		for _, item := range v {
+			if authID, ok := item.(string); ok {
+				if trimmed := strings.TrimSpace(authID); trimmed != "" {
+					out[trimmed] = struct{}{}
+				}
+			}
+		}
+		if len(out) == 0 {
+			return nil
+		}
+		return out
+	default:
+		return nil
 	}
 }
 
@@ -3931,6 +4043,19 @@ func (m *Manager) selectionScopeAuthIDs(providers []string, routeModel string, o
 			continue
 		}
 		allowed[candidate.ID] = struct{}{}
+	}
+	if excluded := retryExcludedAuthIDsFromMetadata(opts.Metadata); len(excluded) > 0 && len(allowed) > 1 {
+		remaining := len(allowed)
+		for authID := range excluded {
+			if _, ok := allowed[authID]; ok {
+				remaining--
+			}
+		}
+		if remaining > 0 {
+			for authID := range excluded {
+				delete(allowed, authID)
+			}
+		}
 	}
 	return allowed
 }

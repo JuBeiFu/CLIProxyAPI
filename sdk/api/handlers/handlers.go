@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -50,6 +51,7 @@ type ErrorDetail struct {
 
 const idempotencyKeyMetadataKey = "idempotency_key"
 const newAPIDownstreamTransportHeader = "X-NewAPI-Downstream-Transport"
+const cliProxyRetryAttemptHeader = "X-NewAPI-CLIProxy-Retry-Attempt"
 const statusClientClosedRequest = 499
 
 const (
@@ -292,12 +294,14 @@ func requestExecutionMetadata(ctx context.Context) map[string]any {
 	// It is forwarded as execution metadata; when absent we generate a UUID.
 	key := ""
 	executionSessionID := executionSessionIDFromContext(ctx)
+	retryAttempt := 0
 	if ctx != nil {
 		if ginCtx, ok := ctx.Value("gin").(*gin.Context); ok && ginCtx != nil && ginCtx.Request != nil {
 			key = strings.TrimSpace(ginCtx.GetHeader("Idempotency-Key"))
 			if executionSessionID == "" {
 				executionSessionID = bridgeExecutionSessionIDFromHeaders(ginCtx.Request.Header)
 			}
+			retryAttempt = cliProxyExternalRetryAttempt(ginCtx.Request.Header)
 		}
 	}
 	if key == "" {
@@ -314,6 +318,9 @@ func requestExecutionMetadata(ctx context.Context) map[string]any {
 	if executionSessionID != "" {
 		meta[coreexecutor.ExecutionSessionMetadataKey] = executionSessionID
 	}
+	if retryAttempt > 0 {
+		meta[coreexecutor.ExternalRetryAttemptMetadataKey] = retryAttempt
+	}
 	if imageGenerationRequestFromContext(ctx) {
 		meta[coreexecutor.ImageGenerationRequestMetadataKey] = true
 	}
@@ -321,6 +328,21 @@ func requestExecutionMetadata(ctx context.Context) map[string]any {
 		meta[coreexecutor.ImageGenerationModelMetadataKey] = imageModel
 	}
 	return meta
+}
+
+func cliProxyExternalRetryAttempt(headers http.Header) int {
+	if headers == nil {
+		return 0
+	}
+	raw := strings.TrimSpace(headers.Get(cliProxyRetryAttemptHeader))
+	if raw == "" {
+		return 0
+	}
+	attempt, err := strconv.Atoi(raw)
+	if err != nil || attempt <= 0 {
+		return 0
+	}
+	return attempt
 }
 
 func populateAuthSessionMetadata(meta map[string]any, ctx context.Context, rawJSON []byte) {

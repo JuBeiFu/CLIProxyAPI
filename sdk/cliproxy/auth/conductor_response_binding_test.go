@@ -1138,6 +1138,77 @@ func TestManagerExecute_OpenAIResponsesCompactPreviousResponseOnlyExpandsToTrans
 	}
 }
 
+func TestManagerExecute_PreviousResponseRetryAttemptExcludesBoundAuth(t *testing.T) {
+	t.Parallel()
+
+	const (
+		authAID = "response-bind-retry-auth-a"
+		authBID = "response-bind-retry-auth-b"
+	)
+
+	manager := NewManager(nil, &RoundRobinSelector{}, nil)
+	executor := &responseStickyExecutor{id: "codex"}
+	manager.RegisterExecutor(executor)
+	reg := registry.GetGlobalRegistry()
+	reg.RegisterClient(authAID, "codex", []*registry.ModelInfo{{ID: "gpt-5.4"}})
+	reg.RegisterClient(authBID, "codex", []*registry.ModelInfo{{ID: "gpt-5.4"}})
+	t.Cleanup(func() {
+		reg.UnregisterClient(authAID)
+		reg.UnregisterClient(authBID)
+	})
+
+	for _, auth := range []*Auth{
+		{ID: authAID, Provider: "codex"},
+		{ID: authBID, Provider: "codex"},
+	} {
+		if _, err := manager.Register(context.Background(), auth); err != nil {
+			t.Fatalf("Register(%s) error = %v", auth.ID, err)
+		}
+	}
+
+	firstPayload := []byte(`{"input":"hello"}`)
+	firstResp, errExecute := manager.Execute(context.Background(), []string{"codex"}, cliproxyexecutor.Request{
+		Model:   "gpt-5.4",
+		Payload: firstPayload,
+	}, cliproxyexecutor.Options{
+		OriginalRequest: firstPayload,
+		SourceFormat:    sdktranslator.FromString("openai-response"),
+		Metadata: map[string]any{
+			cliproxyexecutor.PinnedAuthMetadataKey: authAID,
+		},
+	})
+	if errExecute != nil {
+		t.Fatalf("first Execute() error = %v", errExecute)
+	}
+	firstResponseID := parseStickyResponseID(firstResp.Payload)
+	if firstResponseID == "" {
+		t.Fatalf("first response id = empty, payload = %s", string(firstResp.Payload))
+	}
+
+	secondPayload := []byte(fmt.Sprintf(`{"previous_response_id":"%s","input":"retry me"}`, firstResponseID))
+	var secondSelectedAuth string
+	secondResp, errExecute := manager.Execute(context.Background(), []string{"codex"}, cliproxyexecutor.Request{
+		Model:   "gpt-5.4",
+		Payload: secondPayload,
+	}, cliproxyexecutor.Options{
+		OriginalRequest: secondPayload,
+		SourceFormat:    sdktranslator.FromString("openai-response"),
+		Metadata: map[string]any{
+			cliproxyexecutor.ExternalRetryAttemptMetadataKey: 1,
+			cliproxyexecutor.SelectedAuthCallbackMetadataKey: func(authID string) {
+				secondSelectedAuth = authID
+			},
+		},
+	})
+	if errExecute != nil {
+		t.Fatalf("second Execute() error = %v, selected = %q", errExecute, secondSelectedAuth)
+	}
+	secondAuthID := parseStickyResponseAuthID(secondResp.Payload)
+	if secondAuthID != authBID {
+		t.Fatalf("retry Execute() auth = %q, selected = %q, want %q", secondAuthID, secondSelectedAuth, authBID)
+	}
+}
+
 func TestManager_UnbindResponsesForAuthRemovesCompactTranscripts(t *testing.T) {
 	t.Parallel()
 
