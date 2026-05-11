@@ -276,6 +276,58 @@ func addCodexUpstreamDiagnosticHeaders(headers http.Header, timing codexUpstream
 	return headers
 }
 
+type codexErrorWithHeaders struct {
+	err     error
+	headers http.Header
+}
+
+func (e codexErrorWithHeaders) Error() string {
+	if e.err == nil {
+		return ""
+	}
+	return e.err.Error()
+}
+
+func (e codexErrorWithHeaders) Unwrap() error {
+	return e.err
+}
+
+func (e codexErrorWithHeaders) StatusCode() int {
+	if se, ok := e.err.(interface{ StatusCode() int }); ok && se != nil {
+		return se.StatusCode()
+	}
+	return 0
+}
+
+func (e codexErrorWithHeaders) RetryAfter() *time.Duration {
+	if re, ok := e.err.(interface{ RetryAfter() *time.Duration }); ok && re != nil {
+		return re.RetryAfter()
+	}
+	return nil
+}
+
+func (e codexErrorWithHeaders) Headers() http.Header {
+	if e.headers == nil {
+		return nil
+	}
+	return e.headers.Clone()
+}
+
+func codexErrorWithDiagnosticHeaders(err error, timing codexUpstreamTiming) error {
+	if err == nil {
+		return nil
+	}
+	headers := addCodexUpstreamDiagnosticHeaders(nil, timing)
+	if he, ok := err.(interface{ Headers() http.Header }); ok && he != nil {
+		if existing := he.Headers(); existing != nil {
+			for key, values := range existing {
+				headers[http.CanonicalHeaderKey(key)] = append([]string(nil), values...)
+			}
+		}
+	}
+	return codexErrorWithHeaders{err: err, headers: headers}
+}
+
 func recordCodexProxyPassiveOutcome(timing codexUpstreamTiming, manager *proxypool.HealthManager) {
 	if manager == nil {
 		return
@@ -1074,7 +1126,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 		helps.RecordAPIResponseError(ctx, e.cfg, err)
 		timing.streamErrText = err.Error()
 		finishCodexUpstreamTiming(ctx, timing)
-		return nil, err
+		return nil, codexErrorWithDiagnosticHeaders(err, timing)
 	}
 	timing.status = httpResp.StatusCode
 	recordCodexHTTPResponseProto(&timing, httpResp)
@@ -1091,7 +1143,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 				helps.RecordAPIResponseError(ctx, e.cfg, err)
 				timing.streamErrText = err.Error()
 				finishCodexUpstreamTiming(ctx, timing)
-				return nil, err
+				return nil, codexErrorWithDiagnosticHeaders(err, timing)
 			}
 			timing.status = httpResp.StatusCode
 			recordCodexHTTPResponseProto(&timing, httpResp)
@@ -1110,7 +1162,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 			helps.RecordAPIResponseError(ctx, e.cfg, readErr)
 			timing.streamErrText = readErr.Error()
 			finishCodexUpstreamTiming(ctx, timing)
-			return nil, readErr
+			return nil, codexErrorWithDiagnosticHeaders(readErr, timing)
 		}
 		helps.AppendAPIResponseChunk(ctx, e.cfg, data)
 		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), data))
@@ -1118,7 +1170,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 		handleImageUnsupportedRegion(ctx, opts, auth, req.Model, resolution, err)
 		timing.streamErrText = err.Error()
 		finishCodexUpstreamTiming(ctx, timing)
-		return nil, err
+		return nil, codexErrorWithDiagnosticHeaders(err, timing)
 	}
 	out := make(chan cliproxyexecutor.StreamChunk)
 	go func() {

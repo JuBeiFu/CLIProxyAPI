@@ -232,6 +232,33 @@ func TestAddCodexUpstreamDiagnosticHeaders(t *testing.T) {
 	}
 }
 
+func TestCodexErrorWithDiagnosticHeaders(t *testing.T) {
+	err := codexErrorWithDiagnosticHeaders(statusErr{code: http.StatusBadGateway, msg: "bad gateway"}, codexUpstreamTiming{
+		httpProto:       "HTTP/1.1",
+		streamTransport: "http1.1",
+		http2Disabled:   true,
+	})
+
+	status, ok := err.(interface{ StatusCode() int })
+	if !ok {
+		t.Fatalf("error type = %T, want StatusCode", err)
+	}
+	if status.StatusCode() != http.StatusBadGateway {
+		t.Fatalf("StatusCode() = %d, want %d", status.StatusCode(), http.StatusBadGateway)
+	}
+	headerErr, ok := err.(interface{ Headers() http.Header })
+	if !ok {
+		t.Fatalf("error type = %T, want Headers", err)
+	}
+	headers := headerErr.Headers()
+	if got := headers.Get(codexStreamTransportHeader); got != "http1.1" {
+		t.Fatalf("%s = %q, want http1.1", codexStreamTransportHeader, got)
+	}
+	if got := headers.Get(codexHTTP2DisabledHeader); got != "true" {
+		t.Fatalf("%s = %q, want true", codexHTTP2DisabledHeader, got)
+	}
+}
+
 func TestApplyCodexResolutionTimingIncludesDirectV6Details(t *testing.T) {
 	manager := proxypool.DefaultCodexFailoverManager()
 	authID := "auth-egress-v6"

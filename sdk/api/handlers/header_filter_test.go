@@ -53,3 +53,47 @@ func TestFilterUpstreamHeaders_ReturnsNilWhenAllHeadersBlocked(t *testing.T) {
 		t.Fatalf("expected nil when all headers are filtered, got %#v", filtered)
 	}
 }
+
+func TestClientVisibleUpstreamHeadersKeepsDiagnosticsWhenPassthroughDisabled(t *testing.T) {
+	src := http.Header{}
+	src.Set("X-CLIProxy-Codex-Upstream-Proto", "HTTP/1.1")
+	src.Set("X-CLIProxy-Codex-Stream-Transport", "http1.1")
+	src.Set("X-CLIProxy-Codex-HTTP2-Disabled", "true")
+	src.Set("X-Request-Id", "req-1")
+	src.Set("Set-Cookie", "secret")
+
+	filtered := ClientVisibleUpstreamHeaders(false, src)
+	if filtered.Get("X-CLIProxy-Codex-Upstream-Proto") != "HTTP/1.1" {
+		t.Fatalf("expected diagnostic proto header, got %#v", filtered)
+	}
+	if filtered.Get("X-CLIProxy-Codex-Stream-Transport") != "http1.1" {
+		t.Fatalf("expected diagnostic transport header, got %#v", filtered)
+	}
+	if filtered.Get("X-CLIProxy-Codex-HTTP2-Disabled") != "true" {
+		t.Fatalf("expected diagnostic http2 header, got %#v", filtered)
+	}
+	if filtered.Get("X-Request-Id") != "" {
+		t.Fatalf("expected non-diagnostic header to be removed, got %#v", filtered)
+	}
+	if filtered.Get("Set-Cookie") != "" {
+		t.Fatalf("expected sensitive header to be removed, got %#v", filtered)
+	}
+}
+
+func TestClientVisibleUpstreamHeadersKeepsDiagnosticsWithPassthroughEnabled(t *testing.T) {
+	src := http.Header{}
+	src.Set("X-CLIProxy-Codex-Upstream-Proto", "HTTP/1.1")
+	src.Set("X-Request-Id", "req-1")
+	src.Set("Set-Cookie", "secret")
+
+	filtered := ClientVisibleUpstreamHeaders(true, src)
+	if filtered.Get("X-CLIProxy-Codex-Upstream-Proto") != "HTTP/1.1" {
+		t.Fatalf("expected diagnostic proto header, got %#v", filtered)
+	}
+	if filtered.Get("X-Request-Id") != "req-1" {
+		t.Fatalf("expected passthrough header, got %#v", filtered)
+	}
+	if filtered.Get("Set-Cookie") != "" {
+		t.Fatalf("expected sensitive header to be removed, got %#v", filtered)
+	}
+}

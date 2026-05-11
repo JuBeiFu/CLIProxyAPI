@@ -17,6 +17,12 @@ var gatewayHeaderPrefixes = []string{
 	"x-bt-",
 }
 
+var diagnosticHeaders = map[string]struct{}{
+	"X-Cliproxy-Codex-Upstream-Proto":   {},
+	"X-Cliproxy-Codex-Stream-Transport": {},
+	"X-Cliproxy-Codex-Http2-Disabled":   {},
+}
+
 // hopByHopHeaders lists RFC 7230 Section 6.1 hop-by-hop headers that MUST NOT
 // be forwarded by proxies, plus security-sensitive headers that should not leak.
 var hopByHopHeaders = map[string]struct{}{
@@ -71,6 +77,45 @@ func FilterUpstreamHeaders(src http.Header) http.Header {
 		return nil
 	}
 	return dst
+}
+
+func FilterDiagnosticHeaders(src http.Header) http.Header {
+	if src == nil {
+		return nil
+	}
+	dst := make(http.Header)
+	for key, values := range src {
+		canonicalKey := http.CanonicalHeaderKey(key)
+		if _, ok := diagnosticHeaders[canonicalKey]; !ok {
+			continue
+		}
+		dst[canonicalKey] = append([]string(nil), values...)
+	}
+	if len(dst) == 0 {
+		return nil
+	}
+	return dst
+}
+
+func MergeHeaders(dst http.Header, src http.Header) http.Header {
+	if src == nil {
+		return dst
+	}
+	if dst == nil {
+		dst = make(http.Header)
+	}
+	for key, values := range src {
+		dst[http.CanonicalHeaderKey(key)] = append([]string(nil), values...)
+	}
+	return dst
+}
+
+func ClientVisibleUpstreamHeaders(passthroughEnabled bool, src http.Header) http.Header {
+	diagnostic := FilterDiagnosticHeaders(src)
+	if !passthroughEnabled {
+		return diagnostic
+	}
+	return MergeHeaders(FilterUpstreamHeaders(src), diagnostic)
 }
 
 func connectionScopedHeaders(src http.Header) map[string]struct{} {

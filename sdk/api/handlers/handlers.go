@@ -718,15 +718,12 @@ func (h *BaseAPIHandler) executeWithAuthManager(ctx context.Context, handlerType
 		var addon http.Header
 		if he, ok := err.(interface{ Headers() http.Header }); ok && he != nil {
 			if hdr := he.Headers(); hdr != nil {
-				addon = hdr.Clone()
+				addon = ClientVisibleUpstreamHeaders(PassthroughHeadersEnabled(h.Cfg), hdr)
 			}
 		}
 		return nil, nil, &interfaces.ErrorMessage{StatusCode: status, Error: err, Addon: addon}
 	}
-	if !PassthroughHeadersEnabled(h.Cfg) {
-		return resp.Payload, nil, nil
-	}
-	return resp.Payload, FilterUpstreamHeaders(resp.Headers), nil
+	return resp.Payload, ClientVisibleUpstreamHeaders(PassthroughHeadersEnabled(h.Cfg), resp.Headers), nil
 }
 
 // ExecuteCountWithAuthManager executes a non-streaming request via the core auth manager.
@@ -764,15 +761,12 @@ func (h *BaseAPIHandler) ExecuteCountWithAuthManager(ctx context.Context, handle
 		var addon http.Header
 		if he, ok := err.(interface{ Headers() http.Header }); ok && he != nil {
 			if hdr := he.Headers(); hdr != nil {
-				addon = hdr.Clone()
+				addon = ClientVisibleUpstreamHeaders(PassthroughHeadersEnabled(h.Cfg), hdr)
 			}
 		}
 		return nil, nil, &interfaces.ErrorMessage{StatusCode: status, Error: err, Addon: addon}
 	}
-	if !PassthroughHeadersEnabled(h.Cfg) {
-		return resp.Payload, nil, nil
-	}
-	return resp.Payload, FilterUpstreamHeaders(resp.Headers), nil
+	return resp.Payload, ClientVisibleUpstreamHeaders(PassthroughHeadersEnabled(h.Cfg), resp.Headers), nil
 }
 
 // ExecuteStreamWithAuthManager executes a streaming request via the core auth manager.
@@ -830,7 +824,7 @@ func (h *BaseAPIHandler) executeStreamWithAuthManager(ctx context.Context, handl
 		var addon http.Header
 		if he, ok := err.(interface{ Headers() http.Header }); ok && he != nil {
 			if hdr := he.Headers(); hdr != nil {
-				addon = hdr.Clone()
+				addon = ClientVisibleUpstreamHeaders(PassthroughHeadersEnabled(h.Cfg), hdr)
 			}
 		}
 		errChan <- &interfaces.ErrorMessage{StatusCode: status, Error: err, Addon: addon}
@@ -840,12 +834,9 @@ func (h *BaseAPIHandler) executeStreamWithAuthManager(ctx context.Context, handl
 	passthroughHeadersEnabled := PassthroughHeadersEnabled(h.Cfg)
 	// Capture upstream headers from the initial connection synchronously before the goroutine starts.
 	// Keep a mutable map so bootstrap retries can replace it before first payload is sent.
-	var upstreamHeaders http.Header
-	if passthroughHeadersEnabled {
-		upstreamHeaders = cloneHeader(FilterUpstreamHeaders(streamResult.Headers))
-		if upstreamHeaders == nil {
-			upstreamHeaders = make(http.Header)
-		}
+	upstreamHeaders := cloneHeader(ClientVisibleUpstreamHeaders(passthroughHeadersEnabled, streamResult.Headers))
+	if upstreamHeaders == nil {
+		upstreamHeaders = make(http.Header)
 	}
 	chunks := streamResult.Chunks
 	dataChan := make(chan []byte)
@@ -923,9 +914,7 @@ func (h *BaseAPIHandler) executeStreamWithAuthManager(ctx context.Context, handl
 							bootstrapRetries++
 							retryResult, retryErr := h.AuthManager.ExecuteStream(ctx, providers, req, opts)
 							if retryErr == nil {
-								if passthroughHeadersEnabled {
-									replaceHeader(upstreamHeaders, FilterUpstreamHeaders(retryResult.Headers))
-								}
+								replaceHeader(upstreamHeaders, ClientVisibleUpstreamHeaders(passthroughHeadersEnabled, retryResult.Headers))
 								chunks = retryResult.Chunks
 								continue outer
 							}
@@ -940,7 +929,7 @@ func (h *BaseAPIHandler) executeStreamWithAuthManager(ctx context.Context, handl
 					var addon http.Header
 					if he, ok := streamErr.(interface{ Headers() http.Header }); ok && he != nil {
 						if hdr := he.Headers(); hdr != nil {
-							addon = hdr.Clone()
+							addon = ClientVisibleUpstreamHeaders(passthroughHeadersEnabled, hdr)
 						}
 					}
 					_ = sendErr(&interfaces.ErrorMessage{StatusCode: status, Error: streamErr, Addon: addon})
@@ -1145,8 +1134,12 @@ func (h *BaseAPIHandler) WriteErrorResponse(c *gin.Context, msg *interfaces.Erro
 	}
 	normalizedStatus, normalizedErrText := NormalizeClientFacingError(status, errText)
 	status = normalizedStatus
-	if msg != nil && msg.Addon != nil && PassthroughHeadersEnabled(h.Cfg) {
-		for key, values := range msg.Addon {
+	if msg != nil && msg.Addon != nil {
+		addon := msg.Addon
+		if !PassthroughHeadersEnabled(h.Cfg) {
+			addon = FilterDiagnosticHeaders(addon)
+		}
+		for key, values := range addon {
 			if normalizedStatus != msg.StatusCode && strings.EqualFold(key, "Retry-After") {
 				continue
 			}
