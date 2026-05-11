@@ -1043,6 +1043,11 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 		scanner := bufio.NewScanner(httpResp.Body)
 		scanner.Buffer(nil, 52_428_800) // 50MB
 		var param any
+		aggregator := newCodexNonStreamAggregator()
+		var sawUserContent bool
+		var responseID string
+		var responseModel string
+		var responseCreatedAt int64
 		sendChunk := func(chunk cliproxyexecutor.StreamChunk) bool {
 			if ctx == nil {
 				out <- chunk
@@ -1067,6 +1072,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 			timing.bytesRead += len(line)
 			helps.AppendAPIResponseChunk(ctx, e.cfg, line)
 
+			lineForTranslate := bytes.Clone(line)
 			if bytes.HasPrefix(line, dataTag) {
 				data := bytes.TrimSpace(line[5:])
 				if body, status, ok := codexResponsesEventErrorBody(data); ok {
@@ -1082,6 +1088,20 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 					return
 				}
 				eventType := gjson.GetBytes(data, "type").String()
+				switch eventType {
+				case "response.created":
+					responseID = strings.TrimSpace(gjson.GetBytes(data, "response.id").String())
+					responseModel = strings.TrimSpace(gjson.GetBytes(data, "response.model").String())
+					responseCreatedAt = gjson.GetBytes(data, "response.created_at").Int()
+				case "response.completed":
+					data = aggregator.applyCompleted(data)
+					lineForTranslate = codexHTTPDataLine(data)
+				default:
+					aggregator.ingest(data)
+				}
+				if codexHTTPStreamEventHasUserContent(eventType, data) {
+					sawUserContent = true
+				}
 				if eventType == "response.completed" {
 					timing.streamCompleted = true
 					if detail, ok := helps.ParseCodexUsage(data); ok {
@@ -1092,7 +1112,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 			}
 
 			translateStarted := time.Now()
-			chunks := sdktranslator.TranslateStream(ctx, to, from, req.Model, originalPayload, body, bytes.Clone(line), &param)
+			chunks := sdktranslator.TranslateStream(ctx, to, from, req.Model, originalPayload, body, lineForTranslate, &param)
 			timing.translate += time.Since(translateStarted)
 			timing.streamChunks += len(chunks)
 			for i := range chunks {
@@ -1101,7 +1121,31 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 				}
 			}
 		}
+		synthesizeCompleted := func(reason string) bool {
+			if !sawUserContent || timing.streamCompleted {
+				return false
+			}
+			payload := codexHTTPSyntheticCompletedPayload(req.Model, responseID, responseModel, responseCreatedAt, aggregator)
+			line := codexHTTPDataLine(payload)
+			translateStarted := time.Now()
+			chunks := sdktranslator.TranslateStream(ctx, to, from, req.Model, originalPayload, body, line, &param)
+			timing.translate += time.Since(translateStarted)
+			timing.streamChunks += len(chunks)
+			timing.streamCompleted = true
+			timing.streamErrText = reason
+			for i := range chunks {
+				if !sendChunk(cliproxyexecutor.StreamChunk{Payload: chunks[i]}) {
+					return true
+				}
+			}
+			return true
+		}
 		if errScan := scanner.Err(); errScan != nil {
+			if ctx == nil || ctx.Err() == nil {
+				if synthesizeCompleted("stream error: stream disconnected before completion after user-visible content; synthesized response.completed: " + errScan.Error()) {
+					return
+				}
+			}
 			helps.RecordAPIResponseError(ctx, e.cfg, errScan)
 			reporter.PublishFailureWithError(ctx, errScan)
 			timing.streamErrText = errScan.Error()
@@ -1109,6 +1153,9 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 			return
 		}
 		if !timing.streamCompleted {
+			if synthesizeCompleted("stream error: stream disconnected before completion after user-visible content; synthesized response.completed") {
+				return
+			}
 			errIncomplete := newCodexIncompleteStreamErr()
 			helps.RecordAPIResponseError(ctx, e.cfg, errIncomplete)
 			reporter.PublishFailureWithError(ctx, errIncomplete)
@@ -1121,6 +1168,12 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 
 func codexHTTPStreamEventHasUserContent(eventType string, data []byte) bool {
 	switch {
+	case eventType == "response.output_text.done":
+		return strings.TrimSpace(gjson.GetBytes(data, "text").String()) != ""
+	case eventType == "response.function_call_arguments.done":
+		return strings.TrimSpace(gjson.GetBytes(data, "arguments").String()) != ""
+	case strings.HasPrefix(eventType, "response.reasoning_summary_text"):
+		return strings.TrimSpace(gjson.GetBytes(data, "delta").String()) != ""
 	case strings.HasPrefix(eventType, "response.output_text"):
 		return strings.TrimSpace(gjson.GetBytes(data, "delta").String()) != ""
 	case strings.HasPrefix(eventType, "response.function_call_arguments"):
@@ -1139,6 +1192,38 @@ func codexHTTPStreamEventHasUserContent(eventType string, data []byte) bool {
 	}
 }
 
+func codexHTTPSyntheticCompletedPayload(requestModel, responseID, responseModel string, responseCreatedAt int64, aggregator *codexNonStreamAggregator) []byte {
+	responseID = strings.TrimSpace(responseID)
+	if responseID == "" {
+		responseID = "resp_synthetic_" + strings.ReplaceAll(uuid.NewString(), "-", "")
+	}
+	responseModel = strings.TrimSpace(responseModel)
+	if responseModel == "" {
+		responseModel = strings.TrimSpace(requestModel)
+	}
+	if responseCreatedAt <= 0 {
+		responseCreatedAt = time.Now().Unix()
+	}
+	payload := []byte(`{"type":"response.completed","response":{"id":"","object":"response","created_at":0,"status":"completed","model":"","background":false,"error":null,"output":[]}}`)
+	if updated, err := sjson.SetBytes(payload, "response.id", responseID); err == nil {
+		payload = updated
+	}
+	if updated, err := sjson.SetBytes(payload, "response.created_at", responseCreatedAt); err == nil {
+		payload = updated
+	}
+	if updated, err := sjson.SetBytes(payload, "response.model", responseModel); err == nil {
+		payload = updated
+	}
+	return aggregator.applyCompleted(payload)
+}
+
+func codexHTTPDataLine(data []byte) []byte {
+	line := make([]byte, 0, len("data: ")+len(data))
+	line = append(line, []byte("data: ")...)
+	line = append(line, data...)
+	return line
+}
+
 func codexHTTPResponseOutputHasUserContent(item gjson.Result) bool {
 	if !item.Exists() {
 		return false
@@ -1151,12 +1236,21 @@ func codexHTTPResponseOutputHasUserContent(item gjson.Result) bool {
 			}
 		}
 		return false
+	case "reasoning":
+		for _, summary := range item.Get("summary").Array() {
+			if strings.TrimSpace(summary.Get("text").String()) != "" {
+				return true
+			}
+		}
+		return strings.TrimSpace(item.Get("encrypted_content").String()) != ""
+	case "image_generation_call":
+		return strings.TrimSpace(item.Get("result").String()) != ""
 	case "function_call":
 		return strings.TrimSpace(item.Get("call_id").String()) != "" ||
 			strings.TrimSpace(item.Get("name").String()) != "" ||
 			strings.TrimSpace(item.Get("arguments").String()) != ""
 	default:
-		return strings.TrimSpace(item.Get("type").String()) != ""
+		return false
 	}
 }
 

@@ -185,11 +185,111 @@ func TestCodexExecutorExecuteStreamZeroUsageCompletionWithOutputPasses(t *testin
 	}
 }
 
-func TestCodexExecutorExecuteStreamErrorsWhenStreamClosesBeforeCompleted(t *testing.T) {
+func TestCodexExecutorExecuteStreamSynthesizesCompletionAfterOutputEOF(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_partial\",\"created_at\":1775555723,\"model\":\"gpt-5.5\"}}\n\n"))
+		_, _ = w.Write([]byte("data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial answer\"}\n\n"))
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+	}))
+	defer server.Close()
+
+	executor := NewCodexExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"base_url": server.URL,
+		"api_key":  "test",
+	}}
+
+	result, err := executor.ExecuteStream(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "gpt-5.5",
+		Payload: []byte(`{"model":"gpt-5.5","input":"hello","stream":true}`),
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("openai-response"),
+		Stream:       true,
+	})
+	if err != nil {
+		t.Fatalf("ExecuteStream error: %v", err)
+	}
+
+	var got bytes.Buffer
+	for chunk := range result.Chunks {
+		if chunk.Err != nil {
+			t.Fatalf("unexpected stream error: %v", chunk.Err)
+		}
+		got.Write(chunk.Payload)
+	}
+	if !bytes.Contains(got.Bytes(), []byte("response.output_text.delta")) {
+		t.Fatalf("expected output delta before synthesized completion; got %s", got.String())
+	}
+	if !bytes.Contains(got.Bytes(), []byte("response.completed")) {
+		t.Fatalf("expected synthesized response.completed; got %s", got.String())
+	}
+	if !bytes.Contains(got.Bytes(), []byte("partial answer")) {
+		t.Fatalf("expected synthesized completion to retain output text; got %s", got.String())
+	}
+	if !bytes.Contains(got.Bytes(), []byte(`"type":"message"`)) {
+		t.Fatalf("expected synthesized completion output message; got %s", got.String())
+	}
+	if bytes.Contains(got.Bytes(), []byte(`"usage"`)) {
+		t.Fatalf("synthetic completion must not invent usage; got %s", got.String())
+	}
+}
+
+func TestCodexExecutorExecuteStreamSynthesizesCompletionAfterReasoningEOF(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_reasoning_partial\",\"created_at\":1775555723,\"model\":\"gpt-5.5\"}}\n\n"))
+		_, _ = w.Write([]byte("data: {\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"thinking only\"}\n\n"))
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+	}))
+	defer server.Close()
+
+	executor := NewCodexExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"base_url": server.URL,
+		"api_key":  "test",
+	}}
+
+	result, err := executor.ExecuteStream(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "gpt-5.5",
+		Payload: []byte(`{"model":"gpt-5.5","input":"hello","stream":true}`),
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("openai-response"),
+		Stream:       true,
+	})
+	if err != nil {
+		t.Fatalf("ExecuteStream error: %v", err)
+	}
+
+	var got bytes.Buffer
+	for chunk := range result.Chunks {
+		if chunk.Err != nil {
+			t.Fatalf("unexpected stream error: %v", chunk.Err)
+		}
+		got.Write(chunk.Payload)
+	}
+	if !bytes.Contains(got.Bytes(), []byte("response.reasoning_summary_text.delta")) {
+		t.Fatalf("expected reasoning delta before synthesized completion; got %s", got.String())
+	}
+	if !bytes.Contains(got.Bytes(), []byte("response.completed")) {
+		t.Fatalf("expected synthesized response.completed; got %s", got.String())
+	}
+	if !bytes.Contains(got.Bytes(), []byte("thinking only")) {
+		t.Fatalf("expected synthesized completion to retain reasoning text; got %s", got.String())
+	}
+	if !bytes.Contains(got.Bytes(), []byte(`"type":"reasoning"`)) {
+		t.Fatalf("expected synthesized completion reasoning output; got %s", got.String())
+	}
+}
+
+func TestCodexExecutorExecuteStreamErrorsWhenStreamClosesBeforeCompletedWithoutContent(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		_, _ = w.Write([]byte("data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_incomplete\"}}\n\n"))
-		_, _ = w.Write([]byte("data: {\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"thinking\"}\n\n"))
 		if flusher, ok := w.(http.Flusher); ok {
 			flusher.Flush()
 		}
@@ -224,9 +324,6 @@ func TestCodexExecutorExecuteStreamErrorsWhenStreamClosesBeforeCompleted(t *test
 	}
 	if !bytes.Contains(got.Bytes(), []byte("response.created")) {
 		t.Fatalf("expected response.created before failure; got %s", got.String())
-	}
-	if !bytes.Contains(got.Bytes(), []byte("response.reasoning_summary_text.delta")) {
-		t.Fatalf("expected reasoning delta before failure; got %s", got.String())
 	}
 	if gotErr == nil {
 		t.Fatal("expected terminal stream error when response.completed is missing")
