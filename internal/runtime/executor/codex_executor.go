@@ -243,6 +243,12 @@ func configureCodexResponsesStreamTransport(client *http.Client, cfg *config.Con
 	clone := transport.Clone()
 	clone.ForceAttemptHTTP2 = false
 	clone.TLSNextProto = map[string]func(string, *tls.Conn) http.RoundTripper{}
+	if clone.TLSClientConfig != nil {
+		clone.TLSClientConfig = clone.TLSClientConfig.Clone()
+	} else {
+		clone.TLSClientConfig = &tls.Config{}
+	}
+	clone.TLSClientConfig.NextProtos = []string{"http/1.1"}
 	client.Transport = clone
 	timing.http2Disabled = true
 }

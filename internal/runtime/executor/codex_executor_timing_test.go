@@ -200,6 +200,12 @@ func TestConfigureCodexResponsesStreamTransportDisablesHTTP2(t *testing.T) {
 	if transport.TLSNextProto == nil || len(transport.TLSNextProto) != 0 {
 		t.Fatalf("TLSNextProto = %#v, want empty map", transport.TLSNextProto)
 	}
+	if transport.TLSClientConfig == nil {
+		t.Fatal("expected TLSClientConfig to be set")
+	}
+	if got := transport.TLSClientConfig.NextProtos; len(got) != 1 || got[0] != "http/1.1" {
+		t.Fatalf("TLSClientConfig.NextProtos = %#v, want [http/1.1]", got)
+	}
 	if timing.streamTransport != "http1.1" {
 		t.Fatalf("streamTransport = %q, want http1.1", timing.streamTransport)
 	}
