@@ -30,7 +30,10 @@ const (
 	fallbackImagesMainModel    = "gpt-5.4"
 	defaultImagesToolModel     = "gpt-image-2"
 	openAIImagesEndpoint       = "/v1/images/generations"
+	openAIImageVarEndpoint     = "/v1/images/variations"
 	imageGenerationTimeout     = 10 * time.Minute
+	defaultVariationSize       = "1024x1024"
+	defaultVariationPrompt     = "Create a variation of the provided image while preserving the main subject, composition, and overall style."
 )
 
 var imageGenerationSizePattern = regexp.MustCompile(`^(\d+)x(\d+)$`)
@@ -68,6 +71,16 @@ func (h *OpenAIAPIHandler) ImagesEdits(c *gin.Context) {
 		return
 	}
 	h.handleImagesRequest(c, convertImagesEditRequestToResponses)
+}
+
+// ImagesVariations handles the OpenAI-compatible /v1/images/variations endpoint
+// using an image-edit compatibility flow backed by the Responses image tool.
+func (h *OpenAIAPIHandler) ImagesVariations(c *gin.Context) {
+	if strings.Contains(strings.ToLower(c.GetHeader("Content-Type")), "multipart/form-data") {
+		h.handleImagesRequestWithConvertedPayload(c, convertImagesVariationMultipartRequestToResponses)
+		return
+	}
+	h.handleImagesRequest(c, convertImagesVariationRequestToResponses)
 }
 
 func (h *OpenAIAPIHandler) handleImagesRequest(c *gin.Context, convert func([]byte) ([]byte, string, string, error)) {
@@ -114,6 +127,11 @@ func (h *OpenAIAPIHandler) executeConvertedImagesRequest(c *gin.Context, rawJSON
 }
 
 func (h *OpenAIAPIHandler) executeImagesResponsesPayload(c *gin.Context, responsesJSON []byte, routeModelName, requestedModelName string) {
+	if gjson.GetBytes(responsesJSON, "stream").Type == gjson.True {
+		h.executeImagesStreamingResponsesPayload(c, responsesJSON, routeModelName, requestedModelName)
+		return
+	}
+
 	c.Header("Content-Type", "application/json")
 	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
 	cliCtx = handlers.WithImageGenerationRequest(cliCtx)
@@ -269,11 +287,11 @@ func imageToolModelFromResponsesPayload(payload []byte) string {
 }
 
 func convertImagesGenerationRequestToResponses(rawJSON []byte) ([]byte, string, string, error) {
-	return convertOpenAIImageRequestToResponses(rawJSON, false)
+	return convertOpenAIImageRequestToResponses(rawJSON, "generate", false)
 }
 
 func convertImagesEditRequestToResponses(rawJSON []byte) ([]byte, string, string, error) {
-	return convertOpenAIImageRequestToResponses(rawJSON, true)
+	return convertOpenAIImageRequestToResponses(rawJSON, "edit", true)
 }
 
 func convertImagesEditMultipartRequestToResponses(c *gin.Context) ([]byte, string, string, error) {
@@ -296,11 +314,116 @@ func convertImagesEditMultipartRequestToResponses(c *gin.Context) ([]byte, strin
 			"output_format",
 			"input_fidelity",
 			"moderation",
-			"output_compression",
-			"partial_images",
+			"user",
 		} {
 			if vals := values[key]; len(vals) > 0 {
-				raw, _ = sjson.SetBytes(raw, key, vals[0])
+				raw = setMultipartJSONField(raw, key, vals[0], false)
+			}
+		}
+		for _, key := range []string{"stream"} {
+			if vals := values[key]; len(vals) > 0 {
+				raw = setMultipartJSONField(raw, key, vals[0], true)
+			}
+		}
+		for _, key := range []string{"output_compression", "partial_images", "n"} {
+			if vals := values[key]; len(vals) > 0 {
+				raw = setMultipartJSONField(raw, key, vals[0], true)
+			}
+		}
+		for _, key := range []string{"image", "image[]"} {
+			for _, value := range values[key] {
+				if trimmed := strings.TrimSpace(value); trimmed != "" {
+					raw, _ = sjson.SetBytes(raw, "image.-1", trimmed)
+				}
+			}
+		}
+	}
+
+	if files := form.File; files != nil {
+		for _, key := range []string{"image", "image[]"} {
+			for _, fileHeader := range files[key] {
+				dataURL, err := multipartImageDataURL(fileHeader)
+				if err != nil {
+					return nil, "", "", err
+				}
+				raw, _ = sjson.SetBytes(raw, "image.-1", dataURL)
+			}
+		}
+		for fieldName, fileHeaders := range files {
+			if !strings.HasPrefix(fieldName, "image[") {
+				continue
+			}
+			for _, fileHeader := range fileHeaders {
+				dataURL, err := multipartImageDataURL(fileHeader)
+				if err != nil {
+					return nil, "", "", err
+				}
+				raw, _ = sjson.SetBytes(raw, "image.-1", dataURL)
+			}
+		}
+		for _, fileHeader := range files["mask"] {
+			dataURL, err := multipartImageDataURL(fileHeader)
+			if err != nil {
+				return nil, "", "", err
+			}
+			raw, _ = sjson.SetBytes(raw, "mask.image_url", dataURL)
+		}
+	}
+
+	return convertImagesEditRequestToResponses(raw)
+}
+
+func convertImagesVariationRequestToResponses(rawJSON []byte) ([]byte, string, string, error) {
+	root := gjson.ParseBytes(rawJSON)
+	if !root.IsObject() {
+		return nil, "", "", fmt.Errorf("request body must be a JSON object")
+	}
+	if root.Get("stream").Type == gjson.True {
+		return nil, "", "", fmt.Errorf("stream is not supported for %s", openAIImageVarEndpoint)
+	}
+	if prompt := strings.TrimSpace(root.Get("prompt").String()); prompt == "" {
+		rawJSON, _ = sjson.SetBytes(rawJSON, "prompt", defaultVariationPrompt)
+	}
+	if size := strings.TrimSpace(root.Get("size").String()); size == "" {
+		rawJSON, _ = sjson.SetBytes(rawJSON, "size", defaultVariationSize)
+	} else if !strings.EqualFold(size, defaultVariationSize) {
+		return nil, "", "", fmt.Errorf("image variation compatibility only supports size %s", defaultVariationSize)
+	}
+	images := collectOpenAIImageReferences(gjson.ParseBytes(rawJSON))
+	if len(images) != 1 {
+		return nil, "", "", fmt.Errorf("image variation compatibility requires exactly one image")
+	}
+	modelName := strings.TrimSpace(root.Get("model").String())
+	if modelName == "" || strings.EqualFold(modelName, "dall-e-2") {
+		rawJSON, _ = sjson.SetBytes(rawJSON, "model", defaultImagesToolModel)
+	}
+	return convertOpenAIImageRequestToResponses(rawJSON, "edit", true)
+}
+
+func convertImagesVariationMultipartRequestToResponses(c *gin.Context) ([]byte, string, string, error) {
+	if err := c.Request.ParseMultipartForm(64 << 20); err != nil {
+		return nil, "", "", fmt.Errorf("failed to parse image variation form request: %w", err)
+	}
+	form := c.Request.MultipartForm
+	if form == nil {
+		return nil, "", "", fmt.Errorf("image variation form is required")
+	}
+
+	raw := []byte(`{"model":"","image":[]}`)
+	if values := form.Value; values != nil {
+		for _, key := range []string{"model", "response_format", "size", "user"} {
+			if vals := values[key]; len(vals) > 0 {
+				raw = setMultipartJSONField(raw, key, vals[0], false)
+			}
+		}
+		for _, key := range []string{"stream"} {
+			if vals := values[key]; len(vals) > 0 {
+				raw = setMultipartJSONField(raw, key, vals[0], true)
+			}
+		}
+		for _, key := range []string{"n"} {
+			if vals := values[key]; len(vals) > 0 {
+				raw = setMultipartJSONField(raw, key, vals[0], true)
 			}
 		}
 		for _, key := range []string{"image", "image[]"} {
@@ -336,7 +459,40 @@ func convertImagesEditMultipartRequestToResponses(c *gin.Context) ([]byte, strin
 		}
 	}
 
-	return convertImagesEditRequestToResponses(raw)
+	return convertImagesVariationRequestToResponses(raw)
+}
+
+func setMultipartJSONField(raw []byte, path, value string, typed bool) []byte {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return raw
+	}
+	if !typed {
+		updated, err := sjson.SetBytes(raw, path, value)
+		if err != nil {
+			return raw
+		}
+		return updated
+	}
+	if strings.EqualFold(value, "true") || strings.EqualFold(value, "false") {
+		updated, err := sjson.SetRawBytes(raw, path, []byte(strings.ToLower(value)))
+		if err != nil {
+			return raw
+		}
+		return updated
+	}
+	if parsed, err := strconv.Atoi(value); err == nil {
+		updated, err := sjson.SetBytes(raw, path, parsed)
+		if err != nil {
+			return raw
+		}
+		return updated
+	}
+	updated, err := sjson.SetBytes(raw, path, value)
+	if err != nil {
+		return raw
+	}
+	return updated
 }
 
 func multipartImageDataURL(fileHeader *multipart.FileHeader) (string, error) {
@@ -356,7 +512,7 @@ func multipartImageDataURL(fileHeader *multipart.FileHeader) (string, error) {
 	return "data:" + contentType + ";base64," + base64.StdEncoding.EncodeToString(data), nil
 }
 
-func convertOpenAIImageRequestToResponses(rawJSON []byte, includeImages bool) ([]byte, string, string, error) {
+func convertOpenAIImageRequestToResponses(rawJSON []byte, action string, includeImages bool) ([]byte, string, string, error) {
 	root := gjson.ParseBytes(rawJSON)
 	if !root.IsObject() {
 		return nil, "", "", fmt.Errorf("request body must be a JSON object")
@@ -376,9 +532,8 @@ func convertOpenAIImageRequestToResponses(rawJSON []byte, includeImages bool) ([
 
 	out := []byte(`{"model":"","input":[],"stream":false,"tool_choice":{"type":"image_generation"},"tools":[]}`)
 	out, _ = sjson.SetBytes(out, "model", defaultImagesMainModel)
-	action := "generate"
-	if includeImages {
-		action = "edit"
+	if root.Get("stream").Type == gjson.True {
+		out, _ = sjson.SetBytes(out, "stream", true)
 	}
 	tool := buildOpenAIImageTool(root, action, size)
 	out, _ = sjson.SetRawBytes(out, "tools.-1", tool)
@@ -412,7 +567,7 @@ func buildOpenAIImageTool(root gjson.Result, action, size string) []byte {
 			tool, _ = sjson.SetBytes(tool, field, v)
 		}
 	}
-	for _, field := range []string{"output_compression", "partial_images"} {
+	for _, field := range []string{"n", "output_compression", "partial_images"} {
 		if v := root.Get(field); v.Exists() && v.Type == gjson.Number {
 			tool, _ = sjson.SetBytes(tool, field, v.Int())
 		}
@@ -420,6 +575,8 @@ func buildOpenAIImageTool(root gjson.Result, action, size string) []byte {
 	if mask := strings.TrimSpace(root.Get("mask.image_url").String()); mask != "" {
 		tool, _ = sjson.SetBytes(tool, "input_image_mask.image_url", mask)
 	} else if mask := strings.TrimSpace(root.Get("mask.url").String()); mask != "" {
+		tool, _ = sjson.SetBytes(tool, "input_image_mask.image_url", mask)
+	} else if mask := strings.TrimSpace(root.Get("mask.file_id").String()); mask != "" {
 		tool, _ = sjson.SetBytes(tool, "input_image_mask.image_url", mask)
 	}
 	return tool
@@ -541,6 +698,7 @@ func convertResponsesImageToOpenAIImage(rawJSON []byte) ([]byte, error) {
 		out, _ = sjson.SetBytes(out, "created", time.Now().Unix())
 	}
 
+	config := resolveOpenAIImageResultConfig(root)
 	for _, item := range output.Array() {
 		if item.Get("type").String() != "image_generation_call" {
 			continue
@@ -551,12 +709,20 @@ func convertResponsesImageToOpenAIImage(rawJSON []byte) ([]byte, error) {
 		}
 		imageData := []byte(`{"b64_json":""}`)
 		imageData, _ = sjson.SetBytes(imageData, "b64_json", result)
+		if revisedPrompt := strings.TrimSpace(item.Get("revised_prompt").String()); revisedPrompt != "" {
+			imageData, _ = sjson.SetBytes(imageData, "revised_prompt", revisedPrompt)
+		}
 		out, _ = sjson.SetRawBytes(out, "data.-1", imageData)
 	}
 
 	if len(gjson.GetBytes(out, "data").Array()) == 0 {
 		return nil, fmt.Errorf("upstream image response contained no image data")
 	}
+
+	out = setOptionalOpenAIImageResponseField(out, "background", normalizeResolvedImageConfigValue(config.background))
+	out = setOptionalOpenAIImageResponseField(out, "output_format", strings.TrimSpace(config.outputFormat))
+	out = setOptionalOpenAIImageResponseField(out, "quality", normalizeResolvedImageConfigValue(config.quality))
+	out = setOptionalOpenAIImageResponseField(out, "size", normalizeResolvedImageConfigValue(config.size))
 
 	if usage := root.Get("usage"); usage.Exists() && usage.IsObject() {
 		out, _ = sjson.SetRawBytes(out, "usage", []byte(usage.Raw))
@@ -588,4 +754,16 @@ func normalizeResponsesUsageForOpenAIImages(rawJSON []byte) []byte {
 		out, _ = sjson.SetBytes(out, "usage.completion_tokens_details.reasoning_tokens", reasoningTokens.Int())
 	}
 	return out
+}
+
+func setOptionalOpenAIImageResponseField(rawJSON []byte, path, value string) []byte {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return rawJSON
+	}
+	updated, err := sjson.SetBytes(rawJSON, path, value)
+	if err != nil {
+		return rawJSON
+	}
+	return updated
 }

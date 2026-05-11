@@ -757,6 +757,17 @@ func (h *BaseAPIHandler) ExecuteCountWithAuthManager(ctx context.Context, handle
 // This path is the only supported execution route.
 // The returned http.Header carries upstream response headers captured before streaming begins.
 func (h *BaseAPIHandler) ExecuteStreamWithAuthManager(ctx context.Context, handlerType, modelName string, rawJSON []byte, alt string) (<-chan []byte, http.Header, <-chan *interfaces.ErrorMessage) {
+	return h.executeStreamWithAuthManager(ctx, handlerType, modelName, modelName, rawJSON, alt)
+}
+
+// ExecuteStreamWithAuthManagerRequestedModel executes a streaming request using
+// modelName for auth routing and requestedModel as the client-visible execution
+// hint consumed by provider executors.
+func (h *BaseAPIHandler) ExecuteStreamWithAuthManagerRequestedModel(ctx context.Context, handlerType, modelName string, rawJSON []byte, alt string, requestedModel string) (<-chan []byte, http.Header, <-chan *interfaces.ErrorMessage) {
+	return h.executeStreamWithAuthManager(ctx, handlerType, modelName, requestedModel, rawJSON, alt)
+}
+
+func (h *BaseAPIHandler) executeStreamWithAuthManager(ctx context.Context, handlerType, modelName string, requestedModel string, rawJSON []byte, alt string) (<-chan []byte, http.Header, <-chan *interfaces.ErrorMessage) {
 	providers, normalizedModel, errMsg := h.getRequestDetails(modelName)
 	if errMsg != nil {
 		errChan := make(chan *interfaces.ErrorMessage, 1)
@@ -766,7 +777,11 @@ func (h *BaseAPIHandler) ExecuteStreamWithAuthManager(ctx context.Context, handl
 	}
 	reqMeta := requestExecutionMetadata(ctx)
 	populateAuthSessionMetadata(reqMeta, ctx, rawJSON)
-	reqMeta[coreexecutor.RequestedModelMetadataKey] = normalizedModel
+	requestedModel = strings.TrimSpace(requestedModel)
+	if requestedModel == "" {
+		requestedModel = normalizedModel
+	}
+	reqMeta[coreexecutor.RequestedModelMetadataKey] = requestedModel
 	payload := rawJSON
 	if len(payload) == 0 {
 		payload = nil
@@ -994,7 +1009,7 @@ func (h *BaseAPIHandler) getRequestDetails(modelName string) (providers []string
 	if strings.EqualFold(baseModel, "gpt-image-2") {
 		return nil, "", &interfaces.ErrorMessage{
 			StatusCode: http.StatusServiceUnavailable,
-			Error:      fmt.Errorf("model %s is only supported on /v1/images/generations and /v1/images/edits", baseModel),
+			Error:      fmt.Errorf("model %s is only supported on /v1/images/generations, /v1/images/edits, and /v1/images/variations", baseModel),
 		}
 	}
 

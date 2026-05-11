@@ -97,6 +97,20 @@ func TestImagesEditsRouteUsesAuthMiddleware(t *testing.T) {
 	}
 }
 
+func TestImagesVariationsRouteUsesAuthMiddleware(t *testing.T) {
+	server := newTestServer(t)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/images/variations", strings.NewReader(`{"model":"dall-e-2"}`))
+	req.Header.Set("Content-Type", "application/json")
+
+	rr := httptest.NewRecorder()
+	server.engine.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusUnauthorized {
+		t.Fatalf("unexpected status code: got %d want %d; body=%s", rr.Code, http.StatusUnauthorized, rr.Body.String())
+	}
+}
+
 func TestAmpProviderModelRoutes(t *testing.T) {
 	testCases := []struct {
 		name         string

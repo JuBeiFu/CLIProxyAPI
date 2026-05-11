@@ -22,16 +22,20 @@ import (
 )
 
 type imageCaptureExecutor struct {
-	payload      []byte
-	model        string
-	sourceFormat string
-	metadata     map[string]any
-	deadline     time.Time
-	hasDeadline  bool
-	payloads     [][]byte
-	models       []string
-	metadatas    []map[string]any
-	results      []imageExecutorResult
+	payload         []byte
+	model           string
+	sourceFormat    string
+	metadata        map[string]any
+	deadline        time.Time
+	hasDeadline     bool
+	payloads        [][]byte
+	models          []string
+	metadatas       []map[string]any
+	results         []imageExecutorResult
+	streamPayloads  [][]byte
+	streamModels    []string
+	streamMetadatas []map[string]any
+	streamResults   []imageStreamExecutorResult
 }
 
 func (e *imageCaptureExecutor) Identifier() string { return "codex" }
@@ -59,7 +63,34 @@ func (e *imageCaptureExecutor) Execute(ctx context.Context, auth *coreauth.Auth,
 	return coreexecutor.Response{Payload: []byte(`{"id":"resp_1","object":"response","created_at":1775555723,"model":"gpt-5.5","output":[{"type":"image_generation_call","result":"ZmFrZS1pbWFnZQ==","output_format":"png"}],"usage":{"input_tokens":11,"output_tokens":22,"total_tokens":33}}`)}, nil
 }
 
-func (e *imageCaptureExecutor) ExecuteStream(context.Context, *coreauth.Auth, coreexecutor.Request, coreexecutor.Options) (*coreexecutor.StreamResult, error) {
+func (e *imageCaptureExecutor) ExecuteStream(ctx context.Context, auth *coreauth.Auth, req coreexecutor.Request, opts coreexecutor.Options) (*coreexecutor.StreamResult, error) {
+	_ = ctx
+	_ = auth
+	e.streamPayloads = append(e.streamPayloads, append([]byte(nil), req.Payload...))
+	e.streamModels = append(e.streamModels, req.Model)
+	e.streamMetadatas = append(e.streamMetadatas, cloneImageMetadata(opts.Metadata))
+
+	index := len(e.streamModels) - 1
+	if index < len(e.streamResults) {
+		result := e.streamResults[index]
+		if result.err != nil {
+			return nil, result.err
+		}
+		ch := make(chan coreexecutor.StreamChunk, len(result.chunks))
+		for _, chunk := range result.chunks {
+			ch <- cloneImageStreamChunk(chunk)
+		}
+		close(ch)
+		var headers http.Header
+		if result.headers != nil {
+			headers = result.headers.Clone()
+		}
+		return &coreexecutor.StreamResult{
+			Headers: headers,
+			Chunks:  ch,
+		}, nil
+	}
+
 	return nil, errors.New("not implemented")
 }
 
@@ -80,6 +111,12 @@ type imageExecutorResult struct {
 	err     error
 }
 
+type imageStreamExecutorResult struct {
+	headers http.Header
+	chunks  []coreexecutor.StreamChunk
+	err     error
+}
+
 func cloneImageMetadata(src map[string]any) map[string]any {
 	if src == nil {
 		return nil
@@ -87,6 +124,14 @@ func cloneImageMetadata(src map[string]any) map[string]any {
 	dst := make(map[string]any, len(src))
 	for key, value := range src {
 		dst[key] = value
+	}
+	return dst
+}
+
+func cloneImageStreamChunk(src coreexecutor.StreamChunk) coreexecutor.StreamChunk {
+	dst := src
+	if len(src.Payload) > 0 {
+		dst.Payload = append([]byte(nil), src.Payload...)
 	}
 	return dst
 }
@@ -111,7 +156,7 @@ func TestImagesGenerationsConvertsOpenAIRequestToResponsesAndReturnsImage(t *tes
 	router := gin.New()
 	router.POST("/v1/images/generations", h.ImagesGenerations)
 
-	req := httptest.NewRequest(http.MethodPost, "/v1/images/generations", strings.NewReader(`{"model":"gpt-image-1","prompt":"draw a cat","size":"1024x1536","quality":"high","response_format":"b64_json"}`))
+	req := httptest.NewRequest(http.MethodPost, "/v1/images/generations", strings.NewReader(`{"model":"gpt-image-1","prompt":"draw a cat","size":"1024x1536","quality":"high","response_format":"b64_json","n":2}`))
 	req.Header.Set("Content-Type", "application/json")
 	resp := httptest.NewRecorder()
 	router.ServeHTTP(resp, req)
@@ -155,6 +200,9 @@ func TestImagesGenerationsConvertsOpenAIRequestToResponsesAndReturnsImage(t *tes
 	}
 	if got := gjson.GetBytes(executor.payload, "tools.0.quality").String(); got != "high" {
 		t.Fatalf("tools.0.quality = %q, want high; payload=%s", got, string(executor.payload))
+	}
+	if got := gjson.GetBytes(executor.payload, "tools.0.n").Int(); got != 2 {
+		t.Fatalf("tools.0.n = %d, want 2; payload=%s", got, string(executor.payload))
 	}
 	if got := gjson.GetBytes(executor.payload, "tool_choice.type").String(); got != "image_generation" {
 		t.Fatalf("tool_choice.type = %q, want image_generation; payload=%s", got, string(executor.payload))
@@ -264,6 +312,13 @@ func TestImagesEditsAcceptsMultipartRequestFromNewAPI(t *testing.T) {
 	if _, err := part.Write([]byte{0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n', 0, 0, 0, 0}); err != nil {
 		t.Fatalf("write image: %v", err)
 	}
+	maskPart, err := writer.CreateFormFile("mask", "mask.png")
+	if err != nil {
+		t.Fatalf("CreateFormFile mask: %v", err)
+	}
+	if _, err := maskPart.Write([]byte{0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n', 0, 0, 0, 0}); err != nil {
+		t.Fatalf("write mask: %v", err)
+	}
 	if err := writer.Close(); err != nil {
 		t.Fatalf("close multipart writer: %v", err)
 	}
@@ -291,6 +346,10 @@ func TestImagesEditsAcceptsMultipartRequestFromNewAPI(t *testing.T) {
 	imageURL := gjson.GetBytes(executor.payload, "input.0.content.1.image_url").String()
 	if !strings.HasPrefix(imageURL, "data:image/png;base64,") {
 		t.Fatalf("input image URL = %q, want png data URL; payload=%s", imageURL, string(executor.payload))
+	}
+	maskURL := gjson.GetBytes(executor.payload, "tools.0.input_image_mask.image_url").String()
+	if !strings.HasPrefix(maskURL, "data:image/png;base64,") {
+		t.Fatalf("mask image URL = %q, want png data URL; payload=%s", maskURL, string(executor.payload))
 	}
 }
 
@@ -416,5 +475,29 @@ func TestImagesGenerationsOversizedSquareReturnsError(t *testing.T) {
 	_, _, _, err := convertImagesGenerationRequestToResponses([]byte(`{"model":"gpt-image-2","prompt":"draw a poster","size":"4096x4096"}`))
 	if err == nil {
 		t.Fatal("expected oversized square to return error")
+	}
+}
+
+func TestConvertResponsesImageToOpenAIImageIncludesMetadataAndRevisedPrompt(t *testing.T) {
+	raw := []byte(`{"created_at":1775555723,"tools":[{"type":"image_generation","background":"transparent","output_format":"png","quality":"high","size":"1536x1024"}],"output":[{"type":"image_generation_call","result":"ZmFrZS1pbWFnZQ==","revised_prompt":"refined prompt"}],"usage":{"input_tokens":11,"output_tokens":22,"total_tokens":33}}`)
+
+	out, err := convertResponsesImageToOpenAIImage(raw)
+	if err != nil {
+		t.Fatalf("convertResponsesImageToOpenAIImage returned error: %v", err)
+	}
+	if got := gjson.GetBytes(out, "background").String(); got != "transparent" {
+		t.Fatalf("background = %q, want transparent; body=%s", got, string(out))
+	}
+	if got := gjson.GetBytes(out, "output_format").String(); got != "png" {
+		t.Fatalf("output_format = %q, want png; body=%s", got, string(out))
+	}
+	if got := gjson.GetBytes(out, "quality").String(); got != "high" {
+		t.Fatalf("quality = %q, want high; body=%s", got, string(out))
+	}
+	if got := gjson.GetBytes(out, "size").String(); got != "1536x1024" {
+		t.Fatalf("size = %q, want 1536x1024; body=%s", got, string(out))
+	}
+	if got := gjson.GetBytes(out, "data.0.revised_prompt").String(); got != "refined prompt" {
+		t.Fatalf("revised_prompt = %q, want refined prompt; body=%s", got, string(out))
 	}
 }
