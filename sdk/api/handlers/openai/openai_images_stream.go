@@ -113,6 +113,7 @@ func (h *OpenAIAPIHandler) executeImagesStreamingResponsesPayload(c *gin.Context
 				if !ok {
 					bridge := newOpenAIImageStreamBridge(attemptPayload)
 					bridge.Flush(c.Writer)
+					bridge.emitDone(c.Writer)
 					flusher.Flush()
 					cliCancel(nil)
 					return
@@ -131,6 +132,7 @@ func (h *OpenAIAPIHandler) executeImagesStreamingResponsesPayload(c *gin.Context
 					},
 					WriteDone: func() {
 						bridge.Flush(c.Writer)
+						bridge.emitDone(c.Writer)
 					},
 				})
 				return
@@ -209,14 +211,21 @@ func (b *openAIImageStreamBridge) Flush(w io.Writer) {
 	b.emitFinalItems(w)
 }
 
+func (b *openAIImageStreamBridge) emitDone(w io.Writer) {
+	if w == nil || b.sentDone {
+		return
+	}
+	writeOpenAIImageSSEData(w, nil)
+	b.sentDone = true
+}
+
 func (b *openAIImageStreamBridge) handleFrame(w io.Writer, frame []byte) {
 	data := openAIImageSSEData(frame)
 	if len(data) == 0 {
 		return
 	}
 	if bytes.Equal(data, []byte("[DONE]")) {
-		writeOpenAIImageSSEData(w, nil)
-		b.sentDone = true
+		b.emitDone(w)
 		return
 	}
 	if !json.Valid(data) {

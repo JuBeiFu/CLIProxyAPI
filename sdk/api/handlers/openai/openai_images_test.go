@@ -156,7 +156,7 @@ func TestImagesGenerationsConvertsOpenAIRequestToResponsesAndReturnsImage(t *tes
 	router := gin.New()
 	router.POST("/v1/images/generations", h.ImagesGenerations)
 
-	req := httptest.NewRequest(http.MethodPost, "/v1/images/generations", strings.NewReader(`{"model":"gpt-image-1","prompt":"draw a cat","size":"1024x1536","quality":"high","response_format":"b64_json","n":2}`))
+	req := httptest.NewRequest(http.MethodPost, "/v1/images/generations", strings.NewReader(`{"model":"gpt-image-1","prompt":"draw a cat","size":"1024x1536","quality":"high","response_format":"b64_json","n":1}`))
 	req.Header.Set("Content-Type", "application/json")
 	resp := httptest.NewRecorder()
 	router.ServeHTTP(resp, req)
@@ -201,8 +201,8 @@ func TestImagesGenerationsConvertsOpenAIRequestToResponsesAndReturnsImage(t *tes
 	if got := gjson.GetBytes(executor.payload, "tools.0.quality").String(); got != "high" {
 		t.Fatalf("tools.0.quality = %q, want high; payload=%s", got, string(executor.payload))
 	}
-	if got := gjson.GetBytes(executor.payload, "tools.0.n").Int(); got != 2 {
-		t.Fatalf("tools.0.n = %d, want 2; payload=%s", got, string(executor.payload))
+	if got := gjson.GetBytes(executor.payload, "tools.0.n").Exists(); got {
+		t.Fatalf("tools.0.n unexpectedly present; payload=%s", string(executor.payload))
 	}
 	if got := gjson.GetBytes(executor.payload, "tool_choice.type").String(); got != "image_generation" {
 		t.Fatalf("tool_choice.type = %q, want image_generation; payload=%s", got, string(executor.payload))
@@ -212,6 +212,42 @@ func TestImagesGenerationsConvertsOpenAIRequestToResponsesAndReturnsImage(t *tes
 	}
 	if got := gjson.Get(resp.Body.String(), "usage.total_tokens").Int(); got != 33 {
 		t.Fatalf("usage.total_tokens = %d, want 33; body=%s", got, resp.Body.String())
+	}
+}
+
+func TestImagesGenerationsRejectsMultipleOutputCount(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	executor := &imageCaptureExecutor{}
+	manager := coreauth.NewManager(nil, nil, nil)
+	manager.RegisterExecutor(executor)
+
+	auth := &coreauth.Auth{ID: "image-count-auth", Provider: executor.Identifier(), Status: coreauth.StatusActive}
+	if _, err := manager.Register(context.Background(), auth); err != nil {
+		t.Fatalf("Register auth: %v", err)
+	}
+	registry.GetGlobalRegistry().RegisterClient(auth.ID, auth.Provider, []*registry.ModelInfo{{ID: defaultImagesMainModel}})
+	t.Cleanup(func() {
+		registry.GetGlobalRegistry().UnregisterClient(auth.ID)
+	})
+
+	base := handlers.NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, manager)
+	h := NewOpenAIAPIHandler(base)
+	router := gin.New()
+	router.POST("/v1/images/generations", h.ImagesGenerations)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/images/generations", strings.NewReader(`{"model":"gpt-image-2","prompt":"draw a cat","n":2}`))
+	req.Header.Set("Content-Type", "application/json")
+	resp := httptest.NewRecorder()
+	router.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d; body=%s", resp.Code, http.StatusBadRequest, resp.Body.String())
+	}
+	if len(executor.payloads) != 0 {
+		t.Fatalf("unexpected upstream execution for unsupported n; payloads=%d", len(executor.payloads))
+	}
+	if got := gjson.Get(resp.Body.String(), "error.message").String(); !strings.Contains(got, "n greater than 1") {
+		t.Fatalf("error.message = %q, want unsupported n hint", got)
 	}
 }
 

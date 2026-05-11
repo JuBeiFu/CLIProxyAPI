@@ -517,6 +517,9 @@ func convertOpenAIImageRequestToResponses(rawJSON []byte, action string, include
 	if !root.IsObject() {
 		return nil, "", "", fmt.Errorf("request body must be a JSON object")
 	}
+	if err := validateOpenAIImageCount(root); err != nil {
+		return nil, "", "", err
+	}
 
 	prompt := strings.TrimSpace(root.Get("prompt").String())
 	if prompt == "" {
@@ -567,7 +570,7 @@ func buildOpenAIImageTool(root gjson.Result, action, size string) []byte {
 			tool, _ = sjson.SetBytes(tool, field, v)
 		}
 	}
-	for _, field := range []string{"n", "output_compression", "partial_images"} {
+	for _, field := range []string{"output_compression", "partial_images"} {
 		if v := root.Get(field); v.Exists() && v.Type == gjson.Number {
 			tool, _ = sjson.SetBytes(tool, field, v.Int())
 		}
@@ -580,6 +583,35 @@ func buildOpenAIImageTool(root gjson.Result, action, size string) []byte {
 		tool, _ = sjson.SetBytes(tool, "input_image_mask.image_url", mask)
 	}
 	return tool
+}
+
+func validateOpenAIImageCount(root gjson.Result) error {
+	countValue := root.Get("n")
+	if !countValue.Exists() {
+		return nil
+	}
+
+	count := int64(1)
+	switch countValue.Type {
+	case gjson.Number:
+		count = countValue.Int()
+	case gjson.String:
+		parsed, err := strconv.ParseInt(strings.TrimSpace(countValue.String()), 10, 64)
+		if err != nil {
+			return fmt.Errorf("n must be an integer")
+		}
+		count = parsed
+	default:
+		return fmt.Errorf("n must be an integer")
+	}
+
+	if count <= 0 {
+		return fmt.Errorf("n must be greater than 0")
+	}
+	if count > 1 {
+		return fmt.Errorf("n greater than 1 is not supported on /v1/images via the Responses image_generation bridge")
+	}
+	return nil
 }
 
 func setImagesResponsesInput(out []byte, prompt string, images []string) []byte {

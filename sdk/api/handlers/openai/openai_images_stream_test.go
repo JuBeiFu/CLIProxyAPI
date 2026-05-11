@@ -97,6 +97,30 @@ func TestImagesGenerationsStreamTranslatesResponsesEvents(t *testing.T) {
 	}
 }
 
+func TestImagesGenerationsStreamAddsDoneMarkerWhenUpstreamOmitsIt(t *testing.T) {
+	executor := &imageCaptureExecutor{
+		streamResults: []imageStreamExecutorResult{{
+			chunks: []coreexecutor.StreamChunk{
+				{Payload: []byte("event: response.output_item.done\ndata: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"image_generation_call\",\"result\":\"ZmluYWw=\",\"output_format\":\"png\"}}\n\n")},
+				{Payload: []byte("event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"created_at\":1775555723,\"tools\":[{\"type\":\"image_generation\",\"output_format\":\"png\",\"size\":\"1024x1024\"}]}}\n\n")},
+			},
+		}},
+	}
+	router := newOpenAIImageTestRouter(t, executor)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/images/generations", strings.NewReader(`{"model":"gpt-image-2","prompt":"draw a poster","stream":true}`))
+	req.Header.Set("Content-Type", "application/json")
+	resp := httptest.NewRecorder()
+	router.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", resp.Code, http.StatusOK, resp.Body.String())
+	}
+	if got := strings.Count(resp.Body.String(), "data: [DONE]"); got != 1 {
+		t.Fatalf("done marker count = %d, want 1; body=%s", got, resp.Body.String())
+	}
+}
+
 func TestImagesEditsStreamTranslatesResponsesEvents(t *testing.T) {
 	executor := &imageCaptureExecutor{
 		streamResults: []imageStreamExecutorResult{{
