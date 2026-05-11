@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptrace"
+	"os"
 	"regexp"
 	"sort"
 	"strconv"
@@ -41,6 +42,10 @@ const (
 	codexUserAgent                  = "codex-tui/0.125.0 (Mac OS 26.3.1; arm64) iTerm.app/3.6.9 (codex-tui; 0.125.0)"
 	codexOriginator                 = "codex-tui"
 	newAPIDownstreamTransportHeader = "X-NewAPI-Downstream-Transport"
+	codexUpstreamProtoHeader        = "X-CLIProxy-Codex-Upstream-Proto"
+	codexStreamTransportHeader      = "X-CLIProxy-Codex-Stream-Transport"
+	codexHTTP2DisabledHeader        = "X-CLIProxy-Codex-HTTP2-Disabled"
+	codexResponsesStreamHTTP1Env    = "CLIPROXY_CODEX_RESPONSES_STREAM_HTTP1"
 	codexGPT55ContextLength         = 400000
 )
 
@@ -92,6 +97,9 @@ type codexUpstreamTiming struct {
 	failoverReason  string
 	stickyAuthID    string
 	stickyLease     string
+	httpProto       string
+	streamTransport string
+	http2Disabled   bool
 	status          int
 	bytesRead       int
 	startedAt       time.Time
@@ -132,8 +140,12 @@ func logSlowCodexUpstreamTiming(ctx context.Context, timing codexUpstreamTiming)
 		}
 	}
 	legacyBound := strings.TrimSpace(timing.proxySource) == "bound-assisted"
+	streamTransport := strings.TrimSpace(timing.streamTransport)
+	if streamTransport == "" {
+		streamTransport = "default"
+	}
 	helps.LogWithRequestID(ctx).Infof(
-		"codex upstream timing endpoint=%s model=%s auth_id=%s proxy_source=%s proxy_pool=%s proxy_name=%s proxy_url=%s proxy_fallback_direct=%t runtime_egress_mode=%s direct_bind_ip=%s failover_state=%s failover_reason=%s sticky_auth_id=%s sticky_lease=%s legacy_bound_proxy_used=%t resolution_source=%s status=%d total=%s prepare=%s http_do=%s read_body=%s translate=%s http_conn=%s http_tls=%s http_wrote_req=%s http_first_byte=%s http_conn_reused=%t http_conn_was_idle=%t http_conn_idle=%s response_bytes=%d stream_lines=%d stream_chunks=%d stream_completed=%t stream_err=%s",
+		"codex upstream timing endpoint=%s model=%s auth_id=%s proxy_source=%s proxy_pool=%s proxy_name=%s proxy_url=%s proxy_fallback_direct=%t runtime_egress_mode=%s direct_bind_ip=%s failover_state=%s failover_reason=%s sticky_auth_id=%s sticky_lease=%s legacy_bound_proxy_used=%t resolution_source=%s status=%d http_proto=%s stream_transport=%s http2_disabled=%t total=%s prepare=%s http_do=%s read_body=%s translate=%s http_conn=%s http_tls=%s http_wrote_req=%s http_first_byte=%s http_conn_reused=%t http_conn_was_idle=%t http_conn_idle=%s response_bytes=%d stream_lines=%d stream_chunks=%d stream_completed=%t stream_err=%s",
 		timing.endpoint,
 		timing.model,
 		strings.TrimSpace(timing.authID),
@@ -151,6 +163,9 @@ func logSlowCodexUpstreamTiming(ctx context.Context, timing codexUpstreamTiming)
 		legacyBound,
 		strings.TrimSpace(timing.proxySource),
 		timing.status,
+		strings.TrimSpace(timing.httpProto),
+		streamTransport,
+		timing.http2Disabled,
 		total.Round(time.Millisecond),
 		timing.prepare.Round(time.Millisecond),
 		timing.httpDo.Round(time.Millisecond),
@@ -187,6 +202,72 @@ func applyCodexResolutionTiming(timing *codexUpstreamTiming, auth *cliproxyauth.
 	timing.failoverReason = telemetry.FailoverReason
 	timing.stickyAuthID = telemetry.StickyAuthID
 	timing.stickyLease = telemetry.StickyLease
+}
+
+func codexResponsesStreamHTTP1Enabled(cfg *config.Config) bool {
+	if cfg != nil && cfg.CodexResponsesStreamHTTP1 {
+		return true
+	}
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(codexResponsesStreamHTTP1Env))) {
+	case "1", "true", "yes", "on", "http1", "http1.1", "h1":
+		return true
+	default:
+		return false
+	}
+}
+
+func configureCodexResponsesStreamTransport(client *http.Client, cfg *config.Config, timing *codexUpstreamTiming) {
+	if timing == nil || !strings.EqualFold(strings.TrimSpace(timing.endpoint), "responses_stream") {
+		return
+	}
+	if timing.streamTransport == "" {
+		timing.streamTransport = "default"
+	}
+	if !codexResponsesStreamHTTP1Enabled(cfg) {
+		return
+	}
+	timing.streamTransport = "http1.1"
+	if client == nil {
+		timing.streamTransport = "http1.1_unavailable"
+		return
+	}
+	base := client.Transport
+	if base == nil {
+		base = http.DefaultTransport
+	}
+	transport, ok := base.(*http.Transport)
+	if !ok || transport == nil {
+		timing.streamTransport = "http1.1_unsupported"
+		return
+	}
+	clone := transport.Clone()
+	clone.ForceAttemptHTTP2 = false
+	clone.TLSNextProto = map[string]func(string, *tls.Conn) http.RoundTripper{}
+	client.Transport = clone
+	timing.http2Disabled = true
+}
+
+func recordCodexHTTPResponseProto(timing *codexUpstreamTiming, resp *http.Response) {
+	if timing == nil || resp == nil {
+		return
+	}
+	timing.httpProto = strings.TrimSpace(resp.Proto)
+}
+
+func addCodexUpstreamDiagnosticHeaders(headers http.Header, timing codexUpstreamTiming) http.Header {
+	if headers == nil {
+		headers = make(http.Header)
+	}
+	if proto := strings.TrimSpace(timing.httpProto); proto != "" {
+		headers.Set(codexUpstreamProtoHeader, proto)
+	}
+	streamTransport := strings.TrimSpace(timing.streamTransport)
+	if streamTransport == "" {
+		streamTransport = "default"
+	}
+	headers.Set(codexStreamTransportHeader, streamTransport)
+	headers.Set(codexHTTP2DisabledHeader, strconv.FormatBool(timing.http2Disabled))
+	return headers
 }
 
 func recordCodexProxyPassiveOutcome(timing codexUpstreamTiming, manager *proxypool.HealthManager) {
@@ -755,10 +836,12 @@ func (e *CodexExecutor) retryCodexHTTPRequestWithFailover(ctx context.Context, a
 	}
 	httpClient, retryResolution := helps.NewProxyAwareHTTPClientWithResolution(ctx, e.cfg, auth, 0)
 	applyCodexResolutionTiming(timing, auth, retryResolution)
+	configureCodexResponsesStreamTransport(httpClient, e.cfg, timing)
 	traceCtx := withCodexHTTPTrace(retryReq.Context(), timing)
 	httpStarted := time.Now()
 	retryResp, retryErr := httpClient.Do(retryReq.WithContext(traceCtx))
 	timing.httpDo += time.Since(httpStarted)
+	recordCodexHTTPResponseProto(timing, retryResp)
 	return retryResp, retryResolution, retryErr, true
 }
 
@@ -966,16 +1049,14 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 	})
 
 	httpClient, resolution := helps.NewProxyAwareHTTPClientWithResolution(ctx, e.cfg, auth, 0)
-	timing.proxySource = resolution.Source
-	timing.proxyPool = resolution.ProxyPool
-	timing.proxyName = resolution.ProxyName
-	timing.proxyURL = resolution.ProxyURL
-	timing.proxyFallback = resolution.FallbackToDirect
+	applyCodexResolutionTiming(&timing, auth, resolution)
+	configureCodexResponsesStreamTransport(httpClient, e.cfg, &timing)
 	timing.prepare = time.Since(prepareStarted)
 	traceCtx := withCodexHTTPTrace(httpReq.Context(), &timing)
 	httpStarted := time.Now()
 	httpResp, err := httpClient.Do(httpReq.WithContext(traceCtx))
 	timing.httpDo = time.Since(httpStarted)
+	recordCodexHTTPResponseProto(&timing, httpResp)
 	if err != nil {
 		if retryResp, retryResolution, retryErr, retried := e.retryCodexHTTPRequestWithFailover(ctx, auth, httpReq, &timing, resolution, err, 0); retried {
 			httpResp = retryResp
@@ -990,6 +1071,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 		return nil, err
 	}
 	timing.status = httpResp.StatusCode
+	recordCodexHTTPResponseProto(&timing, httpResp)
 	if codexShouldFailoverForStatus(httpResp.StatusCode) {
 		if errClose := httpResp.Body.Close(); errClose != nil {
 			log.Errorf("codex executor: close response body error: %v", errClose)
@@ -1006,6 +1088,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 				return nil, err
 			}
 			timing.status = httpResp.StatusCode
+			recordCodexHTTPResponseProto(&timing, httpResp)
 		}
 	}
 	helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
@@ -1163,7 +1246,8 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 			_ = sendChunk(cliproxyexecutor.StreamChunk{Err: errIncomplete})
 		}
 	}()
-	return &cliproxyexecutor.StreamResult{Headers: httpResp.Header.Clone(), Chunks: out}, nil
+	headers := addCodexUpstreamDiagnosticHeaders(httpResp.Header.Clone(), timing)
+	return &cliproxyexecutor.StreamResult{Headers: headers, Chunks: out}, nil
 }
 
 func codexHTTPStreamEventHasUserContent(eventType string, data []byte) bool {

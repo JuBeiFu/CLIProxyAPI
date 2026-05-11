@@ -3,6 +3,7 @@ package executor
 import (
 	"bytes"
 	"context"
+	"net/http"
 	"strings"
 	"testing"
 	"time"
@@ -44,6 +45,9 @@ func TestLogSlowCodexUpstreamTimingIncludesAuthIDAndHTTPTraceFields(t *testing.T
 		traceFirstByte:  63 * time.Second,
 		traceWasIdle:    true,
 		traceIdleTime:   2 * time.Second,
+		httpProto:       "HTTP/1.1",
+		streamTransport: "http1.1",
+		http2Disabled:   true,
 		bytesRead:       321,
 		streamLines:     0,
 		streamChunks:    0,
@@ -61,6 +65,9 @@ func TestLogSlowCodexUpstreamTimingIncludesAuthIDAndHTTPTraceFields(t *testing.T
 		"http_tls=",
 		"http_wrote_req=",
 		"http_first_byte=",
+		"http_proto=HTTP/1.1",
+		"stream_transport=http1.1",
+		"http2_disabled=true",
 		"http_conn_reused=true",
 		"http_conn_was_idle=true",
 		"http_conn_idle=",
@@ -174,6 +181,48 @@ func TestLogSlowCodexUpstreamTimingIncludesRuntimeEgressMode(t *testing.T) {
 		if !strings.Contains(out, part) {
 			t.Fatalf("log output missing %q: %s", part, out)
 		}
+	}
+}
+
+func TestConfigureCodexResponsesStreamTransportDisablesHTTP2(t *testing.T) {
+	client := &http.Client{Transport: &http.Transport{ForceAttemptHTTP2: true}}
+	timing := &codexUpstreamTiming{endpoint: "responses_stream"}
+
+	configureCodexResponsesStreamTransport(client, &config.Config{SDKConfig: config.SDKConfig{CodexResponsesStreamHTTP1: true}}, timing)
+
+	transport, ok := client.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("transport type = %T, want *http.Transport", client.Transport)
+	}
+	if transport.ForceAttemptHTTP2 {
+		t.Fatal("expected ForceAttemptHTTP2 to be disabled")
+	}
+	if transport.TLSNextProto == nil || len(transport.TLSNextProto) != 0 {
+		t.Fatalf("TLSNextProto = %#v, want empty map", transport.TLSNextProto)
+	}
+	if timing.streamTransport != "http1.1" {
+		t.Fatalf("streamTransport = %q, want http1.1", timing.streamTransport)
+	}
+	if !timing.http2Disabled {
+		t.Fatal("expected timing.http2Disabled to be true")
+	}
+}
+
+func TestAddCodexUpstreamDiagnosticHeaders(t *testing.T) {
+	headers := addCodexUpstreamDiagnosticHeaders(http.Header{}, codexUpstreamTiming{
+		httpProto:       "HTTP/1.1",
+		streamTransport: "http1.1",
+		http2Disabled:   true,
+	})
+
+	if got := headers.Get(codexUpstreamProtoHeader); got != "HTTP/1.1" {
+		t.Fatalf("%s = %q, want HTTP/1.1", codexUpstreamProtoHeader, got)
+	}
+	if got := headers.Get(codexStreamTransportHeader); got != "http1.1" {
+		t.Fatalf("%s = %q, want http1.1", codexStreamTransportHeader, got)
+	}
+	if got := headers.Get(codexHTTP2DisabledHeader); got != "true" {
+		t.Fatalf("%s = %q, want true", codexHTTP2DisabledHeader, got)
 	}
 }
 

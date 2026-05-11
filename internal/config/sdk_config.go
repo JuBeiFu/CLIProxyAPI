@@ -35,6 +35,10 @@ type SDKConfig struct {
 	// Default is false (disabled).
 	PassthroughHeaders bool `yaml:"passthrough-headers" json:"passthrough-headers"`
 
+	// CodexResponsesStreamHTTP1 forces Codex /responses streaming upstream requests to HTTP/1.1.
+	// It is intended as a gray switch for isolating HTTP/2 stream resets.
+	CodexResponsesStreamHTTP1 bool `yaml:"codex-responses-stream-http1" json:"codex-responses-stream-http1"`
+
 	// Streaming configures server-side streaming behavior (keep-alives and safe bootstrap retries).
 	Streaming StreamingConfig `yaml:"streaming" json:"streaming"`
 
