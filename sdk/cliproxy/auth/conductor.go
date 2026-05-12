@@ -4127,7 +4127,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 					state = ensureModelState(auth, result.Model)
 					modelStateChanged = true
 				}
-				if state != nil && !modelStateIsClean(state) {
+				if state != nil && !modelStateIsClean(state) && !modelStateHasActiveUsageLimitQuota(state, now) {
 					resetModelState(state, now)
 					modelStateChanged = true
 				}
@@ -4644,9 +4644,39 @@ func clearAggregatedAvailability(auth *Auth) {
 	if auth.Quota.Exceeded && (auth.Quota.Reason == codexFiveHourQuotaLowReason || auth.Quota.Reason == codexWeeklyQuotaLowReason) {
 		return
 	}
+	if authHasActiveUsageLimitQuota(auth, time.Now()) {
+		return
+	}
 	auth.Unavailable = false
 	auth.NextRetryAfter = time.Time{}
 	auth.Quota = QuotaState{}
+}
+
+func authHasActiveUsageLimitQuota(auth *Auth, now time.Time) bool {
+	if auth == nil || !auth.Quota.Exceeded || auth.Quota.Reason != "usage_limit" {
+		return false
+	}
+	next := auth.Quota.NextRecoverAt
+	if next.IsZero() {
+		next = auth.NextRetryAfter
+	}
+	return !next.IsZero() && next.After(now)
+}
+
+func modelStateHasActiveUsageLimitQuota(state *ModelState, now time.Time) bool {
+	if state == nil || !state.Quota.Exceeded {
+		return false
+	}
+	switch state.Quota.Reason {
+	case "usage_limit", codexSparkUsageLimitReason, codexStandardUsageLimitReason:
+	default:
+		return false
+	}
+	next := state.Quota.NextRecoverAt
+	if next.IsZero() {
+		next = state.NextRetryAfter
+	}
+	return !next.IsZero() && next.After(now)
 }
 
 func hasModelError(auth *Auth, now time.Time) bool {
@@ -4674,6 +4704,10 @@ func clearAuthStateOnSuccess(auth *Auth, now time.Time) {
 		return
 	}
 	if auth.Quota.Exceeded && (auth.Quota.Reason == codexFiveHourQuotaLowReason || auth.Quota.Reason == codexWeeklyQuotaLowReason) {
+		auth.UpdatedAt = now
+		return
+	}
+	if authHasActiveUsageLimitQuota(auth, now) {
 		auth.UpdatedAt = now
 		return
 	}

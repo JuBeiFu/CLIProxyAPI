@@ -376,3 +376,44 @@ func TestManager_MarkResultSuccessPreservesCodexQuotaRest(t *testing.T) {
 		t.Fatalf("expected quota rest to remain active, unavailable=%v quota=%+v", stored.Unavailable, stored.Quota)
 	}
 }
+
+func TestManager_MarkResultSuccessPreservesActiveCodexUsageLimit(t *testing.T) {
+	ctx := context.Background()
+	mgr := NewManager(nil, nil, nil)
+	next := time.Now().Add(time.Hour)
+	auth := &Auth{
+		ID:             "codex-usage-limit-success",
+		Provider:       "codex",
+		Status:         StatusError,
+		StatusMessage:  "quota exhausted",
+		Unavailable:    true,
+		NextRetryAfter: next,
+		Quota: QuotaState{
+			Exceeded:      true,
+			Reason:        "usage_limit",
+			NextRecoverAt: next,
+		},
+		Metadata: map[string]any{"type": "codex"},
+	}
+	if _, err := mgr.Register(ctx, auth); err != nil {
+		t.Fatalf("Register returned error: %v", err)
+	}
+
+	mgr.MarkResult(ctx, Result{
+		AuthID:   auth.ID,
+		Provider: "codex",
+		Model:    "gpt-5.5",
+		Success:  true,
+	})
+
+	stored, ok := mgr.GetByID(auth.ID)
+	if !ok {
+		t.Fatal("expected auth to remain registered")
+	}
+	if !stored.Unavailable || !stored.Quota.Exceeded || stored.Quota.Reason != "usage_limit" {
+		t.Fatalf("expected active usage_limit to remain active, unavailable=%v quota=%+v", stored.Unavailable, stored.Quota)
+	}
+	if stored.NextRetryAfter.Before(next.Add(-time.Second)) {
+		t.Fatalf("NextRetryAfter = %s, want preserved near %s", stored.NextRetryAfter, next)
+	}
+}
