@@ -19,6 +19,8 @@ var (
 	dataTag = []byte("data:")
 )
 
+const maxOpenAIChatToolArgumentChunkBytes = 64 * 1024
+
 // ConvertCliToOpenAIParams holds parameters for response conversion.
 type ConvertCliToOpenAIParams struct {
 	ResponseID                string
@@ -27,6 +29,65 @@ type ConvertCliToOpenAIParams struct {
 	FunctionCallIndex         int
 	HasReceivedArgumentsDelta bool
 	HasToolCallAnnounced      bool
+}
+
+func splitStringByMaxBytes(value string, maxBytes int) []string {
+	if maxBytes <= 0 || len(value) <= maxBytes {
+		return []string{value}
+	}
+	chunks := make([]string, 0, len(value)/maxBytes+1)
+	start := 0
+	for boundary := range value {
+		if boundary > start && boundary-start >= maxBytes {
+			chunks = append(chunks, value[start:boundary])
+			start = boundary
+		}
+	}
+	if start < len(value) {
+		chunks = append(chunks, value[start:])
+	}
+	if len(chunks) == 0 {
+		return []string{value}
+	}
+	return chunks
+}
+
+func buildToolArgumentDeltaChunks(template []byte, index int, arguments string) [][]byte {
+	argumentChunks := splitStringByMaxBytes(arguments, maxOpenAIChatToolArgumentChunkBytes)
+	chunks := make([][]byte, 0, len(argumentChunks))
+	for _, argumentChunk := range argumentChunks {
+		chunk := bytes.Clone(template)
+		functionCallItemTemplate := []byte(`{"index":0,"function":{"arguments":""}}`)
+		functionCallItemTemplate, _ = sjson.SetBytes(functionCallItemTemplate, "index", index)
+		functionCallItemTemplate, _ = sjson.SetBytes(functionCallItemTemplate, "function.arguments", argumentChunk)
+
+		chunk, _ = sjson.SetRawBytes(chunk, "choices.0.delta.tool_calls", []byte(`[]`))
+		chunk, _ = sjson.SetRawBytes(chunk, "choices.0.delta.tool_calls.-1", functionCallItemTemplate)
+		chunks = append(chunks, chunk)
+	}
+	return chunks
+}
+
+func buildCompleteToolCallChunks(template []byte, index int, callID string, name string, arguments string) [][]byte {
+	argumentChunks := splitStringByMaxBytes(arguments, maxOpenAIChatToolArgumentChunkBytes)
+	chunks := make([][]byte, 0, len(argumentChunks))
+	for i, argumentChunk := range argumentChunks {
+		chunk := bytes.Clone(template)
+		functionCallItemTemplate := []byte(`{"index":0,"function":{"arguments":""}}`)
+		if i == 0 {
+			functionCallItemTemplate = []byte(`{"index":0,"id":"","type":"function","function":{"name":"","arguments":""}}`)
+			functionCallItemTemplate, _ = sjson.SetBytes(functionCallItemTemplate, "id", callID)
+			functionCallItemTemplate, _ = sjson.SetBytes(functionCallItemTemplate, "function.name", name)
+			chunk, _ = sjson.SetBytes(chunk, "choices.0.delta.role", "assistant")
+		}
+		functionCallItemTemplate, _ = sjson.SetBytes(functionCallItemTemplate, "index", index)
+		functionCallItemTemplate, _ = sjson.SetBytes(functionCallItemTemplate, "function.arguments", argumentChunk)
+
+		chunk, _ = sjson.SetRawBytes(chunk, "choices.0.delta.tool_calls", []byte(`[]`))
+		chunk, _ = sjson.SetRawBytes(chunk, "choices.0.delta.tool_calls.-1", functionCallItemTemplate)
+		chunks = append(chunks, chunk)
+	}
+	return chunks
 }
 
 // ConvertCodexResponseToOpenAI translates a single chunk of a streaming response from the
@@ -160,12 +221,7 @@ func ConvertCodexResponseToOpenAI(_ context.Context, modelName string, originalR
 		(*param).(*ConvertCliToOpenAIParams).HasReceivedArgumentsDelta = true
 
 		deltaValue := rootResult.Get("delta").String()
-		functionCallItemTemplate := []byte(`{"index":0,"function":{"arguments":""}}`)
-		functionCallItemTemplate, _ = sjson.SetBytes(functionCallItemTemplate, "index", (*param).(*ConvertCliToOpenAIParams).FunctionCallIndex)
-		functionCallItemTemplate, _ = sjson.SetBytes(functionCallItemTemplate, "function.arguments", deltaValue)
-
-		template, _ = sjson.SetRawBytes(template, "choices.0.delta.tool_calls", []byte(`[]`))
-		template, _ = sjson.SetRawBytes(template, "choices.0.delta.tool_calls.-1", functionCallItemTemplate)
+		return buildToolArgumentDeltaChunks(template, (*param).(*ConvertCliToOpenAIParams).FunctionCallIndex, deltaValue)
 
 	} else if dataType == "response.function_call_arguments.done" {
 		if (*param).(*ConvertCliToOpenAIParams).HasReceivedArgumentsDelta {
@@ -173,14 +229,10 @@ func ConvertCodexResponseToOpenAI(_ context.Context, modelName string, originalR
 			return [][]byte{}
 		}
 
-		// Fallback: no delta events were received, emit the full arguments as a single chunk.
+		// Fallback: no delta events were received, so split the full arguments into
+		// bounded SSE chunks instead of emitting one multi-megabyte event.
 		fullArgs := rootResult.Get("arguments").String()
-		functionCallItemTemplate := []byte(`{"index":0,"function":{"arguments":""}}`)
-		functionCallItemTemplate, _ = sjson.SetBytes(functionCallItemTemplate, "index", (*param).(*ConvertCliToOpenAIParams).FunctionCallIndex)
-		functionCallItemTemplate, _ = sjson.SetBytes(functionCallItemTemplate, "function.arguments", fullArgs)
-
-		template, _ = sjson.SetRawBytes(template, "choices.0.delta.tool_calls", []byte(`[]`))
-		template, _ = sjson.SetRawBytes(template, "choices.0.delta.tool_calls.-1", functionCallItemTemplate)
+		return buildToolArgumentDeltaChunks(template, (*param).(*ConvertCliToOpenAIParams).FunctionCallIndex, fullArgs)
 
 	} else if dataType == "response.output_item.done" {
 		itemResult := rootResult.Get("item")
@@ -215,23 +267,19 @@ func ConvertCodexResponseToOpenAI(_ context.Context, modelName string, originalR
 		// Fallback path: model skipped output_item.added, so emit complete tool call now.
 		(*param).(*ConvertCliToOpenAIParams).FunctionCallIndex++
 
-		functionCallItemTemplate := []byte(`{"index":0,"id":"","type":"function","function":{"name":"","arguments":""}}`)
-		functionCallItemTemplate, _ = sjson.SetBytes(functionCallItemTemplate, "index", (*param).(*ConvertCliToOpenAIParams).FunctionCallIndex)
-
-		template, _ = sjson.SetRawBytes(template, "choices.0.delta.tool_calls", []byte(`[]`))
-		functionCallItemTemplate, _ = sjson.SetBytes(functionCallItemTemplate, "id", itemResult.Get("call_id").String())
-
 		// Restore original tool name if it was shortened.
 		name := itemResult.Get("name").String()
 		rev := buildReverseMapFromOriginalOpenAI(originalRequestRawJSON)
 		if orig, ok := rev[name]; ok {
 			name = orig
 		}
-		functionCallItemTemplate, _ = sjson.SetBytes(functionCallItemTemplate, "function.name", name)
-
-		functionCallItemTemplate, _ = sjson.SetBytes(functionCallItemTemplate, "function.arguments", itemResult.Get("arguments").String())
-		template, _ = sjson.SetBytes(template, "choices.0.delta.role", "assistant")
-		template, _ = sjson.SetRawBytes(template, "choices.0.delta.tool_calls.-1", functionCallItemTemplate)
+		return buildCompleteToolCallChunks(
+			template,
+			(*param).(*ConvertCliToOpenAIParams).FunctionCallIndex,
+			itemResult.Get("call_id").String(),
+			name,
+			itemResult.Get("arguments").String(),
+		)
 
 	} else {
 		return [][]byte{}

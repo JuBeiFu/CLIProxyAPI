@@ -2,6 +2,7 @@ package chat_completions
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"github.com/tidwall/gjson"
@@ -88,5 +89,33 @@ func TestConvertCodexResponseToOpenAI_ToolCallArgumentsDeltaOmitsNullContentFiel
 	}
 	if !gjson.GetBytes(out[0], "choices.0.delta.tool_calls.0.function.arguments").Exists() {
 		t.Fatalf("expected tool call arguments delta to exist, got %s", string(out[0]))
+	}
+}
+
+func TestConvertCodexResponseToOpenAI_SplitsLargeToolCallArgumentsDoneFallback(t *testing.T) {
+	ctx := context.Background()
+	var param any
+
+	out := ConvertCodexResponseToOpenAI(ctx, "gpt-5.4", nil, nil, []byte(`data: {"type":"response.output_item.added","item":{"type":"function_call","call_id":"call_123","name":"websearch"}}`), &param)
+	if len(out) != 1 {
+		t.Fatalf("expected tool call announcement chunk, got %d", len(out))
+	}
+
+	largeArguments := strings.Repeat("x", maxOpenAIChatToolArgumentChunkBytes*2+17)
+	out = ConvertCodexResponseToOpenAI(ctx, "gpt-5.4", nil, nil, []byte(`data: {"type":"response.function_call_arguments.done","arguments":"`+largeArguments+`"}`), &param)
+	if len(out) != 3 {
+		t.Fatalf("expected 3 argument chunks, got %d", len(out))
+	}
+
+	var rebuilt strings.Builder
+	for i, chunk := range out {
+		gotArguments := gjson.GetBytes(chunk, "choices.0.delta.tool_calls.0.function.arguments").String()
+		if len(gotArguments) > maxOpenAIChatToolArgumentChunkBytes {
+			t.Fatalf("chunk %d exceeded max argument bytes: %d", i, len(gotArguments))
+		}
+		rebuilt.WriteString(gotArguments)
+	}
+	if rebuilt.String() != largeArguments {
+		t.Fatalf("rebuilt arguments did not match original")
 	}
 }
