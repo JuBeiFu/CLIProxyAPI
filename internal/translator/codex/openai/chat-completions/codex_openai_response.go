@@ -68,6 +68,18 @@ func buildToolArgumentDeltaChunks(template []byte, index int, arguments string) 
 	return chunks
 }
 
+func buildAssistantTextDeltaChunks(template []byte, field string, value string) [][]byte {
+	valueChunks := splitStringByMaxBytes(value, maxOpenAIChatToolArgumentChunkBytes)
+	chunks := make([][]byte, 0, len(valueChunks))
+	for _, valueChunk := range valueChunks {
+		chunk := bytes.Clone(template)
+		chunk, _ = sjson.SetBytes(chunk, "choices.0.delta.role", "assistant")
+		chunk, _ = sjson.SetBytes(chunk, "choices.0.delta."+field, valueChunk)
+		chunks = append(chunks, chunk)
+	}
+	return chunks
+}
+
 func buildCompleteToolCallChunks(template []byte, index int, callID string, name string, arguments string) [][]byte {
 	argumentChunks := splitStringByMaxBytes(arguments, maxOpenAIChatToolArgumentChunkBytes)
 	chunks := make([][]byte, 0, len(argumentChunks))
@@ -171,16 +183,14 @@ func ConvertCodexResponseToOpenAI(_ context.Context, modelName string, originalR
 
 	if dataType == "response.reasoning_summary_text.delta" {
 		if deltaResult := rootResult.Get("delta"); deltaResult.Exists() {
-			template, _ = sjson.SetBytes(template, "choices.0.delta.role", "assistant")
-			template, _ = sjson.SetBytes(template, "choices.0.delta.reasoning_content", deltaResult.String())
+			return buildAssistantTextDeltaChunks(template, "reasoning_content", deltaResult.String())
 		}
 	} else if dataType == "response.reasoning_summary_text.done" {
 		template, _ = sjson.SetBytes(template, "choices.0.delta.role", "assistant")
 		template, _ = sjson.SetBytes(template, "choices.0.delta.reasoning_content", "\n\n")
 	} else if dataType == "response.output_text.delta" {
 		if deltaResult := rootResult.Get("delta"); deltaResult.Exists() {
-			template, _ = sjson.SetBytes(template, "choices.0.delta.role", "assistant")
-			template, _ = sjson.SetBytes(template, "choices.0.delta.content", deltaResult.String())
+			return buildAssistantTextDeltaChunks(template, "content", deltaResult.String())
 		}
 	} else if dataType == "response.completed" {
 		finishReason := "stop"
@@ -250,9 +260,7 @@ func ConvertCodexResponseToOpenAI(_ context.Context, modelName string, originalR
 				format = "png"
 			}
 			delta := "![image](data:image/" + format + ";base64," + result + ")"
-			template, _ = sjson.SetBytes(template, "choices.0.delta.role", "assistant")
-			template, _ = sjson.SetBytes(template, "choices.0.delta.content", delta)
-			return [][]byte{template}
+			return buildAssistantTextDeltaChunks(template, "content", delta)
 		}
 		if itemType != "function_call" {
 			return [][]byte{}

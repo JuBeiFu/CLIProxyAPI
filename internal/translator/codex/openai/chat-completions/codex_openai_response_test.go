@@ -119,3 +119,26 @@ func TestConvertCodexResponseToOpenAI_SplitsLargeToolCallArgumentsDoneFallback(t
 		t.Fatalf("rebuilt arguments did not match original")
 	}
 }
+
+func TestConvertCodexResponseToOpenAI_SplitsLargeOutputTextDelta(t *testing.T) {
+	ctx := context.Background()
+	var param any
+
+	largeText := strings.Repeat("x", maxOpenAIChatToolArgumentChunkBytes*2+17)
+	out := ConvertCodexResponseToOpenAI(ctx, "gpt-5.4", nil, nil, []byte(`data: {"type":"response.output_text.delta","delta":"`+largeText+`"}`), &param)
+	if len(out) != 3 {
+		t.Fatalf("expected 3 content chunks, got %d", len(out))
+	}
+
+	var rebuilt strings.Builder
+	for i, chunk := range out {
+		gotContent := gjson.GetBytes(chunk, "choices.0.delta.content").String()
+		if len(gotContent) > maxOpenAIChatToolArgumentChunkBytes {
+			t.Fatalf("chunk %d exceeded max content bytes: %d", i, len(gotContent))
+		}
+		rebuilt.WriteString(gotContent)
+	}
+	if rebuilt.String() != largeText {
+		t.Fatalf("rebuilt content did not match original")
+	}
+}
