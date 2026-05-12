@@ -80,6 +80,56 @@ func TestCodexExecutorExecuteStreamForwardsInitialMetadataBeforeUserOutput(t *te
 	}
 }
 
+func TestCodexExecutorExecuteStreamSkipsKeepAliveBeforeData(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte(": keep-alive\n\n"))
+		_, _ = w.Write([]byte("\n"))
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+		_, _ = w.Write([]byte("data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_keepalive\",\"created_at\":1775555723,\"model\":\"gpt-5.5\"}}\n\n"))
+		_, _ = w.Write([]byte("data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_keepalive\",\"object\":\"response\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":0,\"total_tokens\":1}}}\n\n"))
+	}))
+	defer server.Close()
+
+	executor := NewCodexExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"base_url": server.URL,
+		"api_key":  "test",
+	}}
+
+	result, err := executor.ExecuteStream(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "gpt-5.5",
+		Payload: []byte(`{"model":"gpt-5.5","input":"hello","stream":true}`),
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("openai-response"),
+		Stream:       true,
+	})
+	if err != nil {
+		t.Fatalf("ExecuteStream error: %v", err)
+	}
+
+	first, ok := <-result.Chunks
+	if !ok {
+		t.Fatal("stream closed before first data chunk")
+	}
+	if first.Err != nil {
+		t.Fatalf("unexpected first chunk error: %v", first.Err)
+	}
+	if bytes.Contains(first.Payload, []byte("keep-alive")) {
+		t.Fatalf("keep-alive was forwarded as payload: %s", string(first.Payload))
+	}
+	if !bytes.Contains(first.Payload, []byte("response.created")) {
+		t.Fatalf("first payload = %s, want response.created", string(first.Payload))
+	}
+	for chunk := range result.Chunks {
+		if chunk.Err != nil {
+			t.Fatalf("unexpected stream error: %v", chunk.Err)
+		}
+	}
+}
+
 func TestCodexExecutorExecute_EmptyStreamCompletionOutputUsesOutputItemDone(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")

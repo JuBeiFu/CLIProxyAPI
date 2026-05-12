@@ -214,6 +214,18 @@ func TestConfigureCodexResponsesStreamTransportDisablesHTTP2(t *testing.T) {
 	}
 }
 
+func TestPassiveFirstByteForCodexTimingPrefersFirstDataForResponsesStream(t *testing.T) {
+	got := passiveFirstByteForCodexTiming(codexUpstreamTiming{
+		endpoint:       "responses_stream",
+		traceFirstByte: 500 * time.Millisecond,
+		firstDataLine:  12 * time.Second,
+	})
+
+	if got != 12*time.Second {
+		t.Fatalf("passive first byte = %v, want first data line delay", got)
+	}
+}
+
 func TestAddCodexUpstreamDiagnosticHeaders(t *testing.T) {
 	headers := addCodexUpstreamDiagnosticHeaders(http.Header{}, codexUpstreamTiming{
 		httpProto:       "HTTP/1.1",

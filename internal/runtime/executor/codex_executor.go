@@ -116,6 +116,9 @@ type codexUpstreamTiming struct {
 	traceIdleTime   time.Duration
 	streamLines     int
 	streamChunks    int
+	firstDataLine   time.Duration
+	firstPayload    time.Duration
+	preDataLines    int
 	streamCompleted bool
 	streamErrText   string
 }
@@ -145,7 +148,7 @@ func logSlowCodexUpstreamTiming(ctx context.Context, timing codexUpstreamTiming)
 		streamTransport = "default"
 	}
 	helps.LogWithRequestID(ctx).Infof(
-		"codex upstream timing endpoint=%s model=%s auth_id=%s proxy_source=%s proxy_pool=%s proxy_name=%s proxy_url=%s proxy_fallback_direct=%t runtime_egress_mode=%s direct_bind_ip=%s failover_state=%s failover_reason=%s sticky_auth_id=%s sticky_lease=%s legacy_bound_proxy_used=%t resolution_source=%s status=%d http_proto=%s stream_transport=%s http2_disabled=%t total=%s prepare=%s http_do=%s read_body=%s translate=%s http_conn=%s http_tls=%s http_wrote_req=%s http_first_byte=%s http_conn_reused=%t http_conn_was_idle=%t http_conn_idle=%s response_bytes=%d stream_lines=%d stream_chunks=%d stream_completed=%t stream_err=%s",
+		"codex upstream timing endpoint=%s model=%s auth_id=%s proxy_source=%s proxy_pool=%s proxy_name=%s proxy_url=%s proxy_fallback_direct=%t runtime_egress_mode=%s direct_bind_ip=%s failover_state=%s failover_reason=%s sticky_auth_id=%s sticky_lease=%s legacy_bound_proxy_used=%t resolution_source=%s status=%d http_proto=%s stream_transport=%s http2_disabled=%t total=%s prepare=%s http_do=%s read_body=%s translate=%s http_conn=%s http_tls=%s http_wrote_req=%s http_first_byte=%s http_conn_reused=%t http_conn_was_idle=%t http_conn_idle=%s response_bytes=%d stream_lines=%d stream_chunks=%d first_data=%s first_payload=%s pre_data_lines=%d stream_completed=%t stream_err=%s",
 		timing.endpoint,
 		timing.model,
 		strings.TrimSpace(timing.authID),
@@ -181,6 +184,9 @@ func logSlowCodexUpstreamTiming(ctx context.Context, timing codexUpstreamTiming)
 		timing.bytesRead,
 		timing.streamLines,
 		timing.streamChunks,
+		timing.firstDataLine.Round(time.Millisecond),
+		timing.firstPayload.Round(time.Millisecond),
+		timing.preDataLines,
 		timing.streamCompleted,
 		errText,
 	)
@@ -381,6 +387,9 @@ func recordCodexRoutePassiveOutcome(timing codexUpstreamTiming, registry *proxyp
 func passiveFirstByteForCodexTiming(timing codexUpstreamTiming) time.Duration {
 	if strings.EqualFold(strings.TrimSpace(timing.endpoint), "responses/compact") {
 		return 0
+	}
+	if strings.EqualFold(strings.TrimSpace(timing.endpoint), "responses_stream") && timing.firstDataLine > 0 {
+		return timing.firstDataLine
 	}
 	return timing.traceFirstByte
 }
@@ -1213,43 +1222,58 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 			timing.bytesRead += len(line)
 			helps.AppendAPIResponseChunk(ctx, e.cfg, line)
 
-			lineForTranslate := bytes.Clone(line)
-			if bytes.HasPrefix(line, dataTag) {
-				data := bytes.TrimSpace(line[5:])
-				if body, status, ok := codexResponsesEventErrorBody(data); ok {
-					eventErr := newCodexStatusErr(status, body)
-					if bodyCyber, okCyber := codexResponsesEventCyberPolicyErrorBody(data); okCyber {
-						eventErr = newCodexCyberPolicyStatusErr(bodyCyber)
-					}
-					handleImageUnsupportedRegion(ctx, opts, auth, req.Model, resolution, eventErr)
-					helps.RecordAPIResponseError(ctx, e.cfg, eventErr)
-					reporter.PublishFailureWithError(ctx, eventErr)
-					timing.streamErrText = eventErr.Error()
-					_ = sendChunk(cliproxyexecutor.StreamChunk{Err: eventErr})
-					return
+			line = bytes.TrimSpace(line)
+			if len(line) == 0 || !bytes.HasPrefix(line, dataTag) {
+				if timing.firstDataLine <= 0 {
+					timing.preDataLines++
 				}
-				eventType := gjson.GetBytes(data, "type").String()
-				switch eventType {
-				case "response.created":
-					responseID = strings.TrimSpace(gjson.GetBytes(data, "response.id").String())
-					responseModel = strings.TrimSpace(gjson.GetBytes(data, "response.model").String())
-					responseCreatedAt = gjson.GetBytes(data, "response.created_at").Int()
-				case "response.completed":
-					data = aggregator.applyCompleted(data)
-					lineForTranslate = codexHTTPDataLine(data)
-				default:
-					aggregator.ingest(data)
+				continue
+			}
+
+			data := bytes.TrimSpace(line[5:])
+			if len(data) == 0 {
+				if timing.firstDataLine <= 0 {
+					timing.preDataLines++
 				}
-				if codexHTTPStreamEventHasUserContent(eventType, data) {
-					sawUserContent = true
+				continue
+			}
+			if timing.firstDataLine <= 0 {
+				timing.firstDataLine = time.Since(timing.startedAt)
+			}
+			lineForTranslate := codexHTTPDataLine(data)
+			if body, status, ok := codexResponsesEventErrorBody(data); ok {
+				eventErr := newCodexStatusErr(status, body)
+				if bodyCyber, okCyber := codexResponsesEventCyberPolicyErrorBody(data); okCyber {
+					eventErr = newCodexCyberPolicyStatusErr(bodyCyber)
 				}
-				if eventType == "response.completed" {
-					timing.streamCompleted = true
-					if detail, ok := helps.ParseCodexUsage(data); ok {
-						reporter.Publish(ctx, detail)
-					}
-					proxypool.DefaultCodexFailoverManager().MarkSuccess(authID, codexResolutionMode(auth, resolution))
+				handleImageUnsupportedRegion(ctx, opts, auth, req.Model, resolution, eventErr)
+				helps.RecordAPIResponseError(ctx, e.cfg, eventErr)
+				reporter.PublishFailureWithError(ctx, eventErr)
+				timing.streamErrText = eventErr.Error()
+				_ = sendChunk(cliproxyexecutor.StreamChunk{Err: eventErr})
+				return
+			}
+			eventType := gjson.GetBytes(data, "type").String()
+			switch eventType {
+			case "response.created":
+				responseID = strings.TrimSpace(gjson.GetBytes(data, "response.id").String())
+				responseModel = strings.TrimSpace(gjson.GetBytes(data, "response.model").String())
+				responseCreatedAt = gjson.GetBytes(data, "response.created_at").Int()
+			case "response.completed":
+				data = aggregator.applyCompleted(data)
+				lineForTranslate = codexHTTPDataLine(data)
+			default:
+				aggregator.ingest(data)
+			}
+			if codexHTTPStreamEventHasUserContent(eventType, data) {
+				sawUserContent = true
+			}
+			if eventType == "response.completed" {
+				timing.streamCompleted = true
+				if detail, ok := helps.ParseCodexUsage(data); ok {
+					reporter.Publish(ctx, detail)
 				}
+				proxypool.DefaultCodexFailoverManager().MarkSuccess(authID, codexResolutionMode(auth, resolution))
 			}
 
 			translateStarted := time.Now()
@@ -1257,6 +1281,9 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 			timing.translate += time.Since(translateStarted)
 			timing.streamChunks += len(chunks)
 			for i := range chunks {
+				if len(chunks[i]) > 0 && timing.firstPayload <= 0 {
+					timing.firstPayload = time.Since(timing.startedAt)
+				}
 				if !sendChunk(cliproxyexecutor.StreamChunk{Payload: chunks[i]}) {
 					return
 				}
