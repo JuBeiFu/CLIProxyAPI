@@ -1229,7 +1229,7 @@ func readStreamBootstrap(ctx context.Context, ch <-chan cliproxyexecutor.StreamC
 			return nil, false, chunk.Err
 		}
 		buffered = append(buffered, chunk)
-		if len(chunk.Payload) > 0 {
+		if len(chunk.Payload) > 0 && !chunk.BootstrapReplayable {
 			return buffered, false, nil
 		}
 	}

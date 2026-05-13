@@ -78,6 +78,9 @@ type StreamChunk struct {
 	Payload []byte
 	// Err reports any terminal error encountered while producing chunks.
 	Err error
+	// BootstrapReplayable marks payload bytes that have not committed user-visible
+	// output yet. The auth manager may buffer and discard them during bootstrap retry.
+	BootstrapReplayable bool
 }
 
 // StreamResult wraps the streaming response, providing both the chunk channel

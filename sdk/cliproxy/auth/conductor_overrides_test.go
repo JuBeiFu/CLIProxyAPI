@@ -1839,6 +1839,42 @@ func TestManager_ExecuteStream_ResponseBoundOverloadedClearsPinAndSwitchesAuth(t
 	}
 }
 
+func TestReadStreamBootstrapIgnoresReplayableControlPayloadUntilCommit(t *testing.T) {
+	ch := make(chan cliproxyexecutor.StreamChunk, 2)
+	ch <- cliproxyexecutor.StreamChunk{Payload: []byte("data: response.created"), BootstrapReplayable: true}
+	ch <- cliproxyexecutor.StreamChunk{Payload: []byte("data: response.output_text.delta")}
+	close(ch)
+
+	buffered, closed, err := readStreamBootstrap(context.Background(), ch)
+	if err != nil {
+		t.Fatalf("readStreamBootstrap error = %v", err)
+	}
+	if closed {
+		t.Fatal("closed = true, want false after committed payload")
+	}
+	if len(buffered) != 2 {
+		t.Fatalf("buffered chunks = %d, want 2", len(buffered))
+	}
+}
+
+func TestReadStreamBootstrapReturnsErrorAfterReplayableControlPayload(t *testing.T) {
+	ch := make(chan cliproxyexecutor.StreamChunk, 2)
+	ch <- cliproxyexecutor.StreamChunk{Payload: []byte("data: response.created"), BootstrapReplayable: true}
+	ch <- cliproxyexecutor.StreamChunk{Err: &Error{
+		HTTPStatus: http.StatusTooManyRequests,
+		Message:    "Our servers are currently overloaded. Please try again later.",
+	}}
+	close(ch)
+
+	_, closed, err := readStreamBootstrap(context.Background(), ch)
+	if err == nil {
+		t.Fatal("readStreamBootstrap error = nil, want overloaded error")
+	}
+	if closed {
+		t.Fatal("closed = true, want false on bootstrap error")
+	}
+}
+
 func TestManager_MarkResult_RequestScopedNotFoundDoesNotCooldownAuth(t *testing.T) {
 	m := NewManager(nil, nil, nil)
 

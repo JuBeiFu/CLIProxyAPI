@@ -1268,6 +1268,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 			if codexHTTPStreamEventHasUserContent(eventType, data) {
 				sawUserContent = true
 			}
+			bootstrapReplayable := eventType != "response.completed" && !codexHTTPStreamEventHasUserContent(eventType, data)
 			if eventType == "response.completed" {
 				timing.streamCompleted = true
 				if detail, ok := helps.ParseCodexUsage(data); ok {
@@ -1284,7 +1285,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 				if len(chunks[i]) > 0 && timing.firstPayload <= 0 {
 					timing.firstPayload = time.Since(timing.startedAt)
 				}
-				if !sendChunk(cliproxyexecutor.StreamChunk{Payload: chunks[i]}) {
+				if !sendChunk(cliproxyexecutor.StreamChunk{Payload: chunks[i], BootstrapReplayable: bootstrapReplayable}) {
 					return
 				}
 			}
