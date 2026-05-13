@@ -95,6 +95,8 @@ const (
 	defaultMaxRetryInterval    = 120 * time.Second
 )
 
+const modelCapacityRetryCredentialCap = 10
+
 const (
 	defaultResponseCompactMaxBytes     = 256 << 20
 	defaultResponseCompactMaxEntrySize = 16 << 20
@@ -4022,6 +4024,9 @@ func (m *Manager) shouldRetryAfterError(err error, attempt int, providers []stri
 	if err == nil {
 		return 0, false
 	}
+	if isModelCapacityOrOverloadedError(err) {
+		return 0, false
+	}
 	if maxWait <= 0 {
 		return 0, false
 	}
@@ -4067,6 +4072,13 @@ func waitForCooldown(ctx context.Context, wait time.Duration) error {
 }
 
 func credentialRetryLimitReached(maxRetryCredentials, usageLimitRetryCredentials, attempted int, lastErr error) bool {
+	if isModelCapacityOrOverloadedError(lastErr) {
+		capLimit := modelCapacityRetryCredentialCap
+		if usageLimitRetryCredentials > 0 && usageLimitRetryCredentials < capLimit {
+			capLimit = usageLimitRetryCredentials
+		}
+		return attempted >= capLimit
+	}
 	if shouldBypassCredentialRetryLimit(lastErr) {
 		if usageLimitRetryCredentials > 0 {
 			return attempted >= usageLimitRetryCredentials
@@ -4989,6 +5001,40 @@ func fallbackRetryAfterFor429Message(message string) *time.Duration {
 	return nil
 }
 
+func isModelCapacityOrOverloadedError(err error) bool {
+	if err == nil {
+		return false
+	}
+	return isModelCapacityOrOverloadedMessage(err.Error())
+}
+
+// IsModelCapacityOrOverloadedError reports transient upstream capacity failures
+// that are already retried inside the auth manager by rotating credentials.
+func IsModelCapacityOrOverloadedError(err error) bool {
+	return isModelCapacityOrOverloadedError(err)
+}
+
+func isModelCapacityOrOverloadedMessage(message string) bool {
+	lower := strings.ToLower(strings.TrimSpace(message))
+	if lower == "" {
+		return false
+	}
+	patterns := [...]string{
+		"selected model is at capacity",
+		"model is at capacity. please try a different model",
+		"servers are currently overloaded",
+		"server_is_overloaded",
+		"requested model is currently unavailable",
+		"current model is unavailable",
+	}
+	for _, pattern := range patterns {
+		if strings.Contains(lower, pattern) {
+			return true
+		}
+	}
+	return strings.Contains(lower, "model unavailable") && strings.Contains(lower, "switch model")
+}
+
 // isUsageLimitReachedError returns true when the error represents a quota
 // exhaustion (5-hour window or weekly limit) rather than a plain rate limit.
 // These errors carry resets_at / resets_in_seconds and must never be skipped
@@ -5216,6 +5262,9 @@ func (m *Manager) refreshAuthAfterAccessTokenFailure(ctx context.Context, auth *
 }
 
 func isTransientCooldownError(err error) bool {
+	if isModelCapacityOrOverloadedError(err) {
+		return true
+	}
 	return isTransientCooldownStatus(statusCodeFromError(err))
 }
 

@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -1721,6 +1722,113 @@ func TestManager_ExecuteStream_CurrentModelUnavailableSwitchesAuth(t *testing.T)
 
 	calls := executor.StreamCalls()
 	wantCalls := []string{unavailableAuth.ID, healthy.ID}
+	if len(calls) != len(wantCalls) {
+		t.Fatalf("stream calls = %v, want %v", calls, wantCalls)
+	}
+	for i := range wantCalls {
+		if calls[i] != wantCalls[i] {
+			t.Fatalf("stream call %d auth = %q, want %q", i, calls[i], wantCalls[i])
+		}
+	}
+}
+
+func TestManager_Execute_OverloadedIgnoresLowCredentialConfigButCapsAtTen(t *testing.T) {
+	m := NewManager(nil, nil, nil)
+	m.SetRetryConfig(5, time.Second, 1)
+
+	testKey := strings.ReplaceAll(t.Name(), "/", "-")
+	executor := &authFallbackExecutor{
+		id:            "codex",
+		executeErrors: map[string]error{},
+	}
+	m.RegisterExecutor(executor)
+
+	model := testKey + "-model"
+	reg := registry.GetGlobalRegistry()
+	authIDs := make([]string, 0, modelCapacityRetryCredentialCap+2)
+	for i := 0; i < modelCapacityRetryCredentialCap+2; i++ {
+		authID := fmt.Sprintf("%s-auth-%03d", testKey, i)
+		authIDs = append(authIDs, authID)
+		executor.executeErrors[authID] = &Error{
+			HTTPStatus: http.StatusTooManyRequests,
+			Message:    `{"error":{"message":"Our servers are currently overloaded. Please try again later.","type":"service_unavailable_error","code":"server_is_overloaded"}}`,
+		}
+		if _, errRegister := m.Register(context.Background(), &Auth{ID: authID, Provider: "codex"}); errRegister != nil {
+			t.Fatalf("register auth %s: %v", authID, errRegister)
+		}
+		reg.RegisterClient(authID, "codex", []*registry.ModelInfo{{ID: model}})
+	}
+	t.Cleanup(func() {
+		for _, authID := range authIDs {
+			reg.UnregisterClient(authID)
+		}
+	})
+
+	_, errExecute := m.Execute(context.Background(), []string{"codex"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
+	if errExecute == nil {
+		t.Fatal("execute error = nil, want overloaded error")
+	}
+
+	calls := executor.ExecuteCalls()
+	if len(calls) != modelCapacityRetryCredentialCap {
+		t.Fatalf("execute calls = %d (%v), want cap %d", len(calls), calls, modelCapacityRetryCredentialCap)
+	}
+}
+
+func TestManager_ExecuteStream_ResponseBoundOverloadedClearsPinAndSwitchesAuth(t *testing.T) {
+	m := NewManager(nil, nil, nil)
+	m.SetRetryConfig(0, time.Second, 1)
+
+	executor := &authFallbackExecutor{
+		id: "codex",
+		streamFirstErrors: map[string]error{
+			"auth-bound-overloaded": &Error{
+				HTTPStatus: http.StatusTooManyRequests,
+				Message:    `{"error":{"message":"Our servers are currently overloaded. Please try again later.","type":"service_unavailable_error","code":"server_is_overloaded"}}`,
+			},
+		},
+	}
+	m.RegisterExecutor(executor)
+
+	overloadedAuth := &Auth{ID: "auth-bound-overloaded", Provider: "codex"}
+	healthy := &Auth{ID: "auth-bound-healthy", Provider: "codex"}
+	if _, errRegister := m.Register(context.Background(), overloadedAuth); errRegister != nil {
+		t.Fatalf("register overloaded auth: %v", errRegister)
+	}
+	if _, errRegister := m.Register(context.Background(), healthy); errRegister != nil {
+		t.Fatalf("register healthy auth: %v", errRegister)
+	}
+
+	model := "gpt-5.4"
+	reg := registry.GetGlobalRegistry()
+	reg.RegisterClient(overloadedAuth.ID, "codex", []*registry.ModelInfo{{ID: model}})
+	reg.RegisterClient(healthy.ID, "codex", []*registry.ModelInfo{{ID: model}})
+	t.Cleanup(func() {
+		reg.UnregisterClient(overloadedAuth.ID)
+		reg.UnregisterClient(healthy.ID)
+	})
+
+	opts := cliproxyexecutor.Options{Metadata: map[string]any{
+		cliproxyexecutor.PinnedAuthMetadataKey: overloadedAuth.ID,
+		responseBindingPinnedAuthMetadataKey:   true,
+	}}
+	streamResult, errExecute := m.ExecuteStream(context.Background(), []string{"codex"}, cliproxyexecutor.Request{Model: model}, opts)
+	if errExecute != nil {
+		t.Fatalf("execute stream error = %v, want nil", errExecute)
+	}
+	var payload []byte
+	for chunk := range streamResult.Chunks {
+		if chunk.Err != nil {
+			t.Fatalf("stream chunk error = %v, want nil", chunk.Err)
+		}
+		payload = append(payload, chunk.Payload...)
+	}
+	if string(payload) != healthy.ID {
+		t.Fatalf("stream payload = %q, want %q", string(payload), healthy.ID)
+	}
+
+	calls := executor.StreamCalls()
+	wantCalls := []string{overloadedAuth.ID, healthy.ID}
 	if len(calls) != len(wantCalls) {
 		t.Fatalf("stream calls = %v, want %v", calls, wantCalls)
 	}

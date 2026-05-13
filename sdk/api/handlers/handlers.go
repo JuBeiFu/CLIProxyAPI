@@ -982,6 +982,9 @@ func (h *BaseAPIHandler) executeStreamWithAuthManager(ctx context.Context, handl
 		}
 
 		bootstrapEligible := func(err error) bool {
+			if coreauth.IsModelCapacityOrOverloadedError(err) {
+				return false
+			}
 			status := statusFromError(err)
 			if status == 0 {
 				return true

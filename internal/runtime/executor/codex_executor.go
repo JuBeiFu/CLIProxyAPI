@@ -2140,7 +2140,7 @@ func codexResponsesEventErrorBody(eventData []byte) ([]byte, int, bool) {
 		return nil, 0, false
 	}
 	eventType := strings.TrimSpace(gjson.GetBytes(eventData, "type").String())
-	if eventType != "response.failed" && eventType != "response.error" {
+	if eventType != "response.failed" && eventType != "response.error" && eventType != "error" {
 		return nil, 0, false
 	}
 	errNode := gjson.GetBytes(eventData, "response.error")
@@ -2152,10 +2152,16 @@ func codexResponsesEventErrorBody(eventData []byte) ([]byte, int, bool) {
 	}
 	body := []byte(`{}`)
 	body, _ = sjson.SetRawBytes(body, "error", []byte(errNode.Raw))
-	return body, codexResponsesEventErrorStatus(errNode), true
+	return body, codexResponsesEventErrorStatus(eventData, errNode), true
 }
 
-func codexResponsesEventErrorStatus(errNode gjson.Result) int {
+func codexResponsesEventErrorStatus(eventData []byte, errNode gjson.Result) int {
+	for _, path := range []string{"status", "response.status_code", "response.status"} {
+		status := int(gjson.GetBytes(eventData, path).Int())
+		if status >= 400 {
+			return status
+		}
+	}
 	code := strings.TrimSpace(errNode.Get("code").String())
 	errType := strings.TrimSpace(errNode.Get("type").String())
 	switch {

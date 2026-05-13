@@ -171,6 +171,29 @@ func TestNewCodexStatusErrTreatsSSEImageInputRateLimitAsRetryableRateLimit(t *te
 	}
 }
 
+func TestNewCodexStatusErrTreatsGenericSSEServerOverloadedAsRetryableRateLimit(t *testing.T) {
+	event := []byte(`{"type":"error","status":400,"error":{"message":"Our servers are currently overloaded. Please try again later.","type":"service_unavailable_error","code":"server_is_overloaded"}}`)
+	body, status, ok := codexResponsesEventErrorBody(event)
+	if !ok {
+		t.Fatal("expected generic SSE error body")
+	}
+	if status != http.StatusBadRequest {
+		t.Fatalf("event status = %d, want %d", status, http.StatusBadRequest)
+	}
+
+	err := newCodexStatusErr(status, body)
+
+	if got := err.StatusCode(); got != http.StatusTooManyRequests {
+		t.Fatalf("status code = %d, want %d", got, http.StatusTooManyRequests)
+	}
+	if err.RetryAfter() == nil {
+		t.Fatal("expected default retryAfter for overloaded fallback, got nil")
+	}
+	if *err.RetryAfter() != codexModelCapacityRetryAfter {
+		t.Fatalf("expected default retryAfter %v, got %v", codexModelCapacityRetryAfter, *err.RetryAfter())
+	}
+}
+
 func TestCodexResponsesEventCyberPolicyErrorBody(t *testing.T) {
 	event := []byte(`{"type":"response.failed","response":{"error":{"code":"cyber_policy","message":"This chat was flagged for possible cybersecurity risk"}}}`)
 
