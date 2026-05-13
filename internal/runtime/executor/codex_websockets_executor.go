@@ -1227,6 +1227,7 @@ func applyCodexWebsocketHeaders(ctx context.Context, headers http.Header, auth *
 		betaHeader = codexResponsesWebsocketBetaHeaderValue
 	}
 	headers.Set("OpenAI-Beta", betaHeader)
+	misc.EnsureHeader(headers, ginHeaders, "Session_id", "")
 	if strings.Contains(headers.Get("User-Agent"), "Mac OS") {
 		misc.EnsureHeader(headers, ginHeaders, "Session_id", uuid.NewString())
 	}

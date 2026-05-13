@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -58,6 +59,8 @@ const (
 	defaultStreamingKeepAliveSeconds = 0
 	defaultStreamingBootstrapRetries = 0
 )
+
+var authSessionIDPattern = regexp.MustCompile(`_session_([a-f0-9-]+)$`)
 
 type pinnedAuthContextKey struct{}
 type selectedAuthCallbackContextKey struct{}
@@ -360,11 +363,36 @@ func populateAuthSessionMetadata(meta map[string]any, ctx context.Context, rawJS
 }
 
 func requestAuthSessionID(ctx context.Context, rawJSON []byte) string {
+	if len(rawJSON) > 0 {
+		userID := strings.TrimSpace(gjson.GetBytes(rawJSON, "metadata.user_id").String())
+		if userID != "" {
+			if matches := authSessionIDPattern.FindStringSubmatch(userID); len(matches) >= 2 {
+				return "claude:" + strings.TrimSpace(matches[1])
+			}
+			if strings.HasPrefix(userID, "{") {
+				if sessionID := strings.TrimSpace(gjson.Get(userID, "session_id").String()); sessionID != "" {
+					return "claude:" + sessionID
+				}
+			}
+		}
+	}
+
 	if ctx != nil {
 		if ginCtx, ok := ctx.Value("gin").(*gin.Context); ok && ginCtx != nil && ginCtx.Request != nil {
-			for _, header := range []string{"session_id", "conversation_id"} {
-				if value := strings.TrimSpace(ginCtx.GetHeader(header)); value != "" {
-					return value
+			headers := ginCtx.Request.Header
+			for _, source := range []struct {
+				header string
+				prefix string
+			}{
+				{header: "X-Session-ID", prefix: "header:"},
+				{header: "Session_id", prefix: "codex:"},
+				{header: "session_id", prefix: "codex:"},
+				{header: "conversation_id", prefix: "conv:"},
+				{header: "X-Amp-Thread-Id", prefix: "amp:"},
+				{header: "X-Client-Request-Id", prefix: "clientreq:"},
+			} {
+				if value := requestHeaderValue(headers, source.header); value != "" {
+					return source.prefix + value
 				}
 			}
 		}
@@ -372,9 +400,41 @@ func requestAuthSessionID(ctx context.Context, rawJSON []byte) string {
 	if len(rawJSON) == 0 {
 		return ""
 	}
-	for _, path := range []string{"session_id", "conversation_id", "prompt_cache_key"} {
-		if value := strings.TrimSpace(gjson.GetBytes(rawJSON, path).String()); value != "" {
-			return value
+
+	if userID := strings.TrimSpace(gjson.GetBytes(rawJSON, "metadata.user_id").String()); userID != "" {
+		return "user:" + userID
+	}
+	for _, source := range []struct {
+		path   string
+		prefix string
+	}{
+		{path: "session_id", prefix: "codex:"},
+		{path: "conversation_id", prefix: "conv:"},
+		{path: "prompt_cache_key", prefix: "codex:"},
+	} {
+		if value := strings.TrimSpace(gjson.GetBytes(rawJSON, source.path).String()); value != "" {
+			return source.prefix + value
+		}
+	}
+	return ""
+}
+
+func requestHeaderValue(headers http.Header, key string) string {
+	key = strings.TrimSpace(key)
+	if headers == nil || key == "" {
+		return ""
+	}
+	if value := strings.TrimSpace(headers.Get(key)); value != "" {
+		return value
+	}
+	for candidateKey, values := range headers {
+		if !strings.EqualFold(candidateKey, key) {
+			continue
+		}
+		for _, value := range values {
+			if trimmed := strings.TrimSpace(value); trimmed != "" {
+				return trimmed
+			}
 		}
 	}
 	return ""

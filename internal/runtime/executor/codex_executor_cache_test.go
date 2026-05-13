@@ -68,6 +68,36 @@ func TestCodexExecutorCacheHelper_OpenAIChatCompletions_StablePromptCacheKeyFrom
 	}
 }
 
+func TestCodexExecutorCacheHelper_OpenAIResponsesUsesSessionHeaderAsPromptCacheKey(t *testing.T) {
+	ctx := contextWithGinHeaders(map[string]string{
+		"Session_id": "sess-from-header",
+	})
+	executor := &CodexExecutor{}
+	rawJSON := []byte(`{"model":"gpt-5.4","stream":true}`)
+	req := cliproxyexecutor.Request{
+		Model:   "gpt-5.4",
+		Payload: rawJSON,
+	}
+	url := "https://example.com/responses"
+
+	httpReq, err := executor.cacheHelper(ctx, sdktranslator.FromString("openai-response"), url, req, rawJSON)
+	if err != nil {
+		t.Fatalf("cacheHelper error: %v", err)
+	}
+
+	body, errRead := io.ReadAll(httpReq.Body)
+	if errRead != nil {
+		t.Fatalf("read request body: %v", errRead)
+	}
+
+	if gotKey := gjson.GetBytes(body, "prompt_cache_key").String(); gotKey != "sess-from-header" {
+		t.Fatalf("prompt_cache_key = %q, want %q", gotKey, "sess-from-header")
+	}
+	if gotSession := httpReq.Header.Get("Session_id"); gotSession != "sess-from-header" {
+		t.Fatalf("Session_id = %q, want %q", gotSession, "sess-from-header")
+	}
+}
+
 func TestCodexExecutorCacheHelper_LargePayloadPromptCacheKeyAllocationsStayBounded(t *testing.T) {
 	recorder := httptest.NewRecorder()
 	ginCtx, _ := gin.CreateTestContext(recorder)
