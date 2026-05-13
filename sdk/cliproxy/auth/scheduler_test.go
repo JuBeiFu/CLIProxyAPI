@@ -1688,14 +1688,11 @@ func TestManagerExecute_ImageGenerationUsesDifferentAuthWhileFirstAuthIsBusy(t *
 	}
 }
 
-func TestManagerExecute_ImageGenerationReturnsBusyWhenOnlyAuthIsBusy(t *testing.T) {
+func TestManagerExecute_ImageGenerationAllowsSameAuthUntilConcurrencyLimit(t *testing.T) {
 	t.Parallel()
 
 	manager := NewManager(nil, &RoundRobinSelector{}, nil)
-	manager.SetRetryConfig(0, 5*time.Second, 5)
 	executor := newBlockingSelectionExecutor()
-	executor.started["auth-a"] = make(chan struct{})
-	executor.blockExec["auth-a"] = make(chan struct{})
 	manager.RegisterExecutor(executor)
 
 	if _, errRegister := manager.Register(context.Background(), &Auth{ID: "auth-a", Provider: "gemini"}); errRegister != nil {
@@ -1708,49 +1705,143 @@ func TestManagerExecute_ImageGenerationReturnsBusyWhenOnlyAuthIsBusy(t *testing.
 		},
 	}
 
-	firstErrCh := make(chan error, 1)
-	go func() {
-		_, errExecute := manager.Execute(context.Background(), []string{"gemini"}, cliproxyexecutor.Request{}, imageOpts)
-		firstErrCh <- errExecute
+	preLeases := make([]*imageAuthLease, 0, imageAuthConcurrencyLimit()-1)
+	for i := 0; i < imageAuthConcurrencyLimit()-1; i++ {
+		lease, ok := manager.tryAcquireImageAuthLease("auth-a")
+		if !ok {
+			t.Fatalf("pre-acquire image lease #%d failed", i+1)
+		}
+		preLeases = append(preLeases, lease)
+	}
+	defer func() {
+		for _, lease := range preLeases {
+			lease.Release()
+		}
 	}()
 
-	select {
-	case <-executor.started["auth-a"]:
-	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for auth-a image generation to start")
+	resp, errExecute := manager.Execute(context.Background(), []string{"gemini"}, cliproxyexecutor.Request{}, imageOpts)
+	if errExecute != nil {
+		t.Fatalf("Execute() error = %v", errExecute)
 	}
+	if got := string(resp.Payload); got != "auth-a" {
+		t.Fatalf("Execute() payload = %q, want %q", got, "auth-a")
+	}
+}
 
-	_, errExecute := manager.Execute(context.Background(), []string{"gemini"}, cliproxyexecutor.Request{}, imageOpts)
-	if errExecute == nil {
-		t.Fatal("second image Execute() error = nil, want image auth busy")
-	}
-	var authErr *Error
-	if !errors.As(errExecute, &authErr) {
-		t.Fatalf("second image Execute() error type = %T, want *Error", errExecute)
-	}
-	if authErr.Code != "image_auth_busy" {
-		t.Fatalf("second image Execute() code = %q, want image_auth_busy", authErr.Code)
-	}
-	if authErr.StatusCode() != http.StatusServiceUnavailable {
-		t.Fatalf("second image Execute() status = %d, want %d", authErr.StatusCode(), http.StatusServiceUnavailable)
-	}
-	var headerErr interface{ Headers() http.Header }
-	if !errors.As(errExecute, &headerErr) {
-		t.Fatalf("second image Execute() error lacks Headers()")
-	}
-	if got := headerErr.Headers().Get("Retry-After"); got != "10" {
-		t.Fatalf("second image Execute() Retry-After = %q, want 10", got)
-	}
+func TestManagerImageAuthLeaseRejectsAtConcurrencyLimit(t *testing.T) {
+	t.Parallel()
 
-	close(executor.blockExec["auth-a"])
-
-	select {
-	case errFirst := <-firstErrCh:
-		if errFirst != nil {
-			t.Fatalf("first image Execute() error = %v", errFirst)
+	manager := NewManager(nil, &RoundRobinSelector{}, nil)
+	leases := make([]*imageAuthLease, 0, imageAuthConcurrencyLimit())
+	for i := 0; i < imageAuthConcurrencyLimit(); i++ {
+		lease, ok := manager.tryAcquireImageAuthLease("auth-a")
+		if !ok {
+			t.Fatalf("Acquire image lease #%d failed", i+1)
 		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for first image Execute() completion")
+		leases = append(leases, lease)
+	}
+	defer func() {
+		for _, lease := range leases {
+			lease.Release()
+		}
+	}()
+
+	if lease, ok := manager.tryAcquireImageAuthLease("auth-a"); ok {
+		lease.Release()
+		t.Fatal("Acquire image lease beyond limit succeeded")
+	}
+}
+
+func TestManagerExecute_ImageGenerationOnlyAuthSkippedForNormalRequest(t *testing.T) {
+	t.Parallel()
+
+	manager := NewManager(nil, &RoundRobinSelector{}, nil)
+	executor := newBlockingSelectionExecutor()
+	manager.RegisterExecutor(executor)
+
+	if _, errRegister := manager.Register(context.Background(), &Auth{ID: "auth-image", Provider: "gemini", Attributes: map[string]string{"image_generation_only": "true"}}); errRegister != nil {
+		t.Fatalf("Register(auth-image) error = %v", errRegister)
+	}
+	if _, errRegister := manager.Register(context.Background(), &Auth{ID: "auth-normal", Provider: "gemini"}); errRegister != nil {
+		t.Fatalf("Register(auth-normal) error = %v", errRegister)
+	}
+
+	resp, errExecute := manager.Execute(context.Background(), []string{"gemini"}, cliproxyexecutor.Request{}, cliproxyexecutor.Options{})
+	if errExecute != nil {
+		t.Fatalf("Execute() error = %v", errExecute)
+	}
+	if got := string(resp.Payload); got != "auth-normal" {
+		t.Fatalf("Execute() payload = %q, want %q", got, "auth-normal")
+	}
+}
+
+func TestManagerExecute_ImageGenerationPrefersDedicatedAuth(t *testing.T) {
+	t.Parallel()
+
+	manager := NewManager(nil, &RoundRobinSelector{}, nil)
+	executor := newBlockingSelectionExecutor()
+	manager.RegisterExecutor(executor)
+
+	if _, errRegister := manager.Register(context.Background(), &Auth{ID: "auth-normal", Provider: "gemini"}); errRegister != nil {
+		t.Fatalf("Register(auth-normal) error = %v", errRegister)
+	}
+	if _, errRegister := manager.Register(context.Background(), &Auth{ID: "auth-image", Provider: "gemini", Metadata: map[string]any{"image_generation_only": true}}); errRegister != nil {
+		t.Fatalf("Register(auth-image) error = %v", errRegister)
+	}
+
+	imageOpts := cliproxyexecutor.Options{
+		Metadata: map[string]any{
+			cliproxyexecutor.ImageGenerationRequestMetadataKey: true,
+		},
+	}
+	resp, errExecute := manager.Execute(context.Background(), []string{"gemini"}, cliproxyexecutor.Request{}, imageOpts)
+	if errExecute != nil {
+		t.Fatalf("Execute() error = %v", errExecute)
+	}
+	if got := string(resp.Payload); got != "auth-image" {
+		t.Fatalf("Execute() payload = %q, want %q", got, "auth-image")
+	}
+}
+
+func TestManagerExecute_ImageGenerationFallsBackToIdleNormalAuthWhenDedicatedAtLimit(t *testing.T) {
+	t.Parallel()
+
+	manager := NewManager(nil, &RoundRobinSelector{}, nil)
+	executor := newBlockingSelectionExecutor()
+	manager.RegisterExecutor(executor)
+
+	if _, errRegister := manager.Register(context.Background(), &Auth{ID: "auth-image", Provider: "gemini", Attributes: map[string]string{"image_generation_only": "true"}}); errRegister != nil {
+		t.Fatalf("Register(auth-image) error = %v", errRegister)
+	}
+	if _, errRegister := manager.Register(context.Background(), &Auth{ID: "auth-normal", Provider: "gemini"}); errRegister != nil {
+		t.Fatalf("Register(auth-normal) error = %v", errRegister)
+	}
+
+	leases := make([]*imageAuthLease, 0, imageAuthConcurrencyLimit())
+	for i := 0; i < imageAuthConcurrencyLimit(); i++ {
+		lease, ok := manager.tryAcquireImageAuthLease("auth-image")
+		if !ok {
+			t.Fatalf("Acquire image lease #%d failed", i+1)
+		}
+		leases = append(leases, lease)
+	}
+	defer func() {
+		for _, lease := range leases {
+			lease.Release()
+		}
+	}()
+
+	imageOpts := cliproxyexecutor.Options{
+		Metadata: map[string]any{
+			cliproxyexecutor.ImageGenerationRequestMetadataKey: true,
+		},
+	}
+	resp, errExecute := manager.Execute(context.Background(), []string{"gemini"}, cliproxyexecutor.Request{}, imageOpts)
+	if errExecute != nil {
+		t.Fatalf("Execute() error = %v", errExecute)
+	}
+	if got := string(resp.Payload); got != "auth-normal" {
+		t.Fatalf("Execute() payload = %q, want %q", got, "auth-normal")
 	}
 }
 

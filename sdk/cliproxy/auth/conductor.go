@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -105,6 +106,9 @@ const responseBindingPinnedAuthMetadataKey = "__cliproxy_response_binding_pinned
 const sessionBindingPinnedAuthMetadataKey = "__cliproxy_session_binding_pinned_auth"
 const selectionScopeAuthIDsMetadataKey = "__cliproxy_selection_scope_auth_ids"
 const retryExcludedAuthIDsMetadataKey = "__cliproxy_retry_excluded_auth_ids"
+const selectionScopeNoAuthID = "__cliproxy_no_auth__"
+
+const defaultImageAuthConcurrencyLimit = 20
 
 var quotaCooldownDisabled atomic.Bool
 
@@ -422,7 +426,7 @@ func newImageAuthBusyError() error {
 	return &imageAuthBusyStatusError{
 		inner: &Error{
 			Code:       "image_auth_busy",
-			Message:    "all eligible image generation auths are busy",
+			Message:    "all eligible image generation auths are at concurrency limit",
 			Retryable:  true,
 			HTTPStatus: http.StatusServiceUnavailable,
 		},
@@ -478,6 +482,43 @@ func (e *imageAuthBusyStatusError) RetryAfter() *time.Duration {
 	return &d
 }
 
+func imageAuthConcurrencyLimit() int {
+	limit := defaultImageAuthConcurrencyLimit
+	for _, key := range []string{"CLIPROXY_IMAGE_GENERATION_PER_AUTH_LIMIT", "CODEX_GPTDRAW_PER_AUTH_LIMIT"} {
+		raw := strings.TrimSpace(os.Getenv(key))
+		if raw == "" {
+			continue
+		}
+		parsed, err := strconv.Atoi(raw)
+		if err != nil || parsed <= 0 {
+			continue
+		}
+		limit = parsed
+		break
+	}
+	if limit > defaultImageAuthConcurrencyLimit {
+		return defaultImageAuthConcurrencyLimit
+	}
+	return limit
+}
+
+func (m *Manager) imageAuthInflightCount(authID string) int {
+	if m == nil {
+		return 0
+	}
+	authID = strings.TrimSpace(authID)
+	if authID == "" {
+		return 0
+	}
+	m.imageInflightMu.Lock()
+	defer m.imageInflightMu.Unlock()
+	return m.imageInflight[authID]
+}
+
+func (m *Manager) imageAuthHasCapacity(authID string) bool {
+	return m.imageAuthInflightCount(authID) < imageAuthConcurrencyLimit()
+}
+
 func (m *Manager) tryAcquireImageAuthLease(authID string) (*imageAuthLease, bool) {
 	if m == nil {
 		return nil, true
@@ -491,10 +532,10 @@ func (m *Manager) tryAcquireImageAuthLease(authID string) (*imageAuthLease, bool
 	if m.imageInflight == nil {
 		m.imageInflight = make(map[string]int)
 	}
-	if m.imageInflight[authID] > 0 {
+	if m.imageInflight[authID] >= imageAuthConcurrencyLimit() {
 		return nil, false
 	}
-	m.imageInflight[authID] = 1
+	m.imageInflight[authID]++
 	return &imageAuthLease{manager: m, authID: authID}, true
 }
 
@@ -1192,10 +1233,11 @@ func readStreamBootstrap(ctx context.Context, ch <-chan cliproxyexecutor.StreamC
 	}
 }
 
-func (m *Manager) wrapStreamResult(ctx context.Context, auth *Auth, provider, resultModel string, requestPayload []byte, headers http.Header, buffered []cliproxyexecutor.StreamChunk, remaining <-chan cliproxyexecutor.StreamChunk, lease *inflightLease) *cliproxyexecutor.StreamResult {
+func (m *Manager) wrapStreamResult(ctx context.Context, auth *Auth, provider, resultModel string, requestPayload []byte, headers http.Header, buffered []cliproxyexecutor.StreamChunk, remaining <-chan cliproxyexecutor.StreamChunk, lease *inflightLease, imageLease *imageAuthLease) *cliproxyexecutor.StreamResult {
 	out := make(chan cliproxyexecutor.StreamChunk)
 	go func() {
 		defer lease.Release()
+		defer imageLease.Release()
 		defer close(out)
 		var failed bool
 		forward := true
@@ -1282,11 +1324,12 @@ func discardHedgedAttempt(result *hedgedStreamBootstrapResult) {
 	discardStreamChunks(result.result.Chunks)
 }
 
-func (m *Manager) finalizeStreamAttempt(ctx context.Context, auth *Auth, provider, resultModel string, requestPayload []byte, lease *inflightLease, attempt hedgedStreamBootstrapResult) (*cliproxyexecutor.StreamResult, error) {
+func (m *Manager) finalizeStreamAttempt(ctx context.Context, auth *Auth, provider, resultModel string, requestPayload []byte, lease *inflightLease, imageLease *imageAuthLease, attempt hedgedStreamBootstrapResult) (*cliproxyexecutor.StreamResult, error) {
 	if attempt.err != nil {
 		if errCtx := ctx.Err(); errCtx != nil {
 			discardHedgedAttempt(&attempt)
 			lease.Release()
+			imageLease.Release()
 			return nil, errCtx
 		}
 		rerr := resultErrorFromError(attempt.err)
@@ -1295,6 +1338,7 @@ func (m *Manager) finalizeStreamAttempt(ctx context.Context, auth *Auth, provide
 		m.MarkResult(ctx, result)
 		discardHedgedAttempt(&attempt)
 		lease.Release()
+		imageLease.Release()
 		return nil, newStreamBootstrapError(attempt.err, attempt.resultHeaders())
 	}
 	if attempt.closed && len(attempt.buffered) == 0 {
@@ -1302,6 +1346,7 @@ func (m *Manager) finalizeStreamAttempt(ctx context.Context, auth *Auth, provide
 		result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: emptyErr, RequestPayload: bytes.Clone(requestPayload)}
 		m.MarkResult(ctx, result)
 		lease.Release()
+		imageLease.Release()
 		return nil, newStreamBootstrapError(emptyErr, attempt.resultHeaders())
 	}
 	remaining := attempt.result.Chunks
@@ -1310,7 +1355,7 @@ func (m *Manager) finalizeStreamAttempt(ctx context.Context, auth *Auth, provide
 		close(closedCh)
 		remaining = closedCh
 	}
-	return m.wrapStreamResult(ctx, auth.Clone(), provider, resultModel, requestPayload, attempt.result.Headers, attempt.buffered, remaining, lease), nil
+	return m.wrapStreamResult(ctx, auth.Clone(), provider, resultModel, requestPayload, attempt.result.Headers, attempt.buffered, remaining, lease, imageLease), nil
 }
 
 func (r hedgedStreamBootstrapResult) resultHeaders() http.Header {
@@ -1342,7 +1387,7 @@ func (m *Manager) codexRouteHedgeSettings(auth *Auth, provider string, execModel
 	return plan, cfg.CodexRouteManagement.FirstPayloadHedgeAfter, true
 }
 
-func (m *Manager) executeStreamWithCodexRouteHedge(ctx context.Context, executor ProviderExecutor, auth *Auth, provider, resultModel string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, lease *inflightLease, plan codexroute.AuthRoutePlan, hedgeAfter time.Duration) (*cliproxyexecutor.StreamResult, error) {
+func (m *Manager) executeStreamWithCodexRouteHedge(ctx context.Context, executor ProviderExecutor, auth *Auth, provider, resultModel string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, lease *inflightLease, imageLease *imageAuthLease, plan codexroute.AuthRoutePlan, hedgeAfter time.Duration) (*cliproxyexecutor.StreamResult, error) {
 	primaryCancel, primaryCh := m.startStreamBootstrapAttempt(ctx, executor, auth, req, opts, plan.Primary)
 
 	timer := time.NewTimer(hedgeAfter)
@@ -1375,6 +1420,7 @@ func (m *Manager) executeStreamWithCodexRouteHedge(ctx context.Context, executor
 		case <-ctx.Done():
 			cancelPending()
 			lease.Release()
+			imageLease.Release()
 			return nil, ctx.Err()
 		case result, ok := <-primaryCh:
 			if !ok {
@@ -1388,7 +1434,7 @@ func (m *Manager) executeStreamWithCodexRouteHedge(ctx context.Context, executor
 					standbyCancel()
 				}
 				discardHedgedAttempt(standbyResult)
-				return m.finalizeStreamAttempt(ctx, auth, provider, resultModel, req.Payload, lease, result)
+				return m.finalizeStreamAttempt(ctx, auth, provider, resultModel, req.Payload, lease, imageLease, result)
 			}
 			startStandby()
 		case <-timerCh:
@@ -1407,24 +1453,25 @@ func (m *Manager) executeStreamWithCodexRouteHedge(ctx context.Context, executor
 				if controller := m.codexRouteControllerValue(); controller != nil {
 					controller.MarkHedgeWinner(auth.ID, plan.Standby, time.Now())
 				}
-				return m.finalizeStreamAttempt(ctx, auth, provider, resultModel, req.Payload, lease, result)
+				return m.finalizeStreamAttempt(ctx, auth, provider, resultModel, req.Payload, lease, imageLease, result)
 			}
 		}
 		if primaryResult != nil && standbyCh == nil && standbyResult == nil && timerCh == nil {
-			return m.finalizeStreamAttempt(ctx, auth, provider, resultModel, req.Payload, lease, *primaryResult)
+			return m.finalizeStreamAttempt(ctx, auth, provider, resultModel, req.Payload, lease, imageLease, *primaryResult)
 		}
 		if primaryResult != nil && standbyResult != nil {
 			if standbyResult.err != nil {
-				return m.finalizeStreamAttempt(ctx, auth, provider, resultModel, req.Payload, lease, *primaryResult)
+				return m.finalizeStreamAttempt(ctx, auth, provider, resultModel, req.Payload, lease, imageLease, *primaryResult)
 			}
-			return m.finalizeStreamAttempt(ctx, auth, provider, resultModel, req.Payload, lease, *standbyResult)
+			return m.finalizeStreamAttempt(ctx, auth, provider, resultModel, req.Payload, lease, imageLease, *standbyResult)
 		}
 	}
 }
 
-func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor ProviderExecutor, auth *Auth, provider string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, routeModel string, execModels []string, pooled bool, lease *inflightLease) (*cliproxyexecutor.StreamResult, error) {
+func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor ProviderExecutor, auth *Auth, provider string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, routeModel string, execModels []string, pooled bool, lease *inflightLease, imageLease *imageAuthLease) (*cliproxyexecutor.StreamResult, error) {
 	if executor == nil {
 		lease.Release()
+		imageLease.Release()
 		return nil, &Error{Code: "executor_not_found", Message: "executor not registered"}
 	}
 	var lastErr error
@@ -1433,12 +1480,13 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 		execReq := req
 		execReq.Model = execModel
 		if routePlan, hedgeAfter, ok := m.codexRouteHedgeSettings(auth, provider, execModels); ok {
-			return m.executeStreamWithCodexRouteHedge(ctx, executor, auth, provider, resultModel, execReq, opts, lease, routePlan, hedgeAfter)
+			return m.executeStreamWithCodexRouteHedge(ctx, executor, auth, provider, resultModel, execReq, opts, lease, imageLease, routePlan, hedgeAfter)
 		}
 		streamResult, errStream := executor.ExecuteStream(ctx, auth, execReq, opts)
 		if errStream != nil {
 			if errCtx := ctx.Err(); errCtx != nil {
 				lease.Release()
+				imageLease.Release()
 				return nil, errCtx
 			}
 			rerr := resultErrorFromError(errStream)
@@ -1447,6 +1495,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			m.MarkResult(ctx, result)
 			if isRequestInvalidError(errStream) {
 				lease.Release()
+				imageLease.Release()
 				return nil, errStream
 			}
 			lastErr = errStream
@@ -1458,6 +1507,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			if errCtx := ctx.Err(); errCtx != nil {
 				discardStreamChunks(streamResult.Chunks)
 				lease.Release()
+				imageLease.Release()
 				return nil, errCtx
 			}
 			if isRequestInvalidError(bootstrapErr) {
@@ -1467,6 +1517,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 				m.MarkResult(ctx, result)
 				discardStreamChunks(streamResult.Chunks)
 				lease.Release()
+				imageLease.Release()
 				return nil, bootstrapErr
 			}
 			if idx < len(execModels)-1 {
@@ -1484,6 +1535,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			m.MarkResult(ctx, result)
 			discardStreamChunks(streamResult.Chunks)
 			lease.Release()
+			imageLease.Release()
 			return nil, newStreamBootstrapError(bootstrapErr, streamResult.Headers)
 		}
 
@@ -1496,6 +1548,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 				continue
 			}
 			lease.Release()
+			imageLease.Release()
 			return nil, newStreamBootstrapError(emptyErr, streamResult.Headers)
 		}
 
@@ -1505,12 +1558,13 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			close(closedCh)
 			remaining = closedCh
 		}
-		return m.wrapStreamResult(ctx, auth.Clone(), provider, resultModel, execReq.Payload, streamResult.Headers, buffered, remaining, lease), nil
+		return m.wrapStreamResult(ctx, auth.Clone(), provider, resultModel, execReq.Payload, streamResult.Headers, buffered, remaining, lease, imageLease), nil
 	}
 	if lastErr == nil {
 		lastErr = &Error{Code: "auth_not_found", Message: "no upstream model available"}
 	}
 	lease.Release()
+	imageLease.Release()
 	return nil, lastErr
 }
 
@@ -2116,6 +2170,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 	attempted := make(map[string]struct{})
 	usageLimitRetryCredentials := len(selectionScopeAuthIDs)
 	imageRequest := imageGenerationRequestFromMetadata(opts.Metadata)
+	imageFallbackActive := false
 	skippedBusyImageAuth := false
 	var lastErr error
 	for {
@@ -2134,6 +2189,17 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			}
 			if lastErr != nil {
 				return cliproxyexecutor.Response{}, lastErr
+			}
+			if imageRequest && skippedBusyImageAuth && !imageFallbackActive {
+				fallbackScope := m.imageFallbackSelectionScopeAuthIDs(providers, routeModel, opts)
+				if len(fallbackScope) > 0 {
+					opts = ensureSelectionScopeMetadata(opts, fallbackScope)
+					usageLimitRetryCredentials = len(fallbackScope)
+					tried = make(map[string]struct{})
+					imageFallbackActive = true
+					skippedBusyImageAuth = false
+					continue
+				}
 			}
 			if imageRequest && skippedBusyImageAuth {
 				return cliproxyexecutor.Response{}, newImageAuthBusyError()
@@ -2376,6 +2442,9 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 	tried := make(map[string]struct{})
 	attempted := make(map[string]struct{})
 	usageLimitRetryCredentials := len(selectionScopeAuthIDs)
+	imageRequest := imageGenerationRequestFromMetadata(opts.Metadata)
+	imageFallbackActive := false
+	skippedBusyImageAuth := false
 	var lastErr error
 	for {
 		if credentialRetryLimitReached(maxRetryCredentials, usageLimitRetryCredentials, len(attempted), lastErr) {
@@ -2402,7 +2471,32 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 				}
 				return nil, lastErr
 			}
+			if imageRequest && skippedBusyImageAuth && !imageFallbackActive {
+				fallbackScope := m.imageFallbackSelectionScopeAuthIDs(providers, routeModel, opts)
+				if len(fallbackScope) > 0 {
+					opts = ensureSelectionScopeMetadata(opts, fallbackScope)
+					usageLimitRetryCredentials = len(fallbackScope)
+					tried = make(map[string]struct{})
+					imageFallbackActive = true
+					skippedBusyImageAuth = false
+					continue
+				}
+			}
+			if imageRequest && skippedBusyImageAuth {
+				return nil, newImageAuthBusyError()
+			}
 			return nil, errPick
+		}
+
+		var imageLease *imageAuthLease
+		if imageRequest {
+			var ok bool
+			imageLease, ok = m.tryAcquireImageAuthLease(auth.ID)
+			if !ok {
+				skippedBusyImageAuth = true
+				tried[auth.ID] = struct{}{}
+				continue
+			}
 		}
 
 		entry := logEntryWithRequestID(ctx)
@@ -2421,6 +2515,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 		}
 		models, pooled := m.preparedExecutionModels(auth, routeModel)
 		if len(models) == 0 {
+			imageLease.Release()
 			continue
 		}
 		attempted[auth.ID] = struct{}{}
@@ -2428,12 +2523,12 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 		execReq, errExpand := m.expandPreviousResponseRequest(req, opts)
 		if errExpand != nil {
 			lease.Release()
+			imageLease.Release()
 			return nil, errExpand
 		}
-		streamResult, errStream := m.executeStreamWithModelPool(execCtx, executor, auth, provider, execReq, opts, routeModel, models, pooled, lease)
+		streamResult, errStream := m.executeStreamWithModelPool(execCtx, executor, auth, provider, execReq, opts, routeModel, models, pooled, lease, imageLease)
 		if errStream != nil {
 			if errCtx := execCtx.Err(); errCtx != nil {
-				lease.Release()
 				return nil, errCtx
 			}
 			if isTransientCooldownError(errStream) {
@@ -2442,10 +2537,8 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 				opts = clearSessionBindingPinnedAuthMetadata(opts, auth.ID)
 			}
 			if isRequestInvalidError(errStream) {
-				lease.Release()
 				return nil, errStream
 			}
-			lease.Release()
 			lastErr = errStream
 			continue
 		}
@@ -2626,8 +2719,11 @@ func appendRetryExcludedAuthMetadata(opts cliproxyexecutor.Options, authID strin
 }
 
 func ensureSelectionScopeMetadata(opts cliproxyexecutor.Options, allowed map[string]struct{}) cliproxyexecutor.Options {
-	if len(allowed) == 0 {
+	if allowed == nil {
 		return opts
+	}
+	if len(allowed) == 0 {
+		allowed = map[string]struct{}{selectionScopeNoAuthID: {}}
 	}
 	if len(opts.Metadata) == 0 {
 		opts.Metadata = map[string]any{selectionScopeAuthIDsMetadataKey: allowed}
@@ -3985,6 +4081,14 @@ func (m *Manager) usageLimitRetryCredentialCap(providers []string, routeModel st
 }
 
 func (m *Manager) selectionScopeAuthIDs(providers []string, routeModel string, opts cliproxyexecutor.Options) map[string]struct{} {
+	return m.selectionScopeAuthIDsFiltered(providers, routeModel, opts, false)
+}
+
+func (m *Manager) imageFallbackSelectionScopeAuthIDs(providers []string, routeModel string, opts cliproxyexecutor.Options) map[string]struct{} {
+	return m.selectionScopeAuthIDsFiltered(providers, routeModel, opts, true)
+}
+
+func (m *Manager) selectionScopeAuthIDsFiltered(providers []string, routeModel string, opts cliproxyexecutor.Options, imageFallbackNormalOnly bool) map[string]struct{} {
 	if m == nil || len(providers) == 0 {
 		return nil
 	}
@@ -4015,6 +4119,10 @@ func (m *Manager) selectionScopeAuthIDs(providers []string, routeModel string, o
 	now := time.Now()
 	registryRef := registry.GetGlobalRegistry()
 	allowed := make(map[string]struct{})
+	dedicatedImageAllowed := make(map[string]struct{})
+	ordinaryImageAllowed := make(map[string]struct{})
+	ordinaryIdleImageAllowed := make(map[string]struct{})
+	imageRequest := imageGenerationRequestFromMetadata(opts.Metadata)
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	for _, candidate := range m.auths {
@@ -4042,7 +4150,37 @@ func (m *Manager) selectionScopeAuthIDs(providers []string, routeModel string, o
 		if blocked {
 			continue
 		}
+		if imageRequest {
+			imageInflight := m.imageAuthInflightCount(candidate.ID)
+			if imageInflight >= imageAuthConcurrencyLimit() {
+				continue
+			}
+			if candidate.ImageGenerationOnly() {
+				if !imageFallbackNormalOnly {
+					dedicatedImageAllowed[candidate.ID] = struct{}{}
+				}
+				continue
+			}
+			ordinaryImageAllowed[candidate.ID] = struct{}{}
+			if imageInflight == 0 {
+				ordinaryIdleImageAllowed[candidate.ID] = struct{}{}
+			}
+			continue
+		}
+		if candidate.ImageGenerationOnly() {
+			continue
+		}
 		allowed[candidate.ID] = struct{}{}
+	}
+	if imageRequest {
+		switch {
+		case !imageFallbackNormalOnly && len(dedicatedImageAllowed) > 0:
+			allowed = dedicatedImageAllowed
+		case len(ordinaryIdleImageAllowed) > 0:
+			allowed = ordinaryIdleImageAllowed
+		default:
+			allowed = ordinaryImageAllowed
+		}
 	}
 	if excluded := retryExcludedAuthIDsFromMetadata(opts.Metadata); len(excluded) > 0 && len(allowed) > 1 {
 		remaining := len(allowed)

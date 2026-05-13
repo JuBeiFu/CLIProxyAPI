@@ -313,6 +313,41 @@ func (a *Auth) ToolPrefixDisabled() bool {
 	return false
 }
 
+// ImageGenerationOnly reports whether this credential is reserved for image generation.
+func (a *Auth) ImageGenerationOnly() bool {
+	if a == nil {
+		return false
+	}
+	keys := []string{
+		"image_generation_only",
+		"image-generation-only",
+		"image_only",
+		"image-only",
+		"gpt_draw_only",
+		"gptdraw_only",
+		"image_generation_dedicated",
+	}
+	if a.Attributes != nil {
+		for _, key := range keys {
+			if raw := strings.TrimSpace(a.Attributes[key]); raw != "" {
+				if parsed, ok := parseBoolAny(raw); ok {
+					return parsed
+				}
+			}
+		}
+	}
+	if a.Metadata != nil {
+		for _, key := range keys {
+			if raw, ok := a.Metadata[key]; ok {
+				if parsed, okParse := parseBoolAny(raw); okParse {
+					return parsed
+				}
+			}
+		}
+	}
+	return false
+}
+
 // WebsocketsEnabled reports whether this auth should be considered websocket-capable.
 // Explicit websocket flags take precedence. For Codex OAuth/auth-file credentials,
 // websocket support defaults to enabled unless explicitly disabled.

@@ -1314,7 +1314,7 @@ func TestManager_ExecuteStreamWithModelPoolDoesNotClonePayloadForActiveStream(t 
 	}, "codex", cliproxyexecutor.Request{
 		Model:   "gpt-5.4",
 		Payload: reqPayload,
-	}, cliproxyexecutor.Options{}, "gpt-5.4", []string{"gpt-5.4"}, false, &inflightLease{})
+	}, cliproxyexecutor.Options{}, "gpt-5.4", []string{"gpt-5.4"}, false, &inflightLease{}, nil)
 	runtime.ReadMemStats(&after)
 	if err != nil {
 		t.Fatalf("executeStreamWithModelPool() error = %v", err)
