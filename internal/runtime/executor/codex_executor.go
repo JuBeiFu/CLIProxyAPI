@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -853,6 +854,22 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 		return resp, err
 	}
 	helps.AppendAPIResponseChunk(ctx, e.cfg, data)
+	originalBytes := len(data)
+	data, trimmedTrailing, sanitizeErr := sanitizeCodexCompactResponseBody(data)
+	if sanitizeErr != nil {
+		err = newCodexCompactInvalidResponseErr(sanitizeErr)
+		helps.RecordAPIResponseError(ctx, e.cfg, err)
+		timing.streamErrText = err.Error()
+		return resp, err
+	}
+	if trimmedTrailing {
+		helps.LogWithRequestID(ctx).WithFields(log.Fields{
+			"original_bytes":  originalBytes,
+			"sanitized_bytes": len(data),
+			"trimmed_bytes":   originalBytes - len(data),
+			"model":           baseModel,
+		}).Warn("codex compact response contained trailing data; using first JSON object")
+	}
 	reporter.Publish(ctx, helps.ParseOpenAIUsage(data))
 	reporter.EnsurePublished(ctx)
 	timing.streamCompleted = true
@@ -863,6 +880,48 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 	proxypool.DefaultCodexFailoverManager().MarkSuccess(authID, codexResolutionMode(auth, resolution))
 	resp = cliproxyexecutor.Response{Payload: out, Headers: httpResp.Header.Clone()}
 	return resp, nil
+}
+
+func sanitizeCodexCompactResponseBody(data []byte) ([]byte, bool, error) {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 {
+		return nil, false, errors.New("empty compact response body")
+	}
+	decoder := json.NewDecoder(bytes.NewReader(trimmed))
+	var first json.RawMessage
+	if err := decoder.Decode(&first); err != nil {
+		return nil, false, fmt.Errorf("invalid compact response JSON: %w", err)
+	}
+	first = bytes.TrimSpace(first)
+	if len(first) == 0 {
+		return nil, false, errors.New("empty compact response JSON")
+	}
+	if first[0] != '{' {
+		return nil, false, errors.New("compact response JSON must be an object")
+	}
+	var extra json.RawMessage
+	if err := decoder.Decode(&extra); err == io.EOF {
+		return first, false, nil
+	}
+	return first, true, nil
+}
+
+func newCodexCompactInvalidResponseErr(cause error) statusErr {
+	message := "invalid compact response from upstream"
+	if cause != nil {
+		message = fmt.Sprintf("%s: %v", message, cause)
+	}
+	body, err := json.Marshal(map[string]any{
+		"error": map[string]string{
+			"code":    "invalid_upstream_compact_response",
+			"message": message,
+			"type":    "upstream_error",
+		},
+	})
+	if err != nil {
+		body = []byte(`{"error":{"code":"invalid_upstream_compact_response","message":"invalid compact response from upstream","type":"upstream_error"}}`)
+	}
+	return statusErr{code: http.StatusBadGateway, msg: string(body)}
 }
 
 func compactRequestHasInlineInput(body []byte) bool {

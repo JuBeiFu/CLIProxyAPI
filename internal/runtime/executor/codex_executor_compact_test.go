@@ -145,3 +145,69 @@ func TestCodexExecutorCompactPreservesPreviousResponseIDWithoutInput(t *testing.
 		t.Fatalf("previous_response_id = %q, want %q; body: %s", got, "resp-prev", string(gotBody))
 	}
 }
+
+func TestCodexExecutorCompactTrimsTrailingResponseData(t *testing.T) {
+	compactResponse := `{"id":"resp_1","object":"response.compaction","usage":{"input_tokens":1,"output_tokens":2,"total_tokens":3}}`
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(compactResponse + `{"error":{"message":"late upstream bytes"}}`))
+	}))
+	defer server.Close()
+
+	executor := NewCodexExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"base_url": server.URL,
+		"api_key":  "test",
+	}}
+
+	resp, err := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "gpt-5.4",
+		Payload: []byte(`{"model":"gpt-5.4","input":"hello"}`),
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("openai-response"),
+		Alt:          "responses/compact",
+		Stream:       false,
+	})
+	if err != nil {
+		t.Fatalf("Execute error: %v", err)
+	}
+	if string(resp.Payload) != compactResponse {
+		t.Fatalf("payload = %s, want %s", string(resp.Payload), compactResponse)
+	}
+}
+
+func TestCodexExecutorCompactRejectsInvalidResponseJSON(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp_1"`))
+	}))
+	defer server.Close()
+
+	executor := NewCodexExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"base_url": server.URL,
+		"api_key":  "test",
+	}}
+
+	_, err := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "gpt-5.4",
+		Payload: []byte(`{"model":"gpt-5.4","input":"hello"}`),
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("openai-response"),
+		Alt:          "responses/compact",
+		Stream:       false,
+	})
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	coded, ok := err.(interface{ StatusCode() int })
+	if !ok {
+		t.Fatalf("error does not expose status code: %T", err)
+	}
+	if got := coded.StatusCode(); got != http.StatusBadGateway {
+		t.Fatalf("status code = %d, want %d", got, http.StatusBadGateway)
+	}
+	if got := gjson.Get(err.Error(), "error.code").String(); got != "invalid_upstream_compact_response" {
+		t.Fatalf("error code = %q, want invalid_upstream_compact_response; err=%v", got, err)
+	}
+}
