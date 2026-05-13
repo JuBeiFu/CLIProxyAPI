@@ -18,8 +18,10 @@ import (
 	"github.com/gin-gonic/gin"
 	. "github.com/router-for-me/CLIProxyAPI/v6/internal/constant"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/interfaces"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/api/handlers"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
+	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
@@ -132,10 +134,59 @@ func (h *OpenAIAPIHandler) executeImagesResponsesPayload(c *gin.Context, respons
 		return
 	}
 
+	startedAt := time.Now()
+	var (
+		attempts              int
+		finalRouteModel       string
+		selectedAuthID        string
+		selectedAuthIDs       []string
+		upstreamDuration      time.Duration
+		lastAttemptDuration   time.Duration
+		convertDuration       time.Duration
+		writeDuration         time.Duration
+		upstreamResponseBytes int
+		openAIResponseBytes   int
+		logStatus             = http.StatusOK
+		logErr                string
+	)
+	defer func() {
+		logOpenAIImageGenerationTiming(c, log.Fields{
+			"attempts":                attempts,
+			"convert_ms":              convertDuration.Milliseconds(),
+			"final_route_model":       finalRouteModel,
+			"image_action":            imageToolStringFieldFromResponsesPayload(responsesJSON, "action", ""),
+			"image_quality":           imageToolStringFieldFromResponsesPayload(responsesJSON, "quality", ""),
+			"image_size":              imageToolStringFieldFromResponsesPayload(responsesJSON, "size", defaultImageGenerationSize),
+			"last_attempt_ms":         lastAttemptDuration.Milliseconds(),
+			"openai_response_bytes":   openAIResponseBytes,
+			"requested_model":         requestedModelName,
+			"route_model":             routeModelName,
+			"selected_auth_id":        selectedAuthID,
+			"selected_auth_ids":       strings.Join(selectedAuthIDs, ","),
+			"status":                  logStatus,
+			"tool_model":              imageToolModelFromResponsesPayload(responsesJSON),
+			"total_ms":                time.Since(startedAt).Milliseconds(),
+			"upstream_ms":             upstreamDuration.Milliseconds(),
+			"upstream_response_bytes": upstreamResponseBytes,
+			"write_ms":                writeDuration.Milliseconds(),
+			"error":                   logErr,
+		})
+	}()
+
 	c.Header("Content-Type", "application/json")
 	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
 	cliCtx = handlers.WithImageGenerationRequest(cliCtx)
 	cliCtx = handlers.WithImageGenerationModel(cliCtx, imageToolModelFromResponsesPayload(responsesJSON))
+	cliCtx = handlers.WithSelectedAuthIDCallback(cliCtx, func(authID string) {
+		authID = strings.TrimSpace(authID)
+		if authID == "" {
+			return
+		}
+		selectedAuthID = authID
+		if len(selectedAuthIDs) == 0 || selectedAuthIDs[len(selectedAuthIDs)-1] != authID {
+			selectedAuthIDs = append(selectedAuthIDs, authID)
+		}
+	})
 	cliCtx, timeoutCancel := context.WithTimeout(cliCtx, imageGenerationTimeout)
 	defer timeoutCancel()
 	stopKeepAlive := h.StartNonStreamingKeepAlive(c, cliCtx)
@@ -145,8 +196,12 @@ func (h *OpenAIAPIHandler) executeImagesResponsesPayload(c *gin.Context, respons
 		upstreamHeaders http.Header
 		errMsg          *interfaces.ErrorMessage
 	)
+	upstreamStartedAt := time.Now()
 	for index, candidate := range candidates {
+		attempts++
+		finalRouteModel = candidate.routeModelName
 		attemptPayload := setImagesResponsesMainModel(responsesJSON, candidate.routeModelName)
+		attemptStartedAt := time.Now()
 		resp, upstreamHeaders, errMsg = h.ExecuteWithAuthManagerRequestedModel(
 			cliCtx,
 			OpenaiResponse,
@@ -155,6 +210,7 @@ func (h *OpenAIAPIHandler) executeImagesResponsesPayload(c *gin.Context, respons
 			"",
 			candidate.requestedModelName,
 		)
+		lastAttemptDuration = time.Since(attemptStartedAt)
 		if errMsg == nil {
 			break
 		}
@@ -162,15 +218,25 @@ func (h *OpenAIAPIHandler) executeImagesResponsesPayload(c *gin.Context, respons
 			break
 		}
 	}
+	upstreamDuration = time.Since(upstreamStartedAt)
 	stopKeepAlive()
+	upstreamResponseBytes = len(resp)
 	if errMsg != nil {
+		logStatus = errMsg.StatusCode
+		if errMsg.Error != nil {
+			logErr = truncateOpenAIImageTimingError(errMsg.Error.Error())
+		}
 		h.WriteErrorResponse(c, errMsg)
 		cliCancel(errMsg.Error)
 		return
 	}
 
+	convertStartedAt := time.Now()
 	imageResp, err := convertResponsesImageToOpenAIImage(resp)
+	convertDuration = time.Since(convertStartedAt)
 	if err != nil {
+		logStatus = http.StatusBadGateway
+		logErr = truncateOpenAIImageTimingError(err.Error())
 		c.JSON(http.StatusBadGateway, handlers.ErrorResponse{
 			Error: handlers.ErrorDetail{
 				Message: err.Error(),
@@ -182,7 +248,16 @@ func (h *OpenAIAPIHandler) executeImagesResponsesPayload(c *gin.Context, respons
 	}
 
 	handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
-	_, _ = c.Writer.Write(imageResp)
+	writeStartedAt := time.Now()
+	written, writeErr := c.Writer.Write(imageResp)
+	writeDuration = time.Since(writeStartedAt)
+	openAIResponseBytes = written
+	if writeErr != nil {
+		logStatus = 499
+		logErr = truncateOpenAIImageTimingError(writeErr.Error())
+		cliCancel(writeErr)
+		return
+	}
 	cliCancel(imageResp)
 }
 
@@ -287,6 +362,50 @@ func imageToolModelFromResponsesPayload(payload []byte) string {
 		}
 	}
 	return defaultImagesToolModel
+}
+
+func imageToolStringFieldFromResponsesPayload(payload []byte, fieldName, fallback string) string {
+	fieldName = strings.TrimSpace(fieldName)
+	if fieldName == "" {
+		return fallback
+	}
+	tools := gjson.GetBytes(payload, "tools")
+	if !tools.Exists() || !tools.IsArray() {
+		return fallback
+	}
+	for _, tool := range tools.Array() {
+		if !strings.EqualFold(strings.TrimSpace(tool.Get("type").String()), "image_generation") {
+			continue
+		}
+		if value := strings.TrimSpace(tool.Get(fieldName).String()); value != "" {
+			return value
+		}
+	}
+	return fallback
+}
+
+func logOpenAIImageGenerationTiming(c *gin.Context, fields log.Fields) {
+	if c != nil {
+		if requestID := logging.GetGinRequestID(c); requestID != "" {
+			fields["request_id"] = requestID
+		}
+		if c.Request != nil {
+			fields["method"] = c.Request.Method
+			if c.Request.URL != nil {
+				fields["path"] = c.Request.URL.Path
+			}
+		}
+	}
+	log.WithFields(fields).Info("codex image generation timing")
+}
+
+func truncateOpenAIImageTimingError(message string) string {
+	message = strings.TrimSpace(message)
+	const maxLen = 500
+	if len(message) <= maxLen {
+		return message
+	}
+	return message[:maxLen] + "..."
 }
 
 func convertImagesGenerationRequestToResponses(rawJSON []byte) ([]byte, string, string, error) {
