@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/gin-gonic/gin"
@@ -76,10 +77,10 @@ func TestRequestAuthSessionIDExtractsOfficialHeaderSources(t *testing.T) {
 		value  string
 		want   string
 	}{
-		{name: "x-session-id", header: "X-Session-ID", value: "xsess-1", want: "header:xsess-1"},
+		{name: "x-session-id", header: "X-Session-ID", value: "xsess-1", want: "codex:xsess-1"},
 		{name: "codex-session-id", header: "Session_id", value: "sess-1", want: "codex:sess-1"},
+		{name: "conversation-id", header: "conversation_id", value: "conv-1", want: "conv:conv-1"},
 		{name: "amp-thread-id", header: "X-Amp-Thread-Id", value: "amp-1", want: "amp:amp-1"},
-		{name: "client-request-id", header: "X-Client-Request-Id", value: "req-1", want: "clientreq:req-1"},
 	}
 
 	for _, tt := range tests {
@@ -97,11 +98,41 @@ func TestRequestAuthSessionIDExtractsOfficialHeaderSources(t *testing.T) {
 	}
 }
 
+func TestRequestAuthSessionIDIgnoresClientRequestID(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	c.Request.Header.Set("X-Client-Request-Id", "req-1")
+	ctx := context.WithValue(context.Background(), "gin", c)
+
+	if got := requestAuthSessionID(ctx, []byte(`{"model":"gpt-5.4"}`)); got != "" {
+		t.Fatalf("requestAuthSessionID() = %q, want empty", got)
+	}
+}
+
 func TestRequestAuthSessionIDExtractsClaudeMetadataSession(t *testing.T) {
 	rawJSON := []byte(`{"metadata":{"user_id":"{\"session_id\":\"claude-session-1\"}"}}`)
 
 	if got := requestAuthSessionID(context.Background(), rawJSON); got != "claude:claude-session-1" {
 		t.Fatalf("requestAuthSessionID() = %q, want claude session", got)
+	}
+}
+
+func TestRequestAuthSessionIDPrefersClaudeMetadataSessionOverCodexHeaders(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+	c.Request.Header.Set("X-Session-ID", "codex-header-session")
+	c.Request.Header.Set("X-Amp-Thread-Id", "amp-thread")
+	ctx := context.WithValue(context.Background(), "gin", c)
+	rawJSON := []byte(`{"metadata":{"user_id":"{\"session_id\":\"claude-session-1\"}"}}`)
+
+	if got := requestAuthSessionID(ctx, rawJSON); got != "claude:claude-session-1" {
+		t.Fatalf("requestAuthSessionID() = %q, want claude metadata session", got)
 	}
 }
 
@@ -112,9 +143,9 @@ func TestRequestAuthSessionIDExtractsBodyFallbacks(t *testing.T) {
 		want string
 	}{
 		{name: "metadata-user", body: `{"metadata":{"user_id":"user-stable-1"}}`, want: "user:user-stable-1"},
+		{name: "prompt-cache-key", body: `{"prompt_cache_key":"pc-body-1","metadata":{"user_id":"user-stable-1"}}`, want: "codex:pc-body-1"},
 		{name: "session-id", body: `{"session_id":"sess-body-1"}`, want: "codex:sess-body-1"},
 		{name: "conversation-id", body: `{"conversation_id":"conv-body-1"}`, want: "conv:conv-body-1"},
-		{name: "prompt-cache-key", body: `{"prompt_cache_key":"pc-body-1"}`, want: "codex:pc-body-1"},
 	}
 
 	for _, tt := range tests {
@@ -123,6 +154,26 @@ func TestRequestAuthSessionIDExtractsBodyFallbacks(t *testing.T) {
 				t.Fatalf("requestAuthSessionID() = %q, want %q", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestRequestAuthSessionIDUsesContentFallback(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	c.Request.Header.Set("X-Oneapi-User-Id", "7")
+	c.Request.Header.Set("X-Oneapi-Token-Id", "11")
+	ctx := context.WithValue(context.Background(), "gin", c)
+
+	body := []byte(`{"model":"gpt-5.4","input":[{"role":"user","content":"hello"}]}`)
+	got := requestAuthSessionID(ctx, body)
+	if got == "" || got == "codex:hello" {
+		t.Fatalf("requestAuthSessionID() = %q, want derived content key", got)
+	}
+	if !strings.HasPrefix(got, "codex:compat_cs_") {
+		t.Fatalf("requestAuthSessionID() = %q, want codex content key", got)
 	}
 }
 

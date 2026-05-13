@@ -19,6 +19,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/logging"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/executor/helps"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
@@ -363,18 +364,8 @@ func populateAuthSessionMetadata(meta map[string]any, ctx context.Context, rawJS
 }
 
 func requestAuthSessionID(ctx context.Context, rawJSON []byte) string {
-	if len(rawJSON) > 0 {
-		userID := strings.TrimSpace(gjson.GetBytes(rawJSON, "metadata.user_id").String())
-		if userID != "" {
-			if matches := authSessionIDPattern.FindStringSubmatch(userID); len(matches) >= 2 {
-				return "claude:" + strings.TrimSpace(matches[1])
-			}
-			if strings.HasPrefix(userID, "{") {
-				if sessionID := strings.TrimSpace(gjson.Get(userID, "session_id").String()); sessionID != "" {
-					return "claude:" + sessionID
-				}
-			}
-		}
+	if sessionID := requestClaudeMetadataSessionID(rawJSON); sessionID != "" {
+		return sessionID
 	}
 
 	if ctx != nil {
@@ -384,12 +375,10 @@ func requestAuthSessionID(ctx context.Context, rawJSON []byte) string {
 				header string
 				prefix string
 			}{
-				{header: "X-Session-ID", prefix: "header:"},
 				{header: "Session_id", prefix: "codex:"},
 				{header: "session_id", prefix: "codex:"},
 				{header: "conversation_id", prefix: "conv:"},
-				{header: "X-Amp-Thread-Id", prefix: "amp:"},
-				{header: "X-Client-Request-Id", prefix: "clientreq:"},
+				{header: "X-Session-ID", prefix: "codex:"},
 			} {
 				if value := requestHeaderValue(headers, source.header); value != "" {
 					return source.prefix + value
@@ -397,6 +386,30 @@ func requestAuthSessionID(ctx context.Context, rawJSON []byte) string {
 			}
 		}
 	}
+
+	if len(rawJSON) > 0 {
+		for _, source := range []struct {
+			path   string
+			prefix string
+		}{
+			{path: "prompt_cache_key", prefix: "codex:"},
+			{path: "session_id", prefix: "codex:"},
+			{path: "conversation_id", prefix: "conv:"},
+		} {
+			if value := strings.TrimSpace(gjson.GetBytes(rawJSON, source.path).String()); value != "" {
+				return source.prefix + value
+			}
+		}
+	}
+
+	if ctx != nil {
+		if ginCtx, ok := ctx.Value("gin").(*gin.Context); ok && ginCtx != nil && ginCtx.Request != nil {
+			if value := requestHeaderValue(ginCtx.Request.Header, "X-Amp-Thread-Id"); value != "" {
+				return "amp:" + value
+			}
+		}
+	}
+
 	if len(rawJSON) == 0 {
 		return ""
 	}
@@ -404,19 +417,53 @@ func requestAuthSessionID(ctx context.Context, rawJSON []byte) string {
 	if userID := strings.TrimSpace(gjson.GetBytes(rawJSON, "metadata.user_id").String()); userID != "" {
 		return "user:" + userID
 	}
-	for _, source := range []struct {
-		path   string
-		prefix string
-	}{
-		{path: "session_id", prefix: "codex:"},
-		{path: "conversation_id", prefix: "conv:"},
-		{path: "prompt_cache_key", prefix: "codex:"},
-	} {
-		if value := strings.TrimSpace(gjson.GetBytes(rawJSON, source.path).String()); value != "" {
-			return source.prefix + value
+	if key := helps.DeriveCodexContentSessionKey(rawJSON, requestContentSessionNamespace(ctx)); key != "" {
+		return "codex:" + key
+	}
+	return ""
+}
+
+func requestClaudeMetadataSessionID(rawJSON []byte) string {
+	if len(rawJSON) == 0 {
+		return ""
+	}
+	userID := strings.TrimSpace(gjson.GetBytes(rawJSON, "metadata.user_id").String())
+	if userID == "" {
+		return ""
+	}
+	if matches := authSessionIDPattern.FindStringSubmatch(userID); len(matches) >= 2 {
+		return "claude:" + strings.TrimSpace(matches[1])
+	}
+	if strings.HasPrefix(userID, "{") {
+		if sessionID := strings.TrimSpace(gjson.Get(userID, "session_id").String()); sessionID != "" {
+			return "claude:" + sessionID
 		}
 	}
 	return ""
+}
+
+func requestContentSessionNamespace(ctx context.Context) string {
+	if ctx == nil {
+		return ""
+	}
+	ginCtx, ok := ctx.Value("gin").(*gin.Context)
+	if !ok || ginCtx == nil || ginCtx.Request == nil {
+		return ""
+	}
+	headers := ginCtx.Request.Header
+	parts := make([]string, 0, 2)
+	if userID := requestHeaderValue(headers, "X-Oneapi-User-Id"); userID != "" {
+		parts = append(parts, "user:"+userID)
+	}
+	if tokenID := requestHeaderValue(headers, "X-Oneapi-Token-Id"); tokenID != "" {
+		parts = append(parts, "token:"+tokenID)
+	}
+	if len(parts) == 0 {
+		if apiKey := strings.TrimSpace(helps.APIKeyFromContext(ctx)); apiKey != "" {
+			parts = append(parts, "api:"+uuid.NewSHA1(uuid.NameSpaceOID, []byte("cli-proxy-api:codex:content-session:"+apiKey)).String())
+		}
+	}
+	return strings.Join(parts, "|")
 }
 
 func requestHeaderValue(headers http.Header, key string) string {

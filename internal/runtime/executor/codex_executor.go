@@ -1941,22 +1941,46 @@ func applyRefreshedCodexTokenState(auth *cliproxyauth.Auth, storage *codexauth.C
 }
 
 func codexOpenAIResponsePromptCacheKey(ctx context.Context, req cliproxyexecutor.Request, rawJSON []byte) string {
-	for _, payload := range [][]byte{req.Payload, rawJSON} {
-		if value := strings.TrimSpace(gjson.GetBytes(payload, "prompt_cache_key").String()); value != "" {
-			return value
-		}
-	}
-	if value := codexRequestHeaderValue(ctx, "Session_id", "X-Session-ID"); value != "" {
+	if value := codexRequestHeaderValue(ctx, "Session_id", "session_id", "conversation_id", "X-Session-ID"); value != "" {
 		return value
 	}
 	for _, payload := range [][]byte{req.Payload, rawJSON} {
-		for _, path := range []string{"session_id", "conversation_id"} {
+		for _, path := range []string{"prompt_cache_key", "session_id", "conversation_id"} {
 			if value := strings.TrimSpace(gjson.GetBytes(payload, path).String()); value != "" {
 				return value
 			}
 		}
 	}
+	if value := codexRequestHeaderValue(ctx, "X-Amp-Thread-Id"); value != "" {
+		return value
+	}
+	for _, payload := range [][]byte{req.Payload, rawJSON} {
+		if key := helps.DeriveCodexContentSessionKey(payload, codexContentSessionNamespace(ctx)); key != "" {
+			return key
+		}
+	}
 	return ""
+}
+
+func codexContentSessionNamespace(ctx context.Context) string {
+	if ctx == nil {
+		return ""
+	}
+	userID := codexRequestHeaderValue(ctx, "X-Oneapi-User-Id")
+	tokenID := codexRequestHeaderValue(ctx, "X-Oneapi-Token-Id")
+	parts := make([]string, 0, 2)
+	if userID != "" {
+		parts = append(parts, "user:"+userID)
+	}
+	if tokenID != "" {
+		parts = append(parts, "token:"+tokenID)
+	}
+	if len(parts) == 0 {
+		if apiKey := strings.TrimSpace(helps.APIKeyFromContext(ctx)); apiKey != "" {
+			parts = append(parts, "api:"+uuid.NewSHA1(uuid.NameSpaceOID, []byte("cli-proxy-api:codex:content-session:"+apiKey)).String())
+		}
+	}
+	return strings.Join(parts, "|")
 }
 
 func codexRequestHeaderValue(ctx context.Context, names ...string) string {
@@ -2022,6 +2046,9 @@ func (e *CodexExecutor) cacheHelper(ctx context.Context, from sdktranslator.Form
 	}
 	if cache.ID != "" {
 		httpReq.Header.Set("Session_id", cache.ID)
+		if from == "openai-response" {
+			httpReq.Header.Set("Conversation_id", cache.ID)
+		}
 	}
 	return httpReq, nil
 }

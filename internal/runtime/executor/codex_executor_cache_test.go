@@ -96,6 +96,45 @@ func TestCodexExecutorCacheHelper_OpenAIResponsesUsesSessionHeaderAsPromptCacheK
 	if gotSession := httpReq.Header.Get("Session_id"); gotSession != "sess-from-header" {
 		t.Fatalf("Session_id = %q, want %q", gotSession, "sess-from-header")
 	}
+	if gotConversation := httpReq.Header.Get("Conversation_id"); gotConversation != "sess-from-header" {
+		t.Fatalf("Conversation_id = %q, want %q", gotConversation, "sess-from-header")
+	}
+}
+
+func TestCodexExecutorCacheHelper_OpenAIResponsesUsesContentFallback(t *testing.T) {
+	ctx := contextWithGinHeaders(map[string]string{
+		"X-Client-Request-Id": "per-request-id",
+		"X-Oneapi-User-Id":    "7",
+		"X-Oneapi-Token-Id":   "11",
+	})
+	executor := &CodexExecutor{}
+	rawJSON := []byte(`{"model":"gpt-5.4","stream":true,"input":[{"role":"user","content":"hello"}]}`)
+	req := cliproxyexecutor.Request{
+		Model:   "gpt-5.4",
+		Payload: rawJSON,
+	}
+	url := "https://example.com/responses"
+
+	httpReq, err := executor.cacheHelper(ctx, sdktranslator.FromString("openai-response"), url, req, rawJSON)
+	if err != nil {
+		t.Fatalf("cacheHelper error: %v", err)
+	}
+
+	body, errRead := io.ReadAll(httpReq.Body)
+	if errRead != nil {
+		t.Fatalf("read request body: %v", errRead)
+	}
+
+	gotKey := gjson.GetBytes(body, "prompt_cache_key").String()
+	if !strings.HasPrefix(gotKey, "compat_cs_") {
+		t.Fatalf("prompt_cache_key = %q, want content-derived key", gotKey)
+	}
+	if gotKey == "per-request-id" {
+		t.Fatalf("prompt_cache_key used per-request id")
+	}
+	if gotSession := httpReq.Header.Get("Session_id"); gotSession != gotKey {
+		t.Fatalf("Session_id = %q, want %q", gotSession, gotKey)
+	}
 }
 
 func TestCodexExecutorCacheHelper_LargePayloadPromptCacheKeyAllocationsStayBounded(t *testing.T) {
