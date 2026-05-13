@@ -96,10 +96,26 @@ func TestNewCodexStatusErrTreatsCapacityAsRetryableRateLimit(t *testing.T) {
 		t.Fatalf("status code = %d, want %d", got, http.StatusTooManyRequests)
 	}
 	if err.RetryAfter() == nil {
-		t.Fatal("expected 5m default retryAfter for capacity fallback, got nil")
+		t.Fatal("expected default retryAfter for capacity fallback, got nil")
 	}
-	if *err.RetryAfter() != 5*time.Minute {
-		t.Fatalf("expected 5m default, got %v", *err.RetryAfter())
+	if *err.RetryAfter() != codexModelCapacityRetryAfter {
+		t.Fatalf("expected default retryAfter %v, got %v", codexModelCapacityRetryAfter, *err.RetryAfter())
+	}
+}
+
+func TestNewCodexStatusErrTreatsServerOverloadedAsRetryableRateLimit(t *testing.T) {
+	body := []byte(`{"error":{"message":"Our servers are currently overloaded. Please try again later.","type":"service_unavailable_error","param":"","code":"server_is_overloaded"}}`)
+
+	err := newCodexStatusErr(http.StatusServiceUnavailable, body)
+
+	if got := err.StatusCode(); got != http.StatusTooManyRequests {
+		t.Fatalf("status code = %d, want %d", got, http.StatusTooManyRequests)
+	}
+	if err.RetryAfter() == nil {
+		t.Fatal("expected default retryAfter for overloaded fallback, got nil")
+	}
+	if *err.RetryAfter() != codexModelCapacityRetryAfter {
+		t.Fatalf("expected default retryAfter %v, got %v", codexModelCapacityRetryAfter, *err.RetryAfter())
 	}
 }
 
@@ -112,10 +128,10 @@ func TestNewCodexStatusErrTreatsCurrentModelUnavailableAsRetryableRateLimit(t *t
 		t.Fatalf("status code = %d, want %d", got, http.StatusTooManyRequests)
 	}
 	if err.RetryAfter() == nil {
-		t.Fatal("expected 5m default retryAfter for unavailable-model fallback, got nil")
+		t.Fatal("expected default retryAfter for unavailable-model fallback, got nil")
 	}
-	if *err.RetryAfter() != 5*time.Minute {
-		t.Fatalf("expected 5m default, got %v", *err.RetryAfter())
+	if *err.RetryAfter() != codexModelCapacityRetryAfter {
+		t.Fatalf("expected default retryAfter %v, got %v", codexModelCapacityRetryAfter, *err.RetryAfter())
 	}
 }
 
@@ -209,6 +225,23 @@ func TestParseCodexWebsocketErrorTreatsCapacityAsRetryableRateLimit(t *testing.T
 	}
 }
 
+func TestParseCodexWebsocketErrorTreatsServerOverloadedAsRetryableRateLimit(t *testing.T) {
+	payload := []byte(`{"type":"error","status":503,"error":{"message":"Our servers are currently overloaded. Please try again later.","type":"service_unavailable_error","code":"server_is_overloaded"}}`)
+
+	err, ok := parseCodexWebsocketError(payload)
+	if !ok {
+		t.Fatal("expected websocket error to be parsed")
+	}
+
+	statusCoder, ok := err.(interface{ StatusCode() int })
+	if !ok {
+		t.Fatalf("expected status coder, got %T", err)
+	}
+	if got := statusCoder.StatusCode(); got != http.StatusTooManyRequests {
+		t.Fatalf("status code = %d, want %d", got, http.StatusTooManyRequests)
+	}
+}
+
 func TestParseCodexWebsocketErrorTreatsCurrentModelUnavailableAsRetryableRateLimit(t *testing.T) {
 	payload := []byte(`{"type":"error","status":400,"error":{"message":"The requested model is currently unavailable. Please switch model."}}`)
 
@@ -261,8 +294,8 @@ func TestNewCodexStatusErr_CapacityErrorDefaultRetryAfter(t *testing.T) {
 	if err.retryAfter == nil {
 		t.Fatal("expected default retryAfter for capacity error, got nil")
 	}
-	if *err.retryAfter != 5*time.Minute {
-		t.Errorf("expected 5m default, got %v", *err.retryAfter)
+	if *err.retryAfter != codexModelCapacityRetryAfter {
+		t.Errorf("expected default retryAfter %v, got %v", codexModelCapacityRetryAfter, *err.retryAfter)
 	}
 }
 

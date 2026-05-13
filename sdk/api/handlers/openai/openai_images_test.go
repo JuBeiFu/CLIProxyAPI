@@ -537,3 +537,10 @@ func TestConvertResponsesImageToOpenAIImageIncludesMetadataAndRevisedPrompt(t *t
 		t.Fatalf("revised_prompt = %q, want refined prompt; body=%s", got, string(out))
 	}
 }
+
+func TestImagesMainModelUnavailableMessageTreatsServerOverloadedAsFallback(t *testing.T) {
+	message := `{"error":{"message":"Our servers are currently overloaded. Please try again later.","type":"service_unavailable_error","code":"server_is_overloaded"}}`
+	if !isImagesMainModelUnavailableMessage(message) {
+		t.Fatal("expected server_is_overloaded to trigger image main model fallback")
+	}
+}

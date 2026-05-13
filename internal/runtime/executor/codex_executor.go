@@ -2108,6 +2108,8 @@ func applyCodexHeaders(r *http.Request, auth *cliproxyauth.Auth, token string, s
 	util.ApplyCustomHeadersFromAttrs(r, attrs)
 }
 
+const codexModelCapacityRetryAfter = 15 * time.Second
+
 func newCodexStatusErr(statusCode int, body []byte) statusErr {
 	errCode := statusCode
 	if isCodexModelCapacityError(body) {
@@ -2122,7 +2124,7 @@ func newCodexStatusErr(statusCode int, body []byte) statusErr {
 		err.retryAfter = retryAfter
 	}
 	if err.code == http.StatusTooManyRequests && err.retryAfter == nil && isCodexModelCapacityError(body) {
-		fallback := 5 * time.Minute
+		fallback := codexModelCapacityRetryAfter
 		err.retryAfter = &fallback
 	}
 	return err
@@ -2264,6 +2266,11 @@ func isCodexModelCapacityError(errorBody []byte) bool {
 	if len(errorBody) == 0 {
 		return false
 	}
+	code := strings.ToLower(strings.TrimSpace(gjson.GetBytes(errorBody, "error.code").String()))
+	errType := strings.ToLower(strings.TrimSpace(gjson.GetBytes(errorBody, "error.type").String()))
+	if code == "server_is_overloaded" || errType == "service_unavailable_error" {
+		return true
+	}
 	candidates := []string{
 		gjson.GetBytes(errorBody, "error.message").String(),
 		gjson.GetBytes(errorBody, "message").String(),
@@ -2276,6 +2283,8 @@ func isCodexModelCapacityError(errorBody []byte) bool {
 		}
 		if strings.Contains(lower, "selected model is at capacity") ||
 			strings.Contains(lower, "model is at capacity. please try a different model") ||
+			strings.Contains(lower, "servers are currently overloaded") ||
+			strings.Contains(lower, "server_is_overloaded") ||
 			strings.Contains(lower, "requested model is currently unavailable") ||
 			strings.Contains(lower, "current model is unavailable") ||
 			(strings.Contains(lower, "model unavailable") && strings.Contains(lower, "switch model")) {
