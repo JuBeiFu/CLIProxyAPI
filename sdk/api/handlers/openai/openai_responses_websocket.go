@@ -104,11 +104,9 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 		appendWebsocketTimelineEvent(&wsTimelineLog, "request", payload, time.Now())
 
 		allowIncrementalInputWithPreviousResponseID := false
-		currentAuthSupportsIncrementalInput := false
 		if currentAuthID != "" && h != nil && h.AuthManager != nil {
 			if currentAuth, ok := h.AuthManager.GetByID(currentAuthID); ok && currentAuth != nil {
-				currentAuthSupportsIncrementalInput = websocketUpstreamSupportsIncrementalInput(currentAuth)
-				allowIncrementalInputWithPreviousResponseID = currentAuthSupportsIncrementalInput
+				allowIncrementalInputWithPreviousResponseID = websocketUpstreamSupportsIncrementalInput(currentAuth)
 			}
 		} else {
 			requestModelName := strings.TrimSpace(gjson.GetBytes(payload, "model").String())
@@ -177,7 +175,6 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 			cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
 			cliCtx = cliproxyexecutor.WithDownstreamWebsocket(cliCtx)
 			cliCtx = handlers.WithExecutionSessionID(cliCtx, sessionID)
-			cliCtx = handlers.WithAuthSessionID(cliCtx, "responses-ws:"+sessionID)
 			if pinAuthID != "" {
 				selectedAuthID = pinAuthID
 				cliCtx = handlers.WithPinnedAuthID(cliCtx, pinAuthID)
@@ -191,16 +188,10 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 		}
 
 		pinAuthID := ""
-		if len(lastRequestBeforeTurn) > 0 && !allowIncrementalInputWithPreviousResponseID {
-			if h != nil && h.AuthManager != nil {
-				h.AuthManager.CloseExecutionSession(currentExecutionSessionID)
+		if currentAuthID != "" && h != nil && h.AuthManager != nil {
+			if currentAuth, ok := h.AuthManager.GetByID(currentAuthID); ok && currentAuth != nil && websocketUpstreamSupportsIncrementalInput(currentAuth) {
+				pinAuthID = currentAuthID
 			}
-			currentExecutionSessionID = uuid.NewString()
-			currentAuthID = ""
-			currentAuthSupportsIncrementalInput = false
-		}
-		if currentAuthID != "" && currentAuthSupportsIncrementalInput {
-			pinAuthID = currentAuthID
 		}
 
 		lastRequest = finalLastRequest
@@ -603,7 +594,7 @@ func dedupeFunctionCallsByCallID(rawArray string) (string, error) {
 }
 
 func websocketUpstreamSupportsIncrementalInput(auth *coreauth.Auth) bool {
-	return auth != nil && strings.EqualFold(strings.TrimSpace(auth.Provider), "codex") && auth.WebsocketsEnabled()
+	return false
 }
 
 func readResponsesWebsocketImmediateError(errs <-chan *interfaces.ErrorMessage) *interfaces.ErrorMessage {

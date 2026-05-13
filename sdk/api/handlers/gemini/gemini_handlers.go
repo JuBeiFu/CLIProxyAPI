@@ -188,13 +188,13 @@ func (h *GeminiAPIHandler) handleStreamGenerateContent(c *gin.Context, modelName
 	}
 
 	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
-	var dataChan <-chan []byte
-	var upstreamHeaders http.Header
-	var errChan <-chan *interfaces.ErrorMessage
-	if alt == "" {
-		dataChan, upstreamHeaders, errChan = h.ExecuteStreamWithAuthManagerPrecommit(cliCtx, c, flusher, h.HandlerType(), modelName, rawJSON, alt)
-	} else {
-		dataChan, upstreamHeaders, errChan = h.ExecuteStreamWithAuthManager(cliCtx, h.HandlerType(), modelName, rawJSON, alt)
+	dataChan, upstreamHeaders, errChan := h.ExecuteStreamWithAuthManager(cliCtx, h.HandlerType(), modelName, rawJSON, alt)
+
+	setSSEHeaders := func() {
+		c.Header("Content-Type", "text/event-stream")
+		c.Header("Cache-Control", "no-cache")
+		c.Header("Connection", "keep-alive")
+		c.Header("Access-Control-Allow-Origin", "*")
 	}
 
 	// Peek at the first chunk
@@ -209,13 +209,8 @@ func (h *GeminiAPIHandler) handleStreamGenerateContent(c *gin.Context, modelName
 				errChan = nil
 				continue
 			}
-			if alt == "" && c.Writer.Written() {
-				handlers.PrepareEventStreamHeaders(c, upstreamHeaders)
-				writeGeminiStreamError(c, errMsg, alt)
-				flusher.Flush()
-			} else {
-				h.WriteErrorResponse(c, errMsg)
-			}
+			// Upstream failed immediately. Return proper error status and JSON.
+			h.WriteErrorResponse(c, errMsg)
 			if errMsg != nil {
 				cliCancel(errMsg.Error)
 			} else {
@@ -226,10 +221,9 @@ func (h *GeminiAPIHandler) handleStreamGenerateContent(c *gin.Context, modelName
 			if !ok {
 				// Closed without data
 				if alt == "" {
-					handlers.PrepareEventStreamHeaders(c, upstreamHeaders)
-				} else {
-					handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
+					setSSEHeaders()
 				}
+				handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
 				flusher.Flush()
 				cliCancel(nil)
 				return
@@ -237,10 +231,9 @@ func (h *GeminiAPIHandler) handleStreamGenerateContent(c *gin.Context, modelName
 
 			// Success! Set headers.
 			if alt == "" {
-				handlers.PrepareEventStreamHeaders(c, upstreamHeaders)
-			} else {
-				handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
+				setSSEHeaders()
 			}
+			handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
 
 			// Write first chunk
 			if alt == "" {
@@ -326,27 +319,23 @@ func (h *GeminiAPIHandler) forwardGeminiStream(c *gin.Context, flusher http.Flus
 			}
 		},
 		WriteTerminalError: func(errMsg *interfaces.ErrorMessage) {
-			writeGeminiStreamError(c, errMsg, alt)
+			if errMsg == nil {
+				return
+			}
+			status := http.StatusInternalServerError
+			if errMsg.StatusCode > 0 {
+				status = errMsg.StatusCode
+			}
+			errText := http.StatusText(status)
+			if errMsg.Error != nil && errMsg.Error.Error() != "" {
+				errText = errMsg.Error.Error()
+			}
+			body := handlers.BuildErrorResponseBody(status, errText)
+			if alt == "" {
+				_, _ = fmt.Fprintf(c.Writer, "event: error\ndata: %s\n\n", string(body))
+			} else {
+				_, _ = c.Writer.Write(body)
+			}
 		},
 	})
-}
-
-func writeGeminiStreamError(c *gin.Context, errMsg *interfaces.ErrorMessage, alt string) {
-	if c == nil || errMsg == nil {
-		return
-	}
-	status := http.StatusInternalServerError
-	if errMsg.StatusCode > 0 {
-		status = errMsg.StatusCode
-	}
-	errText := http.StatusText(status)
-	if errMsg.Error != nil && errMsg.Error.Error() != "" {
-		errText = errMsg.Error.Error()
-	}
-	body := handlers.BuildErrorResponseBody(status, errText)
-	if alt == "" {
-		_, _ = fmt.Fprintf(c.Writer, "event: error\ndata: %s\n\n", string(body))
-		return
-	}
-	_, _ = c.Writer.Write(body)
 }

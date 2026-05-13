@@ -69,13 +69,18 @@ func (h *OpenAIAPIHandler) executeImagesStreamingResponsesPayload(c *gin.Context
 	cliCtx, timeoutCancel := context.WithTimeout(cliCtx, imageGenerationTimeout)
 	defer timeoutCancel()
 
+	setSSEHeaders := func() {
+		c.Header("Content-Type", "text/event-stream")
+		c.Header("Cache-Control", "no-cache")
+		c.Header("Connection", "keep-alive")
+		c.Header("Access-Control-Allow-Origin", "*")
+	}
+
 	candidates := buildImagesMainModelCandidates(routeModelName, requestedModelName)
 	for index, candidate := range candidates {
 		attemptPayload := setImagesResponsesMainModel(responsesJSON, candidate.routeModelName)
-		dataChan, upstreamHeaders, errChan := h.ExecuteStreamWithAuthManagerRequestedModelPrecommit(
+		dataChan, upstreamHeaders, errChan := h.ExecuteStreamWithAuthManagerRequestedModel(
 			cliCtx,
-			c,
-			flusher,
 			OpenaiResponse,
 			candidate.routeModelName,
 			attemptPayload,
@@ -99,17 +104,12 @@ func (h *OpenAIAPIHandler) executeImagesStreamingResponsesPayload(c *gin.Context
 				if index < len(candidates)-1 && shouldFallbackImagesMainModel(errMsg) {
 					goto nextCandidate
 				}
-				if c.Writer.Written() {
-					handlers.PrepareEventStreamHeaders(c, upstreamHeaders)
-					writeOpenAIImageStreamError(c.Writer, errMsg)
-					flusher.Flush()
-				} else {
-					h.WriteErrorResponse(c, errMsg)
-				}
+				h.WriteErrorResponse(c, errMsg)
 				cliCancel(errMsg.Error)
 				return
 			case chunk, ok := <-dataChan:
-				handlers.PrepareEventStreamHeaders(c, upstreamHeaders)
+				setSSEHeaders()
+				handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
 				if !ok {
 					bridge := newOpenAIImageStreamBridge(attemptPayload)
 					bridge.Flush(c.Writer)
