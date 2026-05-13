@@ -1155,6 +1155,11 @@ type streamBootstrapError struct {
 	headers http.Header
 }
 
+const (
+	streamBootstrapMaxBufferedChunks = 128
+	streamBootstrapMaxBufferedBytes  = 256 * 1024
+)
+
 func cloneHTTPHeader(headers http.Header) http.Header {
 	if headers == nil {
 		return nil
@@ -1208,6 +1213,7 @@ func readStreamBootstrap(ctx context.Context, ch <-chan cliproxyexecutor.StreamC
 		return nil, true, nil
 	}
 	buffered := make([]cliproxyexecutor.StreamChunk, 0, 1)
+	bufferedBytes := 0
 	for {
 		var (
 			chunk cliproxyexecutor.StreamChunk
@@ -1228,9 +1234,13 @@ func readStreamBootstrap(ctx context.Context, ch <-chan cliproxyexecutor.StreamC
 		if chunk.Err != nil {
 			return nil, false, chunk.Err
 		}
-		buffered = append(buffered, chunk)
 		if len(chunk.Payload) > 0 && !chunk.BootstrapReplayable {
+			buffered = append(buffered, chunk)
 			return buffered, false, nil
+		}
+		if len(buffered) < streamBootstrapMaxBufferedChunks && bufferedBytes+len(chunk.Payload) <= streamBootstrapMaxBufferedBytes {
+			buffered = append(buffered, chunk)
+			bufferedBytes += len(chunk.Payload)
 		}
 	}
 }

@@ -176,8 +176,19 @@ func (h *GeminiCLIAPIHandler) handleInternalStreamGenerateContent(c *gin.Context
 	modelName := modelResult.String()
 
 	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
-	dataChan, upstreamHeaders, errChan := h.ExecuteStreamWithAuthManager(cliCtx, h.HandlerType(), modelName, rawJSON, "")
-	handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
+	var dataChan <-chan []byte
+	var upstreamHeaders http.Header
+	var errChan <-chan *interfaces.ErrorMessage
+	if alt == "" {
+		dataChan, upstreamHeaders, errChan = h.ExecuteStreamWithAuthManagerPrecommit(cliCtx, c, flusher, h.HandlerType(), modelName, rawJSON, "")
+	} else {
+		dataChan, upstreamHeaders, errChan = h.ExecuteStreamWithAuthManager(cliCtx, h.HandlerType(), modelName, rawJSON, "")
+	}
+	if alt == "" {
+		handlers.PrepareEventStreamHeaders(c, upstreamHeaders)
+	} else {
+		handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
+	}
 	h.forwardCLIStream(c, flusher, "", func(err error) { cliCancel(err) }, dataChan, errChan)
 	return
 }

@@ -66,6 +66,7 @@ var authSessionIDPattern = regexp.MustCompile(`_session_([a-f0-9-]+)$`)
 type pinnedAuthContextKey struct{}
 type selectedAuthCallbackContextKey struct{}
 type executionSessionContextKey struct{}
+type authSessionContextKey struct{}
 type imageGenerationRequestContextKey struct{}
 type imageGenerationModelContextKey struct{}
 
@@ -119,6 +120,18 @@ func WithExecutionSessionID(ctx context.Context, sessionID string) context.Conte
 		ctx = context.Background()
 	}
 	return context.WithValue(ctx, executionSessionContextKey{}, sessionID)
+}
+
+// WithAuthSessionID returns a child context tagged with an explicit auth affinity session ID.
+func WithAuthSessionID(ctx context.Context, sessionID string) context.Context {
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" {
+		return ctx
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(ctx, authSessionContextKey{}, sessionID)
 }
 
 // WithImageGenerationRequest tags a context as an image generation request.
@@ -321,6 +334,9 @@ func requestExecutionMetadata(ctx context.Context) map[string]any {
 	}
 	if executionSessionID != "" {
 		meta[coreexecutor.ExecutionSessionMetadataKey] = executionSessionID
+	}
+	if authSessionID := authSessionIDFromContext(ctx); authSessionID != "" {
+		meta[coreexecutor.AuthSessionMetadataKey] = authSessionID
 	}
 	if retryAttempt > 0 {
 		meta[coreexecutor.ExternalRetryAttemptMetadataKey] = retryAttempt
@@ -528,6 +544,21 @@ func executionSessionIDFromContext(ctx context.Context) string {
 		return ""
 	}
 	raw := ctx.Value(executionSessionContextKey{})
+	switch v := raw.(type) {
+	case string:
+		return strings.TrimSpace(v)
+	case []byte:
+		return strings.TrimSpace(string(v))
+	default:
+		return ""
+	}
+}
+
+func authSessionIDFromContext(ctx context.Context) string {
+	if ctx == nil {
+		return ""
+	}
+	raw := ctx.Value(authSessionContextKey{})
 	switch v := raw.(type) {
 	case string:
 		return strings.TrimSpace(v)
@@ -942,9 +973,6 @@ func (h *BaseAPIHandler) executeStreamWithAuthManager(ctx context.Context, handl
 	// Capture upstream headers from the initial connection synchronously before the goroutine starts.
 	// Keep a mutable map so bootstrap retries can replace it before first payload is sent.
 	upstreamHeaders := cloneHeader(ClientVisibleUpstreamHeaders(passthroughHeadersEnabled, streamResult.Headers))
-	if upstreamHeaders == nil {
-		upstreamHeaders = make(http.Header)
-	}
 	chunks := streamResult.Chunks
 	dataChan := make(chan []byte)
 	errChan := make(chan *interfaces.ErrorMessage, 1)
@@ -1024,7 +1052,12 @@ func (h *BaseAPIHandler) executeStreamWithAuthManager(ctx context.Context, handl
 							bootstrapRetries++
 							retryResult, retryErr := h.AuthManager.ExecuteStream(ctx, providers, req, opts)
 							if retryErr == nil {
-								replaceHeader(upstreamHeaders, ClientVisibleUpstreamHeaders(passthroughHeadersEnabled, retryResult.Headers))
+								if passthroughHeadersEnabled {
+									if upstreamHeaders == nil {
+										upstreamHeaders = make(http.Header)
+									}
+									replaceHeader(upstreamHeaders, ClientVisibleUpstreamHeaders(passthroughHeadersEnabled, retryResult.Headers))
+								}
 								chunks = retryResult.Chunks
 								continue outer
 							}
