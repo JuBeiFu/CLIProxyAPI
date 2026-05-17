@@ -1324,10 +1324,11 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 			default:
 				aggregator.ingest(data)
 			}
-			if codexHTTPStreamEventHasUserContent(eventType, data) {
+			hasUserContent := codexHTTPStreamEventHasUserContent(eventType, data)
+			if hasUserContent {
 				sawUserContent = true
 			}
-			bootstrapReplayable := eventType != "response.completed" && !codexHTTPStreamEventHasUserContent(eventType, data)
+			bootstrapReplayable := eventType != "response.completed" && !hasUserContent
 			if eventType == "response.completed" {
 				timing.streamCompleted = true
 				if detail, ok := helps.ParseCodexUsage(data); ok {
@@ -1401,11 +1402,9 @@ func codexHTTPStreamEventHasUserContent(eventType string, data []byte) bool {
 		return strings.TrimSpace(gjson.GetBytes(data, "text").String()) != ""
 	case eventType == "response.function_call_arguments.done":
 		return strings.TrimSpace(gjson.GetBytes(data, "arguments").String()) != ""
-	case strings.HasPrefix(eventType, "response.reasoning_summary_text"):
-		return strings.TrimSpace(gjson.GetBytes(data, "delta").String()) != ""
+	case eventType == "response.custom_tool_call_input.done":
+		return strings.TrimSpace(gjson.GetBytes(data, "input").String()) != ""
 	case strings.HasPrefix(eventType, "response.output_text"):
-		return strings.TrimSpace(gjson.GetBytes(data, "delta").String()) != ""
-	case strings.HasPrefix(eventType, "response.function_call_arguments"):
 		return strings.TrimSpace(gjson.GetBytes(data, "delta").String()) != ""
 	case eventType == "response.output_item.done":
 		return codexHTTPResponseOutputHasUserContent(gjson.GetBytes(data, "item"))
@@ -1465,19 +1464,16 @@ func codexHTTPResponseOutputHasUserContent(item gjson.Result) bool {
 			}
 		}
 		return false
-	case "reasoning":
-		for _, summary := range item.Get("summary").Array() {
-			if strings.TrimSpace(summary.Get("text").String()) != "" {
-				return true
-			}
-		}
-		return strings.TrimSpace(item.Get("encrypted_content").String()) != ""
 	case "image_generation_call":
 		return strings.TrimSpace(item.Get("result").String()) != ""
-	case "function_call":
+	case "function_call", "custom_tool_call":
 		return strings.TrimSpace(item.Get("call_id").String()) != "" ||
 			strings.TrimSpace(item.Get("name").String()) != "" ||
-			strings.TrimSpace(item.Get("arguments").String()) != ""
+			strings.TrimSpace(item.Get("arguments").String()) != "" ||
+			strings.TrimSpace(item.Get("input").String()) != ""
+	case "function_call_output", "custom_tool_call_output":
+		return strings.TrimSpace(item.Get("call_id").String()) != "" ||
+			strings.TrimSpace(item.Get("output").String()) != ""
 	default:
 		return false
 	}

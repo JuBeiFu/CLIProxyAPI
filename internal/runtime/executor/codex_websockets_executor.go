@@ -265,6 +265,39 @@ func (a *codexNonStreamAggregator) ingest(payload []byte) {
 		if args := root.Get("arguments"); args.Exists() {
 			dst["arguments"] = args.String()
 		}
+	case "response.custom_tool_call_input.delta":
+		itemID := strings.TrimSpace(root.Get("item_id").String())
+		if itemID == "" {
+			if callID := strings.TrimSpace(root.Get("call_id").String()); callID != "" {
+				itemID = a.itemIDByCall[callID]
+			}
+		}
+		if itemID == "" {
+			return
+		}
+		dst := a.ensureItem(itemID, "custom_tool_call")
+		if dst == nil {
+			return
+		}
+		existingInput := asString(dst["input"])
+		dst["input"] = existingInput + root.Get("delta").String()
+	case "response.custom_tool_call_input.done":
+		itemID := strings.TrimSpace(root.Get("item_id").String())
+		if itemID == "" {
+			if callID := strings.TrimSpace(root.Get("call_id").String()); callID != "" {
+				itemID = a.itemIDByCall[callID]
+			}
+		}
+		if itemID == "" {
+			return
+		}
+		dst := a.ensureItem(itemID, "custom_tool_call")
+		if dst == nil {
+			return
+		}
+		if input := root.Get("input"); input.Exists() {
+			dst["input"] = input.String()
+		}
 	}
 }
 

@@ -90,6 +90,11 @@ const (
 )
 
 const (
+	streamBootstrapMaxBufferedChunks = 4096
+	streamBootstrapMaxBufferedBytes  = 4 << 20
+)
+
+const (
 	defaultRequestRetry        = 2
 	defaultMaxRetryCredentials = 5
 	defaultMaxRetryInterval    = 120 * time.Second
@@ -1203,11 +1208,21 @@ func streamErrorResult(headers http.Header, err error) *cliproxyexecutor.StreamR
 	}
 }
 
+func newStreamBootstrapBufferExceededError(bufferedChunks int, bufferedBytes int) error {
+	return &Error{
+		Code:       "stream_bootstrap_buffer_exceeded",
+		Message:    fmt.Sprintf("stream bootstrap buffered too much replayable data before committed output: chunks=%d bytes=%d", bufferedChunks, bufferedBytes),
+		Retryable:  true,
+		HTTPStatus: http.StatusServiceUnavailable,
+	}
+}
+
 func readStreamBootstrap(ctx context.Context, ch <-chan cliproxyexecutor.StreamChunk) ([]cliproxyexecutor.StreamChunk, bool, error) {
 	if ch == nil {
 		return nil, true, nil
 	}
 	buffered := make([]cliproxyexecutor.StreamChunk, 0, 1)
+	bufferedBytes := 0
 	for {
 		var (
 			chunk cliproxyexecutor.StreamChunk
@@ -1228,10 +1243,15 @@ func readStreamBootstrap(ctx context.Context, ch <-chan cliproxyexecutor.StreamC
 		if chunk.Err != nil {
 			return nil, false, chunk.Err
 		}
-		buffered = append(buffered, chunk)
 		if len(chunk.Payload) > 0 && !chunk.BootstrapReplayable {
+			buffered = append(buffered, chunk)
 			return buffered, false, nil
 		}
+		if len(buffered)+1 > streamBootstrapMaxBufferedChunks || bufferedBytes+len(chunk.Payload) > streamBootstrapMaxBufferedBytes {
+			return nil, false, newStreamBootstrapBufferExceededError(len(buffered), bufferedBytes)
+		}
+		buffered = append(buffered, chunk)
+		bufferedBytes += len(chunk.Payload)
 	}
 }
 

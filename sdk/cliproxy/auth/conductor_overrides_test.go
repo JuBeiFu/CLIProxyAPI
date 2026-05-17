@@ -1875,6 +1875,63 @@ func TestReadStreamBootstrapReturnsErrorAfterReplayableControlPayload(t *testing
 	}
 }
 
+func TestReadStreamBootstrapReturnsRetryableErrorWhenReplayableChunkCapExceeded(t *testing.T) {
+	ch := make(chan cliproxyexecutor.StreamChunk, streamBootstrapMaxBufferedChunks+1)
+	for i := 0; i < streamBootstrapMaxBufferedChunks+1; i++ {
+		ch <- cliproxyexecutor.StreamChunk{Payload: []byte("data: response.created\n\n"), BootstrapReplayable: true}
+	}
+	close(ch)
+
+	buffered, closed, err := readStreamBootstrap(context.Background(), ch)
+	if err == nil {
+		t.Fatal("readStreamBootstrap error = nil, want buffer cap error")
+	}
+	if closed {
+		t.Fatal("closed = true, want false on buffer cap error")
+	}
+	if len(buffered) != 0 {
+		t.Fatalf("buffered chunks = %d, want 0 on buffer cap error", len(buffered))
+	}
+	errResult, ok := err.(*Error)
+	if !ok {
+		t.Fatalf("error = %T, want *Error", err)
+	}
+	if errResult.Code != "stream_bootstrap_buffer_exceeded" {
+		t.Fatalf("Code = %q, want stream_bootstrap_buffer_exceeded", errResult.Code)
+	}
+	if !errResult.Retryable {
+		t.Fatal("Retryable = false, want true")
+	}
+	if errResult.HTTPStatus != http.StatusServiceUnavailable {
+		t.Fatalf("HTTPStatus = %d, want %d", errResult.HTTPStatus, http.StatusServiceUnavailable)
+	}
+}
+
+func TestReadStreamBootstrapReturnsRetryableErrorWhenReplayableByteCapExceeded(t *testing.T) {
+	ch := make(chan cliproxyexecutor.StreamChunk, 2)
+	ch <- cliproxyexecutor.StreamChunk{Payload: make([]byte, streamBootstrapMaxBufferedBytes), BootstrapReplayable: true}
+	ch <- cliproxyexecutor.StreamChunk{Payload: []byte("x"), BootstrapReplayable: true}
+	close(ch)
+
+	buffered, closed, err := readStreamBootstrap(context.Background(), ch)
+	if err == nil {
+		t.Fatal("readStreamBootstrap error = nil, want buffer cap error")
+	}
+	if closed {
+		t.Fatal("closed = true, want false on buffer cap error")
+	}
+	if len(buffered) != 0 {
+		t.Fatalf("buffered chunks = %d, want 0 on buffer cap error", len(buffered))
+	}
+	errResult, ok := err.(*Error)
+	if !ok {
+		t.Fatalf("error = %T, want *Error", err)
+	}
+	if errResult.Code != "stream_bootstrap_buffer_exceeded" {
+		t.Fatalf("Code = %q, want stream_bootstrap_buffer_exceeded", errResult.Code)
+	}
+}
+
 func TestManager_MarkResult_RequestScopedNotFoundDoesNotCooldownAuth(t *testing.T) {
 	m := NewManager(nil, nil, nil)
 
