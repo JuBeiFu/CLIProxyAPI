@@ -2299,6 +2299,11 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 							}
 							setExecutionResultError(&result, errExec)
 						}
+					} else {
+						// Reactive re-login did not produce a usable auth (failed
+						// login or a concurrent refresh already pending). Let the
+						// terminal logic proceed instead of bailing forever.
+						result.SkipAccessTokenRefresh = true
 					}
 				}
 				if errExec == nil {
@@ -2414,6 +2419,11 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 							}
 							setExecutionResultError(&result, errExec)
 						}
+					} else {
+						// Reactive re-login did not produce a usable auth (failed
+						// login or a concurrent refresh already pending). Let the
+						// terminal logic proceed instead of bailing forever.
+						result.SkipAccessTokenRefresh = true
 					}
 				}
 				if errExec == nil {
@@ -5262,9 +5272,19 @@ func (m *Manager) refreshAuthAfterAccessTokenFailure(ctx context.Context, auth *
 	if authID == "" {
 		return nil, false
 	}
+	// Gate entry so two concurrent 401s for the same auth don't both run a
+	// full login (= double re-login). markRefreshPending atomically claims the
+	// refresh slot (sets NextRefreshAfter into the future under m.mu) and
+	// returns false if a refresh is already pending. On false, skip the login
+	// and let the caller's else-arm set SkipAccessTokenRefresh so terminal
+	// logic can still fire. refreshAuth (invoked below) does not gate on
+	// NextRefreshAfter and resets it after the refresh, so claiming the slot
+	// here does not block the refresh we are about to run.
+	if !m.markRefreshPending(authID, time.Now()) {
+		return nil, false
+	}
 	m.mu.Lock()
 	if current := m.auths[authID]; current != nil {
-		current.NextRefreshAfter = time.Time{}
 		if current.Metadata == nil {
 			current.Metadata = make(map[string]any)
 		}

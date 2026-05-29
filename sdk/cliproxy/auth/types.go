@@ -13,6 +13,7 @@ import (
 	"time"
 
 	baseauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth"
+	codexauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/codex"
 )
 
 // PostAuthHook defines a function that is called after an Auth record is created
@@ -154,6 +155,19 @@ func (a *Auth) Clone() *Auth {
 		}
 	}
 	copyAuth.Runtime = a.Runtime
+	// Deep-copy codex token storage so concurrent Clone consumers (e.g. the
+	// reactive re-login path mutating access_token) don't race on the shared
+	// *CodexTokenStorage pointer / its Metadata map.
+	if ts, ok := copyAuth.Storage.(*codexauth.CodexTokenStorage); ok && ts != nil {
+		dup := *ts
+		if ts.Metadata != nil {
+			dup.Metadata = make(map[string]any, len(ts.Metadata))
+			for k, v := range ts.Metadata {
+				dup.Metadata[k] = v
+			}
+		}
+		copyAuth.Storage = &dup
+	}
 	return &copyAuth
 }
 

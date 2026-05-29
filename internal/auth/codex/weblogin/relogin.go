@@ -55,6 +55,12 @@ func extractCreds(auth *cliproxyauth.Auth) (creds, flowKind) {
 	}
 }
 
+// HasReloginCreds reports whether the auth carries usable re-login credentials.
+func HasReloginCreds(auth *cliproxyauth.Auth) bool {
+	_, flow := extractCreds(auth)
+	return flow != flowNone
+}
+
 // SessionLogin re-authenticates and returns the fresh chatgpt session. The caller
 // replaces ONLY auth.Metadata["access_token"] with sess.AccessToken and leaves
 // refresh_token/id_token intact (placeholders). NO Codex PKCE.

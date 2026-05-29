@@ -1825,6 +1825,15 @@ func (e *CodexExecutor) codexAccessTokenForProbe(ctx context.Context, auth *clip
 	svc := codexauth.NewCodexAuth(e.cfg)
 	td, refreshErr := svc.RefreshTokensWithRetry(ctx, refreshToken, 3)
 	if refreshErr != nil {
+		// Only full-login when the refresh GRANT is dead (invalid_grant/revoked/reused)
+		// AND creds are available. Transient network/ctx errors -> normal backoff.
+		// No-creds accounts -> propagate the original error so terminal logic still fires.
+		if errors.Is(refreshErr, context.Canceled) || errors.Is(refreshErr, context.DeadlineExceeded) {
+			return "", jwtPlan, false, refreshErr
+		}
+		if !codexauth.IsNonRetryableRefreshErr(refreshErr) || !weblogin.HasReloginCreds(auth) {
+			return "", jwtPlan, false, refreshErr
+		}
 		// refresh_token is dead (invalid_grant/revoked/reused). Per the session-recovery
 		// design: DON'T propagate (that would delete/disable the account). Instead run a
 		// native-Go chatgpt web login and replace ONLY the access_token, keeping the

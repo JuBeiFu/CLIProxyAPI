@@ -308,6 +308,11 @@ func isNonRetryableRefreshErr(err error) bool {
 	return false
 }
 
+// IsNonRetryableRefreshErr reports whether a refresh error indicates a dead/revoked
+// grant (invalid_grant/token_revoked/refresh_token_reused/...) rather than a transient
+// network failure. Exported for the native-Go re-login fallback to gate when to attempt login.
+func IsNonRetryableRefreshErr(err error) bool { return isNonRetryableRefreshErr(err) }
+
 // UpdateTokenStorage updates an existing CodexTokenStorage with new token data.
 // This is typically called after a successful token refresh to persist the new credentials.
 func (o *CodexAuth) UpdateTokenStorage(storage *CodexTokenStorage, tokenData *CodexTokenData) {
