@@ -134,6 +134,25 @@ var anthropicHosts = map[string]struct{}{
 	"api.anthropic.com": {},
 }
 
+// openaiUtlsHosts are the OpenAI login-surface hosts that require a Chrome TLS
+// fingerprint to pass Cloudflare. Kept separate from anthropicHosts so existing
+// codex token-refresh transport behavior is unchanged.
+var openaiUtlsHosts = map[string]struct{}{
+	"chatgpt.com":         {},
+	"auth.openai.com":     {},
+	"sentinel.openai.com": {},
+}
+
+// hostUsesUtls reports whether a lowercased hostname must use the utls transport.
+func hostUsesUtls(host string) bool {
+	h := strings.ToLower(host)
+	if _, ok := anthropicHosts[h]; ok {
+		return true
+	}
+	_, ok := openaiUtlsHosts[h]
+	return ok
+}
+
 // fallbackRoundTripper uses utls for Anthropic HTTPS hosts and falls back to
 // standard transport for all other requests (non-HTTPS or non-Anthropic hosts).
 type fallbackRoundTripper struct {
@@ -142,10 +161,8 @@ type fallbackRoundTripper struct {
 }
 
 func (f *fallbackRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
-	if req.URL.Scheme == "https" {
-		if _, ok := anthropicHosts[strings.ToLower(req.URL.Hostname())]; ok {
-			return f.utls.RoundTrip(req)
-		}
+	if req.URL.Scheme == "https" && hostUsesUtls(req.URL.Hostname()) {
+		return f.utls.RoundTrip(req)
 	}
 	return f.fallback.RoundTrip(req)
 }
