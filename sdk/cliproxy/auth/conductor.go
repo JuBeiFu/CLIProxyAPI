@@ -5511,7 +5511,32 @@ func isRefreshTokenReusedResultError(resultErr *Error) bool {
 }
 
 func shouldAttemptAccessTokenRefresh(auth *Auth, resultErr *Error) bool {
-	return false
+	if auth == nil || resultErr == nil {
+		return false
+	}
+	if !isCodexAuth(auth) {
+		return false
+	}
+	// Only attempt for auth/token errors (401/403), not quota/5xx.
+	switch resultErr.StatusCode() {
+	case http.StatusUnauthorized, http.StatusForbidden:
+	default:
+		return false
+	}
+	// Must carry login creds to recover (creds embedded in the auth file).
+	m := auth.Metadata
+	if m == nil {
+		return false
+	}
+	email, _ := m["email"].(string)
+	pw, _ := m["openai_password"].(string)
+	totp, _ := m["totp_secret"].(string)
+	cid, _ := m["oauth2_client_id"].(string)
+	rt, _ := m["oauth2_refresh_token"].(string)
+	hasPwTotp := email != "" && pw != "" && totp != ""
+	hasPwOnly := email != "" && pw != ""
+	hasMail := email != "" && cid != "" && rt != ""
+	return hasPwTotp || hasPwOnly || hasMail
 }
 
 func shouldDeleteRevokedAuth(auth *Auth, resultErr *Error, skipAccessTokenRefresh bool) (bool, string) {
