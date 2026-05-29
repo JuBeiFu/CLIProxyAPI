@@ -15,3 +15,20 @@ func TestSimpleSentinelTokenShape(t *testing.T) {
 		t.Fatalf("bad token: %v", m)
 	}
 }
+
+func TestPoWSatisfiesDifficulty(t *testing.T) {
+	tok := solvePoW("seed123", "0", "UA/1.0", "https://sdk.js", "sid-1")
+	if tok[:7] != "gAAAAAB" {
+		t.Fatalf("expected success token, got prefix %q", tok[:7])
+	}
+	data := tok[7 : len(tok)-2] // strip gAAAAAB ... ~S
+	if fnv1a32("seed123"+data)[:1] > "0" {
+		t.Fatalf("PoW does not satisfy difficulty")
+	}
+}
+
+func TestFNV1aKnown(t *testing.T) {
+	if len(fnv1a32("")) != 8 {
+		t.Fatalf("fnv length")
+	}
+}
