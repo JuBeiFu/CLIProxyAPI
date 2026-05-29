@@ -300,6 +300,8 @@ func isNonRetryableRefreshErr(err error) bool {
 		"token_invalidated",
 		"token_revoked",
 		"invalid_grant",
+		"token_expired",
+		"could not validate your token",
 	} {
 		if strings.Contains(raw, needle) {
 			return true

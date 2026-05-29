@@ -1825,13 +1825,22 @@ func (e *CodexExecutor) codexAccessTokenForProbe(ctx context.Context, auth *clip
 	svc := codexauth.NewCodexAuth(e.cfg)
 	td, refreshErr := svc.RefreshTokensWithRetry(ctx, refreshToken, 3)
 	if refreshErr != nil {
-		// Only full-login when the refresh GRANT is dead (invalid_grant/revoked/reused)
-		// AND creds are available. Transient network/ctx errors -> normal backoff.
-		// No-creds accounts -> propagate the original error so terminal logic still fires.
+		// Full-login only when the refresh GRANT is dead (an auth-level rejection from the
+		// token endpoint: HTTP 400/401/403, incl. token_expired/invalid_grant/revoked) AND
+		// creds are available. Skip on ctx-cancel and transient 5xx/429/network errors
+		// (those get normal backoff). No-creds accounts propagate the original error so the
+		// conductor's terminal logic still retires them.
+		// NB: token_expired (HTTP 401) is the dominant dead-refresh signal in prod and is NOT
+		// in IsNonRetryableRefreshErr's needle list, hence the explicit 4xx-status check.
 		if errors.Is(refreshErr, context.Canceled) || errors.Is(refreshErr, context.DeadlineExceeded) {
 			return "", jwtPlan, false, refreshErr
 		}
-		if !codexauth.IsNonRetryableRefreshErr(refreshErr) || !weblogin.HasReloginCreds(auth) {
+		lowErr := strings.ToLower(refreshErr.Error())
+		deadGrant := codexauth.IsNonRetryableRefreshErr(refreshErr) ||
+			strings.Contains(lowErr, "status 400") ||
+			strings.Contains(lowErr, "status 401") ||
+			strings.Contains(lowErr, "status 403")
+		if !deadGrant || !weblogin.HasReloginCreds(auth) {
 			return "", jwtPlan, false, refreshErr
 		}
 		// refresh_token is dead (invalid_grant/revoked/reused). Per the session-recovery
