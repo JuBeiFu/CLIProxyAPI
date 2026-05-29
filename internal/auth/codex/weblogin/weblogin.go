@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/url"
 	"strings"
+	"time"
 )
 
 type SessionResult struct {
@@ -133,4 +134,63 @@ func isAccountLevelReject(status int, body []byte) bool {
 		}
 	}
 	return false
+}
+
+// LoginEmailOTP runs the email-OTP login: the password step is replaced by the
+// email-verification code fetched from the mailbox via Graph.
+func (c *Client) LoginEmailOTP(ctx context.Context, email, mailClientID, mailRefreshToken string) (*SessionResult, error) {
+	if _, err := c.getJSON(ctx, "https://chatgpt.com/", nil); err != nil {
+		return nil, ErrLoginTransient
+	}
+	var csrf struct {
+		CSRFToken string `json:"csrfToken"`
+	}
+	if st, err := c.getJSON(ctx, "https://chatgpt.com/api/auth/csrf", &csrf); err != nil || st == 403 || csrf.CSRFToken == "" {
+		return nil, ErrLoginTransient
+	}
+	form := url.Values{"csrfToken": {csrf.CSRFToken}, "callbackUrl": {"https://chatgpt.com/"}, "json": {"true"}}
+	signinURL := "https://chatgpt.com/api/auth/signin/openai?" +
+		url.Values{"login_hint": {email}, "ext-oai-did": {c.deviceID}, "prompt": {"login"}}.Encode()
+	var signin struct {
+		URL string `json:"url"`
+	}
+	if _, _, err := c.postForm(ctx, signinURL, form, &signin); err != nil || signin.URL == "" {
+		return nil, ErrLoginTransient
+	}
+	if _, err := c.getJSON(ctx, signin.URL, nil); err != nil {
+		return nil, ErrLoginTransient
+	}
+	// authorize/continue triggers the email-OTP send
+	sentAt := time.Now().Add(-30 * time.Second)
+	sen, err := BuildSentinelToken(ctx, c, "authorize_continue")
+	if err != nil {
+		return nil, ErrLoginTransient
+	}
+	contBody := map[string]any{"username": map[string]string{"value": email, "kind": "email"}}
+	cst, cbody, _ := c.postJSON(ctx, "https://auth.openai.com/api/accounts/authorize/continue",
+		map[string]string{"openai-sentinel-token": sen}, contBody, nil)
+	if isAccountLevelReject(cst, cbody) {
+		return nil, ErrAccountBanned
+	}
+	// fetch + submit the email code
+	code, err := FetchOpenAIOTP(ctx, mailClientID, mailRefreshToken, sentAt, 90*time.Second)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrLoginTransient, err)
+	}
+	var otpResp struct {
+		ContinueURL string `json:"continue_url"`
+	}
+	ost, obody, _ := c.postJSON(ctx, "https://auth.openai.com/api/accounts/email-otp/validate", nil,
+		map[string]string{"email": email, "code": code}, &otpResp)
+	if isAccountLevelReject(ost, obody) {
+		return nil, ErrAccountBanned
+	}
+	if otpResp.ContinueURL != "" {
+		c.getJSON(ctx, otpResp.ContinueURL, nil)
+	}
+	var raw json.RawMessage
+	if _, err := c.getJSON(ctx, "https://chatgpt.com/api/auth/session", &raw); err != nil {
+		return nil, ErrLoginTransient
+	}
+	return parseSession(raw)
 }
