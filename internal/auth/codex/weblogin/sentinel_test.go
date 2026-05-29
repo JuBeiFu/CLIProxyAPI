@@ -1,6 +1,7 @@
 package weblogin
 
 import (
+	"context"
 	"encoding/json"
 	"testing"
 )
@@ -17,7 +18,7 @@ func TestSimpleSentinelTokenShape(t *testing.T) {
 }
 
 func TestPoWSatisfiesDifficulty(t *testing.T) {
-	tok := solvePoW("seed123", "0", "UA/1.0", "https://sdk.js", "sid-1")
+	tok := solvePoW(context.Background(), "seed123", "0", "UA/1.0", "https://sdk.js", "sid-1")
 	if tok[:7] != "gAAAAAB" {
 		t.Fatalf("expected success token, got prefix %q", tok[:7])
 	}

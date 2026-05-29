@@ -128,7 +128,7 @@ func (c *Client) LoginPasswordTOTP(ctx context.Context, email, password, totpSec
 // isAccountLevelReject detects deactivated/disabled account responses (terminal).
 func isAccountLevelReject(status int, body []byte) bool {
 	low := strings.ToLower(string(body))
-	for _, needle := range []string{"account_deactivated", "deactivated", "account has been disabled", "access_denied"} {
+	for _, needle := range []string{"account_deactivated", "account has been deactivated", "account deactivated", "account has been disabled"} {
 		if strings.Contains(low, needle) {
 			return true
 		}
@@ -161,7 +161,6 @@ func (c *Client) LoginEmailOTP(ctx context.Context, email, mailClientID, mailRef
 		return nil, ErrLoginTransient
 	}
 	// authorize/continue triggers the email-OTP send
-	sentAt := time.Now().Add(-30 * time.Second)
 	sen, err := BuildSentinelToken(ctx, c, "authorize_continue")
 	if err != nil {
 		return nil, ErrLoginTransient
@@ -172,8 +171,9 @@ func (c *Client) LoginEmailOTP(ctx context.Context, email, mailClientID, mailRef
 	if isAccountLevelReject(cst, cbody) {
 		return nil, ErrAccountBanned
 	}
+	sentAt := time.Now().Add(-3 * time.Second)
 	// fetch + submit the email code
-	code, err := FetchOpenAIOTP(ctx, mailClientID, mailRefreshToken, sentAt, 90*time.Second)
+	code, err := FetchOpenAIOTP(ctx, c.http, mailClientID, mailRefreshToken, sentAt, 90*time.Second)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrLoginTransient, err)
 	}

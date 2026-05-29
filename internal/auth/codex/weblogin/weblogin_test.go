@@ -12,3 +12,12 @@ func TestParseSessionAccessToken(t *testing.T) {
 		t.Fatalf("bad parse: %+v", s)
 	}
 }
+
+func TestIsAccountLevelRejectNeedles(t *testing.T) {
+	if isAccountLevelReject(200, []byte(`{"code":"access_denied"}`)) {
+		t.Fatal("wrong-password access_denied must NOT be account-level")
+	}
+	if !isAccountLevelReject(403, []byte(`{"detail":"account_deactivated"}`)) {
+		t.Fatal("account_deactivated must be account-level")
+	}
+}

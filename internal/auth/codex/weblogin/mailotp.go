@@ -22,7 +22,7 @@ func extractOTPCode(text string) string {
 }
 
 // graphAccessToken exchanges an Outlook OAuth2 refresh_token for a Graph access_token.
-func graphAccessToken(ctx context.Context, clientID, refreshToken string) (string, error) {
+func graphAccessToken(ctx context.Context, httpClient *http.Client, clientID, refreshToken string) (string, error) {
 	form := url.Values{
 		"client_id":     {clientID},
 		"grant_type":    {"refresh_token"},
@@ -32,7 +32,7 @@ func graphAccessToken(ctx context.Context, clientID, refreshToken string) (strin
 	req, _ := http.NewRequestWithContext(ctx, http.MethodPost,
 		"https://login.microsoftonline.com/common/oauth2/v2.0/token", strings.NewReader(form.Encode()))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return "", err
 	}
@@ -48,17 +48,17 @@ func graphAccessToken(ctx context.Context, clientID, refreshToken string) (strin
 }
 
 // FetchOpenAIOTP polls the mailbox for the most recent OpenAI verification code.
-func FetchOpenAIOTP(ctx context.Context, clientID, refreshToken string, since time.Time, timeout time.Duration) (string, error) {
-	tok, err := graphAccessToken(ctx, clientID, refreshToken)
+func FetchOpenAIOTP(ctx context.Context, httpClient *http.Client, clientID, refreshToken string, since time.Time, timeout time.Duration) (string, error) {
+	tok, err := graphAccessToken(ctx, httpClient, clientID, refreshToken)
 	if err != nil {
 		return "", err
 	}
 	deadline := time.Now().Add(timeout)
-	q := "https://graph.microsoft.com/v1.0/me/messages?$top=5&$orderby=receivedDateTime desc&$select=subject,body,receivedDateTime"
+	q := "https://graph.microsoft.com/v1.0/me/messages?$top=5&$orderby=receivedDateTime%20desc&$select=subject,body,receivedDateTime,from"
 	for time.Now().Before(deadline) {
 		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, q, nil)
 		req.Header.Set("Authorization", "Bearer "+tok)
-		resp, err := http.DefaultClient.Do(req)
+		resp, err := httpClient.Do(req)
 		if err == nil {
 			var list struct {
 				Value []struct {
@@ -67,6 +67,11 @@ func FetchOpenAIOTP(ctx context.Context, clientID, refreshToken string, since ti
 					Body             struct {
 						Content string `json:"content"`
 					} `json:"body"`
+					From struct {
+						EmailAddress struct {
+							Address string `json:"address"`
+						} `json:"emailAddress"`
+					} `json:"from"`
 				} `json:"value"`
 			}
 			json.NewDecoder(resp.Body).Decode(&list)
@@ -74,6 +79,10 @@ func FetchOpenAIOTP(ctx context.Context, clientID, refreshToken string, since ti
 			for _, m := range list.Value {
 				rt, _ := time.Parse(time.RFC3339, m.ReceivedDateTime)
 				if rt.Before(since) {
+					continue
+				}
+				from := strings.ToLower(m.From.EmailAddress.Address)
+				if !strings.Contains(from, "openai") && !strings.Contains(from, "chatgpt") {
 					continue
 				}
 				if code := extractOTPCode(m.Subject + " " + m.Body.Content); code != "" {

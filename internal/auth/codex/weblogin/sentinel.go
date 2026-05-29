@@ -27,7 +27,7 @@ type sentinelChallenge struct {
 
 // fetchSentinelChallenge POSTs to sentinel/req and returns the challenge.
 func fetchSentinelChallenge(ctx context.Context, c *Client, flow, requirementsToken string) (*sentinelChallenge, error) {
-	body, _ := json.Marshal(map[string]any{"p": requirementsToken, "flow": flow})
+	body, _ := json.Marshal(map[string]any{"p": requirementsToken, "id": c.deviceID, "flow": flow})
 	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, sentinelReqURL, bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Origin", "https://sentinel.openai.com")
@@ -106,12 +106,22 @@ const powMaxAttempts = 500000
 
 // solvePoW runs the FNV-1a PoW loop and returns "gAAAAAB<b64>~S" on success,
 // or "gAAAAAC<b64("e")>" on exhaustion.
-func solvePoW(seed, difficulty, ua, sdkURL, sid string) string {
+func solvePoW(ctx context.Context, seed, difficulty, ua, sdkURL, sid string) string {
 	cfg := buildConfig(ua, sdkURL, sid)
 	cfg[1] = time.Now().UTC().Format("Mon Jan 02 2006 15:04:05 GMT-0700")
 	diffLen := len(difficulty)
+	if diffLen > 8 {
+		diffLen = 8
+	}
 	start := time.Now()
 	for i := 0; i < powMaxAttempts; i++ {
+		if i%1024 == 0 {
+			select {
+			case <-ctx.Done():
+				return "gAAAAAC" + base64.StdEncoding.EncodeToString([]byte(`"e"`))
+			default:
+			}
+		}
 		cfg[3] = i
 		cfg[9] = int(time.Since(start).Milliseconds())
 		data := b64Config(cfg)
@@ -132,7 +142,7 @@ func BuildSentinelToken(ctx context.Context, c *Client, flow string) (string, er
 	if !ch.ProofOfWork.Required {
 		return buildSimpleSentinelToken(ch.Token, ch.Turnstile.DX, flow), nil
 	}
-	p := solvePoW(ch.ProofOfWork.Seed, ch.ProofOfWork.Difficulty, c.userAgent, c.sdkJSURL, c.sid)
+	p := solvePoW(ctx, ch.ProofOfWork.Seed, ch.ProofOfWork.Difficulty, c.userAgent, c.sdkJSURL, c.sid)
 	m := map[string]any{"p": p, "t": ch.Turnstile.DX, "c": ch.Token, "id": c.deviceID, "flow": flow}
 	b, _ := json.Marshal(m)
 	return string(b), nil
