@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -20,6 +21,7 @@ import (
 	"time"
 
 	codexauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/codex"
+	weblogin "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/codex/weblogin"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/misc"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/proxypool"
@@ -1823,7 +1825,22 @@ func (e *CodexExecutor) codexAccessTokenForProbe(ctx context.Context, auth *clip
 	svc := codexauth.NewCodexAuth(e.cfg)
 	td, refreshErr := svc.RefreshTokensWithRetry(ctx, refreshToken, 3)
 	if refreshErr != nil {
-		return "", jwtPlan, false, refreshErr
+		// refresh_token is dead (invalid_grant/revoked/reused). Per the session-recovery
+		// design: DON'T propagate (that would delete/disable the account). Instead run a
+		// native-Go chatgpt web login and replace ONLY the access_token, keeping the
+		// (dead) refresh_token as a placeholder.
+		sess, loginErr := weblogin.SessionLogin(ctx, e.cfg, auth)
+		if loginErr != nil {
+			// ErrAccountBanned -> message has a terminal needle -> conductor disables.
+			// ErrLoginTransient -> no needle -> conductor backs off and retries.
+			return "", jwtPlan, false, loginErr
+		}
+		exp := jwtExpiryRFC3339(sess.AccessToken)
+		applySessionAccessToken(auth, auth.Storage, sess.AccessToken, exp, now)
+		if sess.PlanType != "" {
+			jwtPlan = strings.ToLower(sess.PlanType)
+		}
+		return sess.AccessToken, jwtPlan, true, nil
 	}
 	storage, _ := auth.Storage.(*codexauth.CodexTokenStorage)
 	applyRefreshedCodexTokenState(auth, storage, td, now)
@@ -1993,6 +2010,49 @@ func applyRefreshedCodexTokenState(auth *cliproxyauth.Auth, storage *codexauth.C
 		storage.Email = td.Email
 		storage.Expire = td.Expire
 		storage.Type = "codex"
+	}
+}
+
+// jwtExpiryRFC3339 reads the "exp" claim from a JWT and returns it as RFC3339 (UTC), or "".
+func jwtExpiryRFC3339(jwt string) string {
+	parts := strings.Split(jwt, ".")
+	if len(parts) < 2 {
+		return ""
+	}
+	raw, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return ""
+	}
+	var claims struct {
+		Exp int64 `json:"exp"`
+	}
+	if json.Unmarshal(raw, &claims) != nil || claims.Exp == 0 {
+		return ""
+	}
+	return time.Unix(claims.Exp, 0).UTC().Format(time.RFC3339)
+}
+
+// applySessionAccessToken replaces ONLY the access_token (+ expired/last_refresh) in
+// both auth.Metadata and the CodexTokenStorage. refresh_token / id_token / account_id
+// are deliberately left untouched (placeholders per the session-recovery design).
+func applySessionAccessToken(auth *cliproxyauth.Auth, storageAny any, accessToken, expire string, now time.Time) {
+	if auth == nil || accessToken == "" {
+		return
+	}
+	if auth.Metadata == nil {
+		auth.Metadata = make(map[string]any)
+	}
+	auth.Metadata["access_token"] = accessToken
+	if expire != "" {
+		auth.Metadata["expired"] = expire
+	}
+	auth.Metadata["last_refresh"] = now.Format(time.RFC3339)
+	if storage, ok := storageAny.(*codexauth.CodexTokenStorage); ok && storage != nil {
+		storage.AccessToken = accessToken
+		if expire != "" {
+			storage.Expire = expire
+		}
+		storage.LastRefresh = now.Format(time.RFC3339)
 	}
 }
 
