@@ -81,3 +81,26 @@ func TestKickAsyncReloginIsNonBlockingAndDetached(t *testing.T) {
 		t.Fatal("background relogin did not start within 10s (not kicked, or request-ctx cancellation aborted it)")
 	}
 }
+
+// A 401/403 on a creds-bearing codex auth (for which the reactive path kicks a
+// background re-login) must be sidelined only briefly — long enough for the
+// login to land and the ensuing success to clear the suspend — not the full
+// 30-minute auth-failure cooldown. Auths without login creds keep the default.
+func TestAuthFailureModelCooldown(t *testing.T) {
+	const deflt = 30 * time.Minute
+	withCreds := &Auth{Provider: "codex", Metadata: map[string]any{
+		"email": "a@x.com", "openai_password": "p", "totp_secret": "s",
+	}}
+	err401 := &Error{HTTPStatus: 401, Message: "unauthorized"}
+	if got := authFailureModelCooldown(withCreds, err401, deflt); got != reloginRecoveryCooldown {
+		t.Fatalf("creds-bearing 401 cooldown = %s, want short %s", got, reloginRecoveryCooldown)
+	}
+	err403 := &Error{HTTPStatus: 403, Message: "forbidden"}
+	if got := authFailureModelCooldown(withCreds, err403, deflt); got != reloginRecoveryCooldown {
+		t.Fatalf("creds-bearing 403 cooldown = %s, want short %s", got, reloginRecoveryCooldown)
+	}
+	noCreds := &Auth{Provider: "codex", Metadata: map[string]any{"email": "a@x.com"}}
+	if got := authFailureModelCooldown(noCreds, err401, deflt); got != deflt {
+		t.Fatalf("no-creds 401 cooldown = %s, want default %s", got, deflt)
+	}
+}

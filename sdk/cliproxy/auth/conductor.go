@@ -4411,7 +4411,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 							if disableCooling {
 								state.NextRetryAfter = time.Time{}
 							} else {
-								next := now.Add(30 * time.Minute)
+								next := now.Add(authFailureModelCooldown(auth, result.Error, 30*time.Minute))
 								state.NextRetryAfter = next
 								suspendReason = "unauthorized"
 								shouldSuspendModel = true
@@ -4420,7 +4420,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 							if disableCooling {
 								state.NextRetryAfter = time.Time{}
 							} else {
-								next := now.Add(30 * time.Minute)
+								next := now.Add(authFailureModelCooldown(auth, result.Error, 30*time.Minute))
 								state.NextRetryAfter = next
 								suspendReason = "payment_required"
 								shouldSuspendModel = true
@@ -5255,6 +5255,24 @@ func setExecutionResultError(result *Result, err error) {
 	if ra := retryAfterFromError(err); ra != nil {
 		result.RetryAfter = ra
 	}
+}
+
+// reloginRecoveryCooldown is the short per-model cooldown applied to a 401/403
+// on a creds-bearing codex auth, for which the reactive path kicks a background
+// web re-login. The auth re-enters rotation right after the login lands (~20s) —
+// where the ensuing successful request clears the suspend — instead of sitting
+// out the full 30-minute auth-failure sideline.
+const reloginRecoveryCooldown = 30 * time.Second
+
+// authFailureModelCooldown returns how long to sideline a model after an
+// auth-level failure (401/403). A creds-bearing codex auth (one the reactive
+// path will re-login in the background) gets the short relogin-recovery
+// cooldown; everything else gets the supplied default.
+func authFailureModelCooldown(auth *Auth, resultErr *Error, deflt time.Duration) time.Duration {
+	if shouldAttemptAccessTokenRefresh(auth, resultErr) {
+		return reloginRecoveryCooldown
+	}
+	return deflt
 }
 
 // asyncReloginTimeout bounds a background web re-login kicked off the request
