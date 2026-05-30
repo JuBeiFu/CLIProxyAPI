@@ -2289,17 +2289,12 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 				}
 				setExecutionResultError(&result, errExec)
 				if shouldAttemptAccessTokenRefresh(auth, result.Error) {
-					if refreshedAuth, ok := m.refreshAuthAfterAccessTokenFailure(execCtx, auth, result.Error); ok {
-						resp, errExec = executor.Execute(execCtx, refreshedAuth, execReq, opts)
-						result = Result{AuthID: refreshedAuth.ID, Provider: provider, Model: resultModel, Success: errExec == nil, RequestPayload: bytes.Clone(execReq.Payload)}
-						if errExec != nil {
-							if errCtx := execCtx.Err(); errCtx != nil {
-								releaseLeases()
-								return cliproxyexecutor.Response{}, errCtx
-							}
-							setExecutionResultError(&result, errExec)
-						}
-					}
+					// Don't block the request on a multi-second web re-login: kick it
+					// in the background and fail over now. The dead auth is recoverable
+					// (creds present), so leaving SkipAccessTokenRefresh false keeps
+					// MarkResult from retiring it; a successful background login returns
+					// it to rotation for subsequent requests.
+					m.kickAsyncRelogin(execCtx, auth, result.Error)
 				}
 				if errExec == nil {
 					m.MarkResult(execCtx, result)
@@ -2404,17 +2399,12 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 				}
 				setExecutionResultError(&result, errExec)
 				if shouldAttemptAccessTokenRefresh(auth, result.Error) {
-					if refreshedAuth, ok := m.refreshAuthAfterAccessTokenFailure(execCtx, auth, result.Error); ok {
-						resp, errExec = executor.CountTokens(execCtx, refreshedAuth, execReq, opts)
-						result = Result{AuthID: refreshedAuth.ID, Provider: provider, Model: resultModel, Success: errExec == nil, RequestPayload: bytes.Clone(execReq.Payload)}
-						if errExec != nil {
-							if errCtx := execCtx.Err(); errCtx != nil {
-								lease.Release()
-								return cliproxyexecutor.Response{}, errCtx
-							}
-							setExecutionResultError(&result, errExec)
-						}
-					}
+					// Don't block the request on a multi-second web re-login: kick it
+					// in the background and fail over now. The dead auth is recoverable
+					// (creds present), so leaving SkipAccessTokenRefresh false keeps
+					// MarkResult from retiring it; a successful background login returns
+					// it to rotation for subsequent requests.
+					m.kickAsyncRelogin(execCtx, auth, result.Error)
 				}
 				if errExec == nil {
 					m.MarkResult(execCtx, result)
@@ -4259,6 +4249,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	terminalWarning := ""
 	terminallyDisabled := false
 	terminallyDeleted := false
+	pendingActivationCooldownApplied := false
 	var cyberAudit *cyberPolicyAuditRecord
 	shouldPersist := false
 
@@ -4269,7 +4260,19 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 		if !result.Success {
 			imageUnsupportedRegion := isImageUnsupportedRegionResult(result)
 			if !imageUnsupportedRegion {
-				if deleteAuth, reason := shouldDeleteRevokedAuth(auth, result.Error, result.SkipAccessTokenRefresh); deleteAuth {
+				if handled, deleteAuth, reason := codexPendingActivationUnauthorizedDecision(auth, result.Error, now); handled && deleteAuth {
+					applyTerminalAuthDisabledState(auth, result.Error, reason, now)
+					terminalAuthSnapshot = auth.Clone()
+					terminalWarning = reason
+					terminallyDisabled = true
+					terminallyDeleted = true
+					authChanged = true
+					delete(m.auths, result.AuthID)
+				} else if handled {
+					applyCodexPendingActivationCooldown(auth, result.Error, now)
+					pendingActivationCooldownApplied = true
+					authChanged = true
+				} else if deleteAuth, reason := shouldDeleteRevokedAuth(auth, result.Error, result.SkipAccessTokenRefresh); deleteAuth {
 					applyTerminalAuthDisabledState(auth, result.Error, reason, now)
 					terminalAuthSnapshot = auth.Clone()
 					terminalWarning = reason
@@ -4287,8 +4290,8 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 			}
 		}
 
-		if terminallyDisabled {
-			// Auth already disabled from runtime state.
+		if terminallyDisabled || pendingActivationCooldownApplied {
+			// Auth already handled by terminal or pending-activation state.
 		} else if result.Success {
 			if result.Model != "" {
 				modelStateChanged := false
@@ -4408,7 +4411,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 							if disableCooling {
 								state.NextRetryAfter = time.Time{}
 							} else {
-								next := now.Add(30 * time.Minute)
+								next := now.Add(authFailureModelCooldown(auth, result.Error, 30*time.Minute))
 								state.NextRetryAfter = next
 								suspendReason = "unauthorized"
 								shouldSuspendModel = true
@@ -4417,7 +4420,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 							if disableCooling {
 								state.NextRetryAfter = time.Time{}
 							} else {
-								next := now.Add(30 * time.Minute)
+								next := now.Add(authFailureModelCooldown(auth, result.Error, 30*time.Minute))
 								state.NextRetryAfter = next
 								suspendReason = "payment_required"
 								shouldSuspendModel = true
@@ -5254,6 +5257,51 @@ func setExecutionResultError(result *Result, err error) {
 	}
 }
 
+// reloginRecoveryCooldown is the short per-model cooldown applied to a 401/403
+// on a creds-bearing codex auth, for which the reactive path kicks a background
+// web re-login. The auth re-enters rotation right after the login lands (~20s) —
+// where the ensuing successful request clears the suspend — instead of sitting
+// out the full 30-minute auth-failure sideline.
+const reloginRecoveryCooldown = 30 * time.Second
+
+// authFailureModelCooldown returns how long to sideline a model after an
+// auth-level failure (401/403). A creds-bearing codex auth (one the reactive
+// path will re-login in the background) gets the short relogin-recovery
+// cooldown; everything else gets the supplied default.
+func authFailureModelCooldown(auth *Auth, resultErr *Error, deflt time.Duration) time.Duration {
+	if shouldAttemptAccessTokenRefresh(auth, resultErr) {
+		return reloginRecoveryCooldown
+	}
+	return deflt
+}
+
+// asyncReloginTimeout bounds a background web re-login kicked off the request
+// hot path, so a hung login can't leak a goroutine indefinitely.
+const asyncReloginTimeout = 2 * time.Minute
+
+// kickAsyncRelogin launches a codex web re-login for a dead-token auth in the
+// background and returns immediately, so the request that hit the 401 fails over
+// without blocking on a multi-second login. The login runs on a context detached
+// from the request (request completion / failover must not cancel it) with a
+// bounded timeout, and is de-duplicated per auth by the markRefreshPending gate
+// inside refreshAuthAfterAccessTokenFailure. Callers leave
+// result.SkipAccessTokenRefresh false so MarkResult treats the auth as
+// refresh-able (cooled, not retired) while the relogin is in flight; a
+// successful background login returns it to rotation for subsequent requests.
+func (m *Manager) kickAsyncRelogin(ctx context.Context, auth *Auth, resultErr *Error) {
+	if m == nil || auth == nil {
+		return
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	bg, cancel := context.WithTimeout(context.WithoutCancel(ctx), asyncReloginTimeout)
+	go func() {
+		defer cancel()
+		m.refreshAuthAfterAccessTokenFailure(bg, auth, resultErr)
+	}()
+}
+
 func (m *Manager) refreshAuthAfterAccessTokenFailure(ctx context.Context, auth *Auth, resultErr *Error) (*Auth, bool) {
 	if m == nil || !shouldAttemptAccessTokenRefresh(auth, resultErr) {
 		return nil, false
@@ -5262,9 +5310,19 @@ func (m *Manager) refreshAuthAfterAccessTokenFailure(ctx context.Context, auth *
 	if authID == "" {
 		return nil, false
 	}
+	// Gate entry so two concurrent 401s for the same auth don't both run a
+	// full login (= double re-login). markRefreshPending atomically claims the
+	// refresh slot (sets NextRefreshAfter into the future under m.mu) and
+	// returns false if a refresh is already pending. On false, skip the login
+	// and let the caller's else-arm set SkipAccessTokenRefresh so terminal
+	// logic can still fire. refreshAuth (invoked below) does not gate on
+	// NextRefreshAfter and resets it after the refresh, so claiming the slot
+	// here does not block the refresh we are about to run.
+	if !m.markRefreshPending(authID, time.Now()) {
+		return nil, false
+	}
 	m.mu.Lock()
 	if current := m.auths[authID]; current != nil {
-		current.NextRefreshAfter = time.Time{}
 		if current.Metadata == nil {
 			current.Metadata = make(map[string]any)
 		}
@@ -5511,12 +5569,82 @@ func isRefreshTokenReusedResultError(resultErr *Error) bool {
 }
 
 func shouldAttemptAccessTokenRefresh(auth *Auth, resultErr *Error) bool {
-	return false
+	if auth == nil || resultErr == nil {
+		return false
+	}
+	if !isCodexAuth(auth) {
+		return false
+	}
+	// Only attempt for auth/token errors (401/403), not quota/5xx.
+	switch resultErr.StatusCode() {
+	case http.StatusUnauthorized, http.StatusForbidden:
+	default:
+		return false
+	}
+	// Must carry login creds to recover (creds embedded in the auth file).
+	m := auth.Metadata
+	if m == nil {
+		return false
+	}
+	email, _ := m["email"].(string)
+	pw, _ := m["openai_password"].(string)
+	totp, _ := m["totp_secret"].(string)
+	cid, _ := m["oauth2_client_id"].(string)
+	rt, _ := m["oauth2_refresh_token"].(string)
+	hasPwTotp := email != "" && pw != "" && totp != ""
+	hasPwOnly := email != "" && pw != ""
+	hasMail := email != "" && cid != "" && rt != ""
+	return hasPwTotp || hasPwOnly || hasMail
+}
+
+func codexPendingActivationUnauthorizedDecision(auth *Auth, resultErr *Error, now time.Time) (bool, bool, string) {
+	if !isCodexPendingActivationAuth(auth) || !isPlainUnauthorizedResultError(resultErr) {
+		return false, false, ""
+	}
+	if shouldDeleteCodexPendingActivationAuth(auth, now, DefaultPendingActivationDeletionGrace) {
+		return true, true, fmt.Sprintf("%s_expired: age>=%s", codexPendingActivationReason, DefaultPendingActivationDeletionGrace)
+	}
+	return true, false, codexPendingActivationReason
+}
+
+func isPlainUnauthorizedResultError(resultErr *Error) bool {
+	if resultErr == nil {
+		return false
+	}
+	message := strings.ToLower(strings.TrimSpace(resultErr.Message))
+	for _, terminalNeedle := range []string{
+		"refresh_token_reused",
+		"refresh_token_invalidated",
+		"refresh token has been invalidated",
+		"refresh token has already been used",
+		"token_revoked",
+		"token_invalidated",
+		"authorization lost",
+		"forbidden",
+		"deactivated_workspace",
+		"account_deactivated",
+		"account has been deactivated",
+		"encountered invalidated oauth token for user",
+		"must be a member of an organization to use the api",
+	} {
+		if strings.Contains(message, terminalNeedle) {
+			return false
+		}
+	}
+	if resultErr.StatusCode() == http.StatusUnauthorized {
+		return true
+	}
+	return strings.Contains(message, `"detail":"unauthorized"`) ||
+		strings.Contains(message, `"detail": "unauthorized"`) ||
+		message == "unauthorized"
 }
 
 func shouldDeleteRevokedAuth(auth *Auth, resultErr *Error, skipAccessTokenRefresh bool) (bool, string) {
 	if !isCodexAuth(auth) || !hasPersistedAuthRecord(auth) {
 		return false, ""
+	}
+	if handled, deleteAuth, reason := codexPendingActivationUnauthorizedDecision(auth, resultErr, time.Now()); handled {
+		return deleteAuth, reason
 	}
 	if !skipAccessTokenRefresh && shouldAttemptAccessTokenRefresh(auth, resultErr) {
 		return false, ""
@@ -5527,6 +5655,9 @@ func shouldDeleteRevokedAuth(auth *Auth, resultErr *Error, skipAccessTokenRefres
 
 func shouldDisableRevokedAuth(auth *Auth, resultErr *Error, skipAccessTokenRefresh bool) (bool, string) {
 	if !isCodexAuth(auth) || auth == nil {
+		return false, ""
+	}
+	if handled, _, _ := codexPendingActivationUnauthorizedDecision(auth, resultErr, time.Now()); handled {
 		return false, ""
 	}
 	if !skipAccessTokenRefresh && shouldAttemptAccessTokenRefresh(auth, resultErr) {
@@ -5779,8 +5910,35 @@ func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Durati
 	}
 }
 
+func applyCodexPendingActivationCooldown(auth *Auth, resultErr *Error, now time.Time) {
+	if auth == nil {
+		return
+	}
+	next := now.Add(DefaultPendingActivationProbeInterval)
+	auth.Unavailable = true
+	if auth.Status != StatusDisabled {
+		auth.Status = StatusError
+	}
+	auth.StatusMessage = codexPendingActivationReason
+	auth.NextRetryAfter = next
+	auth.Quota = QuotaState{
+		Exceeded:      true,
+		Reason:        codexPendingActivationReason,
+		NextRecoverAt: next,
+		UpdatedAt:     now,
+	}
+	if resultErr != nil {
+		auth.LastError = cloneError(resultErr)
+	}
+	auth.UpdatedAt = now
+}
+
 func applyCodexFiveHourQuotaRest(auth *Auth, now time.Time) {
 	if auth == nil || !isCodexAuth(auth) {
+		return
+	}
+	if isCodexPendingActivationAuth(auth) {
+		applyCodexPendingActivationCooldown(auth, nil, now)
 		return
 	}
 	if ratio, okWeekly := codexWeeklyRemainingRatio(auth); okWeekly && ratio <= 0 {
@@ -5833,6 +5991,9 @@ func codexQuotaRefreshRecoveredState(auth *Auth, hasFiveHourRatio bool, now time
 	}
 	if auth.Quota.Exceeded && auth.Quota.Reason == codexWeeklyQuotaLowReason {
 		return true
+	}
+	if auth.Quota.Exceeded && auth.Quota.Reason == codexPendingActivationReason {
+		return !isCodexPendingActivationAuth(auth)
 	}
 	if auth.Quota.Exceeded && auth.Quota.Reason == codexFiveHourQuotaLowReason {
 		return hasFiveHourRatio
@@ -6994,6 +7155,41 @@ func (m *Manager) refreshAuth(ctx context.Context, id string) {
 	now := time.Now()
 	if err != nil {
 		resultErr := resultErrorFromError(err)
+		if handled, deleteAuth, reason := codexPendingActivationUnauthorizedDecision(auth, resultErr, now); handled {
+			if deleteAuth {
+				var authSnapshot *Auth
+				m.mu.Lock()
+				if current := m.auths[id]; current != nil {
+					applyTerminalAuthDisabledState(current, resultErr, reason, now)
+					current.NextRefreshAfter = time.Time{}
+					authSnapshot = current.Clone()
+					delete(m.auths, id)
+				}
+				m.mu.Unlock()
+				if authSnapshot != nil {
+					m.deleteRevokedAuth(authSnapshot, reason, "refresh")
+				}
+				return
+			}
+			var authSnapshot *Auth
+			var persistErr error
+			m.mu.Lock()
+			if current := m.auths[id]; current != nil {
+				applyCodexPendingActivationCooldown(current, resultErr, now)
+				current.NextRefreshAfter = now.Add(DefaultPendingActivationProbeInterval)
+				m.auths[id] = current
+				authSnapshot = current.Clone()
+				persistErr = m.persist(ctx, current)
+			}
+			m.mu.Unlock()
+			if authSnapshot != nil && m.scheduler != nil {
+				m.scheduler.upsertAuth(authSnapshot)
+			}
+			if persistErr != nil {
+				log.Warnf("failed to persist pending activation cooldown for auth %s%s: %v", authSnapshot.ID, authPathSuffix(authSnapshot), persistErr)
+			}
+			return
+		}
 		if deleteAuth, reason := shouldDeleteRevokedAuth(auth, resultErr, false); deleteAuth {
 			var authSnapshot *Auth
 			m.mu.Lock()

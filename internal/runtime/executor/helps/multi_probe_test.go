@@ -196,6 +196,40 @@ func TestProbeCodexPlanAcrossPoolReturnsWeeklyQuotaFromPaidPath(t *testing.T) {
 	}
 }
 
+func TestProbeCodexPlanAcrossPoolReturnsUsageFromFreePath(t *testing.T) {
+	orig := fetchUsageInfoWithProxy
+	defer func() { fetchUsageInfoWithProxy = orig }()
+
+	weeklyQuota := &codexauth.WhamQuotaWindow{RemainingRatio: 0.75}
+	fetchUsageInfoWithProxy = func(ctx context.Context, proxyURL, accessToken string) (codexauth.WhamUsageInfo, error) {
+		return codexauth.WhamUsageInfo{
+			PlanType:        "free",
+			SupportedModels: []string{"gpt-5.4-mini"},
+			WeeklyQuota:     weeklyQuota,
+		}, nil
+	}
+
+	plan, bound, models, fiveHourQuota, gotWeeklyQuota, ok, err := ProbeCodexPlanAcrossPool(context.Background(), &config.Config{}, &cliproxyauth.Auth{Provider: "codex"}, "token")
+	if err != nil {
+		t.Fatalf("ProbeCodexPlanAcrossPool error = %v", err)
+	}
+	if !ok {
+		t.Fatal("probeOK = false, want true")
+	}
+	if plan != "free" || bound != "" {
+		t.Fatalf("plan/bound = %q/%q, want free/empty", plan, bound)
+	}
+	if len(models) != 1 || models[0] != "gpt-5.4-mini" {
+		t.Fatalf("models = %v, want [gpt-5.4-mini]", models)
+	}
+	if fiveHourQuota != nil {
+		t.Fatalf("five-hour quota = %+v, want nil", fiveHourQuota)
+	}
+	if gotWeeklyQuota != weeklyQuota {
+		t.Fatalf("weekly quota = %+v, want %+v", gotWeeklyQuota, weeklyQuota)
+	}
+}
+
 func TestProbeCodexPlanAcrossPoolReturnsTerminalAuthErrorWhenAllPathsUnauthorized(t *testing.T) {
 	orig := fetchUsageInfoWithProxy
 	defer func() { fetchUsageInfoWithProxy = orig }()

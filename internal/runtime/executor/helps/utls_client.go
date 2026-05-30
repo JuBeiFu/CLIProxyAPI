@@ -168,6 +168,16 @@ var codexHosts = map[string]struct{}{
 	"chatgpt.com": {},
 }
 
+// openaiLoginHosts are the OpenAI login-surface hosts that require a Chrome TLS
+// fingerprint to pass Cloudflare during native-Go web re-login. Used only by the
+// dedicated login client (NewOpenAILoginUtlsHTTPClient); existing codex
+// token-refresh and codex API transport routing is deliberately unchanged.
+var openaiLoginHosts = map[string]struct{}{
+	"chatgpt.com":         {},
+	"auth.openai.com":     {},
+	"sentinel.openai.com": {},
+}
+
 // fallbackRoundTripper uses utls for the configured HTTPS host set and falls
 // back to standard transport for all other requests (non-HTTPS or non-listed).
 type fallbackRoundTripper struct {
@@ -222,6 +232,44 @@ func NewUtlsHTTPClient(cfg *config.Config, auth *cliproxyauth.Auth, timeout time
 			utls:     utlsRT,
 			fallback: standardTransport,
 			hosts:    anthropicHosts,
+		},
+	}
+	if timeout > 0 {
+		client.Timeout = timeout
+	}
+	return client
+}
+
+// NewOpenAILoginUtlsHTTPClient builds a utls-backed client for the native-Go
+// ChatGPT web re-login flow: the OpenAI login-surface hosts (chatgpt.com,
+// auth.openai.com, sentinel.openai.com) present a real-browser Chrome TLS
+// fingerprint to pass Cloudflare, while every other host (e.g. the Microsoft
+// Graph mailbox used by the email-OTP flow) falls back to the standard
+// transport. Egress is resolved through the auth's bound proxy for IP
+// consistency with the account's serving traffic.
+func NewOpenAILoginUtlsHTTPClient(cfg *config.Config, auth *cliproxyauth.Auth, timeout time.Duration) *http.Client {
+	resolution := proxypool.Resolve(cfg, auth)
+	proxyURL := strings.TrimSpace(resolution.ProxyURL)
+
+	utlsRT := newUtlsRoundTripper(proxyURL)
+
+	var standardTransport http.RoundTripper
+	if transport := proxypool.BuildHTTPRoundTripperForResolution(resolution); transport != nil {
+		standardTransport = transport
+	} else {
+		standardTransport = &http.Transport{
+			DialContext: (&net.Dialer{
+				Timeout:   30 * time.Second,
+				KeepAlive: 30 * time.Second,
+			}).DialContext,
+		}
+	}
+
+	client := &http.Client{
+		Transport: &fallbackRoundTripper{
+			utls:     utlsRT,
+			fallback: standardTransport,
+			hosts:    openaiLoginHosts,
 		},
 	}
 	if timeout > 0 {

@@ -157,3 +157,40 @@ func TestForceHTTP1ALPN(t *testing.T) {
 		t.Fatalf("Chrome ClientHello spec had no ALPN extension to pin")
 	}
 }
+
+// The native-Go re-login client must present a real-browser TLS fingerprint for
+// the OpenAI login-surface hosts (chatgpt.com / auth.openai.com / sentinel) to
+// clear Cloudflare, while the Microsoft Graph mailbox (email-OTP flow) and every
+// other host stay on the standard transport.
+func TestOpenAILoginHostsRouteUtls(t *testing.T) {
+	var hit string
+	frt := &fallbackRoundTripper{
+		utls:     recordingRT{label: "utls", hit: &hit},
+		fallback: recordingRT{label: "fallback", hit: &hit},
+		hosts:    openaiLoginHosts,
+	}
+	cases := []struct {
+		url  string
+		want string
+	}{
+		{"https://chatgpt.com/api/auth/session", "utls"},
+		{"https://AUTH.OPENAI.COM/api/accounts/password/verify", "utls"}, // case-insensitive
+		{"https://sentinel.openai.com/api/sentinel", "utls"},
+		{"https://graph.microsoft.com/v1.0/me/messages", "fallback"},
+		{"https://example.com/", "fallback"},
+		{"http://chatgpt.com/api/auth/session", "fallback"}, // scheme gate
+	}
+	for _, c := range cases {
+		hit = ""
+		req, err := http.NewRequest(http.MethodGet, c.url, nil)
+		if err != nil {
+			t.Fatalf("new request %q: %v", c.url, err)
+		}
+		if _, err := frt.RoundTrip(req); err != nil {
+			t.Fatalf("RoundTrip %q: %v", c.url, err)
+		}
+		if hit != c.want {
+			t.Errorf("RoundTrip %q routed to %q, want %q", c.url, hit, c.want)
+		}
+	}
+}

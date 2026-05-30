@@ -426,6 +426,16 @@ func isAuthBlockedForModel(auth *Auth, model string, now time.Time) (bool, block
 	if auth.Disabled || auth.Status == StatusDisabled {
 		return true, blockReasonDisabled, time.Time{}
 	}
+	if isCodexPendingActivationAuth(auth) {
+		next := auth.Quota.NextRecoverAt
+		if next.IsZero() {
+			next = auth.NextRetryAfter
+		}
+		if next.IsZero() || !next.After(now) {
+			next = now.Add(DefaultPendingActivationProbeInterval)
+		}
+		return true, blockReasonCooldown, next
+	}
 	if auth.Quota.Exceeded {
 		next := auth.Quota.NextRecoverAt
 		if next.IsZero() {
