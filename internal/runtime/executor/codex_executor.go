@@ -230,6 +230,18 @@ func configureCodexResponsesStreamTransport(client *http.Client, cfg *config.Con
 	if timing.streamTransport == "" {
 		timing.streamTransport = "default"
 	}
+	// The default codex utls client already speaks HTTP/1.1 over a real-browser
+	// TLS ClientHello, so there is no Go-net HTTP/2 SETTINGS frame to downgrade.
+	// Detect it via an interface (the concrete *fallbackRoundTripper lives in
+	// the helps package) and report it correctly instead of mis-classifying it
+	// as "http1.1_unsupported" by the *http.Transport assertion below.
+	if client != nil {
+		if h1, ok := client.Transport.(interface{ CodexUtlsHTTP1() bool }); ok && h1.CodexUtlsHTTP1() {
+			timing.streamTransport = "http1.1_utls"
+			timing.http2Disabled = true
+			return
+		}
+	}
 	if !codexResponsesStreamHTTP1Enabled(cfg) {
 		return
 	}

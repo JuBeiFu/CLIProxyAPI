@@ -261,6 +261,24 @@ nonstream-keepalive-interval: 0
 # codex-header-defaults:
 #   user-agent: "codex_cli_rs/0.114.0 (Mac OS 14.2.0; x86_64) vscode/1.111.0"
 #   beta-features: "multi_agent"
+#   # Route codex (chatgpt.com) upstream traffic through a real-browser TLS
+#   # fingerprint (utls) instead of Go's stdlib ClientHello, which Cloudflare/
+#   # OpenAI trivially flag as a non-browser client (the cause of served codex
+#   # accounts dying). Default false; enable, deploy, then validate that fresh
+#   # served accounts survive sustained traffic before trusting it.
+#   upstream-utls: false
+#   # ClientHello profile for upstream-utls. Match the served user-agent's OS:
+#   # "safari" (default — macOS codex CLI uses native-tls ≈ SecureTransport ≈
+#   # Safari), "ios", "chrome" (Windows/Linux UA), or "firefox".
+#   utls-profile: "safari"
+#   # Keep HTTP/2 on the utls socket (ALPN h2 matches the real codex client) at
+#   # the cost of emitting Go-net's HTTP/2 SETTINGS frame, which no real browser/
+#   # hyper sends — a residual fingerprint tell. Default false pins HTTP/1.1 over
+#   # the browser-TLS socket so there is no Go HTTP/2 fingerprint surface.
+#   utls-http2: false
+#   # NOTE: upstream-utls covers the codex HTTP responses path to chatgpt.com.
+#   # It does NOT yet cover the WebSocket transport (gorilla dialer) or the
+#   # /wham/usage plan-type probe — those still present Go-stdlib TLS.
 
 # OpenAI compatibility providers
 # openai-compatibility:

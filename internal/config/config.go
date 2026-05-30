@@ -198,6 +198,14 @@ type CodexHeaderDefaults struct {
 	// i.e. SecureTransport ≈ Safari), "ios", "chrome", or "firefox". Match the
 	// served User-Agent's OS. Only used when UpstreamUTLS is true.
 	UTLSProfile string `yaml:"utls-profile" json:"utls-profile"`
+	// UTLSHTTP2, when true, keeps HTTP/2 on the codex utls socket (ALPN h2,
+	// matching the real codex client's negotiated protocol) at the cost of
+	// emitting Go-net's HTTP/2 SETTINGS frame, which does not match a real
+	// browser or hyper/h2 and is a residual fingerprint signal on top of the
+	// browser TLS ClientHello. Default false = pin HTTP/1.1 over the browser-TLS
+	// socket so there is no Go-net HTTP/2 fingerprint surface (mirrors sub2api).
+	// Only used when UpstreamUTLS is true.
+	UTLSHTTP2 bool `yaml:"utls-http2" json:"utls-http2"`
 }
 
 // TLSConfig holds HTTPS server settings.
