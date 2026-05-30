@@ -2,11 +2,19 @@ package weblogin
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 )
+
+// reloginAttempts is how many times SessionLoginWithRetry attempts a login
+// before giving up on a transient failure. Web login is flaky (Cloudflare 403
+// gates, sentinel PoW timing, OTP delivery latency), so a few retries materially
+// improve recovery; a banned account (ErrAccountBanned) is terminal and never
+// retried.
+const reloginAttempts = 3
 
 type flowKind int
 
@@ -81,4 +89,39 @@ func SessionLogin(ctx context.Context, cfg *config.Config, auth *cliproxyauth.Au
 		return c.LoginEmailOTP(ctx, cr.Email, cr.MailClientID, cr.MailRefreshToken)
 	}
 	return nil, fmt.Errorf("%w: unsupported flow", ErrLoginTransient)
+}
+
+// SessionLoginWithRetry calls SessionLogin up to reloginAttempts times, retrying
+// only transient (ErrLoginTransient) failures. Success and ErrAccountBanned
+// (terminal) both return immediately; a cancelled context aborts without a
+// further attempt.
+func SessionLoginWithRetry(ctx context.Context, cfg *config.Config, auth *cliproxyauth.Auth) (*SessionResult, error) {
+	return sessionLoginWithRetry(ctx, reloginAttempts, func(ctx context.Context) (*SessionResult, error) {
+		return SessionLogin(ctx, cfg, auth)
+	})
+}
+
+// sessionLoginWithRetry is the testable core of SessionLoginWithRetry: it runs
+// login up to attempts times, returning on the first success, on ErrAccountBanned
+// (never retried), or on a cancelled context; otherwise it retries until the
+// attempt budget is exhausted and returns the last error.
+func sessionLoginWithRetry(ctx context.Context, attempts int, login func(context.Context) (*SessionResult, error)) (*SessionResult, error) {
+	if attempts < 1 {
+		attempts = 1
+	}
+	var lastErr error
+	for i := 0; i < attempts; i++ {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		sess, err := login(ctx)
+		if err == nil {
+			return sess, nil
+		}
+		lastErr = err
+		if errors.Is(err, ErrAccountBanned) {
+			return nil, err
+		}
+	}
+	return nil, lastErr
 }

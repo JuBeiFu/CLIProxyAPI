@@ -1819,7 +1819,7 @@ func (e *CodexExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*
 		// re-login (replace ONLY the access_token) and re-probe once. Banned accounts fail
 		// at login -> terminal. Non-auth probe errors (5xx/network) propagate unchanged.
 		if isAuthInvalidationError(probeErr) && weblogin.HasReloginCreds(auth) {
-			sess, loginErr := weblogin.SessionLogin(ctx, e.cfg, auth)
+			sess, loginErr := weblogin.SessionLoginWithRetry(ctx, e.cfg, auth)
 			if loginErr != nil {
 				return nil, loginErr
 			}
@@ -1889,7 +1889,7 @@ func (e *CodexExecutor) codexAccessTokenForProbe(ctx context.Context, auth *clip
 		// design: DON'T propagate (that would delete/disable the account). Instead run a
 		// native-Go chatgpt web login and replace ONLY the access_token, keeping the
 		// (dead) refresh_token as a placeholder.
-		sess, loginErr := weblogin.SessionLogin(ctx, e.cfg, auth)
+		sess, loginErr := weblogin.SessionLoginWithRetry(ctx, e.cfg, auth)
 		if loginErr != nil {
 			// ErrAccountBanned -> message has a terminal needle -> conductor disables.
 			// ErrLoginTransient -> no needle -> conductor backs off and retries.
