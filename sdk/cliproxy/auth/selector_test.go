@@ -380,6 +380,32 @@ func TestIsAuthBlockedForModel_AuthLevelQuotaCooldownBlocksAcrossModels(t *testi
 	}
 }
 
+func TestIsAuthBlockedForModel_PendingActivationBlocksWithoutQuotaState(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now()
+	auth := &Auth{
+		ID:         "pending-activation",
+		Provider:   "codex",
+		Attributes: map[string]string{"plan_type": "free"},
+		Metadata: map[string]any{
+			MetadataProbedPlanTypeKey:                 "free",
+			MetadataCodexWeeklyQuotaRemainingRatioKey: 0.75,
+		},
+	}
+
+	blocked, reason, next := isAuthBlockedForModel(auth, "gpt-5.4-mini", now)
+	if !blocked {
+		t.Fatal("blocked = false, want true")
+	}
+	if reason != blockReasonCooldown {
+		t.Fatalf("reason = %v, want %v", reason, blockReasonCooldown)
+	}
+	if next.Before(now.Add(4*time.Minute)) || next.After(now.Add(6*time.Minute)) {
+		t.Fatalf("next = %v, want about 5m after now", next)
+	}
+}
+
 func TestFillFirstSelectorPick_ThinkingSuffixFallsBackToBaseModelState(t *testing.T) {
 	t.Parallel()
 

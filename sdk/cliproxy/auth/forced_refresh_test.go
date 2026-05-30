@@ -128,6 +128,26 @@ func TestShouldForceRefresh_Scope(t *testing.T) {
 			expect: false,
 		},
 		{
+			name: "free_weekly_only_session_pending_activation_in",
+			auth: func() *Auth {
+				a := mustAuth("codex", "free", "free", false)
+				delete(a.Metadata, "refresh_token")
+				a.Metadata[MetadataCodexWeeklyQuotaRemainingRatioKey] = 0.75
+				return a
+			}(),
+			expect: true,
+		},
+		{
+			name: "free_weekly_only_refresh_token_out",
+			auth: func() *Auth {
+				a := mustAuth("codex", "free", "free", false)
+				a.Metadata["refresh_token"] = "refresh-token"
+				a.Metadata[MetadataCodexWeeklyQuotaRemainingRatioKey] = 0.75
+				return a
+			}(),
+			expect: false,
+		},
+		{
 			// Probed free but submitted pin missing → settled (no paid contract
 			// to watch for). Exit scope.
 			name:   "empty_submitted_probed_free_out",

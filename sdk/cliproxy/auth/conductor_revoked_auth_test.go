@@ -148,6 +148,18 @@ func newPersistedCodexAuth(id string) *Auth {
 	}
 }
 
+func newPendingActivationCodexAuth(id string, createdAt time.Time) *Auth {
+	auth := newPersistedCodexAuth(id)
+	auth.CreatedAt = createdAt
+	delete(auth.Metadata, "refresh_token")
+	auth.Attributes["plan_type"] = "free"
+	auth.Metadata[MetadataProbedPlanTypeKey] = "free"
+	auth.Metadata[MetadataCodexWeeklyQuotaRemainingRatioKey] = 0.75
+	auth.Metadata[MetadataCodexWeeklyQuotaUpdatedAtKey] = time.Now().UTC().Format(time.RFC3339)
+	auth.Metadata[MetadataCodexFiveHourQuotaUpdatedAtKey] = time.Now().UTC().Format(time.RFC3339)
+	return auth
+}
+
 func assertPersistedAuthDeleted(t *testing.T, mgr *Manager, store *deletingStore, auth *Auth) {
 	t.Helper()
 	if _, ok := mgr.GetByID(auth.ID); ok {
@@ -331,6 +343,104 @@ func TestManager_MarkResult_DisablesRuntimeOnlyAuthOnUnauthorized(t *testing.T) 
 	}
 	if len(store.deleted) != 0 {
 		t.Fatalf("expected runtime-only auth not to be deleted from store, got %v", store.deleted)
+	}
+}
+
+func TestManager_MarkResult_CooldownsPendingActivationCodexOnUnauthorized(t *testing.T) {
+	store := &deletingStore{}
+	mgr := NewManager(store, nil, nil)
+	auth := newPendingActivationCodexAuth("auths/pending-activation.json", time.Now().Add(-30*time.Minute))
+	clearRevokedAuthTombstoneForTest(t, auth)
+	if _, err := mgr.Register(WithSkipPersist(context.Background()), auth); err != nil {
+		t.Fatalf("Register returned error: %v", err)
+	}
+
+	mgr.MarkResult(context.Background(), Result{
+		AuthID:   auth.ID,
+		Provider: "codex",
+		Model:    "gpt-5.4-mini",
+		Success:  false,
+		Error: &Error{
+			HTTPStatus: http.StatusUnauthorized,
+			Message:    `{"detail":"Unauthorized"}`,
+		},
+	})
+
+	stored, ok := mgr.GetByID(auth.ID)
+	if !ok {
+		t.Fatal("expected pending activation auth to remain registered")
+	}
+	if stored.Disabled || stored.Status == StatusDisabled {
+		t.Fatalf("expected auth not disabled, got disabled=%v status=%q", stored.Disabled, stored.Status)
+	}
+	if !stored.Unavailable || stored.Quota.Reason != codexPendingActivationReason {
+		t.Fatalf("expected pending activation quota cooldown, got unavailable=%v quota=%+v", stored.Unavailable, stored.Quota)
+	}
+	if delta := time.Until(stored.Quota.NextRecoverAt); delta < 4*time.Minute || delta > 6*time.Minute {
+		t.Fatalf("expected about 5m cooldown, got %s", delta)
+	}
+	if len(store.deleted) != 0 {
+		t.Fatalf("expected no delete, got %v", store.deleted)
+	}
+	if HasRevokedAuthTombstone(auth, time.Now()) {
+		t.Fatal("expected no revoked tombstone for pending activation cooldown")
+	}
+}
+
+func TestManager_MarkResult_DeletesPendingActivationCodexAfterGrace(t *testing.T) {
+	store := &deletingStore{}
+	mgr := NewManager(store, nil, nil)
+	auth := newPendingActivationCodexAuth("auths/pending-activation-expired.json", time.Now().Add(-5*time.Hour))
+	clearRevokedAuthTombstoneForTest(t, auth)
+	if _, err := mgr.Register(WithSkipPersist(context.Background()), auth); err != nil {
+		t.Fatalf("Register returned error: %v", err)
+	}
+
+	mgr.MarkResult(context.Background(), Result{
+		AuthID:   auth.ID,
+		Provider: "codex",
+		Model:    "gpt-5.4-mini",
+		Success:  false,
+		Error: &Error{
+			HTTPStatus: http.StatusUnauthorized,
+			Message:    `{"detail":"Unauthorized"}`,
+		},
+	})
+
+	assertPersistedAuthDeleted(t, mgr, store, auth)
+}
+
+func TestManager_RefreshAuth_CooldownsPendingActivationCodexOnUnauthorized(t *testing.T) {
+	store := &deletingStore{}
+	mgr := NewManager(store, nil, nil)
+	mgr.RegisterExecutor(&revokedRefreshExecutor{
+		id: "codex",
+		err: &Error{
+			HTTPStatus: http.StatusUnauthorized,
+			Message:    `{"detail":"Unauthorized"}`,
+		},
+	})
+
+	auth := newPendingActivationCodexAuth("auths/pending-activation-refresh.json", time.Now().Add(-30*time.Minute))
+	clearRevokedAuthTombstoneForTest(t, auth)
+	if _, err := mgr.Register(WithSkipPersist(context.Background()), auth); err != nil {
+		t.Fatalf("Register returned error: %v", err)
+	}
+
+	mgr.refreshAuth(context.Background(), auth.ID)
+
+	stored, ok := mgr.GetByID(auth.ID)
+	if !ok {
+		t.Fatal("expected pending activation auth to remain registered")
+	}
+	if stored.Disabled || stored.Status == StatusDisabled {
+		t.Fatalf("expected auth not disabled, got disabled=%v status=%q", stored.Disabled, stored.Status)
+	}
+	if !stored.Unavailable || stored.Quota.Reason != codexPendingActivationReason {
+		t.Fatalf("expected pending activation quota cooldown, got unavailable=%v quota=%+v", stored.Unavailable, stored.Quota)
+	}
+	if len(store.deleted) != 0 {
+		t.Fatalf("expected no delete, got %v", store.deleted)
 	}
 }
 

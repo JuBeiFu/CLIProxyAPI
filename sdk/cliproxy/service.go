@@ -773,14 +773,16 @@ func (s *Service) Run(ctx context.Context) error {
 		// Disabled skip) so downgrade state flips are caught fast and stale
 		// downgrades are deleted after the 2h grace window. It ALSO re-probes
 		// auths whose pinned proxy entry has become unusable so dead proxies
-		// trigger automatic re-binding without operator intervention.
+		// trigger automatic re-binding without operator intervention. Free
+		// weekly-only session auths are also re-probed every tick while they
+		// wait for subscription activation.
 		coreauth.BoundProxyHealthChecker = func(a *coreauth.Auth) bool {
 			return isBoundProxyUnusable(s.cfg, a)
 		}
 		forcedInterval := coreauth.DefaultForcedRefreshInterval
 		forcedGrace := coreauth.DefaultDowngradeDeletionGrace
 		s.coreManager.StartAutoForcedRefresh(context.Background(), forcedInterval, forcedGrace)
-		log.Infof("core auth forced refresh started (interval=%s, downgrade-grace=%s, bound-reprobe=%s, scope=codex {submitted-paid+probed-free, unbound, bound-entry-unhealthy, stale-bound-paid})", forcedInterval, forcedGrace, coreauth.DefaultBoundReprobeInterval)
+		log.Infof("core auth forced refresh started (interval=%s, downgrade-grace=%s, pending-activation-grace=%s, bound-reprobe=%s, scope=codex {submitted-paid+probed-free, pending-activation, unbound, bound-entry-unhealthy, stale-bound-paid})", forcedInterval, forcedGrace, coreauth.DefaultPendingActivationDeletionGrace, coreauth.DefaultBoundReprobeInterval)
 	}
 
 	select {

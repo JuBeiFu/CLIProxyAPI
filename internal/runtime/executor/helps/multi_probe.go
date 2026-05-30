@@ -106,6 +106,9 @@ func ProbeCodexPlanAcrossPool(
 	appendCandidate(probeCandidate{entryName: cliproxyauth.BoundProxyEntryDirect, proxyURL: ""})
 
 	var lastFreePlan string
+	var lastFreeSupportedModels []string
+	var lastFreeFiveHourQuota *codexauth.WhamQuotaWindow
+	var lastFreeWeeklyQuota *codexauth.WhamQuotaWindow
 	var anySucceeded bool
 	var terminalAuthErr error
 
@@ -139,12 +142,15 @@ func ProbeCodexPlanAcrossPool(
 		// path through other nodes: OpenAI edge caches sometimes disagree
 		// on newly-upgraded accounts.
 		lastFreePlan = got
+		lastFreeSupportedModels = info.SupportedModels
+		lastFreeFiveHourQuota = info.FiveHourQuota
+		lastFreeWeeklyQuota = info.WeeklyQuota
 	}
 
 	if anySucceeded {
 		// All paths reported free. Clear any previous binding: the auth
 		// has no egress that will serve it as paid right now.
-		return lastFreePlan, "", nil, nil, nil, true, nil
+		return lastFreePlan, "", lastFreeSupportedModels, lastFreeFiveHourQuota, lastFreeWeeklyQuota, true, nil
 	}
 
 	if terminalAuthErr != nil {

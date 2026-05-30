@@ -39,6 +39,14 @@ const DefaultDowngradeDeletionGrace = 2 * time.Hour
 // within budget.
 const DefaultBoundReprobeInterval = 5 * time.Minute
 
+// DefaultPendingActivationProbeInterval is the retry cadence for newly
+// imported free Codex session auths that expose only the weekly usage window.
+const DefaultPendingActivationProbeInterval = 5 * time.Minute
+
+// DefaultPendingActivationDeletionGrace is the maximum age for a free
+// weekly-only Codex session auth to wait for activation before removal.
+const DefaultPendingActivationDeletionGrace = 4 * time.Hour
+
 // BoundProxyHealthChecker, when non-nil, is consulted by shouldForceRefresh
 // to also bring back into scope any codex auth whose pinned proxy entry is
 // no longer usable (disabled in config, removed from pool, or marked
@@ -89,6 +97,9 @@ func shouldForceRefresh(auth *Auth) bool {
 	}
 	if !strings.EqualFold(strings.TrimSpace(auth.Provider), "codex") {
 		return false
+	}
+	if isCodexPendingActivationAuth(auth) {
+		return true
 	}
 	probed := probedPlanType(auth)
 	if probed == "" {
@@ -228,6 +239,10 @@ func (m *Manager) runForcedRefreshOnce(ctx context.Context, grace time.Duration)
 		if !shouldForceRefresh(a) {
 			continue
 		}
+		if shouldDeleteCodexPendingActivationAuth(a, now, DefaultPendingActivationDeletionGrace) {
+			m.deletePendingActivationExpired(a.ID, DefaultPendingActivationDeletionGrace)
+			continue
+		}
 		// Delete-eligibility check BEFORE refresh: the last probe is at most
 		// one interval stale; if it reported free AND the grace window has
 		// elapsed, that is authoritative enough to remove the auth.
@@ -294,5 +309,24 @@ func (m *Manager) deleteForcedRefreshExpired(id string, grace time.Duration) {
 	log.Warnf("codex forced-refresh: deleting auth %s (downgrade persisted >%s): %s",
 		id, grace, removed.StatusMessage)
 	reason := fmt.Sprintf("codex_downgrade_grace_expired (>%s)", grace)
+	m.deleteRevokedAuth(removed, reason, "forced_refresh")
+}
+
+func (m *Manager) deletePendingActivationExpired(id string, grace time.Duration) {
+	m.mu.Lock()
+	current := m.auths[id]
+	if current == nil {
+		m.mu.Unlock()
+		return
+	}
+	if !isCodexPendingActivationAuth(current) || !shouldDeleteCodexPendingActivationAuth(current, time.Now(), grace) {
+		m.mu.Unlock()
+		return
+	}
+	removed := current.Clone()
+	delete(m.auths, id)
+	m.mu.Unlock()
+	log.Warnf("codex forced-refresh: deleting auth %s (pending activation persisted >=%s)", id, grace)
+	reason := fmt.Sprintf("%s_expired (>= %s)", codexPendingActivationReason, grace)
 	m.deleteRevokedAuth(removed, reason, "forced_refresh")
 }

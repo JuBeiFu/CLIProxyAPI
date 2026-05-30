@@ -146,6 +146,28 @@ func TestRunForcedRefreshOnce_DeletesAfterGrace(t *testing.T) {
 	}
 }
 
+func TestRunForcedRefreshOnce_DeletesPendingActivationAfterGrace(t *testing.T) {
+	t.Parallel()
+	m := NewManager(nil, nil, nil)
+	exec := &forcedRefreshTestExecutor{id: "codex", probeResults: map[string]string{}}
+	m.RegisterExecutor(exec)
+
+	a := mustAuthKeyed("stale_pending_activation", "codex", "free", "free", false)
+	a.CreatedAt = time.Now().Add(-DefaultPendingActivationDeletionGrace - time.Minute)
+	a.Metadata[MetadataCodexWeeklyQuotaRemainingRatioKey] = 0.75
+	clearRevokedAuthTombstoneForTest(t, a)
+	m.auths = map[string]*Auth{"stale_pending_activation": a}
+
+	m.runForcedRefreshOnce(context.Background(), DefaultDowngradeDeletionGrace)
+
+	if _, present := m.auths["stale_pending_activation"]; present {
+		t.Fatalf("pending activation auth must have been deleted after %s", DefaultPendingActivationDeletionGrace)
+	}
+	if len(exec.refreshed()) != 0 {
+		t.Fatalf("should not refresh after pending activation deletion, got %v", exec.refreshed())
+	}
+}
+
 // Before grace elapses, auth is kept and refreshed normally.
 func TestRunForcedRefreshOnce_KeepsBeforeGrace(t *testing.T) {
 	t.Parallel()

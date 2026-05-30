@@ -70,6 +70,8 @@ const (
 
 	MetadataCodexForceTokenRefreshKey = "cliproxy_codex_force_token_refresh"
 
+	codexPendingActivationReason = "codex_pending_activation"
+
 	// BoundProxyEntryDirect is the sentinel value stored in
 	// MetadataBoundProxyEntryKey when the auth should use direct egress
 	// (no proxy) because every pool entry reported a free plan but direct
@@ -232,6 +234,62 @@ func probedPlanType(auth *Auth) string {
 	}
 	v, _ := auth.Metadata[metadataProbedPlanTypeKey].(string)
 	return v
+}
+
+func currentCodexPlanType(auth *Auth) string {
+	if auth == nil {
+		return ""
+	}
+	if v := strings.TrimSpace(probedPlanType(auth)); v != "" {
+		return v
+	}
+	if auth.Attributes != nil {
+		if v := strings.TrimSpace(auth.Attributes["plan_type"]); v != "" {
+			return v
+		}
+	}
+	if auth.Metadata != nil {
+		for _, key := range []string{"plan_type", "chatgpt_plan_type"} {
+			if v, _ := auth.Metadata[key].(string); strings.TrimSpace(v) != "" {
+				return v
+			}
+		}
+	}
+	return ""
+}
+
+func codexAuthHasRefreshToken(auth *Auth) bool {
+	if auth == nil || auth.Metadata == nil {
+		return false
+	}
+	v, _ := auth.Metadata["refresh_token"].(string)
+	return strings.TrimSpace(v) != ""
+}
+
+func isCodexPendingActivationAuth(auth *Auth) bool {
+	if !isCodexAuth(auth) {
+		return false
+	}
+	plan := strings.TrimSpace(currentCodexPlanType(auth))
+	if plan == "" || !isFreePlan(plan) {
+		return false
+	}
+	if codexAuthHasRefreshToken(auth) {
+		return false
+	}
+	_, hasWeekly := codexWeeklyRemainingRatio(auth)
+	_, hasFiveHour := codexFiveHourRemainingRatio(auth)
+	return hasWeekly && !hasFiveHour
+}
+
+func shouldDeleteCodexPendingActivationAuth(auth *Auth, now time.Time, grace time.Duration) bool {
+	if grace <= 0 {
+		grace = DefaultPendingActivationDeletionGrace
+	}
+	if auth == nil || auth.CreatedAt.IsZero() {
+		return false
+	}
+	return !now.Before(auth.CreatedAt.Add(grace))
 }
 
 // setProbedPlanType overwrites the live probed plan_type.

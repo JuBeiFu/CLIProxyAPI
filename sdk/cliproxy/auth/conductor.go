@@ -4259,6 +4259,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	terminalWarning := ""
 	terminallyDisabled := false
 	terminallyDeleted := false
+	pendingActivationCooldownApplied := false
 	var cyberAudit *cyberPolicyAuditRecord
 	shouldPersist := false
 
@@ -4269,7 +4270,19 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 		if !result.Success {
 			imageUnsupportedRegion := isImageUnsupportedRegionResult(result)
 			if !imageUnsupportedRegion {
-				if deleteAuth, reason := shouldDeleteRevokedAuth(auth, result.Error, result.SkipAccessTokenRefresh); deleteAuth {
+				if handled, deleteAuth, reason := codexPendingActivationUnauthorizedDecision(auth, result.Error, now); handled && deleteAuth {
+					applyTerminalAuthDisabledState(auth, result.Error, reason, now)
+					terminalAuthSnapshot = auth.Clone()
+					terminalWarning = reason
+					terminallyDisabled = true
+					terminallyDeleted = true
+					authChanged = true
+					delete(m.auths, result.AuthID)
+				} else if handled {
+					applyCodexPendingActivationCooldown(auth, result.Error, now)
+					pendingActivationCooldownApplied = true
+					authChanged = true
+				} else if deleteAuth, reason := shouldDeleteRevokedAuth(auth, result.Error, result.SkipAccessTokenRefresh); deleteAuth {
 					applyTerminalAuthDisabledState(auth, result.Error, reason, now)
 					terminalAuthSnapshot = auth.Clone()
 					terminalWarning = reason
@@ -4287,8 +4300,8 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 			}
 		}
 
-		if terminallyDisabled {
-			// Auth already disabled from runtime state.
+		if terminallyDisabled || pendingActivationCooldownApplied {
+			// Auth already handled by terminal or pending-activation state.
 		} else if result.Success {
 			if result.Model != "" {
 				modelStateChanged := false
@@ -5514,9 +5527,54 @@ func shouldAttemptAccessTokenRefresh(auth *Auth, resultErr *Error) bool {
 	return false
 }
 
+func codexPendingActivationUnauthorizedDecision(auth *Auth, resultErr *Error, now time.Time) (bool, bool, string) {
+	if !isCodexPendingActivationAuth(auth) || !isPlainUnauthorizedResultError(resultErr) {
+		return false, false, ""
+	}
+	if shouldDeleteCodexPendingActivationAuth(auth, now, DefaultPendingActivationDeletionGrace) {
+		return true, true, fmt.Sprintf("%s_expired: age>=%s", codexPendingActivationReason, DefaultPendingActivationDeletionGrace)
+	}
+	return true, false, codexPendingActivationReason
+}
+
+func isPlainUnauthorizedResultError(resultErr *Error) bool {
+	if resultErr == nil {
+		return false
+	}
+	message := strings.ToLower(strings.TrimSpace(resultErr.Message))
+	for _, terminalNeedle := range []string{
+		"refresh_token_reused",
+		"refresh_token_invalidated",
+		"refresh token has been invalidated",
+		"refresh token has already been used",
+		"token_revoked",
+		"token_invalidated",
+		"authorization lost",
+		"forbidden",
+		"deactivated_workspace",
+		"account_deactivated",
+		"account has been deactivated",
+		"encountered invalidated oauth token for user",
+		"must be a member of an organization to use the api",
+	} {
+		if strings.Contains(message, terminalNeedle) {
+			return false
+		}
+	}
+	if resultErr.StatusCode() == http.StatusUnauthorized {
+		return true
+	}
+	return strings.Contains(message, `"detail":"unauthorized"`) ||
+		strings.Contains(message, `"detail": "unauthorized"`) ||
+		message == "unauthorized"
+}
+
 func shouldDeleteRevokedAuth(auth *Auth, resultErr *Error, skipAccessTokenRefresh bool) (bool, string) {
 	if !isCodexAuth(auth) || !hasPersistedAuthRecord(auth) {
 		return false, ""
+	}
+	if handled, deleteAuth, reason := codexPendingActivationUnauthorizedDecision(auth, resultErr, time.Now()); handled {
+		return deleteAuth, reason
 	}
 	if !skipAccessTokenRefresh && shouldAttemptAccessTokenRefresh(auth, resultErr) {
 		return false, ""
@@ -5527,6 +5585,9 @@ func shouldDeleteRevokedAuth(auth *Auth, resultErr *Error, skipAccessTokenRefres
 
 func shouldDisableRevokedAuth(auth *Auth, resultErr *Error, skipAccessTokenRefresh bool) (bool, string) {
 	if !isCodexAuth(auth) || auth == nil {
+		return false, ""
+	}
+	if handled, _, _ := codexPendingActivationUnauthorizedDecision(auth, resultErr, time.Now()); handled {
 		return false, ""
 	}
 	if !skipAccessTokenRefresh && shouldAttemptAccessTokenRefresh(auth, resultErr) {
@@ -5779,8 +5840,35 @@ func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Durati
 	}
 }
 
+func applyCodexPendingActivationCooldown(auth *Auth, resultErr *Error, now time.Time) {
+	if auth == nil {
+		return
+	}
+	next := now.Add(DefaultPendingActivationProbeInterval)
+	auth.Unavailable = true
+	if auth.Status != StatusDisabled {
+		auth.Status = StatusError
+	}
+	auth.StatusMessage = codexPendingActivationReason
+	auth.NextRetryAfter = next
+	auth.Quota = QuotaState{
+		Exceeded:      true,
+		Reason:        codexPendingActivationReason,
+		NextRecoverAt: next,
+		UpdatedAt:     now,
+	}
+	if resultErr != nil {
+		auth.LastError = cloneError(resultErr)
+	}
+	auth.UpdatedAt = now
+}
+
 func applyCodexFiveHourQuotaRest(auth *Auth, now time.Time) {
 	if auth == nil || !isCodexAuth(auth) {
+		return
+	}
+	if isCodexPendingActivationAuth(auth) {
+		applyCodexPendingActivationCooldown(auth, nil, now)
 		return
 	}
 	if ratio, okWeekly := codexWeeklyRemainingRatio(auth); okWeekly && ratio <= 0 {
@@ -5833,6 +5921,9 @@ func codexQuotaRefreshRecoveredState(auth *Auth, hasFiveHourRatio bool, now time
 	}
 	if auth.Quota.Exceeded && auth.Quota.Reason == codexWeeklyQuotaLowReason {
 		return true
+	}
+	if auth.Quota.Exceeded && auth.Quota.Reason == codexPendingActivationReason {
+		return !isCodexPendingActivationAuth(auth)
 	}
 	if auth.Quota.Exceeded && auth.Quota.Reason == codexFiveHourQuotaLowReason {
 		return hasFiveHourRatio
@@ -6994,6 +7085,41 @@ func (m *Manager) refreshAuth(ctx context.Context, id string) {
 	now := time.Now()
 	if err != nil {
 		resultErr := resultErrorFromError(err)
+		if handled, deleteAuth, reason := codexPendingActivationUnauthorizedDecision(auth, resultErr, now); handled {
+			if deleteAuth {
+				var authSnapshot *Auth
+				m.mu.Lock()
+				if current := m.auths[id]; current != nil {
+					applyTerminalAuthDisabledState(current, resultErr, reason, now)
+					current.NextRefreshAfter = time.Time{}
+					authSnapshot = current.Clone()
+					delete(m.auths, id)
+				}
+				m.mu.Unlock()
+				if authSnapshot != nil {
+					m.deleteRevokedAuth(authSnapshot, reason, "refresh")
+				}
+				return
+			}
+			var authSnapshot *Auth
+			var persistErr error
+			m.mu.Lock()
+			if current := m.auths[id]; current != nil {
+				applyCodexPendingActivationCooldown(current, resultErr, now)
+				current.NextRefreshAfter = now.Add(DefaultPendingActivationProbeInterval)
+				m.auths[id] = current
+				authSnapshot = current.Clone()
+				persistErr = m.persist(ctx, current)
+			}
+			m.mu.Unlock()
+			if authSnapshot != nil && m.scheduler != nil {
+				m.scheduler.upsertAuth(authSnapshot)
+			}
+			if persistErr != nil {
+				log.Warnf("failed to persist pending activation cooldown for auth %s%s: %v", authSnapshot.ID, authPathSuffix(authSnapshot), persistErr)
+			}
+			return
+		}
 		if deleteAuth, reason := shouldDeleteRevokedAuth(auth, resultErr, false); deleteAuth {
 			var authSnapshot *Auth
 			m.mu.Lock()
