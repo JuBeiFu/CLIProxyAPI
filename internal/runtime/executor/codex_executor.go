@@ -1786,7 +1786,27 @@ func (e *CodexExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*
 	// response (verified 2026-04-20 across 5 egress paths); we omit it.
 	realPlan, boundEntry, supportedModels, fiveHourQuota, weeklyQuota, probeOK, probeErr := helps.ProbeCodexPlanAcrossPool(ctx, e.cfg, auth, accessToken)
 	if probeErr != nil {
-		return nil, probeErr
+		// /wham/usage rejected the token (token_invalidated/token_expired/401) — the API
+		// session is dead even though codexAccessTokenForProbe handed back a token (it may
+		// have used a still-by-expiry access_token, or a refresh that minted a token the
+		// API no longer accepts). If creds are available, recover with a full native-Go web
+		// re-login (replace ONLY the access_token) and re-probe once. Banned accounts fail
+		// at login -> terminal. Non-auth probe errors (5xx/network) propagate unchanged.
+		if isAuthInvalidationError(probeErr) && weblogin.HasReloginCreds(auth) {
+			sess, loginErr := weblogin.SessionLogin(ctx, e.cfg, auth)
+			if loginErr != nil {
+				return nil, loginErr
+			}
+			accessToken = sess.AccessToken
+			applySessionAccessToken(auth, auth.Storage, accessToken, jwtExpiryRFC3339(accessToken), now)
+			if sess.PlanType != "" {
+				jwtPlan = strings.ToLower(sess.PlanType)
+			}
+			realPlan, boundEntry, supportedModels, fiveHourQuota, weeklyQuota, probeOK, probeErr = helps.ProbeCodexPlanAcrossPool(ctx, e.cfg, auth, accessToken)
+		}
+		if probeErr != nil {
+			return nil, probeErr
+		}
 	}
 	if !probeOK {
 		log.Warnf("codex executor: /wham/usage multi-path probe for auth %s failed on every candidate", auth.ID)
@@ -1835,11 +1855,7 @@ func (e *CodexExecutor) codexAccessTokenForProbe(ctx context.Context, auth *clip
 		if errors.Is(refreshErr, context.Canceled) || errors.Is(refreshErr, context.DeadlineExceeded) {
 			return "", jwtPlan, false, refreshErr
 		}
-		lowErr := strings.ToLower(refreshErr.Error())
-		deadGrant := codexauth.IsNonRetryableRefreshErr(refreshErr) ||
-			strings.Contains(lowErr, "status 400") ||
-			strings.Contains(lowErr, "status 401") ||
-			strings.Contains(lowErr, "status 403")
+		deadGrant := codexauth.IsNonRetryableRefreshErr(refreshErr) || isAuthInvalidationError(refreshErr)
 		if !deadGrant || !weblogin.HasReloginCreds(auth) {
 			return "", jwtPlan, false, refreshErr
 		}
@@ -2032,6 +2048,27 @@ func applyRefreshedCodexTokenState(auth *cliproxyauth.Auth, storage *codexauth.C
 }
 
 // jwtExpiryRFC3339 reads the "exp" claim from a JWT and returns it as RFC3339 (UTC), or "".
+// isAuthInvalidationError reports whether an error string indicates an auth/token-level
+// rejection (HTTP 400/401/403 from the token endpoint or /wham/usage, or an explicit
+// token-invalidation message) — as opposed to a transient 5xx/429/network error. Used to
+// decide when a dead token warrants a full native-Go web re-login.
+func isAuthInvalidationError(err error) bool {
+	if err == nil {
+		return false
+	}
+	low := strings.ToLower(err.Error())
+	for _, needle := range []string{
+		"status 400", "status 401", "status 403",
+		"token_invalidated", "token_expired", "invalid_grant",
+		"could not validate", "authentication token has been invalidated",
+	} {
+		if strings.Contains(low, needle) {
+			return true
+		}
+	}
+	return false
+}
+
 func jwtExpiryRFC3339(jwt string) string {
 	parts := strings.Split(jwt, ".")
 	if len(parts) < 2 {
