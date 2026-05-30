@@ -278,6 +278,21 @@ func NewCodexUtlsHTTPClient(ctx context.Context, cfg *config.Config, auth *clipr
 	return client, resolution
 }
 
+// NewCodexUtlsWSDialTLSContext returns a gorilla-websocket NetDialTLSContext
+// that dials the resolved egress (direct/socks5/bind) and performs the codex
+// utls handshake with ALPN pinned to http/1.1 (WebSocket upgrades run over
+// HTTP/1.1, which is also what a real browser negotiates for a wss connection),
+// so the WS handshake presents a real-browser TLS ClientHello instead of
+// gorilla's Go-stdlib one. Returns nil when upstream-utls is disabled. The
+// caller must skip http/https-proxy egress (gorilla's HTTP-CONNECT path is not
+// utls-wrappable here) and keep stdlib TLS for that case.
+func NewCodexUtlsWSDialTLSContext(cfg *config.Config, resolution proxypool.Resolution) func(context.Context, string, string) (net.Conn, error) {
+	if cfg == nil || !cfg.CodexHeaderDefaults.UpstreamUTLS {
+		return nil
+	}
+	return codexUtlsDialTLSContext(codexEgressDialer(resolution), codexClientHelloID(cfg))
+}
+
 // codexEgressDialer builds a proxy-aware raw dialer for the resolved egress,
 // honoring socks5/http proxies and bind:// (ipv6 local-addr) leases — the same
 // egress decision the standard transport would use. Empty/inherit -> direct.

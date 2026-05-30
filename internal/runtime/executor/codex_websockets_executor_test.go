@@ -325,6 +325,7 @@ func TestNewProxyAwareWebsocketDialerBindUsesCustomDialer(t *testing.T) {
 	t.Parallel()
 
 	dialer, resolution := newProxyAwareWebsocketDialerWithResolution(
+		context.Background(),
 		&config.Config{},
 		&cliproxyauth.Auth{ProxyURL: "bind://[2602:294:0:eb::100]"},
 	)
@@ -337,6 +338,49 @@ func TestNewProxyAwareWebsocketDialerBindUsesCustomDialer(t *testing.T) {
 	}
 	if resolution.ProxyURL != "bind://[2602:294:0:eb::100]" {
 		t.Fatalf("resolution.ProxyURL = %q, want bind URL", resolution.ProxyURL)
+	}
+}
+
+func TestNewProxyAwareWebsocketDialerUtlsGating(t *testing.T) {
+	t.Parallel()
+
+	newCfg := func(utls bool) *config.Config {
+		c := &config.Config{}
+		c.CodexHeaderDefaults.UpstreamUTLS = utls
+		return c
+	}
+
+	// Flag OFF (default): no utls upgrade, gorilla keeps stdlib TLS (no
+	// NetDialTLSContext).
+	off, _ := newProxyAwareWebsocketDialerWithResolution(
+		context.Background(), newCfg(false),
+		&cliproxyauth.Auth{ProxyURL: "bind://[2602:294:0:eb::100]"},
+	)
+	if off.NetDialTLSContext != nil {
+		t.Fatal("upstream-utls=false should not install NetDialTLSContext")
+	}
+
+	// Flag ON + bind egress: utls upgrade installed, gorilla Proxy disabled.
+	on, _ := newProxyAwareWebsocketDialerWithResolution(
+		context.Background(), newCfg(true),
+		&cliproxyauth.Auth{ProxyURL: "bind://[2602:294:0:eb::100]"},
+	)
+	if on.NetDialTLSContext == nil {
+		t.Fatal("upstream-utls=true (bind) should install utls NetDialTLSContext")
+	}
+	if on.Proxy != nil {
+		t.Fatal("utls WS dialer should clear gorilla Proxy")
+	}
+
+	// Flag ON + http-proxy egress: utls is NOT applied (HTTP-CONNECT path can't
+	// be utls-wrapped here), so NetDialTLSContext stays nil and stdlib TLS is
+	// kept.
+	httpProxy, _ := newProxyAwareWebsocketDialerWithResolution(
+		context.Background(), newCfg(true),
+		&cliproxyauth.Auth{ProxyURL: "http://proxy.example.com:8080"},
+	)
+	if httpProxy.NetDialTLSContext != nil {
+		t.Fatal("utls WS must be skipped for http-proxy egress")
 	}
 }
 

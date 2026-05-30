@@ -1026,15 +1026,15 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 }
 
 func (e *CodexWebsocketsExecutor) dialCodexWebsocket(ctx context.Context, auth *cliproxyauth.Auth, wsURL string, headers http.Header) (*websocket.Conn, *http.Response, error) {
-	dialer, resolution := newProxyAwareWebsocketDialerWithResolution(e.cfg, auth)
-	dialer.HandshakeTimeout = codexResponsesWebsocketHandshakeTO
-	dialer.EnableCompression = true
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	dialer, resolution := newProxyAwareWebsocketDialerWithResolution(ctx, e.cfg, auth)
+	dialer.HandshakeTimeout = codexResponsesWebsocketHandshakeTO
+	dialer.EnableCompression = true
 	conn, resp, err := dialer.DialContext(ctx, wsURL, headers)
 	if err != nil && resolution.FallbackToDirect && strings.TrimSpace(resolution.ProxyURL) != "" && !strings.EqualFold(strings.TrimSpace(resolution.ProxyURL), "direct") && !strings.EqualFold(strings.TrimSpace(resolution.ProxyURL), "none") {
-		directDialer, _ := newProxyAwareWebsocketDialerWithResolution(e.cfg, &cliproxyauth.Auth{ProxyURL: "direct"})
+		directDialer, _ := newProxyAwareWebsocketDialerWithResolution(ctx, e.cfg, &cliproxyauth.Auth{ProxyURL: "direct"})
 		directDialer.HandshakeTimeout = codexResponsesWebsocketHandshakeTO
 		directDialer.EnableCompression = true
 		conn, resp, err = directDialer.DialContext(ctx, wsURL, headers)
@@ -1109,12 +1109,41 @@ func readCodexWebsocketMessage(ctx context.Context, sess *codexWebsocketSession,
 }
 
 func newProxyAwareWebsocketDialer(cfg *config.Config, auth *cliproxyauth.Auth) *websocket.Dialer {
-	dialer, _ := newProxyAwareWebsocketDialerWithResolution(cfg, auth)
+	dialer, _ := newProxyAwareWebsocketDialerWithResolution(context.Background(), cfg, auth)
 	return dialer
 }
 
-func newProxyAwareWebsocketDialerWithResolution(cfg *config.Config, auth *cliproxyauth.Auth) (*websocket.Dialer, proxypool.Resolution) {
-	dialer := &websocket.Dialer{
+// applyCodexWSUtls upgrades the websocket dialer to present a real-browser TLS
+// fingerprint (utls) for the chatgpt.com wss handshake when upstream-utls is on,
+// instead of gorilla's Go-stdlib ClientHello. Skipped for http/https-proxy
+// egress, where gorilla's HTTP-CONNECT path cannot be utls-wrapped here (that
+// case keeps stdlib TLS). Gated off by default; a no-op then.
+func applyCodexWSUtls(dialer *websocket.Dialer, cfg *config.Config, resolution proxypool.Resolution) {
+	if dialer == nil || cfg == nil || !cfg.CodexHeaderDefaults.UpstreamUTLS {
+		return
+	}
+	if proxyURL := strings.TrimSpace(resolution.ProxyURL); proxyURL != "" {
+		if setting, err := proxyutil.Parse(proxyURL); err == nil && setting.Mode == proxyutil.ModeProxy {
+			if scheme := strings.ToLower(setting.URL.Scheme); scheme == "http" || scheme == "https" {
+				log.Debug("codex websockets executor: utls WS skipped for http-proxy egress; keeping stdlib TLS")
+				return
+			}
+		}
+	}
+	dialTLS := helps.NewCodexUtlsWSDialTLSContext(cfg, resolution)
+	if dialTLS == nil {
+		return
+	}
+	dialer.Proxy = nil
+	dialer.NetDialTLSContext = dialTLS
+}
+
+func newProxyAwareWebsocketDialerWithResolution(ctx context.Context, cfg *config.Config, auth *cliproxyauth.Auth) (dialer *websocket.Dialer, resolution proxypool.Resolution) {
+	// Apply the utls upgrade once, after the egress is fully resolved, so it
+	// covers every return branch below.
+	defer func() { applyCodexWSUtls(dialer, cfg, resolution) }()
+
+	dialer = &websocket.Dialer{
 		Proxy:             http.ProxyFromEnvironment,
 		HandshakeTimeout:  codexResponsesWebsocketHandshakeTO,
 		EnableCompression: true,
@@ -1124,7 +1153,7 @@ func newProxyAwareWebsocketDialerWithResolution(cfg *config.Config, auth *clipro
 		}).DialContext,
 	}
 
-	resolution := proxypool.Resolve(cfg, auth)
+	resolution = proxypool.ResolveWithContext(ctx, cfg, auth, proxypool.DefaultHealthManager())
 	proxyURL := strings.TrimSpace(resolution.ProxyURL)
 	if proxyURL == "" {
 		return dialer, resolution

@@ -276,9 +276,10 @@ nonstream-keepalive-interval: 0
 #   # hyper sends — a residual fingerprint tell. Default false pins HTTP/1.1 over
 #   # the browser-TLS socket so there is no Go HTTP/2 fingerprint surface.
 #   utls-http2: false
-#   # NOTE: upstream-utls covers the codex HTTP responses path to chatgpt.com.
-#   # It does NOT yet cover the WebSocket transport (gorilla dialer) or the
-#   # /wham/usage plan-type probe — those still present Go-stdlib TLS.
+#   # NOTE: upstream-utls covers the codex HTTP responses path AND the
+#   # WebSocket transport to chatgpt.com (the WS dialer is utls-wrapped except
+#   # for http/https-proxy egress, which keeps stdlib TLS). It does NOT yet
+#   # cover the /wham/usage plan-type probe — that still presents Go-stdlib TLS.
 
 # OpenAI compatibility providers
 # openai-compatibility:
