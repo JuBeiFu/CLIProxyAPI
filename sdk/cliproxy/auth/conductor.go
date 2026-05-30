@@ -2289,22 +2289,12 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 				}
 				setExecutionResultError(&result, errExec)
 				if shouldAttemptAccessTokenRefresh(auth, result.Error) {
-					if refreshedAuth, ok := m.refreshAuthAfterAccessTokenFailure(execCtx, auth, result.Error); ok {
-						resp, errExec = executor.Execute(execCtx, refreshedAuth, execReq, opts)
-						result = Result{AuthID: refreshedAuth.ID, Provider: provider, Model: resultModel, Success: errExec == nil, RequestPayload: bytes.Clone(execReq.Payload)}
-						if errExec != nil {
-							if errCtx := execCtx.Err(); errCtx != nil {
-								releaseLeases()
-								return cliproxyexecutor.Response{}, errCtx
-							}
-							setExecutionResultError(&result, errExec)
-						}
-					} else {
-						// Reactive re-login did not produce a usable auth (failed
-						// login or a concurrent refresh already pending). Let the
-						// terminal logic proceed instead of bailing forever.
-						result.SkipAccessTokenRefresh = true
-					}
+					// Don't block the request on a multi-second web re-login: kick it
+					// in the background and fail over now. The dead auth is recoverable
+					// (creds present), so leaving SkipAccessTokenRefresh false keeps
+					// MarkResult from retiring it; a successful background login returns
+					// it to rotation for subsequent requests.
+					m.kickAsyncRelogin(execCtx, auth, result.Error)
 				}
 				if errExec == nil {
 					m.MarkResult(execCtx, result)
@@ -2409,22 +2399,12 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 				}
 				setExecutionResultError(&result, errExec)
 				if shouldAttemptAccessTokenRefresh(auth, result.Error) {
-					if refreshedAuth, ok := m.refreshAuthAfterAccessTokenFailure(execCtx, auth, result.Error); ok {
-						resp, errExec = executor.CountTokens(execCtx, refreshedAuth, execReq, opts)
-						result = Result{AuthID: refreshedAuth.ID, Provider: provider, Model: resultModel, Success: errExec == nil, RequestPayload: bytes.Clone(execReq.Payload)}
-						if errExec != nil {
-							if errCtx := execCtx.Err(); errCtx != nil {
-								lease.Release()
-								return cliproxyexecutor.Response{}, errCtx
-							}
-							setExecutionResultError(&result, errExec)
-						}
-					} else {
-						// Reactive re-login did not produce a usable auth (failed
-						// login or a concurrent refresh already pending). Let the
-						// terminal logic proceed instead of bailing forever.
-						result.SkipAccessTokenRefresh = true
-					}
+					// Don't block the request on a multi-second web re-login: kick it
+					// in the background and fail over now. The dead auth is recoverable
+					// (creds present), so leaving SkipAccessTokenRefresh false keeps
+					// MarkResult from retiring it; a successful background login returns
+					// it to rotation for subsequent requests.
+					m.kickAsyncRelogin(execCtx, auth, result.Error)
 				}
 				if errExec == nil {
 					m.MarkResult(execCtx, result)
@@ -5275,6 +5255,33 @@ func setExecutionResultError(result *Result, err error) {
 	if ra := retryAfterFromError(err); ra != nil {
 		result.RetryAfter = ra
 	}
+}
+
+// asyncReloginTimeout bounds a background web re-login kicked off the request
+// hot path, so a hung login can't leak a goroutine indefinitely.
+const asyncReloginTimeout = 2 * time.Minute
+
+// kickAsyncRelogin launches a codex web re-login for a dead-token auth in the
+// background and returns immediately, so the request that hit the 401 fails over
+// without blocking on a multi-second login. The login runs on a context detached
+// from the request (request completion / failover must not cancel it) with a
+// bounded timeout, and is de-duplicated per auth by the markRefreshPending gate
+// inside refreshAuthAfterAccessTokenFailure. Callers leave
+// result.SkipAccessTokenRefresh false so MarkResult treats the auth as
+// refresh-able (cooled, not retired) while the relogin is in flight; a
+// successful background login returns it to rotation for subsequent requests.
+func (m *Manager) kickAsyncRelogin(ctx context.Context, auth *Auth, resultErr *Error) {
+	if m == nil || auth == nil {
+		return
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	bg, cancel := context.WithTimeout(context.WithoutCancel(ctx), asyncReloginTimeout)
+	go func() {
+		defer cancel()
+		m.refreshAuthAfterAccessTokenFailure(bg, auth, resultErr)
+	}()
 }
 
 func (m *Manager) refreshAuthAfterAccessTokenFailure(ctx context.Context, auth *Auth, resultErr *Error) (*Auth, bool) {
