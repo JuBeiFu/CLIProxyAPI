@@ -25,6 +25,7 @@ type utlsRoundTripper struct {
 	connections map[string]*http2.ClientConn
 	pending     map[string]*sync.Cond
 	dialer      proxy.Dialer
+	helloID     tls.ClientHelloID
 }
 
 func newUtlsRoundTripper(proxyURL string) *utlsRoundTripper {
@@ -41,6 +42,30 @@ func newUtlsRoundTripper(proxyURL string) *utlsRoundTripper {
 		connections: make(map[string]*http2.ClientConn),
 		pending:     make(map[string]*sync.Cond),
 		dialer:      dialer,
+		helloID:     tls.HelloChrome_Auto, // default; codex overrides per config
+	}
+}
+
+// codexClientHelloID maps the configured codex utls profile to a utls
+// ClientHelloID. Default Safari: the real Codex CLI uses reqwest's native-tls
+// and its canonical user is macOS (SecureTransport ≈ Safari). Operators whose
+// served UA is Windows/Linux should pick chrome/firefox.
+func codexClientHelloID(cfg *config.Config) tls.ClientHelloID {
+	profile := ""
+	if cfg != nil {
+		profile = strings.ToLower(strings.TrimSpace(cfg.CodexHeaderDefaults.UTLSProfile))
+	}
+	switch profile {
+	case "chrome":
+		return tls.HelloChrome_Auto
+	case "firefox":
+		return tls.HelloFirefox_Auto
+	case "ios":
+		return tls.HelloIOS_Auto
+	case "safari", "":
+		return tls.HelloSafari_Auto
+	default:
+		return tls.HelloSafari_Auto
 	}
 }
 
@@ -87,7 +112,7 @@ func (t *utlsRoundTripper) createConnection(host, addr string) (*http2.ClientCon
 	}
 
 	tlsConfig := &tls.Config{ServerName: host}
-	tlsConn := tls.UClient(conn, tlsConfig, tls.HelloChrome_Auto)
+	tlsConn := tls.UClient(conn, tlsConfig, t.helloID)
 
 	if err := tlsConn.Handshake(); err != nil {
 		conn.Close()
@@ -204,6 +229,7 @@ func NewCodexUtlsHTTPClient(cfg *config.Config, auth *cliproxyauth.Auth, timeout
 	proxyURL := strings.TrimSpace(resolution.ProxyURL)
 
 	utlsRT := newUtlsRoundTripper(proxyURL)
+	utlsRT.helloID = codexClientHelloID(cfg) // Safari (macOS codex) by default; per config
 
 	var standardTransport http.RoundTripper
 	if transport := proxypool.BuildHTTPRoundTripperForResolution(resolution); transport != nil {

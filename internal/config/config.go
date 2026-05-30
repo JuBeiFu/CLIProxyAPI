@@ -193,6 +193,11 @@ type CodexHeaderDefaults struct {
 	// (which Cloudflare/OpenAI trivially flag as a non-browser client — the
 	// cause of served accounts dying). Default false; enable + deploy + test.
 	UpstreamUTLS bool `yaml:"upstream-utls" json:"upstream-utls"`
+	// UTLSProfile selects the codex utls ClientHello: "safari" (default — the
+	// real Codex CLI uses reqwest+native-tls and its canonical user is macOS,
+	// i.e. SecureTransport ≈ Safari), "ios", "chrome", or "firefox". Match the
+	// served User-Agent's OS. Only used when UpstreamUTLS is true.
+	UTLSProfile string `yaml:"utls-profile" json:"utls-profile"`
 }
 
 // TLSConfig holds HTTPS server settings.
