@@ -188,6 +188,11 @@ type ClaudeHeaderDefaults struct {
 type CodexHeaderDefaults struct {
 	UserAgent    string `yaml:"user-agent" json:"user-agent"`
 	BetaFeatures string `yaml:"beta-features" json:"beta-features"`
+	// UpstreamUTLS, when true, routes codex (chatgpt.com) requests through a
+	// real-browser utls TLS fingerprint instead of Go's stdlib ClientHello
+	// (which Cloudflare/OpenAI trivially flag as a non-browser client — the
+	// cause of served accounts dying). Default false; enable + deploy + test.
+	UpstreamUTLS bool `yaml:"upstream-utls" json:"upstream-utls"`
 }
 
 // TLSConfig holds HTTPS server settings.

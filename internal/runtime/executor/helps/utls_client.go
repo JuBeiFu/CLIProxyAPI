@@ -1,6 +1,7 @@
 package helps
 
 import (
+	"context"
 	"net"
 	"net/http"
 	"strings"
@@ -134,16 +135,25 @@ var anthropicHosts = map[string]struct{}{
 	"api.anthropic.com": {},
 }
 
-// fallbackRoundTripper uses utls for Anthropic HTTPS hosts and falls back to
-// standard transport for all other requests (non-HTTPS or non-Anthropic hosts).
+// codexHosts are the chatgpt.com hosts whose codex traffic should present a real
+// browser TLS fingerprint (utls) instead of Go's stdlib ClientHello, which
+// Cloudflare/OpenAI trivially separate from a real client (the cause of served
+// codex accounts dying).
+var codexHosts = map[string]struct{}{
+	"chatgpt.com": {},
+}
+
+// fallbackRoundTripper uses utls for the configured HTTPS host set and falls
+// back to standard transport for all other requests (non-HTTPS or non-listed).
 type fallbackRoundTripper struct {
 	utls     *utlsRoundTripper
 	fallback http.RoundTripper
+	hosts    map[string]struct{}
 }
 
 func (f *fallbackRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
 	if req.URL.Scheme == "https" {
-		if _, ok := anthropicHosts[strings.ToLower(req.URL.Hostname())]; ok {
+		if _, ok := f.hosts[strings.ToLower(req.URL.Hostname())]; ok {
 			return f.utls.RoundTrip(req)
 		}
 	}
@@ -175,10 +185,58 @@ func NewUtlsHTTPClient(cfg *config.Config, auth *cliproxyauth.Auth, timeout time
 		Transport: &fallbackRoundTripper{
 			utls:     utlsRT,
 			fallback: standardTransport,
+			hosts:    anthropicHosts,
 		},
 	}
 	if timeout > 0 {
 		client.Timeout = timeout
 	}
 	return client
+}
+
+// NewCodexUtlsHTTPClient builds a utls-backed client for codex (chatgpt.com)
+// requests and returns the proxy resolution alongside, matching the codex
+// executor's NewProxyAwareHTTPClientWithResolution call sites. chatgpt.com gets
+// a real-browser ClientHello (HelloChrome_Auto); every other host falls back to
+// the standard transport.
+func NewCodexUtlsHTTPClient(cfg *config.Config, auth *cliproxyauth.Auth, timeout time.Duration) (*http.Client, proxypool.Resolution) {
+	resolution := proxypool.Resolve(cfg, auth)
+	proxyURL := strings.TrimSpace(resolution.ProxyURL)
+
+	utlsRT := newUtlsRoundTripper(proxyURL)
+
+	var standardTransport http.RoundTripper
+	if transport := proxypool.BuildHTTPRoundTripperForResolution(resolution); transport != nil {
+		standardTransport = transport
+	} else {
+		standardTransport = &http.Transport{
+			DialContext: (&net.Dialer{
+				Timeout:   30 * time.Second,
+				KeepAlive: 30 * time.Second,
+			}).DialContext,
+		}
+	}
+
+	client := &http.Client{
+		Transport: &fallbackRoundTripper{
+			utls:     utlsRT,
+			fallback: standardTransport,
+			hosts:    codexHosts,
+		},
+	}
+	if timeout > 0 {
+		client.Timeout = timeout
+	}
+	return client, resolution
+}
+
+// NewCodexHTTPClientWithResolution returns a codex HTTP client honoring the
+// cfg.CodexHeaderDefaults.UpstreamUTLS toggle: utls (real-browser TLS) when on,
+// the standard proxy-aware client when off. Drop-in for the codex executor's
+// previous NewProxyAwareHTTPClientWithResolution call sites.
+func NewCodexHTTPClientWithResolution(ctx context.Context, cfg *config.Config, auth *cliproxyauth.Auth, timeout time.Duration) (*http.Client, proxypool.Resolution) {
+	if cfg != nil && cfg.CodexHeaderDefaults.UpstreamUTLS {
+		return NewCodexUtlsHTTPClient(cfg, auth, timeout)
+	}
+	return NewProxyAwareHTTPClientWithResolution(ctx, cfg, auth, timeout)
 }

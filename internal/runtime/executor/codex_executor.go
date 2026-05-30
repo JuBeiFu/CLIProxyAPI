@@ -519,7 +519,7 @@ func (e *CodexExecutor) HttpRequest(ctx context.Context, auth *cliproxyauth.Auth
 	if err := e.PrepareRequest(httpReq, auth); err != nil {
 		return nil, err
 	}
-	httpClient, _ := helps.NewProxyAwareHTTPClientWithResolution(ctx, e.cfg, auth, 0)
+	httpClient, _ := helps.NewCodexHTTPClientWithResolution(ctx, e.cfg, auth, 0)
 	return httpClient.Do(httpReq)
 }
 
@@ -592,7 +592,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 		AuthType:  authType,
 		AuthValue: authValue,
 	})
-	httpClient, resolution := helps.NewProxyAwareHTTPClientWithResolution(ctx, e.cfg, auth, 0)
+	httpClient, resolution := helps.NewCodexHTTPClientWithResolution(ctx, e.cfg, auth, 0)
 	applyCodexResolutionTiming(&timing, auth, resolution)
 	timing.prepare = time.Since(prepareStarted)
 	traceCtx := withCodexHTTPTrace(httpReq.Context(), &timing)
@@ -794,7 +794,7 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 		AuthType:  authType,
 		AuthValue: authValue,
 	})
-	httpClient, resolution := helps.NewProxyAwareHTTPClientWithResolution(ctx, e.cfg, auth, 0)
+	httpClient, resolution := helps.NewCodexHTTPClientWithResolution(ctx, e.cfg, auth, 0)
 	applyCodexResolutionTiming(&timing, auth, resolution)
 	timing.prepare = time.Since(prepareStarted)
 	traceCtx := withCodexHTTPTrace(httpReq.Context(), &timing)
@@ -960,7 +960,7 @@ func (e *CodexExecutor) retryCodexHTTPRequestWithFailover(ctx context.Context, a
 	if errClone != nil {
 		return nil, resolution, requestErr, false
 	}
-	httpClient, retryResolution := helps.NewProxyAwareHTTPClientWithResolution(ctx, e.cfg, auth, 0)
+	httpClient, retryResolution := helps.NewCodexHTTPClientWithResolution(ctx, e.cfg, auth, 0)
 	applyCodexResolutionTiming(timing, auth, retryResolution)
 	configureCodexResponsesStreamTransport(httpClient, e.cfg, timing)
 	traceCtx := withCodexHTTPTrace(retryReq.Context(), timing)
@@ -1174,7 +1174,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 		AuthValue: authValue,
 	})
 
-	httpClient, resolution := helps.NewProxyAwareHTTPClientWithResolution(ctx, e.cfg, auth, 0)
+	httpClient, resolution := helps.NewCodexHTTPClientWithResolution(ctx, e.cfg, auth, 0)
 	applyCodexResolutionTiming(&timing, auth, resolution)
 	configureCodexResponsesStreamTransport(httpClient, e.cfg, &timing)
 	timing.prepare = time.Since(prepareStarted)
@@ -1753,16 +1753,30 @@ func (e *CodexExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*
 			refreshToken = v
 		}
 	}
-	if refreshToken == "" {
-		return auth, nil
-	}
 	if auth.Metadata == nil {
 		auth.Metadata = make(map[string]any)
 	}
 	now := time.Now()
-	accessToken, jwtPlan, refreshed, err := e.codexAccessTokenForProbe(ctx, auth, refreshToken, now)
-	if err != nil {
-		return nil, err
+	var accessToken string
+	var jwtPlan string
+	refreshed := false
+	if refreshToken != "" {
+		var err error
+		accessToken, jwtPlan, refreshed, err = e.codexAccessTokenForProbe(ctx, auth, refreshToken, now)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		accessToken = strings.TrimSpace(stringFromAny(auth.Metadata["access_token"]))
+		delete(auth.Metadata, cliproxyauth.MetadataCodexForceTokenRefreshKey)
+		if idToken := strings.TrimSpace(stringFromAny(auth.Metadata["id_token"])); idToken != "" {
+			if claims, jwtErr := codexauth.ParseJWTToken(idToken); jwtErr == nil {
+				jwtPlan = strings.ToLower(strings.TrimSpace(claims.CodexAuthInfo.ChatgptPlanType))
+			}
+		}
+		if accessToken == "" {
+			return auth, nil
+		}
 	}
 
 	// Resolve the authoritative plan_type by probing /wham/usage with the
