@@ -580,3 +580,90 @@ func TestCodexFailoverManagerRotatesToNextIPv6Lease(t *testing.T) {
 		t.Fatalf("expected rotated lease IP, got %q", lease.IP)
 	}
 }
+
+func codexPreferV6Cfg(prefer bool) (*config.Config, *coreauth.Auth) {
+	cfg := &config.Config{
+		SDKConfig: config.SDKConfig{
+			DefaultProxyPool: "free-egress",
+			ProxyPools: []config.ProxyPool{{
+				Name:                "free-egress",
+				FallbackToDirect:    true,
+				CodexPreferIPv6Bind: prefer,
+				IPv6BindLeaseRanges: []config.IPv6BindLeaseRange{
+					{CIDR: "2602:294:0:eb::/64"},
+				},
+				Entries: []config.ProxyPoolEntry{
+					{Name: "proxy-a", URL: "socks5://a.local:1080"},
+				},
+			}},
+		},
+	}
+	auth := &coreauth.Auth{ID: "codex-prefer-v6", Provider: "codex"}
+	coreauth.SetIPv6BindLease(auth, coreauth.IPv6BindLeaseInfo{
+		Pool:      "free-egress",
+		EntryName: "acct-v6-auth",
+		IP:        "2602:294:0:eb::42",
+		URL:       "bind://[2602:294:0:eb::42]",
+	})
+	return cfg, auth
+}
+
+// With the pool opted in, a codex auth's own lease is the PRIMARY egress on a
+// normal (non-assisted, no failover) request — not direct-v4.
+func TestResolveCodexPreferIPv6BindPrimary(t *testing.T) {
+	t.Parallel()
+	cfg, auth := codexPreferV6Cfg(true)
+	DefaultCodexFailoverManager().Clear(auth.ID)
+	t.Cleanup(func() { DefaultCodexFailoverManager().Clear(auth.ID) })
+
+	got := ResolveWithContext(context.Background(), cfg, auth, nil)
+	if got.Source != "direct-v6-sticky" {
+		t.Fatalf("Source = %q, want direct-v6-sticky (v6 primary)", got.Source)
+	}
+	if got.ProxyURL != "bind://[2602:294:0:eb::42]" {
+		t.Fatalf("ProxyURL = %q, want the bind lease URL", got.ProxyURL)
+	}
+	if got.ProxyName != "acct-v6-auth" {
+		t.Fatalf("ProxyName = %q, want lease entry name", got.ProxyName)
+	}
+	if got.FallbackToDirect {
+		t.Fatal("v6 primary must not silently fall back to direct (escapes the shared IP)")
+	}
+	// Telemetry + failover state machine must agree this is direct-v6.
+	if mode := codexRuntimeEgressMode(got); mode != "direct-v6" {
+		t.Fatalf("runtime egress mode = %q, want direct-v6", mode)
+	}
+}
+
+// Without the opt-in, behavior is unchanged: normal codex serving is direct-v4.
+func TestResolveCodexPreferIPv6BindOffStaysDirectPrimary(t *testing.T) {
+	t.Parallel()
+	cfg, auth := codexPreferV6Cfg(false)
+	DefaultCodexFailoverManager().Clear(auth.ID)
+	t.Cleanup(func() { DefaultCodexFailoverManager().Clear(auth.ID) })
+
+	got := ResolveWithContext(context.Background(), cfg, auth, nil)
+	if got.Source != "direct-primary" {
+		t.Fatalf("Source = %q, want direct-primary (flag off = unchanged)", got.Source)
+	}
+	if got.ProxyURL != "" {
+		t.Fatalf("ProxyURL = %q, want empty (direct)", got.ProxyURL)
+	}
+}
+
+// An active failover override (proxy mode) still wins over the v6-primary branch.
+func TestResolveCodexPreferIPv6BindFailoverStillOverrides(t *testing.T) {
+	cfg, auth := codexPreferV6Cfg(true)
+	manager := DefaultCodexFailoverManager()
+	manager.Clear(auth.ID)
+	manager.PreferProxyPool(cfg, auth.ID, time.Now())
+	t.Cleanup(func() { manager.Clear(auth.ID) })
+
+	got := ResolveWithHealth(cfg, auth, nil)
+	if got.Source != "proxy-pool-fallback" {
+		t.Fatalf("Source = %q, want proxy-pool-fallback (failover overrides v6 primary)", got.Source)
+	}
+	if got.ProxyURL != "socks5://a.local:1080" {
+		t.Fatalf("ProxyURL = %q, want the proxy entry", got.ProxyURL)
+	}
+}

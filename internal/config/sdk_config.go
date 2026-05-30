@@ -93,6 +93,14 @@ type ProxyPool struct {
 	// cheap to configure.
 	IPv6BindLeaseRanges []IPv6BindLeaseRange `yaml:"ipv6-bind-lease-ranges,omitempty" json:"ipv6-bind-lease-ranges,omitempty"`
 
+	// CodexPreferIPv6Bind, when true, makes a codex auth's own persisted IPv6
+	// bind lease its PRIMARY egress (not just a failover target), so every
+	// account egresses from a unique /128 instead of sharing the host's
+	// direct-v4 IP. Avoids collective IP-correlation risk across accounts.
+	// Requires IPv6BindLeaseRanges. Default false (legacy direct-v4 primary +
+	// v6 failover).
+	CodexPreferIPv6Bind bool `yaml:"codex-prefer-ipv6-bind,omitempty" json:"codex-prefer-ipv6-bind,omitempty"`
+
 	Entries []ProxyPoolEntry `yaml:"entries" json:"entries"`
 }
 

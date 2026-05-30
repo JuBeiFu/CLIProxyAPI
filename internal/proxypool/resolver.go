@@ -105,6 +105,29 @@ func ResolveWithContext(ctx context.Context, cfg *config.Config, auth *coreauth.
 				if resolution, ok := resolveCodexFailoverPreference(cfg, auth, pool, manager); ok {
 					return resolution
 				}
+				// Primary per-account IPv6 egress: when the pool opts in, a codex
+				// auth's own persisted bind lease is the PRIMARY egress (not just
+				// a failover target), so every account leaves from a unique /128
+				// instead of sharing the host's direct-v4 IP — avoiding collective
+				// IP-correlation risk. Reuses Source "direct-v6-sticky" so a
+				// failure here is handled by the DirectV6 failover branch
+				// (rotate lease -> proxy), not treated as a fresh direct-v4 hop.
+				if pool.CodexPreferIPv6Bind {
+					if lease := coreauth.IPv6BindLease(auth); lease.URL != "" && lease.IP != "" {
+						leasePool := strings.TrimSpace(lease.Pool)
+						if leasePool == "" || strings.EqualFold(leasePool, pool.Name) {
+							if config.IPv6BindLeasePoolContains(pool, lease.IP) {
+								return Resolution{
+									ProxyURL:         lease.URL,
+									ProxyPool:        pool.Name,
+									ProxyName:        lease.EntryName,
+									Source:           "direct-v6-sticky",
+									FallbackToDirect: false,
+								}
+							}
+						}
+					}
+				}
 				bound := coreauth.BoundProxyEntry(auth)
 				if assisted {
 					if lease := coreauth.IPv6BindLease(auth); lease.URL != "" && lease.IP != "" {
