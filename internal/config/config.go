@@ -45,6 +45,10 @@ const (
 	DefaultCodexRouteCoolingFirstByteThresholdSecs = 30
 	DefaultCodexRouteQuarantineThresholdSecs       = 60
 	DefaultCodexRoutePromotionWinThreshold         = 2
+	// DefaultCodexPlanUpgradeReprobeIntervalSecs is the slow cadence (1h) at
+	// which already-classified free codex auths are re-probed so a later
+	// free->paid upgrade is rediscovered. 0 in config disables the auto branch.
+	DefaultCodexPlanUpgradeReprobeIntervalSecs = 3600
 )
 
 // Config represents the application's configuration, loaded from a YAML file.
@@ -107,6 +111,9 @@ type Config struct {
 
 	// CodexRouteManagement controls same-auth primary/standby route maintenance.
 	CodexRouteManagement CodexRouteManagementConfig `yaml:"codex-route-management,omitempty" json:"codex-route-management,omitempty"`
+
+	// CodexPlanManagement controls plan-aware Codex pool behavior.
+	CodexPlanManagement CodexPlanManagementConfig `yaml:"codex-plan-management,omitempty" json:"codex-plan-management,omitempty"`
 
 	// ResponseCompact controls the in-memory compact transcript cache used to
 	// expand responses/compact follow-up requests.
@@ -286,6 +293,41 @@ type CodexRouteManagementConfig struct {
 	PromotionWinThreshold        int           `yaml:"promotion-win-threshold,omitempty" json:"promotion-win-threshold,omitempty"`
 }
 
+// CodexPlanManagementConfig controls plan-aware Codex pool behavior: the
+// free-plan model gate and the free-account upgrade re-probe cadence.
+type CodexPlanManagementConfig struct {
+	// Enabled is the master switch for this whole block. When false, the free
+	// model gate and the upgrade re-probe both fall back to legacy behavior.
+	Enabled bool `yaml:"enabled,omitempty" json:"enabled,omitempty"`
+	// FreeModelGateEnabled gates whether a free codex auth is restricted to
+	// FreeModelAllowlist. Defaults true when the block is enabled.
+	FreeModelGateEnabled    bool `yaml:"free-model-gate-enabled,omitempty" json:"free-model-gate-enabled,omitempty"`
+	freeModelGateEnabledSet bool `yaml:"-" json:"-"`
+	// FreeModelAllowlist is the set of model IDs a free codex auth may serve.
+	// Defaults to ["gpt-5.5"]. Compared by canonical id (thinking suffix
+	// stripped) so "gpt-5.5(high)" still matches "gpt-5.5".
+	FreeModelAllowlist []string `yaml:"free-model-allowlist,omitempty" json:"free-model-allowlist,omitempty"`
+	// PlanUpgradeReprobeInterval is the cadence for re-probing already-free
+	// accounts to catch upgrades. 0 disables the auto branch (manual only).
+	PlanUpgradeReprobeInterval    time.Duration `yaml:"plan-upgrade-reprobe-interval,omitempty" json:"plan-upgrade-reprobe-interval,omitempty"`
+	planUpgradeReprobeIntervalSet bool          `yaml:"-" json:"-"`
+}
+
+func (c *CodexPlanManagementConfig) UnmarshalYAML(value *yaml.Node) error {
+	if value == nil {
+		return nil
+	}
+	type rawCfg CodexPlanManagementConfig
+	raw := rawCfg(*c)
+	if err := value.Decode(&raw); err != nil {
+		return err
+	}
+	*c = CodexPlanManagementConfig(raw)
+	c.freeModelGateEnabledSet = yamlMappingHasPath(value, []string{"free-model-gate-enabled"})
+	c.planUpgradeReprobeIntervalSet = yamlMappingHasPath(value, []string{"plan-upgrade-reprobe-interval"})
+	return nil
+}
+
 // ResponseCompactConfig controls the in-memory compact transcript cache.
 type ResponseCompactConfig struct {
 	MaxBytes      int `yaml:"max-bytes,omitempty" json:"max-bytes,omitempty"`
@@ -356,6 +398,7 @@ func (c *Config) ApplyRoutingPerformanceDefaults() {
 		c.Routing.PerformanceShadowLog = false
 	}
 	c.applyCodexRouteManagementDefaults()
+	c.ApplyCodexPlanManagementDefaults()
 }
 
 func (c *Config) applyCodexRouteManagementDefaults() {
@@ -388,6 +431,22 @@ func (c *Config) applyCodexRouteManagementDefaults() {
 	}
 	if c.CodexRouteManagement.PromotionWinThreshold <= 0 {
 		c.CodexRouteManagement.PromotionWinThreshold = DefaultCodexRoutePromotionWinThreshold
+	}
+}
+
+// ApplyCodexPlanManagementDefaults backfills CodexPlanManagement defaults.
+func (c *Config) ApplyCodexPlanManagementDefaults() {
+	if c == nil {
+		return
+	}
+	if !c.CodexPlanManagement.freeModelGateEnabledSet {
+		c.CodexPlanManagement.FreeModelGateEnabled = true
+	}
+	if len(c.CodexPlanManagement.FreeModelAllowlist) == 0 {
+		c.CodexPlanManagement.FreeModelAllowlist = []string{"gpt-5.5"}
+	}
+	if !c.CodexPlanManagement.planUpgradeReprobeIntervalSet && c.CodexPlanManagement.PlanUpgradeReprobeInterval <= 0 {
+		c.CodexPlanManagement.PlanUpgradeReprobeInterval = time.Duration(DefaultCodexPlanUpgradeReprobeIntervalSecs) * time.Second
 	}
 }
 
