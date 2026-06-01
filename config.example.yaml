@@ -131,6 +131,21 @@ routing:
   performance-weight-failure: 2.0
   performance-weight-inflight: 0.5
 
+# Plan-aware Codex pool behavior.
+codex-plan-management:
+  # Master switch. When false, the free model gate and upgrade re-probe are off.
+  enabled: false
+  # Restrict a plan_type=free codex auth to the allowlisted models only.
+  free-model-gate-enabled: true
+  # Models a free codex auth may serve (compared by canonical id; thinking
+  # suffixes like "(high)" still match the base id).
+  free-model-allowlist: ["gpt-5.5"]
+  # Re-probe cadence for already-free accounts so a free->plus upgrade is
+  # auto-detected (unlocks models + raises scheduling priority). Use a duration
+  # string (e.g. 1h, 30m); "0s" disables the auto branch (the manual refresh
+  # button stays available).
+  plan-upgrade-reprobe-interval: 1h
+
 # Codex auth -> proxy route maintenance and same-auth standby hedge.
 codex-route-management:
   enabled: false
