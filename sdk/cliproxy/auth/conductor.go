@@ -2032,6 +2032,20 @@ func shouldPreserveRuntimeUsageLimit(auth, existing *Auth, now time.Time) bool {
 	if !existing.Quota.Exceeded || existing.Quota.Reason != "usage_limit" {
 		return false
 	}
+	// Healthy-ratio bypass (mirrors codexQuotaRefreshRecoveredState): when the
+	// incoming refresh carries fresh quota proof with BOTH 5h and weekly
+	// windows readable + above their rest thresholds, the existing usage_limit
+	// cooldown (built from an over-long upstream 429 resets_at) is stale and the
+	// account has genuinely recovered. Requiring BOTH ratios prevents a single
+	// per-edge cache-lagged probe from false-clearing a genuinely-limited auth,
+	// and "no quota proof" refreshes (no ratio keys) still preserve as before.
+	if fiveRatio, fiveOK := codexFiveHourRemainingRatio(auth); fiveOK {
+		if weekRatio, weekOK := codexWeeklyRemainingRatio(auth); weekOK {
+			if fiveRatio >= codexFiveHourQuotaRestThreshold && weekRatio > 0 {
+				return false
+			}
+		}
+	}
 	next := existing.Quota.NextRecoverAt
 	if next.IsZero() {
 		next = existing.NextRetryAfter
@@ -6006,6 +6020,17 @@ func codexQuotaRefreshRecoveredState(auth *Auth, hasFiveHourRatio bool, now time
 		return hasFiveHourRatio
 	}
 	if auth.Quota.Exceeded && auth.Quota.Reason == "usage_limit" {
+		// Healthy-ratio bypass: a fresh probe showing BOTH windows well above
+		// their rest thresholds means the upstream usage_limit window
+		// (next_recover_at, taken verbatim from an over-long upstream 429
+		// resets_at) is stale and the account has genuinely recovered. Require
+		// BOTH 5h and weekly ratios readable + healthy so a single per-edge
+		// cache-lagged probe cannot false-clear a genuinely-limited account.
+		fiveRatio, fiveOK := codexFiveHourRemainingRatio(auth)
+		weekRatio, weekOK := codexWeeklyRemainingRatio(auth)
+		if fiveOK && weekOK && fiveRatio >= codexFiveHourQuotaRestThreshold && weekRatio > 0 {
+			return true
+		}
 		next := auth.Quota.NextRecoverAt
 		if next.IsZero() {
 			next = auth.NextRetryAfter
