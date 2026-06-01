@@ -706,6 +706,9 @@ func (s *authScheduler) pickSingle(ctx context.Context, provider, model string, 
 				return false
 			}
 		}
+		if freePlanModelBlocked(entry.auth, model) {
+			return false
+		}
 		return true
 	}
 	load := func(entry *scheduledAuth) int {
@@ -797,6 +800,9 @@ func (s *authScheduler) pickMixed(ctx context.Context, providers []string, model
 			if entry == nil || entry.auth == nil || entry.auth.ID != pinnedAuthID {
 				return false
 			}
+			if freePlanModelBlocked(entry.auth, model) {
+				return false
+			}
 			if !authAllowedBySelectionScope(allowedAuthIDs, entry.auth.ID) {
 				return false
 			}
@@ -820,6 +826,9 @@ func (s *authScheduler) pickMixed(ctx context.Context, providers []string, model
 
 	predicate := func(entry *scheduledAuth) bool {
 		if entry == nil || entry.auth == nil {
+			return false
+		}
+		if freePlanModelBlocked(entry.auth, model) {
 			return false
 		}
 		if !authAllowedBySelectionScope(allowedAuthIDs, entry.auth.ID) {
