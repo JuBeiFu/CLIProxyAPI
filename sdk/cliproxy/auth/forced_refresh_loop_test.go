@@ -53,7 +53,10 @@ func (e *forcedRefreshTestExecutor) refreshed() []string {
 
 // Only scope-matching auths get refreshed.
 func TestRunForcedRefreshOnce_RefreshesScopeAuthsOnly(t *testing.T) {
-	t.Parallel()
+	// Not parallel: mutates the package-global FreeUpgradeReprobeInterval.
+	old := FreeUpgradeReprobeInterval
+	FreeUpgradeReprobeInterval = time.Hour
+	defer func() { FreeUpgradeReprobeInterval = old }()
 	m := NewManager(nil, nil, nil)
 	exec := &forcedRefreshTestExecutor{id: "codex", probeResults: map[string]string{}}
 	m.RegisterExecutor(exec)
@@ -76,11 +79,15 @@ func TestRunForcedRefreshOnce_RefreshesScopeAuthsOnly(t *testing.T) {
 	// Rule 3: paid+paid WITHOUT a binding (F) is in scope — multi-path
 	// probe needs to run so the auth gets pinned to a usable node.
 	// Rule 4 (via HealthChecker) not exercised in this test.
-	// Confirmed-paid WITH binding (C) and settled free+free (E) stay OUT.
+	// Free-upgrade reprobe: settled free+free (E) is now IN scope because
+	// FreeUpgradeReprobeInterval > 0 and its in-process last-refresh is zero
+	// (never recorded) — so a later free->paid upgrade can be rediscovered.
+	// Confirmed-paid WITH binding (C) stays OUT.
 	want := map[string]bool{
 		"A_paid_unprobed":          true,
 		"B_paid_free":              true,
 		"D_free_unprobed":          true,
+		"E_free_probed_free":       true,
 		"F_paid_confirmed_unbound": true,
 	}
 	if len(got) != len(want) {

@@ -788,6 +788,11 @@ func (s *Service) Run(ctx context.Context) error {
 			}
 			return isFreeAllowedModelIDForAuthPkg(routeModel, cfg.CodexPlanManagement.FreeModelAllowlist)
 		}
+		if s.cfg != nil && s.cfg.CodexPlanManagement.Enabled {
+			coreauth.FreeUpgradeReprobeInterval = s.cfg.CodexPlanManagement.PlanUpgradeReprobeInterval
+		} else {
+			coreauth.FreeUpgradeReprobeInterval = 0
+		}
 		forcedInterval := coreauth.DefaultForcedRefreshInterval
 		forcedGrace := coreauth.DefaultDowngradeDeletionGrace
 		s.coreManager.StartAutoForcedRefresh(context.Background(), forcedInterval, forcedGrace)

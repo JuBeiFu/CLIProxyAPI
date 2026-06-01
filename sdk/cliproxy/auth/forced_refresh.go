@@ -58,6 +58,12 @@ const DefaultPendingActivationDeletionGrace = 4 * time.Hour
 // layer below and cannot import them directly.
 var BoundProxyHealthChecker func(*Auth) bool
 
+// FreeUpgradeReprobeInterval, when > 0, keeps already-classified free codex
+// auths in the forced-refresh scope on this (slow) cadence so a later
+// free->paid upgrade is rediscovered via /wham/usage. 0 disables the branch.
+// Set by the sdk/cliproxy layer from CodexPlanManagement config at startup.
+var FreeUpgradeReprobeInterval time.Duration
+
 // shouldForceRefresh returns true iff the auth is within the short-cycle
 // scope. Disabled is irrelevant — disabled auths MUST be refreshed so they
 // can be re-enabled on activation. Rules:
@@ -130,6 +136,22 @@ func shouldForceRefresh(auth *Auth) bool {
 			}
 		}
 		if !lastRefresh.IsZero() && time.Since(lastRefresh) >= DefaultBoundReprobeInterval {
+			return true
+		}
+	}
+	// Free-upgrade rediscovery: a settled free account (probed free) is
+	// otherwise permanently out of scope, so a later free->paid upgrade is
+	// never auto-detected. Keep such accounts in scope on the slow
+	// FreeUpgradeReprobeInterval cadence. Gated on a non-zero interval and a
+	// stale (or never-recorded in-process) last-refresh so we don't spam.
+	if FreeUpgradeReprobeInterval > 0 && isFreePlan(probed) {
+		lastRefresh := auth.LastRefreshedAt
+		if lastRefresh.IsZero() {
+			if ts, ok := authLastRefreshTimestamp(auth); ok {
+				lastRefresh = ts
+			}
+		}
+		if lastRefresh.IsZero() || time.Since(lastRefresh) >= FreeUpgradeReprobeInterval {
 			return true
 		}
 	}

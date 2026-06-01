@@ -11,6 +11,9 @@ import (
 // be re-enabled on upgrade activation. Non-codex auths are out of scope.
 func TestShouldForceRefresh_Scope(t *testing.T) {
 	t.Parallel()
+	old := FreeUpgradeReprobeInterval
+	FreeUpgradeReprobeInterval = time.Hour
+	defer func() { FreeUpgradeReprobeInterval = old }()
 	cases := []struct {
 		name      string
 		auth      *Auth
@@ -122,9 +125,33 @@ func TestShouldForceRefresh_Scope(t *testing.T) {
 			expect: true,
 		},
 		{
-			// Probed confirmed free AND submitted was free → settled, exit scope.
-			name:   "free_submitted_probed_free_out",
-			auth:   mustAuth("codex", "free", "free", false),
+			// Free probed-free: now IN scope on the upgrade-reprobe cadence
+			// (last refresh older than FreeUpgradeReprobeInterval).
+			name: "free_submitted_probed_free_reprobe_in",
+			auth: func() *Auth {
+				a := mustAuth("codex", "free", "free", false)
+				a.LastRefreshedAt = time.Now().Add(-2 * time.Hour)
+				return a
+			}(),
+			expect: true,
+		},
+		{
+			name: "empty_submitted_probed_free_reprobe_in",
+			auth: func() *Auth {
+				a := mustAuth("codex", "", "free", false)
+				a.LastRefreshedAt = time.Now().Add(-2 * time.Hour)
+				return a
+			}(),
+			expect: true,
+		},
+		{
+			// Free probed-free but refreshed recently => still OUT of scope.
+			name: "free_submitted_probed_free_fresh_out",
+			auth: func() *Auth {
+				a := mustAuth("codex", "free", "free", false)
+				a.LastRefreshedAt = time.Now().Add(-time.Minute)
+				return a
+			}(),
 			expect: false,
 		},
 		{
@@ -138,20 +165,19 @@ func TestShouldForceRefresh_Scope(t *testing.T) {
 			expect: true,
 		},
 		{
+			// Has a refresh_token => NOT pending-activation, so the
+			// pending-activation rule does not fire. With a FRESH last-refresh
+			// the free-upgrade reprobe branch also stays quiet, so this auth is
+			// out of scope (exercises the refresh-token bypass in isolation,
+			// independent of the upgrade cadence).
 			name: "free_weekly_only_refresh_token_out",
 			auth: func() *Auth {
 				a := mustAuth("codex", "free", "free", false)
 				a.Metadata["refresh_token"] = "refresh-token"
 				a.Metadata[MetadataCodexWeeklyQuotaRemainingRatioKey] = 0.75
+				a.LastRefreshedAt = time.Now().Add(-time.Minute)
 				return a
 			}(),
-			expect: false,
-		},
-		{
-			// Probed free but submitted pin missing → settled (no paid contract
-			// to watch for). Exit scope.
-			name:   "empty_submitted_probed_free_out",
-			auth:   mustAuth("codex", "", "free", false),
 			expect: false,
 		},
 		{
