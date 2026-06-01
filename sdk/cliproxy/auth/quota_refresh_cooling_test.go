@@ -64,3 +64,72 @@ func TestRefreshCodexAuths_CoolingOnlySkipsHealthy(t *testing.T) {
 		t.Fatalf("all total = %d, want 1", resAll.Total)
 	}
 }
+
+func TestStartAndGetRefreshCodexJob(t *testing.T) {
+	ctx := context.Background()
+	mgr := NewManager(nil, nil, nil)
+
+	// Cooling free auth.
+	cooling := &Auth{
+		ID:             "cooling",
+		Provider:       "codex",
+		Status:         StatusError,
+		Unavailable:    true,
+		NextRetryAfter: time.Now().Add(time.Hour),
+		Quota:          QuotaState{Exceeded: true, Reason: codexFiveHourQuotaLowReason, NextRecoverAt: time.Now().Add(time.Hour)},
+		Metadata:       map[string]any{"type": "codex", "access_token": "tok"},
+	}
+	if _, err := mgr.Register(ctx, cooling); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	// Register the executor AFTER Register so the fire-and-forget probe inside
+	// Register does not race the explicit refresh.
+	mgr.RegisterExecutor(&codexQuotaRefreshExecutor{updated: &Auth{Metadata: map[string]any{
+		MetadataCodexFiveHourQuotaRemainingRatioKey: 0.9,
+	}}})
+
+	jobID, started := mgr.StartRefreshCodexAuths(true)
+	if !started {
+		t.Fatalf("expected started=true on first start")
+	}
+	if jobID == "" {
+		t.Fatalf("expected non-empty job id")
+	}
+
+	var view RefreshCodexJobView
+	done := false
+	for i := 0; i < 50; i++ {
+		v, ok := mgr.GetRefreshCodexJob(jobID)
+		if !ok {
+			t.Fatalf("job %s not found", jobID)
+		}
+		view = v
+		if v.Status == RefreshJobDone {
+			done = true
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !done {
+		t.Fatalf("job did not complete; last view=%+v", view)
+	}
+	if view.Total != 1 {
+		t.Fatalf("total = %d, want 1", view.Total)
+	}
+	if view.Done != 1 {
+		t.Fatalf("done = %d, want 1", view.Done)
+	}
+	if view.Recovered != 1 {
+		t.Fatalf("recovered = %d, want 1; results=%+v", view.Recovered, view.Results)
+	}
+
+	// After completion a second start creates a NEW job (the prior one is done,
+	// so the single-job slot is free).
+	jobID2, started2 := mgr.StartRefreshCodexAuths(true)
+	if !started2 {
+		t.Fatalf("expected started=true after prior job done")
+	}
+	if jobID2 == jobID {
+		t.Fatalf("expected a new job id after completion, got same id %s", jobID2)
+	}
+}

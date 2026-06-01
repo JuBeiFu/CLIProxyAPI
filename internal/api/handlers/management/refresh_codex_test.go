@@ -50,11 +50,45 @@ func TestRefreshCodexAuthsHandler_RecoversCooling(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("status = %d, body=%s", w.Code, w.Body.String())
 	}
-	var resp coreauth.RefreshCodexResult
-	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
-		t.Fatalf("unmarshal: %v", err)
+	// The handler is now async: it returns the job id immediately, NOT the
+	// aggregated result.
+	var startResp struct {
+		JobID   string `json:"job_id"`
+		Started bool   `json:"started"`
+		Status  string `json:"status"`
 	}
-	if resp.Total != 1 || resp.Recovered != 1 {
-		t.Fatalf("total=%d recovered=%d, want 1/1", resp.Total, resp.Recovered)
+	if err := json.Unmarshal(w.Body.Bytes(), &startResp); err != nil {
+		t.Fatalf("unmarshal start: %v", err)
+	}
+	if strings.TrimSpace(startResp.JobID) == "" {
+		t.Fatalf("expected non-empty job_id, body=%s", w.Body.String())
+	}
+
+	// Poll the status handler until the job completes.
+	var statusResp coreauth.RefreshCodexJobView
+	done := false
+	for i := 0; i < 50; i++ {
+		sw := httptest.NewRecorder()
+		sc, _ := gin.CreateTestContext(sw)
+		sc.Request = httptest.NewRequest(http.MethodGet, "/v0/management/auth-files/refresh/status?job_id="+startResp.JobID, nil)
+		h.RefreshCodexAuthsStatusHandler(sc)
+		if sw.Code != http.StatusOK {
+			t.Fatalf("status handler code = %d, body=%s", sw.Code, sw.Body.String())
+		}
+		statusResp = coreauth.RefreshCodexJobView{}
+		if err := json.Unmarshal(sw.Body.Bytes(), &statusResp); err != nil {
+			t.Fatalf("unmarshal status: %v", err)
+		}
+		if statusResp.Status == coreauth.RefreshJobDone {
+			done = true
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !done {
+		t.Fatalf("job did not complete; last status=%+v", statusResp)
+	}
+	if statusResp.Total != 1 || statusResp.Recovered != 1 {
+		t.Fatalf("total=%d recovered=%d, want 1/1", statusResp.Total, statusResp.Recovered)
 	}
 }

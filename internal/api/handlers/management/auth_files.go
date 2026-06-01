@@ -416,9 +416,12 @@ func (h *Handler) BatchQuotaCheck(c *gin.Context) {
 	})
 }
 
-// RefreshCodexAuthsHandler re-probes codex auths on demand via /wham/usage
-// (clearing recovered cooldowns and updating plan_type). Body:
+// RefreshCodexAuthsHandler starts an ASYNCHRONOUS re-probe of codex auths via
+// /wham/usage (clearing recovered cooldowns and updating plan_type). Body:
 // {"provider":"codex","cooling_only":false}. provider defaults to "codex".
+// SINGLE-JOB model: if a refresh is already running, its job id is returned with
+// started=false. Poll RefreshCodexAuthsStatusHandler with the returned job_id
+// for live progress.
 func (h *Handler) RefreshCodexAuthsHandler(c *gin.Context) {
 	if h == nil || h.authManager == nil {
 		c.JSON(500, gin.H{"error": "handler not initialized"})
@@ -436,8 +439,28 @@ func (h *Handler) RefreshCodexAuthsHandler(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "only codex provider is supported"})
 		return
 	}
-	result := h.authManager.RefreshCodexAuths(c.Request.Context(), body.CoolingOnly)
-	c.JSON(http.StatusOK, result)
+	jobID, started := h.authManager.StartRefreshCodexAuths(body.CoolingOnly)
+	c.JSON(http.StatusOK, gin.H{
+		"job_id":  jobID,
+		"started": started,
+		"status":  "running",
+	})
+}
+
+// RefreshCodexAuthsStatusHandler returns the live progress + final result of an
+// async refresh job. Query param: job_id (empty returns the current job).
+func (h *Handler) RefreshCodexAuthsStatusHandler(c *gin.Context) {
+	if h == nil || h.authManager == nil {
+		c.JSON(500, gin.H{"error": "handler not initialized"})
+		return
+	}
+	jobID := strings.TrimSpace(c.Query("job_id"))
+	view, ok := h.authManager.GetRefreshCodexJob(jobID)
+	if !ok {
+		c.JSON(http.StatusNotFound, gin.H{"error": "job not found"})
+		return
+	}
+	c.JSON(http.StatusOK, view)
 }
 
 func (h *Handler) probeCodexQuota(ctx context.Context, auth *coreauth.Auth) struct {

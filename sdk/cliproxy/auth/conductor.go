@@ -298,6 +298,10 @@ type Manager struct {
 	forcedRefreshCancel context.CancelFunc
 
 	quotaFlusher *quotaFlusher
+
+	// Async codex refresh job tracking (single-job model).
+	refreshJobMu sync.Mutex
+	refreshJob   *RefreshCodexJob // the most recent / currently-running refresh job
 }
 
 // NewManager constructs a manager with optional custom selector and hook.
