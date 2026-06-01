@@ -59,3 +59,23 @@ func TestFilterCodexModelsForFreePlan(t *testing.T) {
 		t.Fatalf("gate off => %v, want all 4", g)
 	}
 }
+
+func TestFreePlanModelGateHookWiring(t *testing.T) {
+	allow := []string{"gpt-5.5"}
+	// emulate the closure body
+	check := func(model string, enabled bool) bool {
+		if !enabled {
+			return true
+		}
+		return isFreeAllowedModelIDForAuthPkg(model, allow)
+	}
+	if !check("gpt-5.5(high)", true) {
+		t.Fatal("gpt-5.5 variant must be allowed")
+	}
+	if check("gpt-5.4", true) {
+		t.Fatal("gpt-5.4 must be disallowed for free")
+	}
+	if !check("gpt-5.4", false) {
+		t.Fatal("disabled gate must allow everything")
+	}
+}

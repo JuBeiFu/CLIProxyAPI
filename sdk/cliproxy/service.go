@@ -779,6 +779,15 @@ func (s *Service) Run(ctx context.Context) error {
 		coreauth.BoundProxyHealthChecker = func(a *coreauth.Auth) bool {
 			return isBoundProxyUnusable(s.cfg, a)
 		}
+		coreauth.FreePlanModelGate = func(routeModel string) bool {
+			s.cfgMu.RLock()
+			cfg := s.cfg
+			s.cfgMu.RUnlock()
+			if cfg == nil || !cfg.CodexPlanManagement.Enabled || !cfg.CodexPlanManagement.FreeModelGateEnabled {
+				return true // gate inactive => allow everything
+			}
+			return isFreeAllowedModelIDForAuthPkg(routeModel, cfg.CodexPlanManagement.FreeModelAllowlist)
+		}
 		forcedInterval := coreauth.DefaultForcedRefreshInterval
 		forcedGrace := coreauth.DefaultDowngradeDeletionGrace
 		s.coreManager.StartAutoForcedRefresh(context.Background(), forcedInterval, forcedGrace)
@@ -1457,6 +1466,14 @@ func isFreeAllowedModelID(modelID string, allowlist []string) bool {
 		}
 	}
 	return false
+}
+
+// isFreeAllowedModelIDForAuthPkg is the route-model variant used by the
+// selection-time FreePlanModelGate hook. isFreeAllowedModelID already strips a
+// parenthesized thinking suffix, so it is reused directly here. Named wrapper
+// kept for call-site clarity.
+func isFreeAllowedModelIDForAuthPkg(routeModel string, allowlist []string) bool {
+	return isFreeAllowedModelID(routeModel, allowlist)
 }
 
 // filterCodexModelsForFreePlan keeps only allowlisted models when the auth's
