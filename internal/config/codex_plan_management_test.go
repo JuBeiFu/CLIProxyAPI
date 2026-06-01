@@ -46,3 +46,16 @@ func TestCodexPlanManagementExplicitValues(t *testing.T) {
 		t.Fatalf("allowlist len = %d, want 2", len(cfg.CodexPlanManagement.FreeModelAllowlist))
 	}
 }
+
+func TestCodexPlanManagementExplicitZeroIntervalPreserved(t *testing.T) {
+	raw := "codex-plan-management:\n  enabled: true\n  plan-upgrade-reprobe-interval: 0s\n"
+	var cfg Config
+	if err := yaml.Unmarshal([]byte(raw), &cfg); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	cfg.ApplyCodexPlanManagementDefaults()
+
+	if cfg.CodexPlanManagement.PlanUpgradeReprobeInterval != 0 {
+		t.Fatalf("explicit interval 0 must be preserved (auto branch disabled), got %s", cfg.CodexPlanManagement.PlanUpgradeReprobeInterval)
+	}
+}
