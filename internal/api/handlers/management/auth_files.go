@@ -416,6 +416,30 @@ func (h *Handler) BatchQuotaCheck(c *gin.Context) {
 	})
 }
 
+// RefreshCodexAuthsHandler re-probes codex auths on demand via /wham/usage
+// (clearing recovered cooldowns and updating plan_type). Body:
+// {"provider":"codex","cooling_only":false}. provider defaults to "codex".
+func (h *Handler) RefreshCodexAuthsHandler(c *gin.Context) {
+	if h == nil || h.authManager == nil {
+		c.JSON(500, gin.H{"error": "handler not initialized"})
+		return
+	}
+	var body struct {
+		Provider    string `json:"provider"`
+		CoolingOnly bool   `json:"cooling_only"`
+	}
+	_ = c.ShouldBindJSON(&body) // empty body allowed
+	if strings.TrimSpace(body.Provider) == "" {
+		body.Provider = "codex"
+	}
+	if !strings.EqualFold(strings.TrimSpace(body.Provider), "codex") {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "only codex provider is supported"})
+		return
+	}
+	result := h.authManager.RefreshCodexAuths(c.Request.Context(), body.CoolingOnly)
+	c.JSON(http.StatusOK, result)
+}
+
 func (h *Handler) probeCodexQuota(ctx context.Context, auth *coreauth.Auth) struct {
 	AuthID     string `json:"auth_id"`
 	AuthIndex  string `json:"auth_index"`
