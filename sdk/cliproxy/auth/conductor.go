@@ -4192,6 +4192,9 @@ func (m *Manager) selectionScopeAuthIDsFiltered(providers []string, routeModel s
 		if candidate.ImageGenerationOnly() {
 			continue
 		}
+		if freePlanModelBlocked(candidate, routeModel) {
+			continue
+		}
 		allowed[candidate.ID] = struct{}{}
 	}
 	if imageRequest {
@@ -6389,6 +6392,9 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 		if modelKey != "" && !m.authSupportsRouteModel(registryRef, candidate, model) {
 			continue
 		}
+		if freePlanModelBlocked(candidate, model) {
+			continue
+		}
 		candidates = append(candidates, candidate)
 	}
 	if len(candidates) == 0 {
@@ -6532,6 +6538,9 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 			continue
 		}
 		if modelKey != "" && !m.authSupportsRouteModel(registryRef, candidate, model) {
+			continue
+		}
+		if freePlanModelBlocked(candidate, model) {
 			continue
 		}
 		candidates = append(candidates, candidate)
