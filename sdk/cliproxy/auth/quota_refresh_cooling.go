@@ -9,6 +9,13 @@ import (
 	"github.com/google/uuid"
 )
 
+// refreshCodexJobTimeout bounds an entire async refresh pass. A pass re-probes
+// up to a few hundred codex auths via /wham/usage; each probe has its own
+// internal timeout, but this is the backstop so a hung probe can never leave
+// the job (and the single-job slot) running forever. Exported as a var so tests
+// can shorten it.
+var refreshCodexJobTimeout = 15 * time.Minute
+
 // RefreshCodexAuthResult is the per-auth outcome of a manual refresh.
 type RefreshCodexAuthResult struct {
 	AuthID       string `json:"auth_id"`
@@ -246,7 +253,7 @@ func (m *Manager) StartRefreshCodexAuths(coolingOnly bool) (string, bool) {
 		return "", false
 	}
 	m.refreshJobMu.Lock()
-	if m.refreshJob != nil && m.refreshJob.Status == RefreshJobRunning {
+	if m.refreshJob != nil && m.refreshJob.Status == RefreshJobRunning && !refreshJobIsStale(m.refreshJob) {
 		id := m.refreshJob.ID
 		m.refreshJobMu.Unlock()
 		return id, false
@@ -262,6 +269,23 @@ func (m *Manager) StartRefreshCodexAuths(coolingOnly bool) (string, bool) {
 
 	go m.runRefreshCodexJob(job, coolingOnly)
 	return job.ID, true
+}
+
+// refreshJobIsStale reports whether a still-"running" job has exceeded the
+// job timeout by enough margin that it must be treated as dead (so it can never
+// permanently block the single-job slot). Reads StartedAt under the job lock.
+func refreshJobIsStale(job *RefreshCodexJob) bool {
+	if job == nil {
+		return false
+	}
+	job.mu.Lock()
+	started := job.StartedAt
+	status := job.Status
+	job.mu.Unlock()
+	if status != RefreshJobRunning || started.IsZero() {
+		return false
+	}
+	return time.Since(started) > refreshCodexJobTimeout+time.Minute
 }
 
 // GetRefreshCodexJob returns a snapshot of the tracked refresh job. When jobID
@@ -286,7 +310,8 @@ func (m *Manager) GetRefreshCodexJob(jobID string) (RefreshCodexJobView, bool) {
 // job's live progress counters as each target completes. Concurrency stays
 // bounded by the existing 16-slot refresh semaphore.
 func (m *Manager) runRefreshCodexJob(job *RefreshCodexJob, coolingOnly bool) {
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(context.Background(), refreshCodexJobTimeout)
+	defer cancel()
 	targets := m.codexRefreshTargets(coolingOnly)
 
 	job.mu.Lock()
