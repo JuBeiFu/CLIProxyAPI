@@ -1048,6 +1048,11 @@ func (s *Service) registerModelsForAuth(a *coreauth.Auth) {
 		}
 		models = applyExcludedModels(models, excluded)
 		models = filterCodexSparkModelsByPlan(models, codexPlanType)
+		if s.cfg != nil && s.cfg.CodexPlanManagement.Enabled {
+			models = filterCodexModelsForFreePlan(models, codexPlanType,
+				s.cfg.CodexPlanManagement.FreeModelGateEnabled,
+				s.cfg.CodexPlanManagement.FreeModelAllowlist)
+		}
 	case "qwen":
 		models = registry.GetQwenModels()
 		models = applyExcludedModels(models, excluded)
@@ -1424,6 +1429,57 @@ func normalizedCodexPlanTypeKey(planType string) string {
 func isCodexSparkModelID(modelID string) bool {
 	modelID = strings.ToLower(strings.TrimSpace(modelID))
 	return strings.HasSuffix(modelID, "-codex-spark")
+}
+
+// freeModelCanonicalID lowercases and strips a trailing parenthesized thinking
+// suffix (e.g. "gpt-5.5(high)" -> "gpt-5.5") so the free allowlist matches all
+// thinking variants of an allowed base model. It deliberately does NOT strip
+// family suffixes, so "gpt-5.5-codex" stays distinct from "gpt-5.5".
+func freeModelCanonicalID(id string) string {
+	id = strings.ToLower(strings.TrimSpace(id))
+	if i := strings.IndexByte(id, '('); i > 0 {
+		id = strings.TrimSpace(id[:i])
+	}
+	return id
+}
+
+// isFreeAllowedModelID reports whether a model ID is in the free-plan allowlist,
+// compared by canonical base id. Never uses HasPrefix (a footgun: it would
+// admit gpt-5.5-mini/-codex/-codex-spark).
+func isFreeAllowedModelID(modelID string, allowlist []string) bool {
+	target := freeModelCanonicalID(modelID)
+	if target == "" {
+		return false
+	}
+	for _, allowed := range allowlist {
+		if freeModelCanonicalID(allowed) == target {
+			return true
+		}
+	}
+	return false
+}
+
+// filterCodexModelsForFreePlan keeps only allowlisted models when the auth's
+// plan is EXPLICITLY free and the gate is enabled. Empty/unknown plan (not yet
+// probed) and all paid plans pass through unchanged. Mirrors
+// filterCodexSparkModelsByPlan.
+func filterCodexModelsForFreePlan(models []*ModelInfo, planType string, gateEnabled bool, allowlist []string) []*ModelInfo {
+	if len(models) == 0 || !gateEnabled || len(allowlist) == 0 {
+		return models
+	}
+	if normalizedCodexPlanTypeKey(planType) != "free" {
+		return models
+	}
+	filtered := make([]*ModelInfo, 0, len(models))
+	for _, model := range models {
+		if model == nil {
+			continue
+		}
+		if isFreeAllowedModelID(model.ID, allowlist) {
+			filtered = append(filtered, model)
+		}
+	}
+	return filtered
 }
 
 func applyExcludedModels(models []*ModelInfo, excluded []string) []*ModelInfo {
