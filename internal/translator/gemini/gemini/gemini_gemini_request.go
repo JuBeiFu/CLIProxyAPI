@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/translator/gemini/common"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/translator/geminisig"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
@@ -79,16 +80,27 @@ func ConvertGeminiRequestToGemini(_ string, inputRawJSON []byte, _ bool) []byte 
 	})
 
 	gjson.GetBytes(out, "contents").ForEach(func(key, content gjson.Result) bool {
-		if content.Get("role").String() == "model" {
-			content.Get("parts").ForEach(func(partKey, part gjson.Result) bool {
-				if part.Get("functionCall").Exists() {
-					out, _ = sjson.SetBytes(out, fmt.Sprintf("contents.%d.parts.%d.thoughtSignature", key.Int(), partKey.Int()), "skip_thought_signature_validator")
-				} else if part.Get("thoughtSignature").Exists() {
-					out, _ = sjson.SetBytes(out, fmt.Sprintf("contents.%d.parts.%d.thoughtSignature", key.Int(), partKey.Int()), "skip_thought_signature_validator")
+		isModel := content.Get("role").String() == "model"
+		content.Get("parts").ForEach(func(partKey, part gjson.Result) bool {
+			sigPath := fmt.Sprintf("contents.%d.parts.%d.thoughtSignature", key.Int(), partKey.Int())
+			// User-turn functionResponse parts must not carry a thoughtSignature.
+			if part.Get("functionResponse").Exists() {
+				if part.Get("thoughtSignature").Exists() {
+					out, _ = sjson.DeleteBytes(out, sigPath)
 				}
 				return true
-			})
-		}
+			}
+			if !isModel {
+				return true
+			}
+			// Model-turn functionCall / signed parts: preserve a valid native
+			// Gemini thoughtSignature; otherwise fall back to the documented
+			// bypass sentinel (previous always-sentinel behavior).
+			if part.Get("functionCall").Exists() || part.Get("thoughtSignature").Exists() {
+				out, _ = sjson.SetBytes(out, sigPath, geminisig.ReplaySignatureOrBypass(part.Get("thoughtSignature").String()))
+			}
+			return true
+		})
 		return true
 	})
 
