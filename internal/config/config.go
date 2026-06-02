@@ -95,6 +95,14 @@ type Config struct {
 	// DisableCooling disables quota cooldown scheduling when true.
 	DisableCooling bool `yaml:"disable-cooling" json:"disable-cooling"`
 
+	// CodexConfuseInstallationID, when true, deterministically re-keys the
+	// client_metadata.x-codex-installation-id field per upstream auth account
+	// before forwarding Codex requests. This severs the "many accounts, one
+	// device" correlation that arises when a single Codex CLI install (one
+	// installation-id) drives multiple pooled accounts. Off by default; only
+	// effective for traffic that actually carries an installation-id.
+	CodexConfuseInstallationID bool `yaml:"codex-confuse-installation-id,omitempty" json:"codex-confuse-installation-id,omitempty"`
+
 	// RequestRetry defines the retry times when the request failed.
 	RequestRetry int `yaml:"request-retry" json:"request-retry"`
 	// MaxRetryCredentials defines the maximum number of credentials to try for a failed request.

@@ -584,6 +584,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	body = maybeAttachImageGenerationTool(baseModel, body)
 
 	url := strings.TrimSuffix(baseURL, "/") + "/responses"
+	body = applyCodexInstallationConfuse(e.cfg, auth, body)
 	httpReq, err := e.cacheHelper(ctx, from, url, req, body)
 	if err != nil {
 		return resp, err
@@ -786,6 +787,7 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 	body = normalizeCodexInstructions(body)
 
 	url := strings.TrimSuffix(baseURL, "/") + "/responses/compact"
+	body = applyCodexInstallationConfuse(e.cfg, auth, body)
 	httpReq, err := e.cacheHelper(ctx, from, url, req, body)
 	if err != nil {
 		return resp, err
@@ -1165,6 +1167,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 	body = maybeAttachImageGenerationTool(baseModel, body)
 
 	url := strings.TrimSuffix(baseURL, "/") + "/responses"
+	body = applyCodexInstallationConfuse(e.cfg, auth, body)
 	httpReq, err := e.cacheHelper(ctx, from, url, req, body)
 	if err != nil {
 		return nil, err
@@ -2653,4 +2656,31 @@ func (e *CodexExecutor) resolveCodexConfig(auth *cliproxyauth.Auth) *config.Code
 		}
 	}
 	return nil
+}
+
+// applyCodexInstallationConfuse deterministically re-keys the request body's
+// client_metadata.x-codex-installation-id to a per-auth-account UUID, so that
+// multiple pooled accounts driven by a single Codex CLI install (one shared
+// installation-id) do not present an identical, correlatable device fingerprint
+// upstream. Gated by cfg.CodexConfuseInstallationID (off by default) and a no-op
+// when the field is absent. The mapping is stable per (authID, original) and
+// distinct across accounts. Mirrors upstream's installation-id identity-confuse.
+func applyCodexInstallationConfuse(cfg *config.Config, auth *cliproxyauth.Auth, body []byte) []byte {
+	if cfg == nil || !cfg.CodexConfuseInstallationID || auth == nil || len(body) == 0 {
+		return body
+	}
+	authID := strings.TrimSpace(auth.ID)
+	if authID == "" {
+		return body
+	}
+	orig := strings.TrimSpace(gjson.GetBytes(body, "client_metadata.x-codex-installation-id").String())
+	if orig == "" {
+		return body
+	}
+	name := "cli-proxy-api:codex:identity-confuse:installation:" + authID + ":" + orig
+	confused := uuid.NewSHA1(uuid.NameSpaceOID, []byte(name)).String()
+	if out, err := sjson.SetBytes(body, "client_metadata.x-codex-installation-id", confused); err == nil {
+		return out
+	}
+	return body
 }
