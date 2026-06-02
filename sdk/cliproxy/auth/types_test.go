@@ -5,6 +5,38 @@ import (
 	"time"
 )
 
+// TestAuth_DisableCoolingOverride_TrueOnly verifies that only an explicit
+// disable_cooling=true is treated as a present override. A false value (or any
+// non-true) must report "unset" so the global quota-cooldown flag still applies —
+// otherwise a stray disable_cooling=false in one auth's metadata would forcibly
+// re-enable cooling for that auth even when the operator disabled cooling globally.
+func TestAuth_DisableCoolingOverride_TrueOnly(t *testing.T) {
+	cases := []struct {
+		name      string
+		metadata  map[string]any
+		wantValue bool
+		wantOK    bool
+	}{
+		{"absent", map[string]any{}, false, false},
+		{"true bool", map[string]any{"disable_cooling": true}, true, true},
+		{"false bool", map[string]any{"disable_cooling": false}, false, false},
+		{"true string", map[string]any{"disable_cooling": "true"}, true, true},
+		{"false string", map[string]any{"disable_cooling": "false"}, false, false},
+		{"hyphen true", map[string]any{"disable-cooling": true}, true, true},
+		{"hyphen false", map[string]any{"disable-cooling": false}, false, false},
+		{"nil metadata", nil, false, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			a := &Auth{Metadata: tc.metadata}
+			gotValue, gotOK := a.DisableCoolingOverride()
+			if gotValue != tc.wantValue || gotOK != tc.wantOK {
+				t.Fatalf("DisableCoolingOverride() = (%v, %v), want (%v, %v)", gotValue, gotOK, tc.wantValue, tc.wantOK)
+			}
+		})
+	}
+}
+
 func TestResolveCreatedAt(t *testing.T) {
 	fallback := time.Date(2026, 6, 2, 0, 0, 0, 0, time.UTC)
 	persisted := time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC)

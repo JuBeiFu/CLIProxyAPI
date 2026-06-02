@@ -293,18 +293,20 @@ func (a *Auth) ProxyInfo() string {
 
 // DisableCoolingOverride returns the auth-file scoped disable_cooling override when present.
 // The value is read from metadata key "disable_cooling" (or legacy "disable-cooling").
+//
+// Only an explicit true is treated as a present override; a false (or any non-true)
+// value is reported as "unset" so the global quota-cooldown flag still applies. This
+// prevents a stray disable_cooling=false in one auth's metadata from forcibly
+// re-enabling cooling for that auth when the operator disabled cooling globally.
 func (a *Auth) DisableCoolingOverride() (bool, bool) {
 	if a == nil || a.Metadata == nil {
 		return false, false
 	}
-	if val, ok := a.Metadata["disable_cooling"]; ok {
-		if parsed, okParse := parseBoolAny(val); okParse {
-			return parsed, true
-		}
-	}
-	if val, ok := a.Metadata["disable-cooling"]; ok {
-		if parsed, okParse := parseBoolAny(val); okParse {
-			return parsed, true
+	for _, key := range []string{"disable_cooling", "disable-cooling"} {
+		if val, ok := a.Metadata[key]; ok {
+			if parsed, okParse := parseBoolAny(val); okParse && parsed {
+				return true, true
+			}
 		}
 	}
 	return false, false
