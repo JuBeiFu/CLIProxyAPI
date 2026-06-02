@@ -6,6 +6,7 @@
 package claude
 
 import (
+	"encoding/base64"
 	"fmt"
 	"strconv"
 	"strings"
@@ -120,6 +121,28 @@ func ConvertClaudeRequestToCodex(modelName string, inputRawJSON []byte, _ bool) 
 				hasContent = true
 			}
 
+			// appendReasoningContent forwards a Claude assistant thinking block's
+			// reasoning signature back upstream as a Codex reasoning item. The
+			// signature is the encrypted_content the upstream issued on a prior turn
+			// (round-tripped via the client). It is only replayed when it is a
+			// valid Fernet-shaped Codex reasoning token; fabricated/cross-provider
+			// signatures are dropped. Without this, multi-turn Claude->Codex
+			// requests omit reasoning items — a behavioral fingerprint and a hard
+			// 400 ("invalid signature in thinking block") source.
+			appendReasoningContent := func(part gjson.Result) {
+				if messageRole != "assistant" {
+					return
+				}
+				signature, ok := compatibleCodexReasoningSignature(part.Get("signature").String())
+				if !ok {
+					return
+				}
+				flushMessage()
+				reasoningItem := []byte(`{"type":"reasoning","summary":[],"content":null}`)
+				reasoningItem, _ = sjson.SetBytes(reasoningItem, "encrypted_content", signature)
+				template, _ = sjson.SetRawBytes(template, "input.-1", reasoningItem)
+			}
+
 			messageContentsResult := messageResult.Get("content")
 			if messageContentsResult.IsArray() {
 				messageContentResults := messageContentsResult.Array()
@@ -130,6 +153,8 @@ func ConvertClaudeRequestToCodex(modelName string, inputRawJSON []byte, _ bool) 
 					switch contentType {
 					case "text":
 						appendTextContent(messageContentResult.Get("text").String())
+					case "thinking":
+						appendReasoningContent(messageContentResult)
 					case "image":
 						sourceResult := messageContentResult.Get("source")
 						if sourceResult.Exists() {
@@ -429,4 +454,74 @@ func normalizeToolParameters(raw string) string {
 		schema, _ = sjson.SetRawBytes(schema, "properties", []byte(`{}`))
 	}
 	return string(schema)
+}
+
+// maxCodexReasoningSignatureLen bounds the Fernet-shaped encrypted_content we are
+// willing to inspect/replay, mirroring upstream signature.MaxGPTReasoningSignatureLen.
+const maxCodexReasoningSignatureLen = 32 * 1024 * 1024
+
+// compatibleCodexReasoningSignature returns a replayable Codex reasoning
+// encrypted_content for rawSignature, or ("", false) if it must not be replayed.
+//
+// A "<provider>#<payload>" cache envelope is unwrapped only for the GPT/Codex
+// family; a cross-provider (claude/gemini) or unknown envelope is rejected so a
+// foreign signature can never be forged into a Codex reasoning slot. The payload
+// must then pass the Fernet transport-shape check.
+func compatibleCodexReasoningSignature(rawSignature string) (string, bool) {
+	sig := strings.TrimSpace(rawSignature)
+	if sig == "" {
+		return "", false
+	}
+	if prefix, rest, ok := strings.Cut(sig, "#"); ok {
+		switch strings.ToLower(strings.TrimSpace(prefix)) {
+		case "openai", "gpt", "codex":
+			sig = strings.TrimSpace(rest)
+		default:
+			return "", false
+		}
+	}
+	if !isFernetLikeCodexReasoningSignature(sig) {
+		return "", false
+	}
+	return sig, true
+}
+
+// isFernetLikeCodexReasoningSignature validates the Fernet-like outer format used
+// by GPT/Codex reasoning encrypted_content (gAAAA base64url prefix; decoded
+// payload >=73 bytes; version byte 0x80; positive AES-block-multiple ciphertext).
+// This is a transport-shape check only; it does not prove decryptability. Inlined
+// from upstream signature.InspectGPTReasoningSignature (that package does not
+// exist in this fork, and lives under a different module major version).
+func isFernetLikeCodexReasoningSignature(sig string) bool {
+	sig = strings.TrimSpace(sig)
+	if sig == "" || len(sig) > maxCodexReasoningSignatureLen {
+		return false
+	}
+	if !strings.HasPrefix(sig, "gAAAA") {
+		return false
+	}
+	for _, r := range sig {
+		switch {
+		case r >= 'A' && r <= 'Z', r >= 'a' && r <= 'z', r >= '0' && r <= '9', r == '-', r == '_', r == '=':
+		default:
+			return false
+		}
+	}
+	decoded, ok := decodeCodexReasoningSignature(sig)
+	if !ok || len(decoded) < 73 || decoded[0] != 0x80 {
+		return false
+	}
+	// version(1) + timestamp(8) + IV(16) + ciphertext(n) + HMAC(32)
+	ciphertextLen := len(decoded) - 1 - 8 - 16 - 32
+	return ciphertextLen > 0 && ciphertextLen%16 == 0
+}
+
+func decodeCodexReasoningSignature(sig string) ([]byte, bool) {
+	if decoded, err := base64.RawURLEncoding.DecodeString(sig); err == nil {
+		return decoded, true
+	}
+	if decoded, err := base64.URLEncoding.DecodeString(sig); err == nil {
+		return decoded, true
+	}
+	return nil, false
 }
