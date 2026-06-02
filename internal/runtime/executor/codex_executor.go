@@ -42,7 +42,7 @@ import (
 )
 
 const (
-	codexUserAgent                  = "codex-tui/0.125.0 (Mac OS 26.3.1; arm64) iTerm.app/3.6.9 (codex-tui; 0.125.0)"
+	codexUserAgent                  = "codex-tui/0.135.0 (Mac OS 26.5.0; arm64) iTerm.app/3.6.10 (codex-tui; 0.135.0)"
 	codexOriginator                 = "codex-tui"
 	newAPIDownstreamTransportHeader = "X-NewAPI-Downstream-Transport"
 	codexUpstreamProtoHeader        = "X-CLIProxy-Codex-Upstream-Proto"
