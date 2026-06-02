@@ -140,7 +140,7 @@ func synthesizeFileAuths(ctx *SynthesisContext, fullPath string, data []byte) []
 		ProxyURL:  proxyURL,
 		ProxyPool: proxyPool,
 		Metadata:  metadata,
-		CreatedAt: now,
+		CreatedAt: coreauth.ResolveCreatedAt(metadata, now),
 		UpdatedAt: now,
 	}
 	// Read priority from auth file.

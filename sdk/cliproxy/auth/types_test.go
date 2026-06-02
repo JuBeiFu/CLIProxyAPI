@@ -1,6 +1,43 @@
 package auth
 
-import "testing"
+import (
+	"testing"
+	"time"
+)
+
+func TestResolveCreatedAt(t *testing.T) {
+	fallback := time.Date(2026, 6, 2, 0, 0, 0, 0, time.UTC)
+	persisted := time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC)
+
+	md := map[string]any{"created_at": persisted.Format(time.RFC3339)}
+	if got := ResolveCreatedAt(md, fallback); !got.Equal(persisted) {
+		t.Fatalf("persisted: got %s want %s", got, persisted)
+	}
+	if got := ResolveCreatedAt(map[string]any{}, fallback); !got.Equal(fallback) {
+		t.Fatalf("absent: got %s want %s", got, fallback)
+	}
+	if got := ResolveCreatedAt(map[string]any{"created_at": "not-a-time"}, fallback); !got.Equal(fallback) {
+		t.Fatalf("bad: got %s want %s", got, fallback)
+	}
+	if got := ResolveCreatedAt(nil, fallback); !got.Equal(fallback) {
+		t.Fatalf("nil: got %s want %s", got, fallback)
+	}
+}
+
+func TestStampCreatedAt(t *testing.T) {
+	md := map[string]any{}
+	ts := time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC)
+	StampCreatedAt(md, ts)
+	if md["created_at"] != ts.UTC().Format(time.RFC3339) {
+		t.Fatalf("stamp: got %v", md["created_at"])
+	}
+	md2 := map[string]any{}
+	StampCreatedAt(md2, time.Time{})
+	if _, ok := md2["created_at"]; ok {
+		t.Fatalf("zero time must not write created_at")
+	}
+	StampCreatedAt(nil, ts) // must not panic
+}
 
 func TestToolPrefixDisabled(t *testing.T) {
 	var a *Auth

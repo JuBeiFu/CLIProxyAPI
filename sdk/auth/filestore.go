@@ -67,6 +67,12 @@ func (s *FileTokenStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (str
 	}
 
 	metadata := applyRuntimeQuotaStateMetadata(auth.Metadata, auth.Quota)
+	// Persist created_at into metadata so it survives reloads: load paths prefer
+	// metadata["created_at"] over the file mtime, so a refresh that rewrites the
+	// file (bumping mtime) no longer drifts the account's creation marker. Both
+	// the Storage path (SetMetadata below merges this map) and the metadata path
+	// serialize this map, so a single stamp covers both.
+	cliproxyauth.StampCreatedAt(metadata, auth.CreatedAt)
 
 	// metadataSetter is a private interface for TokenStorage implementations that support metadata injection.
 	type metadataSetter interface {
@@ -272,7 +278,7 @@ func (s *FileTokenStore) readAuthFile(path, baseDir string) (*cliproxyauth.Auth,
 		Disabled:         disabled,
 		Attributes:       map[string]string{"path": path},
 		Metadata:         metadata,
-		CreatedAt:        info.ModTime(),
+		CreatedAt:        cliproxyauth.ResolveCreatedAt(metadata, info.ModTime()),
 		UpdatedAt:        info.ModTime(),
 		LastRefreshedAt:  time.Time{},
 		NextRefreshAfter: time.Time{},

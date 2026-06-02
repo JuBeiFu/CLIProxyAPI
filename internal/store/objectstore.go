@@ -182,8 +182,16 @@ func (s *ObjectTokenStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (s
 		return "", fmt.Errorf("object store: create auth directory: %w", err)
 	}
 
+	// Persist created_at into metadata so it survives reloads (load prefers
+	// metadata["created_at"] over the file mtime). Stamp before serialization so
+	// a refresh that rewrites the file no longer drifts the creation marker.
+	cliproxyauth.StampCreatedAt(auth.Metadata, auth.CreatedAt)
+
 	switch {
 	case auth.Storage != nil:
+		if setter, ok := auth.Storage.(interface{ SetMetadata(map[string]any) }); ok && auth.Metadata != nil {
+			setter.SetMetadata(auth.Metadata)
+		}
 		if err = auth.Storage.SaveTokenToFile(path); err != nil {
 			return "", err
 		}
@@ -597,7 +605,7 @@ func (s *ObjectTokenStore) readAuthFile(path, baseDir string) (*cliproxyauth.Aut
 		Disabled:         disabled,
 		Attributes:       attr,
 		Metadata:         metadata,
-		CreatedAt:        info.ModTime(),
+		CreatedAt:        cliproxyauth.ResolveCreatedAt(metadata, info.ModTime()),
 		UpdatedAt:        info.ModTime(),
 		LastRefreshedAt:  time.Time{},
 		NextRefreshAfter: time.Time{},

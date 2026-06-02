@@ -654,3 +654,29 @@ func normaliseUnix(raw int64) time.Time {
 	}
 	return time.Unix(raw, 0)
 }
+
+// ResolveCreatedAt returns the persisted created_at from metadata when present
+// and parseable, otherwise the supplied fallback (typically the file mtime or
+// load time). This makes created_at stable across refreshes that rewrite the
+// auth file (and bump its mtime): once metadata["created_at"] exists, the mtime
+// no longer participates in determining the account's creation marker.
+func ResolveCreatedAt(metadata map[string]any, fallback time.Time) time.Time {
+	if len(metadata) > 0 {
+		if v, ok := metadata["created_at"]; ok {
+			if ts, ok2 := parseTimeValue(v); ok2 && !ts.IsZero() {
+				return ts
+			}
+		}
+	}
+	return fallback
+}
+
+// StampCreatedAt writes t into metadata["created_at"] as an RFC3339 (UTC)
+// string so it persists across saves. A zero t is never written (avoids
+// persisting 0001-01-01); a nil map is a no-op.
+func StampCreatedAt(metadata map[string]any, t time.Time) {
+	if metadata == nil || t.IsZero() {
+		return
+	}
+	metadata["created_at"] = t.UTC().Format(time.RFC3339)
+}
