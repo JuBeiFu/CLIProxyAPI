@@ -692,6 +692,7 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.POST("/auth-files/refresh", s.mgmt.RefreshCodexAuthsHandler)
 		mgmt.GET("/auth-files/refresh/status", s.mgmt.RefreshCodexAuthsStatusHandler)
 		mgmt.GET("/auth-files/ban-records", s.mgmt.ListAuthBanRecords)
+		mgmt.GET("/auth-files/account-stats", s.mgmt.GetAuthAccountStats)
 		mgmt.GET("/auth-files/models", s.mgmt.GetAuthFileModels)
 		mgmt.GET("/model-definitions/:channel", s.mgmt.GetStaticModelDefinitions)
 		mgmt.GET("/auth-files/download", s.mgmt.DownloadAuthFile)

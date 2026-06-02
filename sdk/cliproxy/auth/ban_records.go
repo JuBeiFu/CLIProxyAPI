@@ -25,10 +25,38 @@ type BanRecord struct {
 	Name      string     `json:"name,omitempty"`
 	Account   string     `json:"account,omitempty"`
 	Provider  string     `json:"provider,omitempty"`
+	Plan      string     `json:"plan,omitempty"`
 	Source    string     `json:"source,omitempty"`
 	Reason    string     `json:"reason"`
 	CreatedAt *time.Time `json:"created_at,omitempty"`
 	BannedAt  time.Time  `json:"banned_at"`
+}
+
+// authPlanType returns the account's live plan ("free"/"plus"/"pro") — the
+// refresh-maintained Attributes value first (reflects later upgrades), then
+// metadata, then the (stale) JWT claim. Empty when unknown.
+func authPlanType(auth *Auth) string {
+	if auth == nil {
+		return ""
+	}
+	if auth.Attributes != nil {
+		if v := strings.TrimSpace(auth.Attributes["plan_type"]); v != "" {
+			return strings.ToLower(v)
+		}
+	}
+	if auth.Metadata != nil {
+		if v, ok := auth.Metadata["plan_type"].(string); ok {
+			if t := strings.TrimSpace(v); t != "" {
+				return strings.ToLower(t)
+			}
+		}
+	}
+	if claims := banRecordCodexClaims(auth); claims != nil {
+		if v := strings.TrimSpace(claims.CodexAuthInfo.ChatgptPlanType); v != "" {
+			return strings.ToLower(v)
+		}
+	}
+	return ""
 }
 
 func appendBanRecord(auth *Auth, reason string, source string, now time.Time) error {
@@ -109,6 +137,7 @@ func buildBanRecord(auth *Auth, reason string, source string, now time.Time) Ban
 		Name:     banRecordName(auth),
 		Account:  banRecordAccount(auth),
 		Provider: strings.TrimSpace(auth.Provider),
+		Plan:     authPlanType(auth),
 		Source:   strings.TrimSpace(source),
 		Reason:   strings.TrimSpace(reason),
 		BannedAt: now,

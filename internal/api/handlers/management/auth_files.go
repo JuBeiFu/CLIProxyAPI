@@ -1369,11 +1369,21 @@ func (h *Handler) writeAuthFile(ctx context.Context, name string, data []byte) e
 	if err != nil {
 		return err
 	}
+	// "上号" event: only when this is a genuinely NEW auth file (not a re-upload /
+	// token refresh), so each day's add-record count equals that day's new
+	// accounts. Stat before the write decides new-vs-existing.
+	_, statErr := os.Stat(dst)
+	isNewAuthFile := errors.Is(statErr, os.ErrNotExist)
 	if errWrite := os.WriteFile(dst, data, 0o600); errWrite != nil {
 		return fmt.Errorf("failed to write file: %w", errWrite)
 	}
 	if err := h.upsertAuthRecord(ctx, auth); err != nil {
 		return err
+	}
+	if isNewAuthFile {
+		if errAdd := coreauth.AppendAddRecord(h.cfg.AuthDir, auth, time.Now()); errAdd != nil {
+			log.WithError(errAdd).Warn("failed to append add record")
+		}
 	}
 	return nil
 }
