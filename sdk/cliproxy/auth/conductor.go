@@ -5660,12 +5660,44 @@ func isPlainUnauthorizedResultError(resultErr *Error) bool {
 		message == "unauthorized"
 }
 
+// codexSessionUnauthorizedReason is the disable reason recorded when a Codex
+// account is blocked at the account/session level (a bare {"detail":"Unauthorized"}
+// 401). The block survives access-token replacement, so it is terminal for the
+// relogin recovery path; the auth is disabled (kept on disk for a later full
+// re-auth) rather than left forever in the "recoverable, retrying" limbo.
+const codexSessionUnauthorizedReason = "codex_session_unauthorized"
+
+// isCodexSessionUnauthorizedResultError reports whether resultErr is the bare
+// {"detail":"Unauthorized"} 401 OpenAI returns when a Codex account/session is
+// blocked at the account level. Verified in prod: a freshly minted access token
+// still 401s on /responses while /wham/usage reports the account healthy as Plus,
+// so token replacement (and therefore the background relogin recovery) can never
+// clear it. This signal must retire the auth immediately instead of deferring to
+// that recovery. It is deliberately narrow — the {"error":{"message":"..."}} form
+// and generic 401s keep their existing handling.
+func isCodexSessionUnauthorizedResultError(resultErr *Error) bool {
+	if resultErr == nil {
+		return false
+	}
+	if resultErr.StatusCode() != http.StatusUnauthorized {
+		return false
+	}
+	message := strings.ToLower(strings.TrimSpace(resultErr.Message))
+	return strings.Contains(message, `"detail":"unauthorized"`) ||
+		strings.Contains(message, `"detail": "unauthorized"`)
+}
+
 func shouldDeleteRevokedAuth(auth *Auth, resultErr *Error, skipAccessTokenRefresh bool) (bool, string) {
 	if !isCodexAuth(auth) || !hasPersistedAuthRecord(auth) {
 		return false, ""
 	}
 	if handled, deleteAuth, reason := codexPendingActivationUnauthorizedDecision(auth, resultErr, time.Now()); handled {
 		return deleteAuth, reason
+	}
+	if isCodexSessionUnauthorizedResultError(resultErr) {
+		// Account/session block: disable and keep the file for a later full
+		// re-auth (see shouldDisableRevokedAuth); never delete.
+		return false, ""
 	}
 	if !skipAccessTokenRefresh && shouldAttemptAccessTokenRefresh(auth, resultErr) {
 		return false, ""
@@ -5680,6 +5712,14 @@ func shouldDisableRevokedAuth(auth *Auth, resultErr *Error, skipAccessTokenRefre
 	}
 	if handled, _, _ := codexPendingActivationUnauthorizedDecision(auth, resultErr, time.Now()); handled {
 		return false, ""
+	}
+	if isCodexSessionUnauthorizedResultError(resultErr) {
+		// Disable immediately, bypassing the relogin deferral below: this block
+		// survives access-token replacement, so deferring to a background
+		// re-login just keeps the dead auth in rotation, silently 401ing every
+		// request (logged at info level, masked by failover). Keep the file so a
+		// later full OAuth re-auth can recover the account.
+		return true, codexSessionUnauthorizedReason
 	}
 	if !skipAccessTokenRefresh && shouldAttemptAccessTokenRefresh(auth, resultErr) {
 		return false, ""

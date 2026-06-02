@@ -684,6 +684,128 @@ func TestManager_MarkResult_WritesBanRecordOnRevokedDisable(t *testing.T) {
 	}
 }
 
+func newCredsBearingCodexAuth(id string) *Auth {
+	auth := newPersistedCodexAuth(id)
+	auth.Attributes["plan_type"] = "plus"
+	auth.Metadata[MetadataProbedPlanTypeKey] = "plus"
+	auth.Metadata["email"] = "creds@example.com"
+	auth.Metadata["openai_password"] = "pw"
+	auth.Metadata["totp_secret"] = "totp"
+	return auth
+}
+
+func TestIsCodexSessionUnauthorizedResultError(t *testing.T) {
+	cases := []struct {
+		name string
+		err  *Error
+		want bool
+	}{
+		{"bare detail 401", &Error{HTTPStatus: http.StatusUnauthorized, Message: `{"detail":"Unauthorized"}`}, true},
+		{"detail with space 401", &Error{HTTPStatus: http.StatusUnauthorized, Message: `{"detail": "unauthorized"}`}, true},
+		{"error.message form 401", &Error{HTTPStatus: http.StatusUnauthorized, Message: `{"error":{"message":"Unauthorized"}}`}, false},
+		{"detail but 403", &Error{HTTPStatus: http.StatusForbidden, Message: `{"detail":"Unauthorized"}`}, false},
+		{"nil", nil, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isCodexSessionUnauthorizedResultError(tc.err); got != tc.want {
+				t.Fatalf("got %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestManager_MarkResult_DisablesEstablishedCodexOnDetailUnauthorized covers the
+// account/session-level block: a bare {"detail":"Unauthorized"} 401 that survives
+// access-token replacement. The auth carries relogin creds (so the legacy path
+// would defer retirement to a background re-login that can never fix it); the fix
+// must disable it immediately while keeping the file on disk for a later re-auth.
+func TestManager_MarkResult_DisablesEstablishedCodexOnDetailUnauthorized(t *testing.T) {
+	store := &deletingStore{}
+	mgr := NewManager(store, nil, nil)
+	auth := newCredsBearingCodexAuth("auths/detail-unauthorized.json")
+	clearRevokedAuthTombstoneForTest(t, auth)
+	if _, err := mgr.Register(WithSkipPersist(context.Background()), auth); err != nil {
+		t.Fatalf("Register returned error: %v", err)
+	}
+
+	reg := registry.GetGlobalRegistry()
+	reg.RegisterClient(auth.ID, "codex", []*registry.ModelInfo{{ID: "gpt-5.4"}})
+	t.Cleanup(func() { reg.UnregisterClient(auth.ID) })
+
+	resultErr := &Error{
+		HTTPStatus: http.StatusUnauthorized,
+		Message:    `{"detail":"Unauthorized"}`,
+	}
+	if !shouldAttemptAccessTokenRefresh(auth, resultErr) {
+		t.Fatal("test precondition: expected creds-bearing auth to be relogin-eligible")
+	}
+
+	mgr.MarkResult(context.Background(), Result{
+		AuthID:   auth.ID,
+		Provider: "codex",
+		Model:    "gpt-5.4",
+		Success:  false,
+		Error:    resultErr,
+	})
+
+	stored, ok := mgr.GetByID(auth.ID)
+	if !ok {
+		t.Fatal("expected auth to remain registered (disabled, not deleted)")
+	}
+	if !stored.Disabled || stored.Status != StatusDisabled {
+		t.Fatalf("expected auth disabled, got disabled=%v status=%q", stored.Disabled, stored.Status)
+	}
+	if len(store.deleted) != 0 {
+		t.Fatalf("expected auth not deleted from store, got %v", store.deleted)
+	}
+	if !HasRevokedAuthTombstone(auth, time.Now()) {
+		t.Fatal("expected a revoked tombstone so a racing relogin cannot re-enable it")
+	}
+}
+
+// TestManager_MarkResult_KeepsCredsBearingCodexOnRecoverable401 guards the
+// relogin path: a 401 that is NOT the account/session block (e.g. an expired
+// access token) must still defer to the background re-login, not be disabled.
+func TestManager_MarkResult_KeepsCredsBearingCodexOnRecoverable401(t *testing.T) {
+	store := &deletingStore{}
+	mgr := NewManager(store, nil, nil)
+	auth := newCredsBearingCodexAuth("auths/recoverable-401.json")
+	clearRevokedAuthTombstoneForTest(t, auth)
+	if _, err := mgr.Register(WithSkipPersist(context.Background()), auth); err != nil {
+		t.Fatalf("Register returned error: %v", err)
+	}
+
+	reg := registry.GetGlobalRegistry()
+	reg.RegisterClient(auth.ID, "codex", []*registry.ModelInfo{{ID: "gpt-5.4"}})
+	t.Cleanup(func() { reg.UnregisterClient(auth.ID) })
+
+	mgr.MarkResult(context.Background(), Result{
+		AuthID:   auth.ID,
+		Provider: "codex",
+		Model:    "gpt-5.4",
+		Success:  false,
+		Error: &Error{
+			HTTPStatus: http.StatusUnauthorized,
+			Message:    `{"error":{"message":"Your authentication token has expired."},"status":401}`,
+		},
+	})
+
+	stored, ok := mgr.GetByID(auth.ID)
+	if !ok {
+		t.Fatal("expected auth to remain registered")
+	}
+	if stored.Disabled || stored.Status == StatusDisabled {
+		t.Fatalf("expected recoverable 401 to defer to relogin (not disable), got disabled=%v status=%q", stored.Disabled, stored.Status)
+	}
+	if len(store.deleted) != 0 {
+		t.Fatalf("expected no delete, got %v", store.deleted)
+	}
+	if HasRevokedAuthTombstone(auth, time.Now()) {
+		t.Fatal("expected no tombstone for a recoverable 401")
+	}
+}
+
 func testJWTWithCodexClaims(t *testing.T, claims map[string]any) string {
 	t.Helper()
 
