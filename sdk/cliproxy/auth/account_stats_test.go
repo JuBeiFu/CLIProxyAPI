@@ -66,6 +66,38 @@ func TestBuildAccountStats(t *testing.T) {
 	}
 }
 
+// TestBuildAccountStats_BannedAmongAdded verifies the "封号率(占上号)" numerator:
+// only bans of accounts that were actually onboarded (present in add-records)
+// count, deduped per account — NOT every historical ban. This keeps the rate
+// (banned_among_added / total_added) bounded at 100% even when ban-records carry
+// long history but add-records only started recording recently.
+func TestBuildAccountStats_BannedAmongAdded(t *testing.T) {
+	loc := time.UTC
+	d := func(s string) time.Time { tm, _ := time.ParseInLocation("2006-01-02", s, loc); return tm }
+	add := []AddRecord{
+		{Name: "acct-a.json", AddedAt: d("2026-06-01").Add(1 * time.Hour)},
+		{Name: "acct-b.json", AddedAt: d("2026-06-01").Add(2 * time.Hour)},
+		{Name: "acct-c.json", AddedAt: d("2026-06-02").Add(1 * time.Hour)},
+		{Name: "acct-d.json", AddedAt: d("2026-06-02").Add(2 * time.Hour)},
+	}
+	ban := []BanRecord{
+		{Name: "acct-a.json", BannedAt: d("2026-06-02").Add(3 * time.Hour), Reason: "x"},  // onboarded
+		{Name: "acct-a.json", BannedAt: d("2026-06-03").Add(1 * time.Hour), Reason: "x"},  // same acct again -> still 1 distinct
+		{Name: "acct-c.json", BannedAt: d("2026-06-02").Add(4 * time.Hour), Reason: "x"},  // onboarded
+		{Name: "legacy-z.json", BannedAt: d("2026-06-02").Add(5 * time.Hour), Reason: "x"}, // NOT onboarded -> excluded
+	}
+	st := BuildAccountStats(add, ban, d("2026-06-01"), d("2026-06-03"), loc)
+	if st.TotalAdded != 4 {
+		t.Fatalf("TotalAdded=%d want 4", st.TotalAdded)
+	}
+	if st.TotalBanned != 4 {
+		t.Fatalf("TotalBanned=%d want 4 (all ban events)", st.TotalBanned)
+	}
+	if st.BannedAmongAdded != 2 {
+		t.Fatalf("BannedAmongAdded=%d want 2 (acct-a deduped + acct-c; legacy-z excluded)", st.BannedAmongAdded)
+	}
+}
+
 func TestAddRecordRoundTripAndRange(t *testing.T) {
 	dir := t.TempDir()
 	day1 := time.Date(2026, 6, 1, 10, 0, 0, 0, time.Local)

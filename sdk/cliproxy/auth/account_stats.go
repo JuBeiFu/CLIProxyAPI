@@ -87,6 +87,11 @@ type AccountStats struct {
 	Daily       []DailyStat    `json:"daily"`
 	TotalAdded  int            `json:"total_added"`
 	TotalBanned int            `json:"total_banned"`
+	// BannedAmongAdded is the count of DISTINCT onboarded accounts (present in
+	// add-records) that were later banned. It is the correct numerator for the
+	// "封号率(占上号)" rate (BannedAmongAdded/TotalAdded), unlike TotalBanned which
+	// includes bans of accounts that predate add-record tracking.
+	BannedAmongAdded int `json:"banned_among_added"`
 	BanByPlan   map[string]int `json:"ban_by_plan"`
 	BanByReason map[string]int `json:"ban_by_reason"`
 	BanBySource map[string]int `json:"ban_by_source"`
@@ -110,12 +115,17 @@ func BuildAccountStats(add []AddRecord, ban []BanRecord, start, end time.Time, l
 		BanBySource: map[string]int{},
 		AddByPlan:   map[string]int{},
 	}
+	addedIdents := make(map[string]struct{}, len(add))
 	for _, rec := range add {
 		key := rec.AddedAt.In(loc).Format("2006-01-02")
 		addByDay[key]++
 		st.TotalAdded++
 		st.AddByPlan[planKey(rec.Plan)]++
+		if id := accountIdentityKey(rec.Name, rec.Account); id != "" {
+			addedIdents[id] = struct{}{}
+		}
 	}
+	bannedAddedIdents := make(map[string]struct{})
 	for _, rec := range ban {
 		key := rec.BannedAt.In(loc).Format("2006-01-02")
 		banByDay[key]++
@@ -123,7 +133,17 @@ func BuildAccountStats(add []AddRecord, ban []BanRecord, start, end time.Time, l
 		st.BanByPlan[planKey(rec.Plan)]++
 		st.BanByReason[ClassifyBanReason(rec.Reason)]++
 		st.BanBySource[sourceKey(rec.Source)]++
+		// Count a ban toward the "占上号" rate only if the banned account was
+		// actually onboarded in this window (present in add-records), deduped per
+		// account — so the rate stays bounded even when ban history predates
+		// add-record tracking.
+		if id := accountIdentityKey(rec.Name, rec.Account); id != "" {
+			if _, ok := addedIdents[id]; ok {
+				bannedAddedIdents[id] = struct{}{}
+			}
+		}
 	}
+	st.BannedAmongAdded = len(bannedAddedIdents)
 	for _, d := range days {
 		key := d.Format("2006-01-02")
 		st.Daily = append(st.Daily, DailyStat{Date: key, Added: addByDay[key], Banned: banByDay[key]})
@@ -133,6 +153,19 @@ func BuildAccountStats(add []AddRecord, ban []BanRecord, start, end time.Time, l
 		st.End = days[len(days)-1].Format("2006-01-02")
 	}
 	return st
+}
+
+// accountIdentityKey returns a stable identity for matching an add-record to a
+// ban-record. Both are derived from the same auth via banRecordName/banRecordAccount,
+// so the auth-file name is preferred (most stable) with the account as fallback.
+func accountIdentityKey(name, account string) string {
+	if n := strings.ToLower(strings.TrimSpace(name)); n != "" {
+		return "n:" + n
+	}
+	if a := strings.ToLower(strings.TrimSpace(account)); a != "" {
+		return "a:" + a
+	}
+	return ""
 }
 
 func planKey(p string) string {
